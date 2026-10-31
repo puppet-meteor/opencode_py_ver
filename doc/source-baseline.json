@@ -10,5 +10,13 @@
   {"path":"packages/core/src/tool.ts","sha256":"340b025c833b19d530d10515a474d8c44ba8291720b7eb485c9eed803306dbfe"},
   {"path":"packages/core/src/config/discovery.ts","sha256":"48118dafc1ba0ec03112e98cdd616f339262a08a42b4ae75e9014575d863434d"},
   {"path":"packages/ai/src/schema/messages.ts","sha256":"774a19d9118deaad202737b844113ce747c0ae6b9a8c1471c352e4d3d6220d36"},
-  {"path":"packages/ai/src/schema/events.ts","sha256":"a50bb8706cf2473fecaa7cbb9032e8168b363bb3c942a0b427d26b81e12bbd2a"}
+  {"path":"packages/ai/src/schema/events.ts","sha256":"a50bb8706cf2473fecaa7cbb9032e8168b363bb3c942a0b427d26b81e12bbd2a"},
+  {"path":"packages/ai/src/testing.ts","sha256":"bd056b9b48bb518bb08df24e0e1ab5f67578d99ed56e542b3f0c1f95f37c0ea5"},
+  {"path":"packages/core/src/aisdk.ts","sha256":"6692b1407d45869aa3d3239e10d39fcbb19c2152415d14b271a98530edd0a59d"},
+  {"path":"packages/ai/src/route/transport/http.ts","sha256":"c210d61c1224e8e0f02c953405dc2d4f540fce0f4afe3e7df01de149f64f3a59"},
+  {"path":"packages/ai/src/route/executor.ts","sha256":"706566b817f57267533719db5df3ec7d6e190b4199d7f39376c282a9672edf9b"},
+  {"path":"packages/core/src/model-retry.ts","sha256":"046657b2b6242ca082db4e2a9b41505ac4dfaa2721361d9ca381cb517b58a90e"},
+  {"path":"packages/core/src/filesystem.ts","sha256":"19a8d3df0691d572ed855ba08b3aba5c28e777040eb1b2e9b71b003fdfd23bad"},
+  {"path":"packages/core/src/database/sqlite.bun.ts","sha256":"6dc4c1e9bc6ba08f15b3fa5f4e29fc6e7ec69db4e8cf4fc8ffd7d8413de1eb59"},
+  {"path":"packages/core/src/event/sql.ts","sha256":"1efc99f1d5e35fc23eb5c6bff8b577b918e8e792875d3e4e04f33f8ae8c42832"}
 ]

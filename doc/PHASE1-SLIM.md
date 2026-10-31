@@ -1,7 +1,7 @@
 # Phase 1：带接缝的核心闭环
 
 > 本文是执行计划；接口以 [CORE-CONTRACTS](CORE-CONTRACTS.md) 为准。
-> 预算：单人全职 + AI 辅助，约 5 周功能切片 + 1–3 周集成/修正余量，共 6–8 开发周；R0 后复估。
+> 预算：单人全职 + AI 辅助，R0-A/R0-B 约 1–1.5 周，其余功能切片约 4.5 周，另留 1–3 周集成/修正余量，共约 6.5–9 开发周；R0 后仍需复估。
 > 当前只有规划文档，以下验收项均未执行。
 
 ## 1. Done 的定义
@@ -31,8 +31,9 @@
 
 | 切片 | 基础预算 | 前置 | 结束时可演示 |
 |---|---:|---|---|
-| R0 风险打样 | 0.5 周 | 无 | 真实/fake 流和平台假设验证 |
-| R1 存储垂直闭环 | 1 周 | R0 | create → 用户事件 → 投影 → 重启查询 |
+| R0-A provider/CI 风险打样 | 0.5 周 | 无 | 真实/fake 流、provider 生命周期和双平台质量门 |
+| R0-B 平台/锁探针 | 0.5–1 周 | R0-A | 进程树、路径、SQLite WAL/OS writer lock |
+| R1 存储垂直闭环 | 1 周 | R0-B | create → 用户事件 → 投影 → 重启查询 |
 | R2 对话与一次工具调用 | 1 周 | R1 | CLI → provider → read → 回填 → idle |
 | R3 工具/权限/配置 | 1 周 | R2 | 受策略控制的本地 coding 任务 |
 | R4 MCP 与故障恢复 | 1 周 | R3 | stdio 工具 + crash-window 恢复 |
@@ -42,12 +43,22 @@
 
 ### R0：先验证不确定性（执行卡片：[STEP-01-R0.md](STEP-01-R0.md)）
 
-交付：最小 pyproject/锁文件/pytest/ruff/mypy/Windows+Linux CI；MAAS spike；fake OpenAI-compatible HTTP server；原生平台进程/路径 spike。
+R0 分两个闸门，总预算约 1–1.5 周；R0-A 通过后才能开始 R0-B，R0-B 通过后才能进入 R1。具体步骤、源码依据和证据格式以执行卡片为准。
+
+#### R0-A：provider 和 CI
+
+交付：最小 pyproject/锁文件/pytest/ruff/mypy/Windows+Linux CI；MAAS spike；fake OpenAI-compatible HTTP server。
 
 - 验收 A：真实端点完成文本流、两个交错 tool call、usage/finish；记录脱敏 fixture、模型上下文上限和 provider 差异。
-- 验收 B：fake server 能控制错误分片、EOF、429、超时和工具参数；CI 无凭据运行。
-- 验收 C：Windows/Unix 各验证解释器选择、进程树回收、symlink/junction、SQLite WAL/文件锁；第二 writer 明确失败。
-- 验证：HTTP adapter 契约测试 + 小型平台探针；结果记录到 parity 和平台支持表。R0 失败必须先修假设或收缩支持范围。
+- 验收 B：fake server 能控制交错调用、EOF、429、header/chunk/total timeout 和取消；CI 无凭据运行。非法 JSON、重复 ID、未知工具和 schema 参数错误列入 R2 承接清单，不计入 R0-A 通过条件。
+- 验证：HTTP adapter 契约测试；R0-A 失败必须先修假设或收缩 provider 范围。
+
+#### R0-B：平台和锁探针
+
+交付：Windows/Unix 解释器选择、进程树回收、symlink/junction、SQLite WAL/OS 文件锁探针。
+
+- 验收：两个独立 writer 进程竞争同一数据目录锁时，第二个在写事务前明确失败；进程树取消/超时后所有 descendant 在 grace period 内退出；路径越界和 symlink/junction 逃逸被拒绝。
+- 验证：平台探针和证据矩阵记录到 `doc/platform-support.md`、`doc/evidence/r0/platform.json`；R0-B 失败必须停止进入 R1。
 
 真实 MAAS 凭据暂不可用时可继续不依赖它的 R1；Phase 1 发布仍需实际端点证据，不能以 fake 成功替代。
 
