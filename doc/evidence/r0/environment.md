@@ -46,4 +46,5 @@
 ## 6. R0-B 补记(2026-10-31)
 
 - R0-B 平台/存储探针的环境与验证命令同上(§3 六条命令 + `uv run python tools/r0/platform_probe.py --output doc/evidence/r0/platform.json`,本地 Windows 四项探针全 verified);探针零新增依赖(纯 stdlib),`uv.lock` 未变。
-- R0-B 的平台结论、限制与证据级别(manual/ci/unsupported)见 [platform-support.md](../platform-support.md) 与 [platform.json](platform.json);CI 侧探针证据待本轮 commit+push 后以 artifact(`platform-probe-<os>`)回填。
+- R0-B 的平台结论、限制与证据级别(manual/ci/unsupported)见 [platform-support.md](../platform-support.md) 与 [platform.json](platform.json)。
+- CI 侧探针证据 **已回填**:run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)(commit `d5cdb11`,ubuntu-latest + windows-latest 全绿,pytest 各 32 passed);探针 artifact `platform-probe-<os>` 中四项探针均 `ci_verified`、`unsupported` 为空。中间失败已修复:ubuntu POSIX zombie 误判 alive(`f653877`)、linux mypy `_winapi` 桩平台条件(`d5cdb11`)。
