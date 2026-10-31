@@ -1,6 +1,6 @@
 {
-  "scenario": "wire-content-after-finish-normalized",
-  "description": "misbehaving wire sends content after a finish frame; held-back finish keeps output valid",
+  "scenario": "wire-content-after-finish-rejected",
+  "description": "text content after a finish frame; the stream is rejected with a protocol error",
   "sanitization": "synthetic fake-server data only; no real endpoint, credential, prompt or model output",
   "request": {
     "request_id": "r0-fixture-wire-002",
@@ -38,35 +38,13 @@
       "usage": null,
       "reason": null,
       "raw_reason": null
-    },
-    {
-      "request_id": "r0-fixture-wire-002",
-      "index": 1,
-      "type": "text_delta",
-      "part_id": "text-0",
-      "delta": "b",
-      "call_index": null,
-      "tool_call_id": null,
-      "name": null,
-      "raw_arguments": null,
-      "usage": null,
-      "reason": null,
-      "raw_reason": null
-    },
-    {
-      "request_id": "r0-fixture-wire-002",
-      "index": 2,
-      "type": "finish",
-      "part_id": null,
-      "delta": null,
-      "call_index": null,
-      "tool_call_id": null,
-      "name": null,
-      "raw_arguments": null,
-      "usage": null,
-      "reason": "stop",
-      "raw_reason": "stop"
     }
   ],
-  "error": null
+  "error": {
+    "code": "ValidationError",
+    "message": "provider stream sent content after the finish frame",
+    "details": {
+      "violation": "content_after_finish"
+    }
+  }
 }

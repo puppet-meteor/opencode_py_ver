@@ -1,6 +1,6 @@
 {
-  "scenario": "wire-double-finish-normalized",
-  "description": "misbehaving wire sends two finish frames; adapter still emits exactly one terminal",
+  "scenario": "wire-duplicate-finish-rejected",
+  "description": "two finish frames on the wire; the stream is rejected with a protocol error, no finish terminal",
   "sanitization": "synthetic fake-server data only; no real endpoint, credential, prompt or model output",
   "request": {
     "request_id": "r0-fixture-wire-001",
@@ -38,21 +38,13 @@
       "usage": null,
       "reason": null,
       "raw_reason": null
-    },
-    {
-      "request_id": "r0-fixture-wire-001",
-      "index": 1,
-      "type": "finish",
-      "part_id": null,
-      "delta": null,
-      "call_index": null,
-      "tool_call_id": null,
-      "name": null,
-      "raw_arguments": null,
-      "usage": null,
-      "reason": "tool_calls",
-      "raw_reason": "tool_calls"
     }
   ],
-  "error": null
+  "error": {
+    "code": "ValidationError",
+    "message": "provider stream sent a duplicate finish frame",
+    "details": {
+      "violation": "duplicate_finish"
+    }
+  }
 }

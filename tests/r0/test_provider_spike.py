@@ -232,15 +232,16 @@ async def test_interleaved_tool_calls_with_argument_shards() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Adapter-level structural guarantees against misbehaving wire streams
+# Adapter-level wire-protocol rejection (STEP-01-R0 L86: duplicate or
+# out-of-order chunks must be rejected, never normalized)
 # ---------------------------------------------------------------------------
 
 
-async def test_wire_double_finish_yields_single_terminal() -> None:
-    """A duplicated finish frame on the wire must not produce two terminals.
+async def test_wire_double_finish_is_rejected() -> None:
+    """A duplicated finish frame on the wire must fail the whole stream.
 
-    The output-sequence contract (one terminal, last chunk) is guaranteed
-    structurally by the adapter, not only by the test-side validator.
+    STEP-01-R0 L86 rejects duplicate terminals instead of merging them, so
+    the consumer sees a protocol error and no finish terminal at all.
     """
     async with fake_server(
         [
@@ -255,19 +256,19 @@ async def test_wire_double_finish_yields_single_terminal() -> None:
     ) as server:
         chunks, error = await consume(make_adapter(server), make_request())
 
-    assert error is None
-    validate_sequence(chunks, "req-1")
-    finishes = [c for c in chunks if c.type == "finish"]
-    assert len(finishes) == 1  # single terminal despite two wire finish frames
-    # Normalization detail: the last wire finish_reason wins (recorded in provider.md).
-    assert (finishes[0].reason, finishes[0].raw_reason) == ("tool_calls", "tool_calls")
+    assert error is not None
+    assert error.code == "ValidationError"
+    assert error.details["violation"] == "duplicate_finish"
+    validate_sequence(chunks, "req-1", require_terminal=False)
+    assert not [c for c in chunks if c.type == "finish"]  # held-back finish discarded
+    assert len(server.requests) == 1  # protocol violations are never retried
 
 
-async def test_wire_content_after_finish_is_normalized() -> None:
-    """Content emitted after a finish frame on the wire stays pre-terminal.
+async def test_wire_text_after_finish_is_rejected() -> None:
+    """Text arriving after a finish frame is an out-of-order violation.
 
-    The logical finish is held back to the end, so a misordered wire cannot
-    produce a chunk-after-terminal violation in the output sequence.
+    The stream fails with a protocol error instead of appending the late
+    content; the held-back finish is discarded (error supersedes finish).
     """
     async with fake_server(
         [
@@ -282,10 +283,36 @@ async def test_wire_content_after_finish_is_normalized() -> None:
     ) as server:
         chunks, error = await consume(make_adapter(server), make_request())
 
-    assert error is None
-    validate_sequence(chunks, "req-1")
-    assert [c.type for c in chunks] == ["text_delta", "text_delta", "finish"]
-    assert "".join(c.delta or "" for c in chunks if c.type == "text_delta") == "ab"
+    assert error is not None
+    assert error.code == "ValidationError"
+    assert error.details["violation"] == "content_after_finish"
+    validate_sequence(chunks, "req-1", require_terminal=False)
+    assert [c.type for c in chunks] == ["text_delta"]  # only pre-finish content survives
+    assert "".join(c.delta or "" for c in chunks if c.type == "text_delta") == "a"
+    assert len(server.requests) == 1
+
+
+async def test_wire_tool_call_after_finish_is_rejected() -> None:
+    """Tool-call content after a finish frame is rejected like late text."""
+    async with fake_server(
+        [
+            ScriptedResponse(
+                frames=[
+                    Frame(tool_call_start_frame(0, "call-1", "fs__read")),
+                    Frame(finish_frame("stop")),
+                    Frame(tool_call_args_frame(0, '{"path": "/a"}')),
+                ]
+            )
+        ]
+    ) as server:
+        chunks, error = await consume(make_adapter(server), make_request(tools=(READ_TOOL,)))
+
+    assert error is not None
+    assert error.code == "ValidationError"
+    assert error.details["violation"] == "content_after_finish"
+    validate_sequence(chunks, "req-1", require_terminal=False)
+    assert [c.type for c in chunks] == ["tool_call_start"]  # no tool_call_end, no finish
+    assert len(server.requests) == 1
 
 
 # ---------------------------------------------------------------------------

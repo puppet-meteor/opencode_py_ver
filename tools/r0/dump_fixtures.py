@@ -249,8 +249,8 @@ async def _scenarios() -> list[tuple[str, dict[str, Any]]]:
         (
             "06_wire_double_finish.json",
             await _fixture(
-                "wire-double-finish-normalized",
-                "misbehaving wire sends two finish frames; adapter still emits exactly one terminal",
+                "wire-duplicate-finish-rejected",
+                "two finish frames on the wire; the stream is rejected with a protocol error, no finish terminal",
                 [
                     ScriptedResponse(
                         frames=[
@@ -269,8 +269,8 @@ async def _scenarios() -> list[tuple[str, dict[str, Any]]]:
         (
             "07_wire_content_after_finish.json",
             await _fixture(
-                "wire-content-after-finish-normalized",
-                "misbehaving wire sends content after a finish frame; held-back finish keeps output valid",
+                "wire-content-after-finish-rejected",
+                "text content after a finish frame; the stream is rejected with a protocol error",
                 [
                     ScriptedResponse(
                         frames=[

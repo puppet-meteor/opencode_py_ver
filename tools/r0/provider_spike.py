@@ -470,6 +470,31 @@ class MaasSpikeAdapter:
 
     def _map_chunk(self, raw: Any, state: _AttemptState, request_id: str) -> list[ProviderChunk]:
         out: list[ProviderChunk] = []
+        choices = raw.choices or []
+        choice = choices[0] if choices else None
+        delta = choice.delta if choice is not None else None
+        content = getattr(delta, "content", None) if delta is not None else None
+        tool_calls = (getattr(delta, "tool_calls", None) or []) if delta is not None else []
+
+        # STEP-01-R0 L86: duplicate or out-of-order chunks are rejected, not
+        # normalized. Once a finish frame has been seen, only usage frames
+        # (usage after finish stays legal per L88) and the stream end may
+        # follow; content/tool-call frames or a second finish frame are wire
+        # protocol violations that fail the whole stream.
+        if state.pending_finish is not None:
+            if content or tool_calls:
+                raise CoreError(
+                    "ValidationError",
+                    "provider stream sent content after the finish frame",
+                    details={"violation": "content_after_finish"},
+                )
+            if choice is not None and choice.finish_reason is not None:
+                raise CoreError(
+                    "ValidationError",
+                    "provider stream sent a duplicate finish frame",
+                    details={"violation": "duplicate_finish"},
+                )
+
         if raw.usage is not None:
             # Emit usage as soon as it arrives. The logical finish is held
             # back until the stream ends, so usage survives in both wire
@@ -482,13 +507,9 @@ class MaasSpikeAdapter:
                     usage=_map_usage(raw.usage),
                 )
             )
-        choices = raw.choices or []
-        if not choices:
+        if choice is None:
             return out
-        choice = choices[0]
-        delta = choice.delta
         if delta is not None:
-            content = getattr(delta, "content", None)
             if content:
                 # OpenAI-compatible streams carry no text part id: one
                 # synthetic part per response (recorded difference vs TS).
@@ -501,7 +522,6 @@ class MaasSpikeAdapter:
                         delta=content,
                     )
                 )
-            tool_calls = getattr(delta, "tool_calls", None) or []
             for item in tool_calls:
                 call_index = item.index
                 function = item.function
@@ -537,6 +557,8 @@ class MaasSpikeAdapter:
                         )
                     )
         if choice.finish_reason is not None:
+            # A second finish frame never reaches here: the rejection block
+            # at the top of _map_chunk already failed the stream (L86).
             state.pending_finish = choice.finish_reason
         return out
 

@@ -1,9 +1,9 @@
 # R0-A Provider 证据
 
-> spike 落点：`tools/r0/provider_spike.py`（类型与 adapter）、`tests/r0/fake_openai_server.py`（fake SSE server）、`tests/r0/test_provider_spike.py`（契约测试，23 用例）。
+> spike 落点：`tools/r0/provider_spike.py`（类型与 adapter）、`tests/r0/fake_openai_server.py`（fake SSE server）、`tests/r0/test_provider_spike.py`（契约测试，24 用例）。
 > 行为依据：TS 锚点 `aisdk.ts:65-169,746-857`、`http.ts:94-140`、`executor.ts:22-35`、`model-retry.ts:62-103`、`testing.ts:40-150`（指纹见 `doc/source-baseline.json`）。
 
-## 1. 覆盖的 R0-A 必测集（pytest 23/23）
+## 1. 覆盖的 R0-A 必测集（pytest 24/24）
 
 | 场景 | 用例 | 断言要点 |
 |---|---|---|
@@ -18,9 +18,10 @@
 | chunk/read 超时 | `test_chunk_timeout` | `timeout_kind=chunk`，首帧已交付 |
 | total deadline | `test_total_deadline` | `timeout_kind=total`，部分内容后触发 |
 | 取消 | `test_cancellation_propagates_and_cleans_up` | `CancelledError` 传播；adapter.close + server.aclose 后 `asyncio.all_tasks()` 无泄漏 |
-| wire 重复 finish（adapter 级） | `test_wire_double_finish_yields_single_terminal` | wire 发两个 finish 帧仍只产出 **1 个终态**，最后 raw_reason 胜出——结构性保证，非仅输出校验 |
-| wire 终态后乱序内容（adapter 级） | `test_wire_content_after_finish_is_normalized` | 逻辑 finish 压到流末，wire 终态后内容不产生"终态后 chunk"违规，输出仍为 [text, text, finish] |
-| 序列契约单元（输出校验器） | `test_validate_sequence_*`（7 拒绝 + 1 接受） | request_id / index 严格递增 / 终态唯一且最后 / 类型必填字段。注意：这是对手工构造序列的**输出侧校验**；"重复/乱序被拒绝"的 **wire 侧结构保证**由上面两个 adapter 级用例证明 |
+| wire 重复 finish（adapter 级） | `test_wire_double_finish_is_rejected` | wire 发两个 finish 帧 → `CoreError(ValidationError, violation=duplicate_finish)`，无 finish 终态、1 次请求不重试——STEP-01-R0 L86 拒绝，不归一化 |
+| wire 终态后文本（adapter 级） | `test_wire_text_after_finish_is_rejected` | finish 后文本 → `ValidationError(content_after_finish)`，仅保留 finish 前内容，held-back finish 被丢弃 |
+| wire 终态后 tool call（adapter 级） | `test_wire_tool_call_after_finish_is_rejected` | finish 后 tool-call 帧 → 同上拒绝；无 tool_call_end、无 finish |
+| 序列契约单元（输出校验器） | `test_validate_sequence_*`（7 拒绝 + 1 接受） | request_id / index 严格递增 / 终态唯一且最后 / 类型必填字段。注意：这是对手工构造序列的**输出侧校验**；"重复/乱序被拒绝"的 **wire 侧结构保证**由上面三个 adapter 级用例证明 |
 | Retry-After 解析单元 | `test_retry_after_seconds_prefers_ms_header` | ms 优先于秒；非法/负值忽略 |
 | SDK 类型不泄漏 | `test_sdk_types_do_not_leak` | 所有 chunk 字段的类型模块均非 `openai*`/`httpx*` |
 
@@ -34,8 +35,8 @@
   - `03_interleaved_tool_calls.json` — 双交错 tool call + 参数分片聚合，`tool_call_end` 携带完整 `raw_arguments`，usage 在 tool_call_end 之前保留；
   - `04_eof_without_terminal.json` — 干净结束 body 但无 `[DONE]` 行/finish 帧 → `ProviderStreamInterrupted`；
   - `05_429_retry_then_success.json` — 首内容前 429（`retry-after-ms` 被尊重）重试成功，`http_request_count=2`；
-  - `06_wire_double_finish.json` — wire 双 finish 帧归一化为单终态（最后 raw_reason 胜出）；
-  - `07_wire_content_after_finish.json` — wire 终态后内容被归一化，输出仍合法；
+  - `06_wire_double_finish.json` — wire 双 finish 帧 → 协议错误拒绝（`ValidationError`，violation=duplicate_finish），无 finish 终态；
+  - `07_wire_content_after_finish.json` — wire 终态后文本 → 协议错误拒绝（violation=content_after_finish），仅保留 finish 前内容；
 - 脱敏保证：全部为合成 fake-server 数据，无真实 endpoint、凭据、prompt 或模型输出进入文件；adapter 在 spike 中不产出 provider metadata（恒为空字典），fixture 不含该字段，满足"provider metadata 经过有界化和脱敏后才进入 fixture"（STEP-01-R0 L93）；
 - R2 重建 `src/opencode/ai/` 时必须重跑本目录全部 fixture（见 §7）。
 
@@ -74,10 +75,11 @@
 4. **类型实现**：`ProviderChunk` 等为 dataclass；正式版按 CORE-CONTRACTS 用 pydantic（R2）；
 5. **Retry-After**：只解析 `retry-after-ms`（优先）与秒数；HTTP-date 未实现；
 6. **reasoning**：OpenAI 兼容 wire 无 reasoning 字段，`reasoning_delta` 永不产生（usage 的 `completion_tokens_details.reasoning_tokens` 已映射）；
-7. **usage 顺序**：usage 在 wire 上位于 finish 前或后都能保留——逻辑 finish 被压到流末，顺序恒为 usage → tool_call_end(s) → finish；
+7. **usage 顺序**：usage 在 wire 上位于 finish 前或后都能保留——逻辑 finish 被压到流末，顺序恒为 usage → tool_call_end(s) → finish；finish 之后仅 usage 帧合法（STEP-01-R0 L88），其余内容帧触发协议错误（见第 11 条）；
 8. **base_url 挂载**：OpenAI SDK 在 base_url 后拼 `/chat/completions`，故 base_url 必须含 `/v1` 段（fake server 只服务 `/v1/chat/completions`，并校验路径与 `stream=true`，否则 404/400）；
 9. **5xx 不自动重试**（见 §4），与 TS 行为有差（TS 对"明确没跑"的请求重试），留给 R2 对照真实后端再定；
-10. **直接依赖声明**：`provider_spike.py` 直接 `import httpx2`，故 pyproject 声明 `httpx2>=2.12.0,<3`（与 openai 3.42 声明的 `httpx2<3,>=2.12.0` 范围一致），不依赖传递关系泄漏。
+10. **直接依赖声明**：`provider_spike.py` 直接 `import httpx2`，故 pyproject 声明 `httpx2>=2.12.0,<3`（与 openai 3.42 声明的 `httpx2<3,>=2.12.0` 范围一致），不依赖传递关系泄漏；
+11. **wire 协议违规拒绝**（STEP-01-R0 L86）：重复 finish 帧、finish 之后的文本/tool-call 内容帧 → `CoreError(ValidationError, retryable=False, details.violation=duplicate_finish|content_after_finish)`，整流失败、held-back finish 被丢弃、绝不重试（协议违规不在 429/connect 可重试集合内）。错误码选用 spike 错误子集中的 `ValidationError`（在 CORE-CONTRACTS §8 错误码表内，语义为"provider 流违反协议"；未新增契约外错误码），R2 重建时可重新审视是否需要更专用的错误码。
 
 ## 7. R2 承接清单（fixture 待补，不计入 R0-A 通过条件）
 
@@ -111,7 +113,7 @@ R2 重建 `src/opencode/ai/` 时：**必须重跑** `tests/r0/` 全部用例与 
 ```
 uv lock --check                    # 通过（29 packages resolved）
 uv sync --locked                   # 通过
-uv run pytest -q tests/r0         # 23 passed（连续 10 次）
+uv run pytest -q tests/r0         # 24 passed（连续 10 次）
 uv run ruff check .                # All checks passed
 uv run ruff format --check .       # 18 files already formatted
 uv run mypy src tools/r0 tests/r0  # Success: no issues in 7 source files

@@ -25,7 +25,7 @@
 |---|---|
 | `uv lock --check` | 通过(锁与 pyproject 一致) |
 | `uv sync --locked` | 通过 |
-| `uv run pytest -q tests/r0` | **23 passed**,连续 10 次全绿(曾存在高偶发失败,根因与修复见 provider.md §5) |
+| `uv run pytest -q tests/r0` | **24 passed**,连续 10 次全绿(曾存在高偶发失败,根因与修复见 provider.md §5) |
 | `uv run ruff check .` | All checks passed |
 | `uv run ruff format --check .` | 18 files already formatted |
 | `uv run mypy src tools/r0 tests/r0` | Success: no issues in 7 source files |
