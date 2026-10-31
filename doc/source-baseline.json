@@ -1,0 +1,14 @@
+[
+  {"path":"package.json","sha256":"7e807299c3ec5215b6d66436c8406f9c9459584d9ad345bc5dd78757ddcef76c"},
+  {"path":"packages/schema/src/event.ts","sha256":"f39ab332fe69fcb85adeda95bcf4af608e13fc7e32d9dca5887fc35c51390fa9"},
+  {"path":"packages/schema/src/session-message.ts","sha256":"15ed05f87a9ae88ee54157cf3eb50dba70557ad086f0df1f0d66f0fa1f2ba128"},
+  {"path":"packages/schema/src/session-event.ts","sha256":"6c4e19b447fc2a1aee0c3b80518bf6a63653ce127c5969642396855983a2d3ef"},
+  {"path":"packages/schema/src/tool.ts","sha256":"b5e35a5a5208f48bf564705563f4f77e5d46d7d57fd8c0091847b38772990e06"},
+  {"path":"packages/schema/src/permission.ts","sha256":"45b63a6d9f7619d9285663111f26a9a939d64683cac3272881e6dd196409bc1d"},
+  {"path":"packages/core/src/bus.ts","sha256":"84470964226401cfc5e67d83c51fa38e4fa026b5bb8cbf182900d6a50538b3b2"},
+  {"path":"packages/core/src/session/projector.ts","sha256":"95e9f3ca31c3e808995d94ee1ef009ae3a385a4475d98ecc163643d1b3b847b1"},
+  {"path":"packages/core/src/tool.ts","sha256":"340b025c833b19d530d10515a474d8c44ba8291720b7eb485c9eed803306dbfe"},
+  {"path":"packages/core/src/config/discovery.ts","sha256":"48118dafc1ba0ec03112e98cdd616f339262a08a42b4ae75e9014575d863434d"},
+  {"path":"packages/ai/src/schema/messages.ts","sha256":"774a19d9118deaad202737b844113ce747c0ae6b9a8c1471c352e4d3d6220d36"},
+  {"path":"packages/ai/src/schema/events.ts","sha256":"a50bb8706cf2473fecaa7cbb9032e8168b363bb3c942a0b427d26b81e12bbd2a"}
+]
