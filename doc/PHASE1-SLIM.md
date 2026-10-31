@@ -40,7 +40,7 @@
 
 另留 1–3 周吸收修正，不把 R5 的发布工作当作全部缓冲。
 
-### R0：先验证不确定性
+### R0：先验证不确定性（执行卡片：[STEP-01-R0.md](STEP-01-R0.md)）
 
 交付：最小 pyproject/锁文件/pytest/ruff/mypy/Windows+Linux CI；MAAS spike；fake OpenAI-compatible HTTP server；原生平台进程/路径 spike。
 

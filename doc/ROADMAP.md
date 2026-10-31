@@ -26,6 +26,7 @@
 | 文档 | 负责的内容 |
 |---|---|
 | [PHASE1-SLIM.md](PHASE1-SLIM.md) | 切片、依赖、验收、测试、交付顺序 |
+| [STEP-01-R0.md](STEP-01-R0.md) | R0 风险打样的逐步执行、证据和闸门 |
 | [CORE-CONTRACTS.md](CORE-CONTRACTS.md) | 六个接缝的接口、事件数据、错误与恢复语义 |
 | [PHASE2-MODULES.md](PHASE2-MODULES.md) | 可选模块、真实依赖、变更范围和估算 |
 | [parity.md](parity.md) | TS 对照、已知差异、参考源码锁定 |
