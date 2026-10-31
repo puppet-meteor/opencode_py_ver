@@ -40,5 +40,5 @@
 
 ## 5. 未验证项
 
-- Linux 端实际运行(本地无 Linux 环境;由 CI `ubuntu-latest` 覆盖,尚未推送到远端触发,**CI 运行结果:未验证**);
+- ~~Linux 端实际运行~~ **已验证**:CI run [41177228445](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445)(commit `edcf891`,2026-10-31)`ubuntu-latest` 与 `windows-latest` 两个 job 均 success,pytest 各 `23 passed`(详见 provider.md §9);
 - 真实 MAAS smoke:无凭据,标记“R0-A 外部证据待补”(见 provider.md §8)。

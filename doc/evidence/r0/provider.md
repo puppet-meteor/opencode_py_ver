@@ -101,7 +101,10 @@ R2 重建 `src/opencode/ai/` 时：**必须重跑** `tests/r0/` 全部用例与 
 ## 9. CI 验证状态
 
 - 工作流：`.github/workflows/ci.yml`——单 job matrix（`ubuntu-latest` + `windows-latest`），`astral-sh/setup-uv@v5`，Python 3.12；步骤 = `uv lock --check` → `uv sync --locked` → `uv run pytest -q tests/r0` → `uv run ruff check .` → `uv run ruff format --check .` → `uv run mypy src tools/r0 tests/r0`；无 secrets，不访问真实端点；
-- **状态：已配置，未验证**——按 STEP-01-R0 L142，R0-A 闸门需要 Windows 与 Linux 各至少一次 Actions 成功记录；推送后以实际运行 URL 回填本节（工作流文件存在 ≠ CI 通过）。
+- **状态：已验证**——commit `edcf891` 触发 Actions run [41177228445](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445)（2026-10-31），两个 OS 均成功：
+  - [test (ubuntu-latest)](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445/job/124467183985)：success——日志行 `23 passed in 2.87s`、`All checks passed!`、`18 files already formatted`、`Success: no issues found in 7 source files`；
+  - [test (windows-latest)](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445/job/124467184184)：success——日志行 `23 passed in 3.73s`、`All checks passed!`、`Success: no issues found in 7 source files`；
+- 按 STEP-01-R0 L142，Windows 与 Linux 各至少一次 Actions 成功记录已满足（同一 run 的 matrix 两个 job）。
 
 ## 10. 验证命令记录
 
