@@ -171,6 +171,19 @@ def _proc_alive(pid: int) -> bool:
             return lib.WaitForSingleObject(handle, 0) == _WIN_WAIT_TIMEOUT
         finally:
             lib.CloseHandle(handle)
+    # POSIX: a zombie (exited, not yet reaped by its parent) still answers
+    # kill(pid, 0) but is dead for reaping purposes -- read its state when
+    # /proc is available, e.g. Linux. macOS falls back to kill(pid, 0).
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except OSError:
+        data = None
+    if data is not None:
+        # state is the field right after "(comm)"; comm may contain parens.
+        rparen = data.rfind(b")")
+        state = data[rparen + 2 : rparen + 3]
+        return state not in (b"Z", b"X")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -310,11 +323,22 @@ def _wait_for_tree_markers(child_marker: Path, grandchild_marker: Path, timeout:
     raise TimeoutError("child/grandchild markers not observed in time")
 
 
-def _await_descendants(pids: dict[str, int], grace: float) -> tuple[dict[str, bool], bool, int]:
-    """Poll every descendant repeatedly until all exit or the grace budget ends."""
+def _await_descendants(
+    pids: dict[str, int], grace: float, child: subprocess.Popen[bytes] | None = None
+) -> tuple[dict[str, bool], bool, int]:
+    """Poll every descendant repeatedly until all exit or the grace budget ends.
+
+    The child shell is checked via its Popen handle (poll reaps the POSIX
+    zombie our own subprocess table would otherwise keep "alive" for kill(0)).
+    """
     start = time.monotonic()
     while True:
-        exited = {role: not _proc_alive(pid) for role, pid in pids.items()}
+        exited: dict[str, bool] = {}
+        for role, pid in pids.items():
+            if role == "child_shell" and child is not None:
+                exited[role] = child.poll() is not None
+            else:
+                exited[role] = not _proc_alive(pid)
         if all(exited.values()):
             return exited, True, int((time.monotonic() - start) * 1000)
         if time.monotonic() - start >= grace:
@@ -392,7 +416,7 @@ def _run_tree_scenario(scenario_dir: Path, scenario: str, interpreter_exe: str) 
             except ProcessLookupError:
                 pass
         exited, all_exited, elapsed = _await_descendants(
-            {"child_shell": pids["child"], "grandchild": pids["grandchild"]}, GRACE_SECONDS
+            {"child_shell": pids["child"], "grandchild": pids["grandchild"]}, GRACE_SECONDS, child
         )
         outcome["descendants"] = exited
         outcome["elapsed_ms"] = elapsed
@@ -411,7 +435,7 @@ def _run_tree_scenario(scenario_dir: Path, scenario: str, interpreter_exe: str) 
                 for pid in pids.values():
                     _win_terminate_pid(pid)
             exited, all_exited, elapsed = _await_descendants(
-                {"child_shell": pids["child"], "grandchild": pids["grandchild"]}, GRACE_SECONDS
+                {"child_shell": pids["child"], "grandchild": pids["grandchild"]}, GRACE_SECONDS, child
             )
             outcome["descendants"] = exited
             outcome["elapsed_ms"] = elapsed
