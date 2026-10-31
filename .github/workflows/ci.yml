@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Single job matrix (pytest + lint + types together): keeps the private-repo
+    # Windows runner minute cost (2x) bounded. No secrets, no real MAAS access.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Lock check
+        run: uv lock --check
+      - name: Sync locked environment
+        run: uv sync --locked
+      - name: Provider contract tests
+        run: uv run pytest -q tests/r0
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy src tools/r0 tests/r0

@@ -1,0 +1,93 @@
+{
+  "scenario": "text-stream-usage-after-finish",
+  "description": "wire order: finish frame, then usage frame; both survive",
+  "sanitization": "synthetic fake-server data only; no real endpoint, credential, prompt or model output",
+  "request": {
+    "request_id": "r0-fixture-text-001",
+    "model_provider": "maas",
+    "model": "fake-model",
+    "tools": [],
+    "timeout_s": 10.0
+  },
+  "wire": [
+    {
+      "status": 200,
+      "headers": {},
+      "sse_frames": [
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"Hello\"}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \" world\"}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 12, \"completion_tokens\": 34, \"prompt_tokens_details\": {\"cached_tokens\": 2}, \"completion_tokens_details\": {\"reasoning_tokens\": 5}}}\r\n\r\n"
+      ],
+      "terminates_body": true,
+      "omits_done_line": false,
+      "note": "server frames each payload as one HTTP chunk; terminate=True appends the SSE 'data: [DONE]' line"
+    }
+  ],
+  "http_request_count": 1,
+  "chunks": [
+    {
+      "request_id": "r0-fixture-text-001",
+      "index": 0,
+      "type": "text_delta",
+      "part_id": "text-0",
+      "delta": "Hello",
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-text-001",
+      "index": 1,
+      "type": "text_delta",
+      "part_id": "text-0",
+      "delta": " world",
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-text-001",
+      "index": 2,
+      "type": "usage",
+      "part_id": null,
+      "delta": null,
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 34,
+        "reasoning_tokens": 5,
+        "cache_read_tokens": 2,
+        "cache_write_tokens": null
+      },
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-text-001",
+      "index": 3,
+      "type": "finish",
+      "part_id": null,
+      "delta": null,
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": "stop",
+      "raw_reason": "stop"
+    }
+  ],
+  "error": null
+}

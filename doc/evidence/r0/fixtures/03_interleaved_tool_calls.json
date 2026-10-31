@@ -1,0 +1,168 @@
+{
+  "scenario": "interleaved-tool-calls",
+  "description": "two interleaved calls with argument sharding; full args parsed only at tool_call_end",
+  "sanitization": "synthetic fake-server data only; no real endpoint, credential, prompt or model output",
+  "request": {
+    "request_id": "r0-fixture-tools-001",
+    "model_provider": "maas",
+    "model": "fake-model",
+    "tools": [
+      "fs__read"
+    ],
+    "timeout_s": 10.0
+  },
+  "wire": [
+    {
+      "status": 200,
+      "headers": {},
+      "sse_frames": [
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call-1\", \"type\": \"function\", \"function\": {\"name\": \"fs__read\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"pa\"}}]}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 1, \"id\": \"call-2\", \"type\": \"function\", \"function\": {\"name\": \"fs__read\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 1, \"function\": {\"arguments\": \"{\\\"path\\\": \\\"/b\\\"}\"}}]}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"th\\\": \\\"/a\\\"}\"}}]}, \"finish_reason\": null}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}]}\r\n\r\n",
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 9, \"completion_tokens\": 11, \"prompt_tokens_details\": null, \"completion_tokens_details\": null}}\r\n\r\n"
+      ],
+      "terminates_body": true,
+      "omits_done_line": false,
+      "note": "server frames each payload as one HTTP chunk; terminate=True appends the SSE 'data: [DONE]' line"
+    }
+  ],
+  "http_request_count": 1,
+  "chunks": [
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 0,
+      "type": "tool_call_start",
+      "part_id": null,
+      "delta": null,
+      "call_index": 0,
+      "tool_call_id": "call-1",
+      "name": "fs__read",
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 1,
+      "type": "tool_call_args_delta",
+      "part_id": null,
+      "delta": "{\"pa",
+      "call_index": 0,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 2,
+      "type": "tool_call_start",
+      "part_id": null,
+      "delta": null,
+      "call_index": 1,
+      "tool_call_id": "call-2",
+      "name": "fs__read",
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 3,
+      "type": "tool_call_args_delta",
+      "part_id": null,
+      "delta": "{\"path\": \"/b\"}",
+      "call_index": 1,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 4,
+      "type": "tool_call_args_delta",
+      "part_id": null,
+      "delta": "th\": \"/a\"}",
+      "call_index": 0,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 5,
+      "type": "usage",
+      "part_id": null,
+      "delta": null,
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 11,
+        "reasoning_tokens": null,
+        "cache_read_tokens": null,
+        "cache_write_tokens": null
+      },
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 6,
+      "type": "tool_call_end",
+      "part_id": null,
+      "delta": null,
+      "call_index": 0,
+      "tool_call_id": "call-1",
+      "name": "fs__read",
+      "raw_arguments": "{\"path\": \"/a\"}",
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 7,
+      "type": "tool_call_end",
+      "part_id": null,
+      "delta": null,
+      "call_index": 1,
+      "tool_call_id": "call-2",
+      "name": "fs__read",
+      "raw_arguments": "{\"path\": \"/b\"}",
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    },
+    {
+      "request_id": "r0-fixture-tools-001",
+      "index": 8,
+      "type": "finish",
+      "part_id": null,
+      "delta": null,
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": "tool_calls",
+      "raw_reason": "tool_calls"
+    }
+  ],
+  "error": null
+}

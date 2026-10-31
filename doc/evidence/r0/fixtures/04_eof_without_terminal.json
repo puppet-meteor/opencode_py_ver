@@ -1,0 +1,46 @@
+{
+  "scenario": "eof-without-terminal",
+  "description": "clean body end but no SSE [DONE] line and no finish frame; maps to ProviderStreamInterrupted",
+  "sanitization": "synthetic fake-server data only; no real endpoint, credential, prompt or model output",
+  "request": {
+    "request_id": "r0-fixture-eof-001",
+    "model_provider": "maas",
+    "model": "fake-model",
+    "tools": [],
+    "timeout_s": 10.0
+  },
+  "wire": [
+    {
+      "status": 200,
+      "headers": {},
+      "sse_frames": [
+        "data: {\"id\": \"chatcmpl-fake\", \"object\": \"chat.completion.chunk\", \"created\": 0, \"model\": \"fake-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"partial\"}, \"finish_reason\": null}]}\r\n\r\n"
+      ],
+      "terminates_body": true,
+      "omits_done_line": true,
+      "note": "server frames each payload as one HTTP chunk; terminate=True appends the SSE 'data: [DONE]' line"
+    }
+  ],
+  "http_request_count": 1,
+  "chunks": [
+    {
+      "request_id": "r0-fixture-eof-001",
+      "index": 0,
+      "type": "text_delta",
+      "part_id": "text-0",
+      "delta": "partial",
+      "call_index": null,
+      "tool_call_id": null,
+      "name": null,
+      "raw_arguments": null,
+      "usage": null,
+      "reason": null,
+      "raw_reason": null
+    }
+  ],
+  "error": {
+    "code": "ProviderStreamInterrupted",
+    "message": "stream ended without a terminal chunk",
+    "details": {}
+  }
+}
