@@ -1,0 +1,238 @@
+{
+  "probe_version": "r0b-1",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "machine": "AMD64",
+    "sys_platform": "win32",
+    "python": "3.13.12"
+  },
+  "generated": {
+    "by": "manual",
+    "probe": "tools/r0/platform_probe.py"
+  },
+  "ci_verified": [],
+  "manual_verified": [
+    "interpreter",
+    "process_tree",
+    "path_containment",
+    "sqlite_writer_lock"
+  ],
+  "unsupported": [],
+  "checks": {
+    "interpreter": {
+      "status": "verified",
+      "required_by_contract": "powershell",
+      "interpreter": "powershell.exe",
+      "version": "5.1.26100.9711",
+      "selection": "explicit executable resolved on PATH; argv spawn; platform default shell never used",
+      "shell_true_used": false,
+      "default_shell_used": false
+    },
+    "process_tree": {
+      "status": "verified",
+      "mechanism": "win32 Job Object (JOB_OBJECT_LIMIT_KILL_ON_CLOSE, AssignProcessToJobObject before grandchild spawn via proceed-gate, TerminateJobObject)",
+      "tree_shape": "probe -> child interpreter -> grandchild (explicit interpreters, shell never used)",
+      "scenarios": [
+        {
+          "scenario": "cancel",
+          "descendants": {
+            "child_shell": true,
+            "grandchild": true
+          },
+          "all_exited_within_grace": true,
+          "elapsed_ms": 100,
+          "escalation_used": false,
+          "grace_seconds": 5.0,
+          "reason": null
+        },
+        {
+          "scenario": "timeout",
+          "descendants": {
+            "child_shell": true,
+            "grandchild": true
+          },
+          "all_exited_within_grace": true,
+          "elapsed_ms": 100,
+          "escalation_used": false,
+          "grace_seconds": 5.0,
+          "reason": null
+        }
+      ],
+      "temp_cleanup_verified": true
+    },
+    "path_containment": {
+      "status": "verified",
+      "order": "lexical resolve -> containment -> realpath(strict) -> containment(realpathed root)",
+      "comparison": "os.path.normcase-aware prefix containment (case-insensitive on Windows)",
+      "scenarios": [
+        {
+          "case": "inside_file",
+          "expected": "allow",
+          "actual": "allow",
+          "result": "verified"
+        },
+        {
+          "case": "nested_file",
+          "expected": "allow",
+          "actual": "allow",
+          "result": "verified"
+        },
+        {
+          "case": "dotdot_traversal",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "escapes_workspace_before_realpath"
+        },
+        {
+          "case": "absolute_outside",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "escapes_workspace_before_realpath"
+        },
+        {
+          "case": "missing_target",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "realpath_failed_or_missing"
+        },
+        {
+          "case": "nul_byte",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "nul_byte_in_path"
+        },
+        {
+          "case": "symlink_inside_workspace",
+          "expected": "allow",
+          "actual": "allow",
+          "result": "verified"
+        },
+        {
+          "case": "symlink_escape",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "escapes_workspace_after_realpath"
+        },
+        {
+          "case": "junction_escape",
+          "expected": "deny",
+          "actual": "deny",
+          "result": "verified",
+          "rejection_reason": "escapes_workspace_after_realpath"
+        }
+      ],
+      "temp_cleanup_verified": true,
+      "unsupported_capabilities": []
+    },
+    "sqlite_writer_lock": {
+      "status": "verified",
+      "lock_mechanism": "msvcrt.locking(LK_NBLCK) on the data-directory lock file (native LockFile region lock)",
+      "third_party_dependency": "none (stdlib fcntl/msvcrt/sqlite3)",
+      "crash_release": {
+        "crashed_exit_code": 3,
+        "lock_released_by_os_on_death": true
+      },
+      "writer2": {
+        "result": "conflict",
+        "database_opened": false
+      },
+      "no_write_evidence": {
+        "compared_fields": [
+          "file_name",
+          "size_bytes",
+          "mtime_ns",
+          "sha256_or_unreadable"
+        ],
+        "dir_snapshot_before_writer2": {
+          "app.db": [
+            4096,
+            1793432579362675900,
+            "ecebcfef853ac1d1a44fc652c28ae7a95f8fce2a9b8d2a64c9dd5315ec865abb"
+          ],
+          "app.db-shm": [
+            32768,
+            1793432579365637800,
+            "c31d1ef57aca2727fd7badc20bcd5ef51e69d37181f8fa342d77a1e3fe4cb5f9"
+          ],
+          "app.db-wal": [
+            41232,
+            1793432579374609000,
+            "2613fa9695acdd2be8781993ff14e55959e1757d66db883b6e50374eaf4dba6b"
+          ],
+          "writer.lock": [
+            1,
+            1793432578856184900,
+            "hash_unreadable"
+          ]
+        },
+        "dir_snapshot_after_writer2": {
+          "app.db": [
+            4096,
+            1793432579362675900,
+            "ecebcfef853ac1d1a44fc652c28ae7a95f8fce2a9b8d2a64c9dd5315ec865abb"
+          ],
+          "app.db-shm": [
+            32768,
+            1793432579365637800,
+            "c31d1ef57aca2727fd7badc20bcd5ef51e69d37181f8fa342d77a1e3fe4cb5f9"
+          ],
+          "app.db-wal": [
+            41232,
+            1793432579374609000,
+            "2613fa9695acdd2be8781993ff14e55959e1757d66db883b6e50374eaf4dba6b"
+          ],
+          "writer.lock": [
+            1,
+            1793432578856184900,
+            "hash_unreadable"
+          ]
+        },
+        "files_hash_unreadable": [
+          "writer.lock"
+        ],
+        "snapshots_identical": true,
+        "writer1_rows_stable_across_hold": true
+      },
+      "writer1": {
+        "result": "ok",
+        "database_opened": true,
+        "lock": "acquired-before-db-open",
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout_ms": 5000,
+        "rows_written": 2,
+        "fk_violation_rejected": true,
+        "rows_before_hold": 2,
+        "hold_timed_out": false,
+        "rows_after_hold": 2,
+        "wal_file_present": true,
+        "db_sha256": "ecebcfef853ac1d1a44fc652c28ae7a95f8fce2a9b8d2a64c9dd5315ec865abb"
+      },
+      "sqlite": {
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout_ms": 5000,
+        "fk_violation_rejected": true,
+        "schema_shape": "event_sequence -> event parent/child FK (event/sql.ts analog)"
+      },
+      "cleanup": {
+        "files_left_after_close": [
+          "app.db",
+          "writer.lock"
+        ],
+        "temp_dir_removed": true
+      }
+    }
+  },
+  "notes": [
+    "sanitization: host paths <WORKSPACE>/<TEMP> placeholders only; no usernames, PIDs, prompts, secrets or endpoints recorded",
+    "restricted status = capability untestable in this environment with a recorded reason, not a pass",
+    "raw child-process debug output stays in the system temp dir and is removed with it"
+  ]
+}

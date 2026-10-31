@@ -26,6 +26,18 @@ jobs:
         run: uv sync --locked
       - name: Provider contract tests
         run: uv run pytest -q tests/r0
+      - name: Platform probe (R0-B)
+        # Sanitized evidence only: the probe records <WORKSPACE>/<TEMP>
+        # placeholders, no host paths, usernames, PIDs, secrets or endpoints.
+        # GITHUB_ACTIONS=true makes the probe self-mark results as ci_verified.
+        run: uv run python tools/r0/platform_probe.py --output ${{ runner.temp }}/platform.json
+      - name: Upload platform probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/platform.json
+          if-no-files-found: error
       - name: Lint
         run: uv run ruff check .
       - name: Format check

@@ -57,3 +57,12 @@ TS 路径相对参考目录；Python 路径是预定落点，不是已有文件�
 ## 4. 每次实现后填写的证据
 
 将对应 planned 项改 verified 前，必须补实际的 Python 测试路径、正常/失败 fixture、运行平台/依赖版本、验证结果和仍有差异。故意不兼容的变化更新 ADR 和事件版本；不改旧事件内容来掩盖差异。
+
+## 5. R0 探针实测记录（平台行为，非正式模块）
+
+以下为 R0-B 平台探针实测结论（探针 `tools/r0/platform_probe.py`；测试 `tests/r0/test_platform_probe.py` 8 项；证据 `evidence/r0/platform.json`）。它们验证未来模块将依赖的平台行为，不代表正式模块已实现；§2 表内条目仍为 planned。
+
+- filesystem.ts 路径顺序（lexical resolve → containment → realpath(strict) → containment(realpathed root)）：Windows 11 本地实测 9 场景全部符合——`..` 与绝对越界路径在 realpath 前拦截（`escapes_workspace_before_realpath`），越界 symlink/junction 在 realpath 后拦截（`escapes_workspace_after_realpath`），缺失目标 strict realpath 拒绝，workspace 内路径（含指向内部的 symlink）放行。
+- SQLite + OS 单 writer（CORE-CONTRACTS L165）：WAL、`foreign_keys=ON`、`busy_timeout=5000` 实测生效（FK 违规 IntegrityError 实测）；OS 数据目录锁（Windows `msvcrt.locking`/POSIX `fcntl.flock`）先于 DB 打开；第二 writer 在写事务前锁失败返回 conflict 且无任何写入（数据目录快照一致 + writer 1 行数稳定）；持锁 writer 异常退出后 OS 自动释放锁。Windows 已实测；POSIX 锁语义待 CI 实测补记。
+- 进程树回收（CORE-CONTRACTS L234）：Windows Job Object（KILL_ON_CLOSE + proceed-gate 保证 Assign 先于孙进程创建）cancel/timeout 两场景子+孙进程均在 grace 内退出、临时目录清理验证；POSIX process group 机制待 CI 实测补记。
+- 平台结果与限制（restricted ≠ 失败；CI 与本地分开记录）：见 [platform-support.md](platform-support.md)。

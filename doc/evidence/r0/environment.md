@@ -42,3 +42,8 @@
 
 - ~~Linux 端实际运行~~ **已验证**:CI run [41177228445](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445)(commit `edcf891`,2026-10-31)`ubuntu-latest` 与 `windows-latest` 两个 job 均 success,pytest 各 `23 passed`(详见 provider.md §9);
 - 真实 MAAS smoke:无凭据,标记“R0-A 外部证据待补”(见 provider.md §8)。
+
+## 6. R0-B 补记(2026-10-31)
+
+- R0-B 平台/存储探针的环境与验证命令同上(§3 六条命令 + `uv run python tools/r0/platform_probe.py --output doc/evidence/r0/platform.json`,本地 Windows 四项探针全 verified);探针零新增依赖(纯 stdlib),`uv.lock` 未变。
+- R0-B 的平台结论、限制与证据级别(manual/ci/unsupported)见 [platform-support.md](../platform-support.md) 与 [platform.json](platform.json);CI 侧探针证据待本轮 commit+push 后以 artifact(`platform-probe-<os>`)回填。
