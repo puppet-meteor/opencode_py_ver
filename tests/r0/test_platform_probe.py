@@ -106,8 +106,9 @@ def test_symlink_escape_rejected_after_realpath() -> None:
         assert resolve_user_path(str(workspace), "good-link.txt") == (True, "inside_workspace")
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="junctions are windows-only")
 def test_junction_escape_rejected_after_realpath() -> None:
+    if sys.platform != "win32":
+        pytest.skip("junctions are windows-only")
     import _winapi
 
     with tempfile.TemporaryDirectory() as raw:
