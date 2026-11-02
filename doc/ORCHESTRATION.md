@@ -79,7 +79,8 @@
 | T-B-004 | B | r1-slices.md 微调（按 T-A-003 终裁对齐预写） | 15:48 | 活性监控（1h 日志零增量） | 已验收（15:56） | doc/plans/r1-slices.md（修订） |
 | T-C1-002 | C-1 | contracts 修补批次（M-1/M-4/N-2+裁决落地） | 15:48 | 活性监控（1h 日志零增量） | 已验收（16:02，N-2 半项→T-C1-002B） | src/opencode/contracts/、tests/contract/ |
 | T-C1-002B | C-1 | 微补：EventDraft 空串 id 拒绝直测 | 16:02 | 活性监控（1h 日志零增量） | 已验收（16:04） | tests/contract/test_events.py |
-| T-B-005 | B | contracts 补丁快速审查（T-C1-002/002B+三遗留问） | 16:06 | 活性监控（1h 日志零增量） | 派发中 | doc/reviews/T-C1-002-review.md（待） |
+| T-B-005 | B | contracts 补丁快速审查（T-C1-002/002B+三遗留问） | 16:06 | 活性监控（1h 日志零增量） | 已验收（16:08） | doc/reviews/T-C1-002-review.md |
+| T-C1-003 | C-1 | R1-S2：Alembic 0001+引擎打开（worktree） | 16:12 | 活性监控（1h 日志零增量） | 派发中 | worktree r1-s2：src/opencode/storage/、tests/integration/ |
 
 ## 7. 调度日志
 
@@ -101,7 +102,8 @@
 - 15:56 T-B-004 回报"完成"（15:48 实启，~8min）。验收通过：三处预写对齐终裁——①S1 files 行改终裁方案 (b)（字段全集精确、files 键含空列表按未知字段拒绝、新输入=ValidationError/已存日志=损坏隔离、R2+ 升版本+upcaster、现实现 e61cdd5 已合规无需改动，引 §2.1/§8/§10）+补【实施交接】行记 C-1 补丁范围；②S7 ID 注记改四前缀强制+request_id 例外（引 §3.1/§10，含 TS 三处单点依据+run_ Python 论证），RunRef 表述同步、step 1 补入参 pattern 校验并修正状态名笔误 closing→cleanup_failed（对齐契约 §7.1 原文）、step 4 补三类生成 ID pattern 要求；③§4 #5 标已决（含 B 预写与终裁两处差异说明：req_ 剔除、files (a)→(b)），§4 标题改"全部已决无待决项"；另 §3 差异表补第 10 行（四前缀+bool 守卫的 TS 单点 vs Python 全量差异）。调度器 Select-String 复核全文零"待 T-A-003"残留；文件头 [T-B-004] 行在；B 自身产出仅 r1-slices.md（git status 中 contracts 两文件为 C-1 并行在飞补丁，非 B 产出，与 §10 交接一致）。检查点#13 提交；监视器刷新为仅盯 T-C1-002。B 建议补丁完成后照常走 B 快速结构化审查再进 S2——采纳（记 T-B-005）。
 - 16:02 T-C1-002 回报"完成"（15:48 实启，~14min）。验收（有条件）：四门禁调度器亲跑复核全绿（89 passed 13.11s/ruff check/format 50 files/mypy 15 文件），与自报一致；逐项核对——M-1 ✓（`_reject_bool` 统一 helper 接 EventDraft.version/DurableEvent.seq/ConfigSnapshot.schema_version 三处）、§3.1 四 pattern ✓（EventDraft/EphemeralEvent id ^evt_+session_id ^ses_、UserMessage.id ^msg_、PromptAcceptedData.run_id ^run_、request_id 仅 min_length 无 pattern 且有反例钉住）、`_require_run_metadata` 扩展 ✓（run_id 键出现即校验前缀，null/非串/错前缀均拒）、M-4 ✓（version:"1" 解码拒/seq:True 构造拒/surrogate fail-closed 三测）、files (b) ✓（files: []/[...] 键拒绝测试+docstring 更新）、fixtures 零改动 ✓、git 仅授权路径 ✓。唯一缺口：N-2 首项 EventDraft(id="") 拒绝无直测（text="" 允许已钉）→ 派 T-C1-002B 微补（单测一条）。C-1 遗留三问（①构造路 version="1" pydantic lax 强转 vs 解码路拒绝的不对称是否收紧；②surrogate 当前值域不可触发、未来加字符串字段建议显式前置扫描；③metadata.run_id"出现即校验"比 run-scoped 更严——与裁决字面一致）转 T-B-005 审查回应，必要时升 A。补丁暂不提交，随 002B 一并落检查点#15。检查点#14 提交（台账+002B 任务包）；监视器刷新为 T-C1-002B。
 - 16:04 T-C1-002B 回报"完成"（16:02 实启，~2min）。验收通过：`test_empty_event_id_rejected` 在（L489，三构造入口覆盖：EventDraft 直构/DurableEvent 继承/EphemeralEvent 独立 id 声明单过）；`""` 从前缀循环测试移出、前缀测只管前缀违例（职责分离）；仅改 test_events.py ✓；四门禁调度器亲跑复核全绿（90 passed 11.85s/ruff check/format 51 files/mypy 15 文件）。N-2 半项闭环，contracts 补丁批次（T-C1-002+002B）至此完整。检查点#15 提交（补丁+测试+进度+台账+T-B-005 任务包）；监视器刷新为 T-B-005。
-- 下一事件：T-B-005 回报 → 验收（结论+三遗留问意见；blocker/major→派 C 修订；③若 B 判与裁决字面不符则升 A）→ 通过后建 C-1 worktree → 写 T-C1-003 任务包 → T-C1-003（R1-S2：Alembic 0001+引擎打开，worktree 内）→ S3 起按依赖序。
+- 16:08 T-B-005 回报"完成"（16:06 实启）。验收通过：结论**通过**（0 blocker/0 major/0 minor/2 nit）；B 独立复验 58 contract 测全绿+ruff clean+四前缀与三 bool 守卫逐点源码核实（含行号，与调度器亲验 diff 一致）；四项闭环（M-1/M-4/N-2/Minor-2）全部核销；§1 排查确认 S1 仅 version/seq/schema_version 三个 int 字段全守卫、EventDefinition.version 为 dataclass 非 wire 正确豁免；fixtures 零改动复核合理。三遗留问 B 意见：①version="1" 构造路维持现状不本批收紧（§1 字面只裁 bool；对称收紧建议作 R5 硬化项请 A 裁）→ 记**待裁清单**，A 下轮契约任务合并提出，不阻塞 R1；②surrogate 前置扫描记入 **R3 任务清单**（调度器在 R3 任务包定义时带入）；③metadata.run_id"出现即校验"与 §3.1 裁决字面一致（"一旦出现"=whenever-present），无需回退。2 nit：N-a 进度文件 13→14 测计数过期（报告即勘误）；N-b 即遗留①。git 仅新增 doc/reviews/T-C1-002-review.md。**R1-S1 全流程彻底收口**（契约→方案→实现→硬化→审查通过）。检查点#16 提交 → 建 C-1 worktree（r1-s2）→ 派 T-C1-003（R1-S2，worktree 内，新会话 ses_orch_C1s2——worktree 属不同项目路径，续用 ses_orch_C1 不可靠）。监视器刷新。
+- 下一事件：T-C1-003 回报 → worktree 内四门禁亲跑复核+0001 列清单对照契约 §3.2 逐列核对 → worktree 分支提交（检查点#17）→ B 审查 S2（T-B-006）→ 通过后并回主树 → S3（SessionStore.commit）起按依赖序。待办：A 待裁清单+N-b（str→int 构造路对称收紧，R5 前落定）；R3 任务包带入 surrogate 前置扫描注记。
 
 ## 待用户定夺（不阻塞冒烟）
 
