@@ -20,14 +20,38 @@ from opencode.storage.db import (
     WriterLockHeldError,
     open_database,
 )
+from opencode.storage.store import EventBatch, Projector, SessionStore
+from opencode.storage.txn import (
+    ConflictError,
+    IdempotencyConflictError,
+    IsolationPersistFailedError,
+    LifecycleCleanupFailedError,
+    SessionClosedError,
+    SessionReadOnlyError,
+    StorageCorruptError,
+    StoreError,
+    StoreValidationError,
+)
 
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "WRITER_LOCK_NAME",
+    "ConflictError",
     "Database",
     "DatabaseNotFoundError",
+    "EventBatch",
+    "IdempotencyConflictError",
+    "IsolationPersistFailedError",
+    "LifecycleCleanupFailedError",
     "OpenMode",
+    "Projector",
+    "SessionClosedError",
+    "SessionReadOnlyError",
+    "SessionStore",
+    "StorageCorruptError",
     "StorageError",
+    "StoreError",
+    "StoreValidationError",
     "WriterLock",
     "WriterLockHeldError",
     "open_database",
