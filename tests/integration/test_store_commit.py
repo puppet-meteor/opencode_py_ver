@@ -19,7 +19,12 @@ Covers the T-C1-004 acceptance criteria over CORE-CONTRACTS §3.2/§3.2.1:
 - N-1: bare ``alembic upgrade head`` without ``-x db_path`` fails fast;
 - N-2: open_database rejects an unknown open mode with ValueError;
 - N-2 (S3 review): stored-batch retry over a corrupted committed row and a
-  hand-forged unknown sessions.status both route into §3.2.1 isolation.
+  hand-forged unknown sessions.status both route into §3.2.1 isolation;
+- T-C1-006 (T-B-009 M-1/Nit-2/⑤): the literal N-2① recipe (invalid-JSON
+  ``data`` on a committed row) isolates with the offending row located and
+  A at discovery; an injected isolation-persistence failure keeps the
+  original StorageCorrupt caller-facing, chains IsolationPersistFailedError
+  as __cause__, and holds the in-memory write gate.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from opencode.storage import (
     ConflictError,
     EventBatch,
     IdempotencyConflictError,
+    IsolationPersistFailedError,
     SessionReadOnlyError,
     SessionStore,
     StorageCorruptError,
@@ -470,8 +476,8 @@ async def test_commit_stored_batch_retry_with_corrupted_row_isolates(tmp_path: P
     floor): the replay comparison does not compare seq, so the corruption is
     caught when the stored batch is decoded -- REASON_STORED_DECODE_FAILED,
     §3.2.1 isolation, and the gate holds for any later commit. (Corrupting
-    ``data`` to invalid JSON instead leaks a raw JSONDecodeError from the S3
-    comparison loop -- see the progress-file open question.)
+    ``data`` to invalid JSON is the literal T-C1-005 recipe, now covered by
+    the M-1 test below.)
     """
     db_path = tmp_path / "app.db"
     _require_success(_upgrade_head(db_path))
@@ -493,13 +499,19 @@ async def test_commit_stored_batch_retry_with_corrupted_row_isolates(tmp_path: P
         assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
         assert error.value.core.details["reason"] == "stored_event_decode_failed"
 
-        # Isolation persisted: status flipped, read model + applied_seq preserved.
+        # Isolation persisted: status flipped, read model + applied_seq preserved,
+        # with the diagnostic locating the corrupted row (Nit-2) and A at discovery.
         status, applied, diagnostic = _fetch_all(
             db_path, "SELECT status, applied_seq, diagnostic FROM sessions WHERE session_id = 'ses_n2a'"
         )[0]
         assert status == "read_only_diagnostic"
         assert applied == 2
-        assert json.loads(diagnostic)["reason"] == "stored_event_decode_failed"
+        assert json.loads(diagnostic) == {
+            "reason": "stored_event_decode_failed",
+            "applied_seq": 2,
+            "first_bad_seq": 0,
+            "first_bad_event_id": "evt_n2a2",
+        }
 
         # The gate holds before any idempotency replay for later commits.
         with pytest.raises(SessionReadOnlyError):
@@ -539,6 +551,113 @@ async def test_commit_unknown_session_status_isolates(tmp_path: Path) -> None:
         with pytest.raises(SessionReadOnlyError):
             await store.commit("ses_n2b", first, 1)
         assert _fetch_scalar(db_path, "SELECT COUNT(*) FROM events WHERE session_id = 'ses_n2b'") == (1,)
+
+
+async def test_commit_stored_batch_retry_with_illegal_json_data_isolates(tmp_path: Path) -> None:
+    """T-C1-006 (M-1): the literal N-2① recipe from the T-C1-005 task book.
+
+    Corrupting a committed row's ``data`` to invalid JSON and retrying the
+    whole batch is §3.2.1 "invalid JSON" over already-stored data: the replay
+    comparison loop no longer leaks a raw JSONDecodeError but raises
+    StorageCorrupt, isolates the session, locates the bad row (the second
+    one, not the first) and reports the discovery-time applied_seq.
+    """
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    projector = RecordingProjector()
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=projector)
+        batch = EventBatch(
+            "batch_1",
+            (_session_created_draft("ses_m1", "evt_m11"), _prompt_accepted_draft("ses_m1", "evt_m12")),
+        )
+        await store.commit("ses_m1", batch, 0)
+
+        # The literal recipe: the committed data column of the SECOND row
+        # stops being valid JSON; the whole batch is then retried.
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("UPDATE events SET data = '{not json' WHERE id = 'evt_m12'")
+
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit("ses_m1", batch, 0)
+        assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
+        assert error.value.core.details["reason"] == "stored_event_decode_failed"
+        assert error.value.core.details["first_bad_seq"] == 2
+        assert error.value.core.details["first_bad_event_id"] == "evt_m12"
+        assert error.value.core.details["applied_seq"] == 2
+
+        # Isolation persisted: status flipped, read model + applied_seq
+        # preserved, sanitized diagnostic locating the bad row with A at
+        # discovery (not the first committed row, not applied_seq=0).
+        status, applied, diagnostic = _fetch_all(
+            db_path, "SELECT status, applied_seq, diagnostic FROM sessions WHERE session_id = 'ses_m1'"
+        )[0]
+        assert status == "read_only_diagnostic"
+        assert applied == 2
+        assert json.loads(diagnostic) == {
+            "reason": "stored_event_decode_failed",
+            "applied_seq": 2,
+            "first_bad_seq": 2,
+            "first_bad_event_id": "evt_m12",
+        }
+
+        # The gate holds before any idempotency replay: even the committed
+        # batch retry is rejected with SessionReadOnly, with zero new rows.
+        with pytest.raises(SessionReadOnlyError):
+            await store.commit("ses_m1", batch, 2)
+        assert _fetch_scalar(db_path, "SELECT COUNT(*) FROM events WHERE session_id = 'ses_m1'") == (2,)
+
+
+async def test_isolation_persist_failure_chains_and_keeps_memory_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-C1-006 (⑤): the N-1 exception chain under an injected isolation
+    persistence failure -- the original StorageCorrupt stays caller-facing
+    (code/reason unchanged), IsolationPersistFailedError is the explicit
+    __cause__, and the in-memory write gate holds for later commits although
+    the sessions row was never flipped (§3.2.1 L192)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    projector = RecordingProjector()
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=projector)
+        await store.commit("ses_p1", EventBatch("batch_1", (_session_created_draft("ses_p1", "evt_p11"),)), 0)
+
+        # Corrupt A (A != H) so the next commit routes into §3.2.1 isolation.
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("UPDATE sessions SET applied_seq = 5 WHERE session_id = 'ses_p1'")
+
+        # Inject the persistence failure on the isolation transaction's
+        # engine.connect: within one commit the business transaction connects
+        # first and the independent isolation transaction connects second.
+        # (AsyncEngine instances reject instance-level attribute assignment,
+        # so the patch sits on the class; this test's engine is the only one
+        # in the process and monkeypatch restores the original afterwards.)
+        real_connect = database.engine.connect
+        connects = 0
+
+        def failing_connect(*args: Any, **kwargs: Any) -> Any:
+            nonlocal connects
+            connects += 1
+            if connects == 2:
+                raise RuntimeError("injected isolation persistence failure")
+            return real_connect(**kwargs)
+
+        monkeypatch.setattr(type(database.engine), "connect", failing_connect)
+
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit("ses_p1", EventBatch("batch_2", (_prompt_accepted_draft("ses_p1", "evt_p12"),)), 1)
+        assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
+        assert error.value.core.details["reason"] == "applied_seq_mismatch"
+        assert isinstance(error.value.__cause__, IsolationPersistFailedError)
+
+        # Isolation was never persisted (the row still says active): the
+        # in-memory write gate is what rejects later commits.
+        assert _fetch_scalar(db_path, "SELECT status FROM sessions WHERE session_id = 'ses_p1'") == ("active",)
+        with pytest.raises(SessionReadOnlyError):
+            await store.commit("ses_p1", EventBatch("batch_3", (_prompt_accepted_draft("ses_p1", "evt_p13"),)), 1)
 
 
 async def test_commit_validates_caller_input(tmp_path: Path) -> None:

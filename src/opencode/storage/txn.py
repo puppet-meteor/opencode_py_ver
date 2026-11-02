@@ -358,7 +358,7 @@ class TransactionWriter:
         # §3.2 step 2: idempotency BEFORE expected_seq -- replaying a whole
         # committed batch returns the original events even with a stale
         # expected_seq, with no H/A advance and no re-projection.
-        replay = await self._idempotent_replay(connection, session_id, batch)
+        replay = await self._idempotent_replay(connection, session_id, batch, applied)
         if replay is not None:
             return replay
 
@@ -450,13 +450,18 @@ class TransactionWriter:
                 ) from error
 
     async def _idempotent_replay(
-        self, connection: AsyncConnection, session_id: str, batch: EventBatch
+        self, connection: AsyncConnection, session_id: str, batch: EventBatch, applied: int
     ) -> list[DurableEvent[Any]] | None:
         """Return the original events for an exact whole-batch retry, else None.
 
         Rejections (§3.2 step 2; never re-projected): a stored id committed in
         another session, mixed committed+new ids, or same-id-different-content
-        under this batch id -- all IdempotencyConflict.
+        under this batch id -- all IdempotencyConflict. A stored JSON column
+        that no longer decodes is §3.2.1 "invalid JSON" over already-stored
+        data (M-1): StorageCorrupt with isolation, the offending row located
+        and A at discovery time (``applied``, the watermark the write gate
+        read). Each row's JSON columns decode before the content comparison,
+        so diverged-but-decodable content still rejects as IdempotencyConflict.
         """
         existing = (
             await connection.execute(_SELECT_EVENT_IDS, {"ids": [event.id for event in batch.events]})
@@ -476,31 +481,52 @@ class TransactionWriter:
                 details={"session_id": session_id, "batch_id": batch.id},
             )
         for ordinal, (row, event) in enumerate(zip(committed, batch.events, strict=True)):
+            # M-1: the comparison loop reads already-stored rows, so an
+            # undecodable JSON column here is stored corruption (§3.2.1), not
+            # a content divergence; locate the offending row itself.
+            try:
+                stored_data = _json_column(row.data)
+                stored_metadata = _json_column(row.metadata)
+            except ValueError as error:
+                raise _corruption(
+                    REASON_STORED_DECODE_FAILED,
+                    Diagnostic(
+                        reason=REASON_STORED_DECODE_FAILED,
+                        first_bad_seq=int(row.seq),
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied,
+                    ),
+                ) from error
             if (
                 int(row.batch_ordinal) != ordinal
                 or row.id != event.id
                 or row.type != event.type
                 or int(row.version) != event.version
                 or int(row.created) != epoch_ms(event.created_at)
-                or _json_column(row.data) != event.data.model_dump(mode="json")
-                or _json_column(row.metadata) != event.metadata
+                or stored_data != event.data.model_dump(mode="json")
+                or stored_metadata != event.metadata
             ):
                 raise IdempotencyConflictError(
                     f"batch {batch.id} content diverges from the committed batch at ordinal {ordinal}",
                     details={"session_id": session_id, "batch_id": batch.id, "batch_ordinal": ordinal},
                 )
-        try:
-            return [self._decode_stored(row) for row in committed]
-        except (EventDecodeError, ValueError) as error:
-            raise _corruption(
-                REASON_STORED_DECODE_FAILED,
-                Diagnostic(
-                    reason=REASON_STORED_DECODE_FAILED,
-                    first_bad_seq=int(committed[0].seq),
-                    first_bad_event_id=str(committed[0].id),
-                    applied_seq=0,
-                ),
-            ) from error
+        decoded: list[DurableEvent[Any]] = []
+        for row in committed:
+            # Nit-2: decode per row so the diagnostic locates the bad row
+            # (not the first committed row) and reports A at discovery.
+            try:
+                decoded.append(self._decode_stored(row))
+            except (EventDecodeError, ValueError) as error:
+                raise _corruption(
+                    REASON_STORED_DECODE_FAILED,
+                    Diagnostic(
+                        reason=REASON_STORED_DECODE_FAILED,
+                        first_bad_seq=int(row.seq),
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied,
+                    ),
+                ) from error
+        return decoded
 
     def _decode_stored(self, row: Any) -> DurableEvent[Any]:
         """Decode one stored events row into a typed DurableEvent (fail closed)."""
