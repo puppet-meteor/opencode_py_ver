@@ -2,7 +2,8 @@
 
 > 修订：[T-B-003] 2026-11-02 按审查报告 doc/reviews/R1-S1-review.md §4 九条修订——并入 T-A-002 契约裁决（§3.2 水位/§3.2.1 诊断/§4 坏页/§7 prompt/§9 冲突表）、S2 依赖更正、S1 交付追认、files 待裁预写、ID 生成器注记、§3 差异表补齐、开放问题清理。
 > 修订：[T-B-004] 2026-11-02 按 T-A-003 终裁微调（契约 changelog/§10）：files 终裁=方案 (b)（R1 v1 无 files 字段、任何 files 键按未知字段拒绝、R2+ 升版本+upcaster 引入）；ID=四前缀强制（evt_/msg_/ses_/run_）+request_id 例外（§3.1）；extra-forbid=封闭演进（§8）；bool 守卫升 §1 仓库级规则；§4 #5 标已决、§3 差异表补第 10 行；全文清除 A-003 待裁预写字样。
-> 席位B（T-B-001）产出，供 C 席按序实现。状态：**S1 已交付（commit e61cdd5，审查通过 doc/reviews/R1-S1-review.md）；S2 起待派**。
+> 修订：[T-B-007] 2026-11-02 S2 交付标记（worktree r1-s2 #19 99cf753 并回 #22 98d4355，审查通过 doc/reviews/R1-S2-review.md，N-1/N-2→T-C1-004）+ S3 在飞标记（T-C1-004，worktree r1-s3）+ §4 #6 标已决（T-C1-003 实证）+ §4 #7 补 S2 实测注记。
+> 席位B（T-B-001）产出，供 C 席按序实现。状态：**S1 已交付（commit e61cdd5，审查通过 doc/reviews/R1-S1-review.md）；S2 已交付（worktree r1-s2 检查点#19 `99cf753` 并回 #22 `98d4355`，审查通过 doc/reviews/R1-S2-review.md，遗留 N-1/N-2 已并入 T-C1-004）；S3 在飞（T-C1-004，worktree r1-s3）；S4 起待派**。
 > 依据：doc/PHASE1-SLIM.md §3 R1、doc/CORE-CONTRACTS.md（含 T-A-002 修订：§3.2/§3.2.1/§4/§6.1/§6.2/§7/§9；T-A-003 修订：§1/§2.1/§3.1/§8/§10）、doc/ROADMAP.md §3/§5、doc/reestimate-r0.md、doc/adr/0001。
 > TS 基准：`D:/26_code/opencode_py_ver/opencode-2.2.2/`（指纹见 doc/source-baseline.json，全部已锁定）。
 > 拆分基准：按现行文档拆；A 席若修订 R1 定义，由调度器对齐后本文件再改版。
@@ -24,7 +25,7 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
 | ID | 一句话目标 | 接缝 | 前置 | C 席预计 |
 |---|---|---|---|---|
 | R1-S1【试点·已交付 e61cdd5】 | 最小 contracts：事件 envelope、type+version 注册表、R1 事件子集、UserMessage、CoreError | S1/S4 输入类型 | 无 | 30–45 min（实际已交付，见审查报告） |
-| R1-S2 | Alembic 0001 最小 schema + 引擎打开（WAL/FK/busy_timeout/目录锁复用 R0-B） | S4 | R1-S1 | 30–45 min |
+| R1-S2【已交付 99cf753→并回 #22，审查通过】 | Alembic 0001 最小 schema + 引擎打开（WAL/FK/busy_timeout/目录锁复用 R0-B） | S4 | R1-S1 | 30–45 min |
 | R1-S3 | SessionStore.commit + 私有 TransactionWriter（幂等先于 expected_seq、连续 seq、批次原子） | S4/S6 | R1-S1、R1-S2 | 45–60 min |
 | R1-S4 | projector 纯折叠 + sessions/messages/applied_seq 同事务投影 + commit 时状态校验 | S4/S6 | R1-S3 | 45–60 min |
 | R1-S5 | volatile Bus：live-only 订阅、队列上限、SlowConsumer 断开 | S2 | R1-S1 | 30–45 min |
@@ -59,7 +60,7 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
 - **测试计划**：纯单测，无 DB。fixture 驱动参数化；round-trip（model→JSON→model 等值）。fake 适配器策略：本切片无适配器，fixture 即"假数据源"。
 - **试点说明**：粒度=一次 C 实现循环（30–60 min），无外部依赖、门禁（pytest/ruff/mypy）齐全，适合三角色+watchdog 全流程演练。
 
-### R1-S2 迁移 0001 + 存储引擎打开
+### R1-S2 迁移 0001 + 存储引擎打开【已交付：worktree #19 99cf753 并回 #22；审查通过 doc/reviews/R1-S2-review.md（N-1/N-2→T-C1-004）】
 
 - **目标**：从空库用 Alembic 建 0001 最小 schema；提供带 WAL/foreign_keys/busy_timeout 与数据目录 OS 锁的引擎打开/关闭入口。
 - **涉及接缝**：S4。
@@ -178,6 +179,6 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
 3. ~~未知事件版本在读取路径的行为~~ **【已决·T-A-002，见 CORE-CONTRACTS §3.2.1/§4/§9】**：fail closed——坏页整页 StorageCorrupt(retryable=false)、不返半页、不推进 next_cursor；"读取仍可用"=健康前缀+已投影 messages/状态。已并入 R1-S6 验收标准与 §3 差异表第 9 条；B 原临时方案撤回。
 4. ~~expected_seq 与 applied_seq 的关系~~ **【已决·T-A-002，见 CORE-CONTRACTS §3.2 水位裁决/§9】**：expected_seq=提交前 H 期望值（非独立水位、非目标 seq）；H=日志水位、A=applied_seq、健康 A=H 不变量。已并入 R1-S3 目标/验收标准。
 5. ~~contracts 边角三连~~ **【已决·T-A-003，见 CORE-CONTRACTS changelog/§10，具体 §1/§2.1/§3.1/§8】**：(a) ID 前缀=**四前缀强制**（evt_/msg_/ses_/run_ pattern 全量适用 draft/durable/ephemeral、typed data、嵌套消息、SessionRef/RunRef/游标及 metadata 保留键 run_id；request_id 例外仅非空字符串，§3.1）——B 建议采纳（原预写清单含 `req_`，终裁剔除）；M-1 bool 守卫升为 §1 仓库级规则（全部整数语义字段 before-validator 拒 bool），C 席 T-C1-002 补丁落实；(b) files=**方案 (b)**：R1 v1 无 files 字段、任何 files 键按未知字段拒绝，R2+ 升版本+upcaster 引入（§2.1/§8），现实现 e61cdd5 已合规无需改动——B 原预写倾向 (a)，未采纳；(c) extra-forbid=**封闭演进**：envelope/typed data/嵌套消息新增字段（含可选）一律升版本+upcaster，不走同版本可选字段路径（§8 新条款）——B 建议采纳。三处预写差异已由 T-B-004 全文对齐（§2 R1-S1/R1-S7/§3 差异表第 10 行）。
-6. **Alembic env 与测试库**：migrations 需在 async 环境跑（aiosqlite）；建议 env.py 用同步引擎跑迁移、运行时用 async 引擎（SQLite 文件级兼容）。C 席需验证此组合在 Windows 路径下无坑。
-7. **估算（T-B-003 更新）**：S1 已交付（30–60 min 循环成立）；余 7 切片 × 30–60 min C 循环 + 评审/返工，对照 doc/reestimate-r0.md §4 的 R1 目标 5 人日/上限 6 人日——纯实现约 1.5–2.5 个工作日，余量留给 S3/S4 事务故障注入深化、T-A-002 并入的水位/坏页/四步顺序测试点与 CI 双平台验证；若范围再扩大，优先加切片不加大单切片粒度。
+6. ~~Alembic env 与测试库~~ **【已决·T-C1-003 实证，B 审查 T-B-006 §5-7 采纳】**：env.py 用同步引擎跑迁移 + 运行时 async 引擎（open_database）同一 DB 文件，Windows 路径下全链路验证通过（async 写入/PRAGMA 三项/WAL 持久/锁释放后重开）；sqlalchemy 必须带 `[asyncio]` extra（greenlet），纯包 async 引擎运行时失败。S2 已按此落地。
+7. **估算（T-B-003 更新）**：S1 已交付（30–60 min 循环成立）；S2 实测 C 循环 ~47 min，落在 30–60 min 预估带内；余 7 切片 × 30–60 min C 循环 + 评审/返工，对照 doc/reestimate-r0.md §4 的 R1 目标 5 人日/上限 6 人日——纯实现约 1.5–2.5 个工作日，余量留给 S3/S4 事务故障注入深化、T-A-002 并入的水位/坏页/四步顺序测试点与 CI 双平台验证；若范围再扩大，优先加切片不加大单切片粒度。
 8. **目录锁与测试并行**：数据目录 OS 锁（单 writer）会让 pytest 并行/同目录多库受限；建议集成测试每用例独立 tmp_path 目录（现行 R0 测试已如此）。
