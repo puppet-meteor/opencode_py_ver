@@ -1,0 +1,20 @@
+{
+  "id": "evt_0000000000000000000000000008",
+  "type": "py.prompt.accepted",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-02T08:00:07Z",
+  "data": {
+    "request_id": "req_0000000000000000000000000003",
+    "run_id": "run_0000000000000000000000000003",
+    "message": {
+      "id": "msg_0000000000000000000000000003",
+      "type": "user",
+      "created_at": "2026-11-02T08:00:07Z",
+      "metadata": {},
+      "text": "metadata must be a JSON object, not a string"
+    }
+  },
+  "metadata": "run_0000000000000000000000000003",
+  "seq": 8
+}

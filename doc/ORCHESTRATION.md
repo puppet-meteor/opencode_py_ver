@@ -72,7 +72,8 @@
 | T-B-001 | B | R1 切片拆分草稿 | 11:50 | ≈12:10 | 已验收（11:57） | doc/plans/r1-slices.md |
 | T-A-001 | A | R0 复估定稿 | 11:50（resume 续接） | ≈12:15 | 已验收（12:28） | doc/reestimate-r0.md |
 | T-A-002 | A | R1 契约裁决（4 项落条款） | 14:20（resume 续接） | 活性监控（1h 日志零增量） | 派发中 | doc/CORE-CONTRACTS.md（修订） |
-| T-C1-001 | C-1 | R1-S1 试点：最小 contracts+fixture | 14:20 | 活性监控（1h 日志零增量） | 派发中 | src/opencode/contracts/、tests/contract/ |
+| T-C1-001 | C-1 | R1-S1 试点：最小 contracts+fixture | 14:20 | 活性监控（1h 日志零增量） | 已验收（14:55） | src/opencode/contracts/、tests/contract/ |
+| T-B-002 | B | R1-S1 结构化审查 | 15:00 | 活性监控（1h 日志零增量） | 派发中 | doc/reviews/R1-S1-review.md（待） |
 
 ## 7. 调度日志
 
@@ -85,7 +86,8 @@
 - 12:28 T-A-001 回报"完成"（11:50 启动，用时 ~38min，超名义 25min——通知驱动下调度器无独立定时器，回报到达时任务已完成，无需 kill/恢复；名义值校准至 ~40min，见 §3）。验收通过：五节齐全（复估结论/R1 定义确认+退出项/契约修订 3 项均附 TS 行号引用+Python-only 边界标注/R1–R5 基线表目标 24 上限 30 人日/高风险 A-S4·A-S6·A-RECOVERY·A-PLATFORM·A-PROVIDER 终审标记）；抽查一致：doc/evidence/r0/ 三文件+fixtures 在盘、source-baseline 实测 20 项（任务包误写 21，A 已修正）、R0 测试 26 函数/参数化 32 用例与回报相符、platform-support.md 含所引 CI run 41182347042、git 仅新增 reestimate-r0.md。汇合要点：R1 定义维持 PHASE1-SLIM §3 不变；R0-A 条件通过（真实 MAAS smoke 凭据缺，不阻塞 R1）；B 开放问题中"未知版本读取路径"A 已有取向（只读诊断+已投影内容可读），余 3 项（R1 prompt 语义/config_snapshot 最小形状与 hash/expected_seq 是否即 applied_seq）待 A 书面裁决；B 纯实现 1.5–2.5 工作日 vs A 基线 R1 5 人日——口径不同（C 循环 vs 全流程），以 A 基线为进度对照、B 口径为 C 派发节奏。检查点#4 提交。
 - 14:20 暂停点① 用户全部同意（5/5；答复于 12:35–14:20 间到达，调度器 14:20 续接处理）：①接受 A 基线 R1–R5 目标 24/上限 30 人日（超目标 30% 触发复估）②prompt() 保留在 R1（仅持久化 py.prompt.accepted+返回 RunRef，不调度）③真实 MAAS smoke 凭据推迟至 R2 前单独补齐 ④R1-S1 试点批准、主树直做（纯新增文件）、S2 起切独立 worktree ⑤技术性契约裁决授权 A 直接落条款。据此派发：T-A-002（4 项裁决落 CORE-CONTRACTS，30min 名义）、T-C1-001（试点 R1-S1，45min 名义）并行。调整：pydantic 依赖引入由 S2 前移至 S1（S1 需 Pydantic v2 wire model，B 方案边界笔误；已授权 C-1 仅经 `uv add "pydantic>=2"` 修改 pyproject/uv.lock）。检查点#5 提交。
 - 14:47 用户指示（14:20–14:47 间到达，调度器 14:47 续接处理）：watchdog 放宽为活性监控——名义时长仅参考（A 席可能数小时），**判卡死唯一标准=子 shell 输出日志 1 小时零增量**→kill→恢复阶梯。§3/任务表已改；调度器为 T-A-002/T-C1-001 挂后台活性监视器（10min 检查、1h 零增量报警退出、6h 到期重挂；每次唤醒后按仍存活任务刷新）。检查点#6 提交。
-- 下一事件：T-A-002 / T-C1-001 回报 → 各自验收 → 裁决×实现交叉对齐（冲突则派 C 修订）→ B 审查 R1-S1（T-B-002）→ 通过后按 S2 起（worktree）依赖序派发。
+- 14:55 T-C1-001 回报"完成"（14:21 实启，~35min）。验收通过：门禁由调度器亲跑复核（contract 44 passed/全量 76 passed/ruff check+format/mypy 15 文件全绿）；8 fixtures=2 正例+6 反例；round-trip 与 py.*/version=1 原始可检；文件与授权清单一致（CORE-CONTRACTS.md 未提交修改属 A 席 T-A-002 并行任务，diff 已核非 C 越权）。亮点：C-1 在切片中途消化了 A 合入的 T-A-002 裁决（config_snapshot 精确形状/sha256 canonical/解码重算摘要/NaN 与重复键拒绝），A×C 并行对齐自动完成；自报 8 项方案审视发现+6 项未决问题，转 B 审查回应。检查点#7 提交（feat: R1-S1 contracts，不含 A 在飞契约修订与 logs/）；T-B-002（B 结构化审查）派发；监视器刷新为 A+B 两日志。
+- 下一事件：T-A-002 / T-B-002 回报 → T-A-002 验收（4 项裁决落条款+git 仅改 CORE-CONTRACTS+与 C-1 已对齐实现核一致）→ T-B-002 审查结论（blocker/major 修订项→派 T-C1-002）→ 试点流程收口 → S2（worktree）派发。
 
 ## 待用户定夺（不阻塞冒烟）
 

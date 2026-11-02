@@ -450,6 +450,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx2" },
     { name = "openai" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -464,6 +465,7 @@ dev = [
 requires-dist = [
     { name = "httpx2", specifier = ">=2.12.0,<3" },
     { name = "openai", specifier = ">=1.60" },
+    { name = "pydantic", specifier = ">=2" },
 ]
 
 [package.metadata.requires-dev]

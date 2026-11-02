@@ -1,0 +1,18 @@
+{
+  "id": "evt_0000000000000000000000000007",
+  "type": "py.session.created",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-02T08:00:06Z",
+  "data": {
+    "working_dir": "D:/work/demo",
+    "config_snapshot": {
+      "schema_version": 1,
+      "permission_rules": []
+    },
+    "snapshot_hash": "77c932c31585517c128479af02c40cd377e26d4d25ce57df197fc8509e14f802",
+    "future_extension_field": {"note": "unknown fields must be rejected, not silently kept"}
+  },
+  "metadata": {},
+  "seq": 7
+}

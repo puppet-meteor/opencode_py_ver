@@ -1,0 +1,22 @@
+{
+  "id": "evt_0000000000000000000000000006",
+  "type": "py.prompt.accepted",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-02T08:00:05Z",
+  "data": {
+    "request_id": "req_0000000000000000000000000002",
+    "message": {
+      "id": "msg_0000000000000000000000000002",
+      "type": "user",
+      "created_at": "2026-11-02T08:00:05Z",
+      "metadata": {},
+      "text": "hello again, agent"
+    }
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002",
+    "request_id": "req_0000000000000000000000000002"
+  },
+  "seq": 6
+}
