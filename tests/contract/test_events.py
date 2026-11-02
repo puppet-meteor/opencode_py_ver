@@ -453,3 +453,129 @@ class TestUserMessage:
         )
         assert data.message.type == "user"
         assert PromptAcceptedData.model_validate(json.loads(data.model_dump_json())) == data
+
+
+class TestContractHardening:
+    """T-C1-002 pins: §1 bool rule (M-1), §2.1 files option b, §3.1 ID prefixes, M-4/N-2."""
+
+    def test_bool_version_rejected_on_construction(self) -> None:
+        payload = _session_created_draft().model_dump()
+        for bad in (True, False):
+            with pytest.raises(ValidationError):
+                EventDraft[SessionCreatedData].model_validate({**payload, "version": bad})
+
+    def test_bool_seq_rejected_on_construction(self) -> None:
+        payload = _session_created_draft().model_dump()
+        for bad in (True, False):
+            with pytest.raises(ValidationError):
+                DurableEvent[SessionCreatedData].model_validate({**payload, "seq": bad})
+
+    def test_string_version_rejected_on_decode_path(self) -> None:
+        raw = _load_fixture(POSITIVE_FIXTURES[PY_SESSION_CREATED]) | {"version": "1"}
+        with pytest.raises(EventDecodeError):
+            default_event_registry().decode_durable(raw)
+
+    def test_bool_seq_rejected_on_decode_path(self) -> None:
+        raw = _load_fixture(POSITIVE_FIXTURES[PY_SESSION_CREATED]) | {"seq": True}
+        with pytest.raises(ValidationError):
+            default_event_registry().decode_durable(raw)
+
+    def test_lone_surrogate_fails_closed_in_canonical_bytes(self) -> None:
+        # §6.2.1: illegal Unicode (lone surrogate) must never reach the hash. The
+        # UTF-8 encode of the canonical text raises UnicodeEncodeError (⊂ ValueError).
+        with pytest.raises(ValueError):
+            canonical_json({"x": "\ud800"}).encode("utf-8")
+
+    def test_empty_event_id_rejected(self) -> None:
+        # N-2 first item, pinned directly: an empty id violates both min_length=1 and
+        # ^evt_. EphemeralEvent declares its own id field, so each entry point is
+        # exercised; DurableEvent inherits EventDraft's declaration.
+        payload = _session_created_draft().model_dump()
+        with pytest.raises(ValidationError):
+            EventDraft[SessionCreatedData].model_validate({**payload, "id": ""})
+        with pytest.raises(ValidationError):
+            DurableEvent[SessionCreatedData].model_validate({**payload, "id": "", "seq": 1})
+        with pytest.raises(ValidationError):
+            EphemeralEvent[_HeartbeatData].model_validate({**_heartbeat_raw(), "id": ""})
+
+    def test_event_and_session_id_prefixes_enforced(self) -> None:
+        payload = _session_created_draft().model_dump()
+        for bad_id in ("ev_1", "ses_1", "run_1", "msg_1"):
+            with pytest.raises(ValidationError):
+                EventDraft[SessionCreatedData].model_validate({**payload, "id": bad_id})
+        for bad_session_id in ("se_1", "session_1", "evt_1", "run_1"):
+            with pytest.raises(ValidationError):
+                EventDraft[SessionCreatedData].model_validate({**payload, "session_id": bad_session_id})
+
+    def test_ephemeral_id_prefixes_enforced(self) -> None:
+        registry = _ephemeral_registry()
+        with pytest.raises(ValidationError):
+            registry.decode_ephemeral(_heartbeat_raw() | {"id": "ev_0001"})
+        with pytest.raises(ValidationError):
+            registry.decode_ephemeral(_heartbeat_raw() | {"session_id": "se_0001"})
+
+    def test_user_message_id_prefix_enforced(self) -> None:
+        base: dict[str, Any] = {"type": "user", "created_at": "2026-11-02T08:00:00Z", "text": "hi"}
+        with pytest.raises(ValidationError):
+            UserMessage.model_validate({**base, "id": "user_1"})
+        message = UserMessage.model_validate({**base, "id": "msg_0000000000000000000000000099"})
+        assert message.id.startswith("msg_")
+
+    def test_user_message_files_key_rejected(self) -> None:
+        base: dict[str, Any] = {
+            "id": "msg_0000000000000000000000000099",
+            "type": "user",
+            "created_at": "2026-11-02T08:00:00Z",
+            "text": "hi",
+        }
+        # §2.1 option b: the R1 v1 wire has no files field; the key itself — even
+        # an empty list — is rejected, never silently dropped or tolerated.
+        with pytest.raises(ValidationError):
+            UserMessage.model_validate({**base, "files": []})
+        with pytest.raises(ValidationError):
+            UserMessage.model_validate({**base, "files": [{"path": "D:/work/demo/a.png"}]})
+
+    def test_user_message_empty_text_allowed(self) -> None:
+        message = UserMessage(
+            id="msg_0000000000000000000000000098",
+            type="user",
+            created_at=datetime(2026, 11, 2, 8, 0, 0, tzinfo=UTC),
+            text="",
+        )
+        assert message.text == ""
+
+    def test_run_id_prefix_enforced_in_data(self) -> None:
+        valid = UserMessage(
+            id="msg_0000000000000000000000000097",
+            type="user",
+            created_at=datetime(2026, 11, 2, 8, 0, 0, tzinfo=UTC),
+            text="hi",
+        )
+        with pytest.raises(ValidationError):
+            PromptAcceptedData(request_id="req_1", run_id="rn_1", message=valid)
+
+    def test_metadata_run_id_validated_wherever_present(self) -> None:
+        payload = _session_created_draft().model_dump()
+        # §3.1: whenever the metadata key run_id appears — even on a non-run-scoped
+        # event — it must be a ^run_ string; null, non-string, wrong prefix rejected.
+        for bad_metadata in ({"run_id": "rn_1"}, {"run_id": None}, {"run_id": 1}):
+            with pytest.raises(ValidationError):
+                EventDraft[SessionCreatedData].model_validate({**payload, "metadata": bad_metadata})
+        accepted = EventDraft[SessionCreatedData].model_validate(
+            {**payload, "metadata": {"run_id": "run_0000000000000000000000000095"}}
+        )
+        assert accepted.metadata["run_id"] == "run_0000000000000000000000000095"
+
+    def test_request_id_has_no_prefix_pattern(self) -> None:
+        valid = UserMessage(
+            id="msg_0000000000000000000000000096",
+            type="user",
+            created_at=datetime(2026, 11, 2, 8, 0, 0, tzinfo=UTC),
+            text="hi",
+        )
+        data = PromptAcceptedData(
+            request_id="client-chosen-id-without-prefix",
+            run_id="run_0000000000000000000000000096",
+            message=valid,
+        )
+        assert data.request_id == "client-chosen-id-without-prefix"

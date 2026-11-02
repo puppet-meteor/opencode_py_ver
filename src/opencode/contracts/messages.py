@@ -28,14 +28,16 @@ UtcDateTime = Annotated[datetime, AfterValidator(_as_utc)]
 class UserMessage(BaseModel):
     """User-authored session message (§2.1 ``user`` row).
 
-    ``files`` stays out until media lands (M6); Phase 1 callers send plain text,
-    and a non-empty ``files`` list is rejected as UnsupportedCapability at the
-    tool/config layer, not here.
+    ``files`` stays out until media lands (M6): the R1 v1 wire has no optional
+    ``files`` field (CORE-CONTRACTS §2.1, T-A-003 option b) — a ``files`` key
+    (even an empty list) on the wire is rejected here by ``extra="forbid"``
+    rather than silently dropped; Phase 1 callers send plain text and a non-empty
+    files list is rejected as UnsupportedCapability at the tool/config layer.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1)
+    id: str = Field(min_length=1, pattern=r"^msg_")
     type: Literal["user"]
     created_at: UtcDateTime
     metadata: JsonObject = Field(default_factory=dict)

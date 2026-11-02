@@ -34,6 +34,21 @@ RUN_SCOPED_EVENT_TYPES: frozenset[str] = frozenset({PY_PROMPT_ACCEPTED})
 
 _SHA256_HEX = r"^[0-9a-f]{64}$"
 
+_EVT_ID = r"^evt_"
+_SES_ID = r"^ses_"
+_RUN_ID = r"^run_"
+
+
+def _reject_bool(field: str, value: Any) -> Any:
+    """§1 repo rule: integer-semantic fields reject bools before type conversion.
+
+    Pydantic's bool→int/Literal equality would let True masquerade as 1; guard both
+    model construction and decode paths with the same behavior.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer, not a boolean")
+    return value
+
 
 def versioned_type(event_type: str, version: int) -> str:
     """Registry key format, mirrors TS ``versionedType`` (``${type}.${version}``)."""
@@ -70,11 +85,8 @@ class ConfigSnapshot(BaseModel):
 
     @field_validator("schema_version", mode="before")
     @classmethod
-    def _schema_version_must_not_be_bool(cls, value: Any) -> Any:
-        """Literal[1] equality accepts True (bool is an int subclass); §6.1 forbids that."""
-        if isinstance(value, bool):
-            raise ValueError("schema_version must be the integer 1, not a boolean")
-        return value
+    def _schema_version_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("schema_version", value)
 
     @classmethod
     def create(cls) -> ConfigSnapshot:
@@ -105,14 +117,22 @@ class PromptAcceptedData(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
     message: UserMessage
 
 
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
-    """Run-scoped events must carry run_id in envelope metadata (§3.1)."""
+    """Run-scoped events must carry run_id in envelope metadata (§3.1).
+
+    The run_id metadata key, whenever it appears, must be a string matching ^run_
+    (§3.1); null, non-string, or wrongly-prefixed values are rejected.
+    """
     if event_type in RUN_SCOPED_EVENT_TYPES and "run_id" not in metadata:
         raise ValueError(f"metadata.run_id is required for run-scoped event type {event_type!r}")
+    if "run_id" in metadata:
+        value = metadata["run_id"]
+        if not isinstance(value, str) or not value.startswith("run_"):
+            raise ValueError("metadata.run_id, when present, must be a string matching ^run_")
 
 
 class EventDraft[DataT: BaseModel](BaseModel):
@@ -125,13 +145,18 @@ class EventDraft[DataT: BaseModel](BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1)
+    id: str = Field(min_length=1, pattern=_EVT_ID)
     type: str = Field(min_length=1)
     version: int = Field(ge=1)
-    session_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1, pattern=_SES_ID)
     created_at: UtcDateTime
     data: DataT
     metadata: JsonObject = Field(default_factory=dict)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _version_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("version", value)
 
     @model_validator(mode="after")
     def _run_metadata_present(self) -> EventDraft[DataT]:
@@ -144,15 +169,20 @@ class DurableEvent[DataT: BaseModel](EventDraft[DataT]):
 
     seq: int = Field(ge=1)
 
+    @field_validator("seq", mode="before")
+    @classmethod
+    def _seq_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("seq", value)
+
 
 class EphemeralEvent[DataT: BaseModel](BaseModel):
     """Live-only envelope (§3.1): no version, no seq, no durable cursor."""
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1)
+    id: str = Field(min_length=1, pattern=_EVT_ID)
     type: str = Field(min_length=1)
-    session_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1, pattern=_SES_ID)
     created_at: UtcDateTime
     data: DataT
     metadata: JsonObject = Field(default_factory=dict)
