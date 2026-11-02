@@ -8,7 +8,7 @@
 
 | 席位 | 角色 | 命令 | 模型 | 会话续接 |
 |---|---|---|---|---|
-| A | 仲裁者：架构定稿/契约裁决/疑难根因/连续失败升级/高风险终审/沉淀规范 | `codex exec`（0.163.0） | gpt-6.1-sol · reasoning max（本机 codex config，不覆盖） | `codex exec resume <sid>`（sid 从 --json 事件流捕获） |
+| A | 仲裁者：架构定稿/契约裁决/疑难根因/连续失败升级/高风险终审/沉淀规范 | `codex exec`（0.163.0） | gpt-6.1-sol · reasoning max（本机 codex config，不覆盖） | `codex exec resume 01a19a51-71d4-7ed0-a4ce-40730a5d26b7`（线程ID已捕获；resume 不支持 --cd，靠 shell workdir） |
 | B | 规划评审：拆模块/迁移方案草稿/常规结构化审查 | `opencode run --session ses_orch_B` | gateway/glm-5.3#max | 同 `--session` ID 重派 |
 | C-1 | 实现者主力：方案可执行性审视/实现/修订；核心接缝与高风险专用 | `opencode run --session ses_orch_C1` | gateway/glm-5.3#max | 同上 |
 | C-2 | 实现者补充：批量/夜间/机械环节；可多席并行（每席独立 worktree + 独立 session ID） | `opencode run --session ses_orch_C2` | gateway/volcengine/deepseek-v4.1-flash#max | 同上 |
@@ -58,22 +58,27 @@
 ## 5. 状态机与暂停点
 
 - 任务状态：`派发中 → 已回报 → 已验收 ｜ 卡住 → 已重启 ｜ 网络故障 → 已重试/已上报`
-- 暂停点（等用户确认，grilling ≤3 问、单主题、逐层推进；争议默认以 TS 原始实现裁决）：① A 复估定稿后 ② 高风险模块 A 终审后 ③ 升级事件处置后 ④ 里程碑完成时
+- 暂停点（等用户确认，grilling ≤5 问、单主题、逐层推进；争议默认以 TS 原始实现裁决）：① A 复估定稿后 ② 高风险模块 A 终审后 ③ 升级事件处置后 ④ 里程碑完成时
 
 ## 6. 任务表
 
 | ID | 席位 | 任务 | 启动 | 名义deadline | 状态 | 产出 |
 |---|---|---|---|---|---|---|
-| T-PROBE-A | A | 冒烟测试 | 11:33 | ≈11:43 | 派发中（事件流活跃） | doc/orchestration/probe/seat-A.md（待） |
-| T-PROBE-B | B | 冒烟测试 | 11:37 重派 | ≈11:47 | 重派中（首派参数错，见日志） | doc/orchestration/probe/seat-B.md（待） |
-| T-PROBE-C1 | C-1 | 冒烟测试 | 11:37 重派 | ≈11:47 | 重派中（同上） | doc/orchestration/probe/seat-C1.md（待） |
-| T-PROBE-C2 | C-2 | 冒烟测试 | 11:37 重派 | ≈11:47 | 重派中（同上） | doc/orchestration/probe/seat-C2.md（待） |
+| T-PROBE-A | A | 冒烟测试 | 11:33 | ≈11:43 | 已验收（11:44） | doc/orchestration/probe/seat-A.md |
+| T-PROBE-B | B | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-B.md |
+| T-PROBE-C1 | C-1 | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-C1.md |
+| T-PROBE-C2 | C-2 | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-C2.md |
+| T-B-001 | B | R1 切片拆分草稿 | 11:50 | ≈12:10 | 派发中 | doc/plans/r1-slices.md（待） |
+| T-A-001 | A | R0 复估定稿 | 11:50（resume 续接） | ≈12:15 | 派发中 | doc/reestimate-r0.md（待） |
 
 ## 7. 调度日志
 
 - 11:32 名册确认（A=codex/GPT-6.1-Sol max；B、C-1=opencode/GLM-5.3#max；C-2=opencode/DeepSeek-V4.1-Flash#max）。codex 0.163.0 `exec`/`resume`/`--json`/`-o` 验证通过；opencode `run --session/--model/--auto` 验证通过。台账建立（含网络恢复协议）。四席位冒烟并行派发（B/C1/C2 初用 orch-seat-* 会话ID）。
 - 11:36 B/C1/C2 首派即败（退出码 1）：`--session` 值必须以 `ses` 开头——客户端参数校验错误，秒败、无模型调用、非网络故障。会话 ID 更正为 `ses_orch_B/C1/C2` 重派。A（codex）事件流确认存活。用户指示：git 提交与版本控制唯一归调度器，固化入 §1。检查点#1 提交。
-- 下一事件：四席冒烟验收 → T-A-001（R0 复估）∥ T-B-001（R1 切片草稿）→ 暂停点①（grilling）。
+- 11:40 B/C1/C2 冒烟验收通过：回报行（PROBE-*-OK）、交付文件（seat-*.md，R1 定义正确）、git 无异常变更，三项全过。A 冒烟进入收尾（seat-A.md 已产出，codex 用 python 自检通过：单行『R1：最小事件/恢复闭环』）。观察：席位日志开头有一条非致命 stderr 记录（"Expected a string starting with ses"，PS 2>&1 重排所致），未影响结果，持续观察。T-B-001 派发至 B（GLM-5.3#max，按默认模型）。检查点#2 提交。
+- 11:44 A 冒烟验收通过（PROBE-A-OK / seat-A.md / git 干净），四席冒烟全过。A 线程 ID 捕获并记入 §1。（勘误：本行及 11:40 行所记 T-A-001/T-B-001 派发与检查点#2 提交均未实际发生——调度器在启动进程前会话中断。观察：A 读中文文件正常，其 stdout 捕获存在控制台编码噪声（锟斤拷，仅显示层，文件内容无损）。）
+- 11:50 用户指示：grilling 提问上限 ≤3→≤5 问（§5 及全部暂停点生效）。断点恢复：T-A-001 经 `codex exec resume` 派发（实测续接机制）、T-B-001 经 `opencode run --session ses_orch_B` 派发；启动 11:50，名义deadline A≈12:15 / B≈12:10；检查点#2 提交（台账修订+任务包+冒烟证据，排除在飞 logs/）。
+- 下一事件：T-A-001 / T-B-001 回报 → 各自验收（A：reestimate-r0.md 五节+TS 引用；B：r1-slices.md 依赖序+试点标注）→ 汇合对齐 → 暂停点①（grilling ≤5 问）。
 
 ## 待用户定夺（不阻塞冒烟）
 
