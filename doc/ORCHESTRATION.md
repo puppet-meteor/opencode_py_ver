@@ -32,7 +32,7 @@
 
 ## 3. Watchdog
 
-- 名义 deadline（试点后校准）：冒烟 ~10min｜审查 ~15min｜方案 ~20min｜复估定稿 ~25min｜实现 30–60min
+- 名义 deadline（试点后校准；实测：方案 7min、复估 38min）：冒烟 ~10min｜审查 ~15min｜方案 ~20min｜复估定稿 ~40min｜实现 30–60min
 - 巡检时机：任一席位回报事件、每次门禁、用户喊"查状态"
 - 打断：外部进程可真 kill（Stop-Process）；kill 后按恢复阶梯决定续接或重发；未验收残留按 git diff 丢弃
 - 连击升级：同任务 2 次卡住 / 同模块 2 轮审查不过 → 升 A 根因；疑似网络/环境 → 上报用户
@@ -69,7 +69,7 @@
 | T-PROBE-C1 | C-1 | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-C1.md |
 | T-PROBE-C2 | C-2 | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-C2.md |
 | T-B-001 | B | R1 切片拆分草稿 | 11:50 | ≈12:10 | 已验收（11:57） | doc/plans/r1-slices.md |
-| T-A-001 | A | R0 复估定稿 | 11:50（resume 续接） | ≈12:15 | 派发中 | doc/reestimate-r0.md（待） |
+| T-A-001 | A | R0 复估定稿 | 11:50（resume 续接） | ≈12:15 | 已验收（12:28） | doc/reestimate-r0.md |
 
 ## 7. 调度日志
 
@@ -79,7 +79,8 @@
 - 11:44 A 冒烟验收通过（PROBE-A-OK / seat-A.md / git 干净），四席冒烟全过。A 线程 ID 捕获并记入 §1。（勘误：本行及 11:40 行所记 T-A-001/T-B-001 派发与检查点#2 提交均未实际发生——调度器在启动进程前会话中断。观察：A 读中文文件正常，其 stdout 捕获存在控制台编码噪声（锟斤拷，仅显示层，文件内容无损）。）
 - 11:50 用户指示：grilling 提问上限 ≤3→≤5 问（§5 及全部暂停点生效）。断点恢复：T-A-001 经 `codex exec resume` 派发（实测续接机制）、T-B-001 经 `opencode run --session ses_orch_B` 派发；启动 11:50，名义deadline A≈12:15 / B≈12:10；检查点#2 提交（台账修订+任务包+冒烟证据，排除在飞 logs/）。
 - 11:57 T-B-001 回报"完成"（用时 ~7min，远低于名义 20min）。验收通过：依赖序明确（S1→S2→S3→S4→[S5 可并行]→S6→S7→S8）、试点切片 R1-S1 标注+粒度 30–45min、逐切片 TS 文件+行号映射、验收标准逐条归属 PHASE1-SLIM R1 验收 A/B/C+测试计划齐全；git 仅新增 doc/plans/r1-slices.md。开放问题 4 项（R1 prompt 语义/config_snapshot 最小形状与 hash/未知事件版本读取路径 fail-closed vs 读取可用/expected_seq 是否即 applied_seq）提请与 A 汇合裁决——暂停点① 素材。检查点#3 提交。
-- 下一事件：T-A-001 回报 → 验收（reestimate-r0.md 五节+TS 引用+证据一致+git 仅新增该文件）→ 与 r1-slices.md 汇合对齐 → 暂停点①（grilling ≤5 问）。
+- 12:28 T-A-001 回报"完成"（11:50 启动，用时 ~38min，超名义 25min——通知驱动下调度器无独立定时器，回报到达时任务已完成，无需 kill/恢复；名义值校准至 ~40min，见 §3）。验收通过：五节齐全（复估结论/R1 定义确认+退出项/契约修订 3 项均附 TS 行号引用+Python-only 边界标注/R1–R5 基线表目标 24 上限 30 人日/高风险 A-S4·A-S6·A-RECOVERY·A-PLATFORM·A-PROVIDER 终审标记）；抽查一致：doc/evidence/r0/ 三文件+fixtures 在盘、source-baseline 实测 20 项（任务包误写 21，A 已修正）、R0 测试 26 函数/参数化 32 用例与回报相符、platform-support.md 含所引 CI run 41182347042、git 仅新增 reestimate-r0.md。汇合要点：R1 定义维持 PHASE1-SLIM §3 不变；R0-A 条件通过（真实 MAAS smoke 凭据缺，不阻塞 R1）；B 开放问题中"未知版本读取路径"A 已有取向（只读诊断+已投影内容可读），余 3 项（R1 prompt 语义/config_snapshot 最小形状与 hash/expected_seq 是否即 applied_seq）待 A 书面裁决；B 纯实现 1.5–2.5 工作日 vs A 基线 R1 5 人日——口径不同（C 循环 vs 全流程），以 A 基线为进度对照、B 口径为 C 派发节奏。检查点#4 提交。
+- 下一事件：暂停点①（grilling ≤5 问）：R1 定稿与试点切片 R1-S1 派发确认 → 批准后建 C-1 worktree、按 B 方案 S1→S2→…顺序派发。
 
 ## 待用户定夺（不阻塞冒烟）
 
