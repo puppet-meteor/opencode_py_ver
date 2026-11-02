@@ -104,7 +104,12 @@ _INSERT_SESSION_DIAGNOSTIC = sa.text(
 
 
 def epoch_ms(value: datetime) -> int:
-    """Exact integer epoch milliseconds (storage precision of ``events.created``)."""
+    """Exact integer epoch milliseconds (storage precision of ``events.created``).
+
+    Millisecond truncation is the storage precision: sub-millisecond differences
+    between a retry and the committed row are indistinguishable in the idempotency
+    comparison, which is what "retries reuse content" (§3.2) requires (N-3).
+    """
     delta = value - _EPOCH
     return (delta.days * 86_400 + delta.seconds) * 1000 + delta.microseconds // 1000
 
@@ -295,11 +300,12 @@ class TransactionWriter:
                         # isolation runs in an independent short transaction (§3.2.1).
                         try:
                             await self._isolate_locked(session_id, _diagnostic_from(corruption))
-                        except StorageError:
+                        except StorageError as persist_error:
                             # The diagnostic row could not be persisted: the
                             # in-memory write gate holds and the original
-                            # corruption error below stays caller-facing.
-                            pass
+                            # corruption error is re-raised, explicitly
+                            # chained to the persistence failure (N-1).
+                            raise corruption from persist_error
                     raise
 
     async def _commit_transaction(
