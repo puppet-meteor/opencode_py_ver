@@ -1,10 +1,13 @@
-# R1-S1 / R1-S2 已交付公共面静态清单
+# R1-S1..R1-S3 已交付公共面静态清单（滚动更新）
 
-> 范围：`src/opencode/contracts/`、`src/opencode/storage/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
-> 符号总数：**45**（contracts 27 + storage 18）。包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）、`storage.__all__` 9 项（全部来自 `db.py`，不含迁移脚本符号）。
-> 扫描时间：2026-11-02；基线提交工作树（`git status` 中存在他席位产生的改动，见 §3 注）。
+> 范围：覆盖 **R1-S1..R1-S3 已并入主树的交付面**（滚动更新：S4 并入后另行滚动）——`src/opencode/contracts/` 与 `src/opencode/storage/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
+> 符号总数：**69** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）。
+> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`REASON_*` 均**未进** `__all__`。
+> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；工作树状态见 §3 注。
 
 ## 1. 公共面清单
+
+### 1.1 R1-S1 / R1-S2（contracts、storage/db + migrations）
 
 | 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 |
 |---|---|---|---|---|
@@ -54,19 +57,48 @@
 | `opencode.storage.migrations.versions.0001_initial.upgrade` | function | `() -> None` | 建五表（events/sessions/messages/tool_executions/permissions）与具名唯一索引 | `.../0001_initial.py:56` |
 | `opencode.storage.migrations.versions.0001_initial.downgrade` | function | `() -> None` | 拒绝降级，要求从校验备份恢复 | `.../0001_initial.py:132` |
 
+> S3 说明：以下 `store.py` / `txn.py` 符号按首派口径（源码定义处公共符号，下划线私有名不收）收录；**导出性**列标注是否在 `opencode.storage.__all__` 中。`TransactionWriter` 为模块级公共名但明确**不导出，S4 私有**（CORE-CONTRACTS §3.2：仅供 `SessionStore` 调用）。
+
+| 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 | 导出性 |
+|---|---|---|---|---|---|
+| `opencode.storage.store.EventBatch` | class (dataclass, frozen, slots) | `id: str; events: tuple[EventDraft[Any], ...]; dedupe_key: str \| None = None` | 一次原子提交单元：batch 幂等键 + 有序草稿（+可选去重键） | `src/opencode/storage/store.py:31` | 导出 |
+| `opencode.storage.store.Projector` | Protocol | `async apply(connection: AsyncConnection, event: DurableEvent[Any]) -> None` | 读模型投影 seam，在提交事务内按批次顺序调用 | `src/opencode/storage/store.py:45` | 导出 |
+| `opencode.storage.store.SessionStore` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry \| None = None); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]` | 唯一提交接口，内部委托 `TransactionWriter` | `src/opencode/storage/store.py:62` | 导出 |
+| `opencode.storage.txn.REASON_READ_MODEL_MISSING` | constant | `"sessions_row_missing_with_log"` | 有日志行但 sessions 行缺失 | `src/opencode/storage/txn.py:63` | 不导出 |
+| `opencode.storage.txn.REASON_APPLIED_SEQ_MISMATCH` | constant | `"applied_seq_mismatch"` | A≠H | `src/opencode/storage/txn.py:64` | 不导出 |
+| `opencode.storage.txn.REASON_SEQ_GAP` | constant | `"seq_gap"` | seq 不连续 | `src/opencode/storage/txn.py:65` | 不导出 |
+| `opencode.storage.txn.REASON_DUPLICATE_SEQ` | constant | `"duplicate_seq"` | seq 重复 | `src/opencode/storage/txn.py:66` | 不导出 |
+| `opencode.storage.txn.REASON_ILLEGAL_SEQ` | constant | `"illegal_seq"` | seq < 1 | `src/opencode/storage/txn.py:67` | 不导出 |
+| `opencode.storage.txn.REASON_UNKNOWN_STATUS` | constant | `"unknown_session_status"` | sessions.status 非法 | `src/opencode/storage/txn.py:68` | 不导出 |
+| `opencode.storage.txn.REASON_STORED_DECODE_FAILED` | constant | `"stored_event_decode_failed"` | 已存事件解码失败 | `src/opencode/storage/txn.py:69` | 不导出 |
+| `opencode.storage.txn.REASON_PROJECTION_INVARIANT` | constant | `"applied_seq_not_advanced_after_projection"` | 投影后 A 未推进到 H+n | `src/opencode/storage/txn.py:70` | 不导出 |
+| `opencode.storage.txn.epoch_ms` | function | `(value: datetime) -> int` | datetime → 整数 epoch 毫秒（`events.created` 精度） | `src/opencode/storage/txn.py:106` | 不导出 |
+| `opencode.storage.txn.from_epoch_ms` | function | `(value: int) -> datetime` | `epoch_ms` 的逆函数（毫秒精度） | `src/opencode/storage/txn.py:112` | 不导出 |
+| `opencode.storage.txn.StoreError` | exception | `class StoreError(StorageError)`；`code: ClassVar[CoreErrorCode]; retryable: ClassVar[bool] = False; __init__(message: str, *, details: JsonObject \| None = None)`，携带 `self.core: CoreError` | 提交拒绝基类，锁定 §8 错误码 | `src/opencode/storage/txn.py:124` | 导出 |
+| `opencode.storage.txn.SessionReadOnlyError` | exception | `class SessionReadOnlyError(StoreError)`；`code = CoreErrorCode.SESSION_READ_ONLY` | session 已隔离（read_only_diagnostic） | `src/opencode/storage/txn.py:145` | 导出 |
+| `opencode.storage.txn.SessionClosedError` | exception | `class SessionClosedError(StoreError)`；`code = CoreErrorCode.SESSION_CLOSED` | session 已关闭 | `src/opencode/storage/txn.py:151` | 导出 |
+| `opencode.storage.txn.LifecycleCleanupFailedError` | exception | `class LifecycleCleanupFailedError(StoreError)`；`code = CoreErrorCode.LIFECYCLE_CLEANUP_FAILED` | 资源清理失败 | `src/opencode/storage/txn.py:157` | 导出 |
+| `opencode.storage.txn.StoreValidationError` | exception | `class StoreValidationError(StoreError)`；`code = CoreErrorCode.VALIDATION_ERROR` | 调用参数/所有权/版本/批次形状非法 | `src/opencode/storage/txn.py:163` | 导出 |
+| `opencode.storage.txn.ConflictError` | exception | `class ConflictError(StoreError)`；`code = CoreErrorCode.CONFLICT` | `expected_seq` 与健康日志水位不等 | `src/opencode/storage/txn.py:169` | 导出 |
+| `opencode.storage.txn.IdempotencyConflictError` | exception | `class IdempotencyConflictError(StoreError)`；`code = CoreErrorCode.IDEMPOTENCY_CONFLICT` | 批次身份冲突（混 id/内容漂移/跨 session） | `src/opencode/storage/txn.py:175` | 导出 |
+| `opencode.storage.txn.StorageCorruptError` | exception | `class StorageCorruptError(StoreError)`；`code = CoreErrorCode.STORAGE_CORRUPT`；`__init__(message: str, *, isolate: bool = True, details=None)` | 存储不变量破坏；`isolate` 决定是否进入 §3.2.1 隔离 | `src/opencode/storage/txn.py:181` | 导出 |
+| `opencode.storage.txn.IsolationPersistFailedError` | exception | `class IsolationPersistFailedError(StorageError)` | 诊断行落库失败（内存写门仍生效） | `src/opencode/storage/txn.py:198` | 导出 |
+| `opencode.storage.txn.Diagnostic` | class (dataclass, frozen, slots) | `reason: str; first_bad_seq: int \| None = None; first_bad_event_id: str \| None = None; applied_seq: int = 0; to_json() -> JsonObject` | 脱敏 §3.2.1 诊断载荷 | `src/opencode/storage/txn.py:203` | 不导出 |
+| `opencode.storage.txn.TransactionWriter` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]`（另有 per-session asyncio 锁 + 进程级写锁） | §3.2 事务序列与 §3.2.1 隔离实现；**不导出，S4 私有** | `src/opencode/storage/txn.py:258` | **不导出（S4 私有）** |
+
 ## 2. 错误码三方对照表
 
 契约来源：`doc/CORE-CONTRACTS.md` §8，全部 22 个码位于**同一行 L340**（逐个直读，非记忆）。实现：`CoreErrorCode` 成员，`src/opencode/contracts/errors.py:24-45`。
-**测试引用数注**：统计 `tests/` 下全部 `*.py`，口径 = 该码**引号字符串字面量**出现次数（`Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches`，按 `Matches` 计数） + **枚举成员名**出现次数（`-CaseSensitive -Pattern '\b<MEMBER_NAME>\b' -AllMatches`）；两者互斥，合计即表列数字。
+**测试引用数注**：统计 `tests/` 下全部 `*.py`（含 S3 新增 `tests/integration/test_store_commit.py`），口径 = 该码**引号字符串字面量**出现次数（`Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches`，按 `Matches` 计数） + **枚举成员名**出现次数（`-CaseSensitive -Pattern '\b<MEMBER_NAME>\b' -AllMatches`）；两者互斥，合计即表列数字。S3 测试主要经 `StoreError` 子类断言，本表只计**码字面量/枚举成员**，故增量低于异常类引用量。
 
 | 码名 | 契约行 | 实现位置 | 测试引用数 | 一致性结论 |
 |---|---|---|---|---|
-| `ValidationError` | L340 | `errors.py:24`（`VALIDATION_ERROR`） | 5（1 字符串 + 4 成员引用） | 一致 |
+| `ValidationError` | L340 | `errors.py:24`（`VALIDATION_ERROR`） | 6（4 + 2） | 一致 |
 | `UnsupportedCapability` | L340 | `errors.py:25`（`UNSUPPORTED_CAPABILITY`） | 1 | 一致 |
 | `NotFound` | L340 | `errors.py:26`（`NOT_FOUND`） | 4（2 + 2） | 一致 |
 | `SessionBusy` | L340 | `errors.py:27`（`SESSION_BUSY`） | 2 | 一致 |
-| `Conflict` | L340 | `errors.py:28`（`CONFLICT`） | 3（2 + 1） | 一致 |
-| `IdempotencyConflict` | L340 | `errors.py:29`（`IDEMPOTENCY_CONFLICT`） | 2 | 一致 |
+| `Conflict` | L340 | `errors.py:28`（`CONFLICT`） | 4（1 + 3） | 一致 |
+| `IdempotencyConflict` | L340 | `errors.py:29`（`IDEMPOTENCY_CONFLICT`） | 4（1 + 3） | 一致 |
 | `InvalidCursor` | L340 | `errors.py:30`（`INVALID_CURSOR`） | 2 | 一致 |
 | `PermissionDenied` | L340 | `errors.py:31`（`PERMISSION_DENIED`） | 1 | 一致 |
 | `ApprovalUnavailable` | L340 | `errors.py:32`（`APPROVAL_UNAVAILABLE`） | 1 | 一致 |
@@ -78,13 +110,13 @@
 | `ProviderStreamInterrupted` | L340 | `errors.py:38`（`PROVIDER_STREAM_INTERRUPTED`） | 3（R0 spike 断言） | 一致 |
 | `ContextLimitExceeded` | L340 | `errors.py:39`（`CONTEXT_LIMIT_EXCEEDED`） | 1 | 一致 |
 | `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 2 | 一致 |
-| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 3（1 + 2） | 一致 |
+| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 6（1 + 5） | 一致 |
 | `MigrationRequired` | L340 | `errors.py:42`（`MIGRATION_REQUIRED`） | 2 | 一致 |
-| `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 2 | 一致 |
+| `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 3（1 + 2） | 一致 |
 | `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 1 | 一致 |
 | `LifecycleCleanupFailed` | L340 | `errors.py:45`（`LIFECYCLE_CLEANUP_FAILED`） | 1 | 一致 |
 
-汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。
+汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **53**（首派 45 → 本次 53，+8，全部来自 S3 测试）。
 
 ## 3. 盘点方法注记（可复现）
 
@@ -96,8 +128,11 @@
 6. 测试引用计数（区分大小写，避免 `CONFLICT` 命中 `IdempotencyConflict`）：`Get-ChildItem -Recurse tests -Filter *.py | Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches` 与 `-Pattern '\b<MEMBER>\b' -AllMatches`，对 `Matches` 求和。
 7. 门禁：`uv run pytest -q`；`uv run ruff check .`；`uv run ruff format --check .`；`uv run mypy src tools/r0 tests/r0 tests/contract tests/integration`。
 8. 变更核对：`git status --short`、`git log --oneline -3`（只读）。
+9. S3 滚动（T-C2-002）定义行号：`Get-ChildItem src/opencode/storage/store.py,src/opencode/storage/txn.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(class |def |REASON_[A-Z_]+|@dataclass)' }`。
+10. S3 导出面核对：`ctx_read src/opencode/storage/__init__.py mode=full`，逐项比对 `__all__`（21 项）与源码定义处公共名，标出 `TransactionWriter`/`Diagnostic`/`epoch_ms`/`from_epoch_ms`/`REASON_*` 为不导出。
+11. S3 错误码引用重算：沿用第 6 条同一命令与同一口径，仅扩到含 `tests/integration/test_store_commit.py` 的全 `tests/` 树；`Select-String` 全部显式 `-CaseSensitive`。
 
 ### 观测到的非本任务差异（仅报告，未处理）
 
-- 门禁 `ruff format --check .` 输出 **68 files already formatted**，与基线 62 相差 +6；无格式错误。限定范围复核 `uv run ruff format --check src tests tools` 为 **24 files already formatted**，与仓库内 `.py` 实际数量（24，排除 `.venv`）吻合；差异来自环境/扫描集合，不是本次改动。
-- `git status --short` 在盘点开始前后均含他席位改动：` M doc/plans/r1-slices.md`、`?? doc/orchestration/logs/`。本任务只新增本文件，未触碰上述路径。
+- 门禁 `ruff format --check .` 本次输出 **77 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；首派记录为 68，变化来自扫描集合（工作树新增 S3 文件），无格式问题。
+- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（首派的 ` M doc/plans/r1-slices.md` 已随 merge #30 落库，不再出现）。本任务只修改本文件，未触碰该路径。
