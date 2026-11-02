@@ -214,8 +214,13 @@ class AscendingIds:
             self._last_ms = ms
             self._counter = 0
         else:
-            # Same millisecond (or a clock step backwards): keep counting so
-            # IDs stay unique and ascending within the process.
+            # Same millisecond: keep counting so IDs stay unique and ascending
+            # within the process. That guarantee holds only while the clock
+            # never steps backwards: a backwards step can emit a smaller ID
+            # than an earlier one (breaking ascending), and oscillation back
+            # to an already-seen millisecond can repeat an old (ms, counter)
+            # pair (breaking unique). Clamping a backwards clock is R2 work,
+            # deliberately not done here.
             self._counter += 1
         return f"{ms:013d}{self._counter:010d}"
 
@@ -523,6 +528,38 @@ class SessionService:
         """
         self._closed = True
         self._locks.clear()
+
+    # -- §3.3 rebuild (management command, not a §7 business method) ------------
+
+    async def rebuild(self, session_id: str) -> None:
+        """Rebuild one session's read model from its event log (§3.3, R1-S8).
+
+        A controlled management command, not one of the §7 L298-312 business
+        methods (that table has no rebuild row): the single entry point for
+        CLI/same-process callers, forwarding to
+        :meth:`opencode.storage.SessionStore.rebuild` under this service's
+        per-session lock and closing gate. A never-created session (no
+        sessions row, no log) is NotFound; a missing sessions row over a
+        surviving log is the rebuild target, not corruption -- the read model
+        is exactly what rebuild restores, so the ``_read_record`` corruption
+        mapping does not apply on this face. A read_only_diagnostic session
+        MAY rebuild (data-plane recovery: messages/config/applied_seq come
+        back), but the administrative mark survives the rebuild (§3.2.1
+        L196) and write commands keep answering SessionReadOnly, including
+        same-request_id retries. Rebuild never notifies the bus and never
+        appends events (§3.3).
+        """
+        _require_session_id_arg(session_id)
+        async with self._session_lock(session_id):
+            if self._closed:
+                # Open point E, conservative reading: the service-level gate
+                # is uniform with prompt/create -- a closed service answers
+                # SessionClosed on every management face too.
+                raise SessionClosedError("service is closed")
+            record = await self._repos.session(session_id)
+            if record is None and await self._repos.log_high(session_id) == 0:
+                raise NotFoundError(f"session {session_id} does not exist", details={"session_id": session_id})
+            await self._store.rebuild(session_id)
 
     # -- internals -------------------------------------------------------------
 
