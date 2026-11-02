@@ -76,7 +76,7 @@
 | T-B-002 | B | R1-S1 结构化审查 | 14:59 | 活性监控（1h 日志零增量） | 已验收（15:07） | doc/reviews/R1-S1-review.md |
 | T-A-003 | A | 契约微裁决（审查遗留 7 项） | 15:14（resume 续接） | 活性监控（1h 日志零增量） | 已验收（15:44） | doc/CORE-CONTRACTS.md、doc/parity.md（修订+§10） |
 | T-B-003 | B | r1-slices.md 修订（审查报告 §4 九条） | 15:14 | 活性监控（1h 日志零增量） | 已验收（15:22） | doc/plans/r1-slices.md（修订） |
-| T-B-004 | B | r1-slices.md 微调（按 T-A-003 终裁对齐预写） | 15:48 | 活性监控（1h 日志零增量） | 派发中 | doc/plans/r1-slices.md（修订） |
+| T-B-004 | B | r1-slices.md 微调（按 T-A-003 终裁对齐预写） | 15:48 | 活性监控（1h 日志零增量） | 已验收（15:56） | doc/plans/r1-slices.md（修订） |
 | T-C1-002 | C-1 | contracts 修补批次（M-1/M-4/N-2+裁决落地） | 15:48 | 活性监控（1h 日志零增量） | 派发中 | src/opencode/contracts/、tests/contract/ |
 
 ## 7. 调度日志
@@ -96,7 +96,8 @@
 - 15:17 用户确认停止节奏：**维持现状**（自主推进到 R1 退出条件；复估触发/升级链/网络故障自动暂停，R2 前天然停找用户要 MAAS 凭据；用户随时可手动喊停=无损冻结在最近检查点）。同刻观察：B 席已在修改其授权文件 doc/plans/r1-slices.md（T-B-003 实际开工证据）。
 - 15:22 T-B-003 回报"完成"（15:14 实启，~8min）。验收通过：九条修订逐条核对落实——①S2 依赖更正（仅 alembic/sqlalchemy/aiosqlite，pydantic 前移注记）②S1 交付追认（ConfigSnapshot/canonical_json/compute_snapshot_hash/RUN_SCOPED_EVENT_TYPES/22 错误码全锁/8 fixture/摘要常量钉死测试）③files 按 B 建议 (a) 预写并标"待 T-A-003 终裁"（含备选 (b)）④S3 并入 H/A 水位不变量+写入门禁先于幂等+§3.2.1 隔离入口归 S3/全量检测归 S8+水位/隔离测试点⑤S6 坏页语义七项断言（整页 StorageCorrupt/无半页/next_cursor 不推进/cursor 回退/follow 保健康后终止/H=日志水位/details 脱敏）⑥S7 四步固定顺序+RunRef 三非空字段+ID 生成器对齐 TS ascending() 注记（前缀强制待裁）+accepted 占槽/close 只释放自有资源⑦S8 rebuild 同事务全验证/失败回滚含清空/诊断标记跨 reopen 保留/诊断期禁恢复补写⑧§3 差异表补第 7-9 三行⑨开放问题 #1-#4 标已决引 CORE-CONTRACTS §9、新增 #5 待 T-A-003 三连、原 #5-#7 顺移 #6-#8 并更新估算（R1 目标 5 人日/上限 6）。文件头 [T-B-003] 修订行在；git 仅改 r1-slices.md（+44/-30）；过时行号引用已替换为章节引用。检查点#11 提交；监视器刷新为仅盯 T-A-003。
 - 15:44 T-A-003 回报"完成"（15:14 实启，~30min）。验收通过：7 项全落无 TBD——①files=方案 (b)（§2.1：R1 v1 字段全集 id/type/created_at/metadata/text，任何 files 键含空列表按未知字段拒绝，R2+ 升版本引入；附 session-message.ts:76-84+Python-only 论证）②extra-forbid 封闭演进（§1+§8：新增字段一律升版本+upcaster，不走同版本可选字段；附 event.ts:28-32,174-187/bus.ts:74-88）③四前缀模型层强制（§3.1：evt_/msg_/ses_/run_ pattern，适用 draft/durable/ephemeral/typed data/嵌套/Ref/游标，metadata 保留 run_id 键同样受 pattern；request_id 仍只非空；附 event.ts:9-14/session-message.ts:21-29/session-id.ts:5-11）④bool-int 仓库级规则（§1：所有整数语义字段 before-validator 拒 bool）⑤JSON Schema 归 R5（各切片 fixture 锁形状）⑥Ephemeral 生产注册留 R2⑦parity 两行（details 恒出现 {}、异常家族细化附 bus.ts:60-66,78-90）。changelog [T-A-003] 行+§10 实施交接在（M-2 选 b、无方向分歧、ses_ 收紧与 run_ 专有已明示）；git 仅改 CORE-CONTRACTS.md（+30/-9）+parity.md（+3）。与 B 预写两处不同（files 选 b≠a、request_id 不强制前缀≠B 清单含 req_）→ 派 T-B-004 微调；T-C1-002（M-1 bool 守卫/M-4 反例/N-2 断言+ID pattern+files 钉住）并行派发。检查点#12 提交；监视器刷新为 B-004+C1-002。
-- 下一事件：T-B-004 / T-C1-002 回报 → 各自验收（B：三处预写对齐终裁+全文无"待 T-A-003"残留；C：四门禁调度器亲跑复核+pattern/bool/反例矩阵逐项核对）→ 建 C-1 worktree → T-C1-003（R1-S2：Alembic 0001+引擎打开，worktree 内）→ S3 起按依赖序。
+- 15:56 T-B-004 回报"完成"（15:48 实启，~8min）。验收通过：三处预写对齐终裁——①S1 files 行改终裁方案 (b)（字段全集精确、files 键含空列表按未知字段拒绝、新输入=ValidationError/已存日志=损坏隔离、R2+ 升版本+upcaster、现实现 e61cdd5 已合规无需改动，引 §2.1/§8/§10）+补【实施交接】行记 C-1 补丁范围；②S7 ID 注记改四前缀强制+request_id 例外（引 §3.1/§10，含 TS 三处单点依据+run_ Python 论证），RunRef 表述同步、step 1 补入参 pattern 校验并修正状态名笔误 closing→cleanup_failed（对齐契约 §7.1 原文）、step 4 补三类生成 ID pattern 要求；③§4 #5 标已决（含 B 预写与终裁两处差异说明：req_ 剔除、files (a)→(b)），§4 标题改"全部已决无待决项"；另 §3 差异表补第 10 行（四前缀+bool 守卫的 TS 单点 vs Python 全量差异）。调度器 Select-String 复核全文零"待 T-A-003"残留；文件头 [T-B-004] 行在；B 自身产出仅 r1-slices.md（git status 中 contracts 两文件为 C-1 并行在飞补丁，非 B 产出，与 §10 交接一致）。检查点#13 提交；监视器刷新为仅盯 T-C1-002。B 建议补丁完成后照常走 B 快速结构化审查再进 S2——采纳（记 T-B-005）。
+- 下一事件：T-C1-002 回报 → 验收（四门禁调度器亲跑复核+M-1/M-4/N-2/pattern/files 钉住逐项核对）→ 检查点#14 → 建 C-1 worktree ∥ T-B-005（B 对补丁的快速结构化审查）→ 通过后 T-C1-003（R1-S2：Alembic 0001+引擎打开，worktree 内）→ S3 起按依赖序。
 
 ## 待用户定夺（不阻塞冒烟）
 

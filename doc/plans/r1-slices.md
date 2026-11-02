@@ -1,8 +1,9 @@
 # R1 实现切片拆分
 
 > 修订：[T-B-003] 2026-11-02 按审查报告 doc/reviews/R1-S1-review.md §4 九条修订——并入 T-A-002 契约裁决（§3.2 水位/§3.2.1 诊断/§4 坏页/§7 prompt/§9 冲突表）、S2 依赖更正、S1 交付追认、files 待裁预写、ID 生成器注记、§3 差异表补齐、开放问题清理。
+> 修订：[T-B-004] 2026-11-02 按 T-A-003 终裁微调（契约 changelog/§10）：files 终裁=方案 (b)（R1 v1 无 files 字段、任何 files 键按未知字段拒绝、R2+ 升版本+upcaster 引入）；ID=四前缀强制（evt_/msg_/ses_/run_）+request_id 例外（§3.1）；extra-forbid=封闭演进（§8）；bool 守卫升 §1 仓库级规则；§4 #5 标已决、§3 差异表补第 10 行；全文清除 A-003 待裁预写字样。
 > 席位B（T-B-001）产出，供 C 席按序实现。状态：**S1 已交付（commit e61cdd5，审查通过 doc/reviews/R1-S1-review.md）；S2 起待派**。
-> 依据：doc/PHASE1-SLIM.md §3 R1、doc/CORE-CONTRACTS.md（含 T-A-002 修订：§3.2/§3.2.1/§4/§6.1/§6.2/§7/§9）、doc/ROADMAP.md §3/§5、doc/reestimate-r0.md、doc/adr/0001。
+> 依据：doc/PHASE1-SLIM.md §3 R1、doc/CORE-CONTRACTS.md（含 T-A-002 修订：§3.2/§3.2.1/§4/§6.1/§6.2/§7/§9；T-A-003 修订：§1/§2.1/§3.1/§8/§10）、doc/ROADMAP.md §3/§5、doc/reestimate-r0.md、doc/adr/0001。
 > TS 基准：`D:/26_code/opencode_py_ver/opencode-2.2.2/`（指纹见 doc/source-baseline.json，全部已锁定）。
 > 拆分基准：按现行文档拆；A 席若修订 R1 定义，由调度器对齐后本文件再改版。
 
@@ -44,7 +45,8 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
   - `src/opencode/contracts/events.py`（EventDraft/DurableEvent/EphemeralEvent envelope；`type+version → data model` 注册表；所有事件 version=1；未知版本解码=显式错误）
   - 【已交付追加项·T-B-003 追认】events.py 还交付了 T-A-002 中途合入的：`ConfigSnapshot`（§6.1 精确形状：schema_version=1 必需、permission_rules 必需、非整数 1 拒绝、无内嵌 hash）、`canonical_json`/`compute_snapshot_hash`（§6.2：sort_keys+紧凑分隔符+ensure_ascii=False，sha256）、`RUN_SCOPED_EVENT_TYPES`（metadata 强制 run_id 关联集合）。
   - `src/opencode/contracts/messages.py`（UserMessage：id/type/created_at/metadata/text）
-  - 【待 T-A-003 终裁·T-B-003 预写】UserMessage 可选 `files` 字段：B 审查建议 (a) `files: list[FileContent] = Field(default_factory=list, max_length=0)`（FileContent 最小 wire 模型，空列表合法、非空拒绝 UnsupportedCapability，对齐契约 §2.1 字面）；备选 (b) 修订契约明确"R1 v1 wire 不含 files"。现实现（e61cdd5）无 files 字段、`files: []` 载荷被 extra=forbid 拒绝（审查 Minor-2）——A 裁决为 (b) 则现实现即合规，为 (a) 则 C 席打补丁。
+  - 【T-A-003 终裁·T-B-004 更正】UserMessage **无 `files` 字段**（终裁=方案 (b)，CORE-CONTRACTS §2.1/§8/§10）：R1 v1 wire 字段全集精确为 id/type/created_at/metadata/text；缺省不补 files，出现 `files` 键（含 `files: []`）一律按未知字段拒绝——新输入=ValidationError，已存日志=损坏按 §3.2.1/§8 进只读诊断；R2+ 引入 files 须升级承载事件的 version+upcaster，不走同版本可选字段路径；字段可编码不等于媒体启用（§2.1）。现实现 e61cdd5 无 files 字段、`files: []` 被拒——与终裁一致，**无需改动**。
+  - 【实施交接·契约 §10】C 席 contracts 补丁（T-C1-002）按 §10 落实：四类 ID pattern、version/seq 等全部整数语义字段 before-validator 拒 bool（§1 仓库级规则）、相应反例补测（B 审查 M-4/N-2）与 UserMessage files 阶段说明更新；现 R1 files 拒绝行为与裁决一致，本补丁不动其行为。
   - `src/opencode/contracts/errors.py`（CoreError：code/message/retryable/details；至少覆盖 R1 用到的 code）
   - 【已交付追加项·T-B-003 追认】errors.py 实际锁定 §8 全量 22 个 CoreErrorCode + 未知 code 拒绝（超出本方案原定"至少 R1 子集"，审查通过）。
   - `tests/contract/test_events.py`、`tests/contract/__init__.py`、`tests/contract/fixtures/events_*.json`
@@ -130,7 +132,7 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
 
 ### R1-S7 SessionService + 提交锁 + app 组合
 
-- **目标**：应用命令入口：`create(config_snapshot)`、`messages()`、`prompt()`（R1 仅持久化 `py.prompt.accepted` 并返回 RunRef（三字段非空字符串），不调度 run——调度属 R2；契约 §7 T-A-002 修订：先持久 accepted 再调度，R1 只做到持久）；每 session 短期提交锁（固定顺序：状态门禁→生成事件/expected_seq=提交前 H→commit→本地通知，全程串行，不跨外部等待持锁）；app.py 显式组合依赖与资源创建/关闭。**ID 生成器注记（T-B-003 补）**：对齐 TS `Event.ID.create = "evt_" + ascending()`（event.ts L9-14）——时间有序、可字典序排序的递增 ID（ULID 风格），不用随机 UUID（保证日志可排序、测试可断言前缀）；`evt_/ses_/run_/msg_/req_` 前缀是否模型层 pattern 强制**待 T-A-003 终裁**（B 建议强制，见审查报告 §3-2；TS 基准 `isStartingWith("evt_")` 是强制的）。
+- **目标**：应用命令入口：`create(config_snapshot)`、`messages()`、`prompt()`（R1 仅持久化 `py.prompt.accepted` 并返回 RunRef，不调度 run——调度属 R2；契约 §7：先持久 accepted 再调度，R1 只做到持久）；每 session 短期提交锁（固定顺序：状态门禁→生成事件/expected_seq=提交前 H→commit→本地通知，全程串行，不跨外部等待持锁）；app.py 显式组合依赖与资源创建/关闭。**RunRef/ID 注记（T-B-004 按 T-A-003 终裁更正）**：RunRef={session_id, run_id, request_id} 三项均非空字符串，session_id/run_id 另须满足 §3.1 的 ses_/run_ pattern，request_id 由调用方给定、仅非空字符串、**不强制前缀**（§7/§3.1）。ID 生成对齐 TS `Event.ID.create = "evt_" + ascending()`（event.ts L9-14）——时间有序、可字典序排序的递增 ID（ULID 风格），不用随机 UUID（保证日志可排序、测试可断言前缀）。模型层**四前缀强制**（§3.1，T-A-003）：evt_/msg_/ses_/run_ pattern，适用 draft/durable/ephemeral envelope、typed data、嵌套消息及 SessionRef/RunRef/游标；metadata 保留键 run_id 一旦出现也须匹配；前缀检查不替代归属验证/seq 排序。TS 依据：event.ts:9-14（evt_）、session-message.ts:21-29（msg_）、session-id.ts:5-11（ses，Python 收紧为 ses_）；run_ 为 Python 侧约束。C 席 T-C1-002 补丁落实 pattern 与 bool 守卫。
 - **涉及接缝**：S6（应用层）、S4（调用唯一 commit）。
 - **新增文件**：`src/opencode/session/service.py`、`src/opencode/app.py`（组合入口；R1 只组合 storage+bus+session）。
 - **TS 基准映射**：TS 无同构 SessionService（ADR-0001 决策 1：Python 新增应用层）。行为基准取：
@@ -138,10 +140,10 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
   - `session/projector.ts` layer 组合（L537+：deps [Bus.node, Database.node]）→ Python app.py 显式注入（对应 sqlite.bun.ts Layer 结构 L100-103 的非 Effect 替代）。
   - CORE-CONTRACTS §7 表：create/session_status/messages/run_status 的 R1 子集。
 - **验收标准（引用验收 C 前半 + T-A-002 §7 拒绝顺序裁决，按固定顺序实现）**：从空库建库并写用户消息，退出、重新打开（新 engine 新 service 实例）并得到相同消息。prompt 固定顺序（§7.1-§7.4，顺序即语义）：
-  1. **状态门禁**：session 不存在→NotFound；read_only_diagnostic→SessionReadOnly（同 request_id 重试同样拒绝，除非命中第 2 步幂等）；closing→LifecycleCleanupFailed；closed→SessionClosed；closing 门禁对 prompt 封闭。
+  1. **状态门禁**（含入参校验，§7.1）：session_id/request_id 非空字符串、session_id 符合 §3.1 ses_ pattern、text 为字符串不隐式转换；session 不存在→NotFound；read_only_diagnostic→SessionReadOnly（同 request_id 重试同样拒绝，除非命中第 2 步幂等）；cleanup_failed→LifecycleCleanupFailed；closed→SessionClosed；session active 后再查 service 级 closing/closed gate→SessionClosed。
   2. **durable 幂等查询**（先于第 3/4 步）：按 `(session_id, dedupe_key)` 查已提交批次，dedupe_key=`"prompt:" + request_id`（字符串拼接、大小写敏感、跨 session 可复用）；命中→按 code point 比较文本：**相同文本→返回原 RunRef**（不生成新 ID、不重投影、不通知）；**不同文本→IdempotencyConflict**（即使会话 busy 也如此）。
   3. **active_run_id 门禁**：前两步通过且 active_run_id 已占→SessionBusy。
-  4. 通过后才生成/固定 ID 与时间戳、expected_seq=提交前 H，走 SessionStore.commit。
+  4. 通过后才生成/固定 ID 与时间戳（事件 id `evt_`、message id `msg_`、run id `run_`——均须满足 §3.1 pattern，T-A-003 终裁）、expected_seq=提交前 H，走 SessionStore.commit。
   追加：R1 accepted 的 run 跨 close/reopen 持续占用 active-run 槽（无终态、不自动释放）；R1 close 只释放自有资源（不触碰 run 恢复——归 R4）。
 - **测试计划**：tests/integration/test_service.py：完整闭环（create→prompt→messages→关→重开→messages 相同）；request_id 幂等；提交锁串行（并发 prompt 一个成功一个 SessionBusy 或幂等返回）。fake 策略：不需要 provider fake（R1 无模型调用）；config_snapshot 用最小合法快照对象。追加（T-A-002 §7）：四步顺序各分支断言——① NotFound/SessionReadOnly（含同 request_id 重试）/LifecycleCleanupFailed/SessionClosed 各拒绝码；② 相同 request_id+相同文本→原 RunRef（事件数不增）、相同 request_id+不同文本→IdempotencyConflict（即使 busy）；③ busy→SessionBusy 且发生在幂等未命中之后；④ ID 生成期望 seq=H（提交前水位）。
 
@@ -167,14 +169,15 @@ R1 涉及的事件子集（CORE-CONTRACTS §3.1 清单的 R1 最小集）：`py.
 7. `versionedType`/`durableMap`（event.ts L174-187）已对齐：`f"{type}.{version}"` 与 TS `` `${type}.${version}` `` 逐字符一致（S1 测试钉死）；重复 durable 定义拒绝语义一致。
 8. 异常面：Python `EventDecodeError` 家族 + `DurabilityMismatchError`（envelope/注册表/耐久性错配分层）为 TS 单一 `InvalidDurableEventError`（bus.ts L60-66）的细化——行为更精确、无契约冲突；S4/S6 负责映射到 StorageCorrupt/只读诊断。
 9. TS `readAfter` 遇未知 durable 类型跳过但 seq 前进（bus.ts L809-827）vs Python 坏页整页 StorageCorrupt、不返半页、不推进 next_cursor——T-A-002 终裁落 CORE-CONTRACTS §3.2.1/§4（fail closed），见 R1-S6 验收标准。
+10. ID 前缀与整数 bool 守卫（T-A-003，§1/§3.1）：TS 仅单点强制 evt_（event.ts:9-14）/msg_（session-message.ts:21-29）并校验 ses 前缀（session-id.ts:5-11，Python 收紧为 ses_）；Python **四前缀全量强制**（含 run_——TS 无对应物，Python 侧论证：独立标识 run 身份、统一身份域）且适用范围扩至 SessionRef/RunRef/游标与 metadata 保留键。全部整数语义字段 before-validator 拒 bool（pydantic bool→int 陷阱为 Python 特有，TS `Schema.Int` 无此问题）。
 
-## 4. 开放问题（T-B-003 清理：#1–#4 已由 T-A-002 裁决关闭，新增 #5 待 T-A-003）
+## 4. 开放问题（T-B-003/004 清理：#1–#4 已决于 T-A-002、#5 已决于 T-A-003；全部已决，无待决项）
 
 1. ~~R1 的 prompt 语义~~ **【已决·T-A-002，见 CORE-CONTRACTS §7/§9】**：prompt 仅持久化+返回 RunRef（三字段非空字符串），不调度；固定拒绝顺序与 dedupe_key=`"prompt:" + request_id` 已并入 R1-S7 验收标准。R1 退出后库中存在无终态 run（恢复协调器在 R4），`--continue` 类恢复 R1 不做。
 2. ~~config_snapshot 最小形状~~ **【已决·T-A-002，见 CORE-CONTRACTS §6.1/§6.2/§9】**：最小快照=仅 `schema_version:1`+`permission_rules:[]`；hash=sha256(canonical JSON)；已在 R1-S1 交付（`ConfigSnapshot`/`canonical_json`/`compute_snapshot_hash`，摘要常量 `77c932c3…f802` 钉死测试）并追认于 R1-S1 新增文件清单。R3 替换为真实 loader 产物。
 3. ~~未知事件版本在读取路径的行为~~ **【已决·T-A-002，见 CORE-CONTRACTS §3.2.1/§4/§9】**：fail closed——坏页整页 StorageCorrupt(retryable=false)、不返半页、不推进 next_cursor；"读取仍可用"=健康前缀+已投影 messages/状态。已并入 R1-S6 验收标准与 §3 差异表第 9 条；B 原临时方案撤回。
 4. ~~expected_seq 与 applied_seq 的关系~~ **【已决·T-A-002，见 CORE-CONTRACTS §3.2 水位裁决/§9】**：expected_seq=提交前 H 期望值（非独立水位、非目标 seq）；H=日志水位、A=applied_seq、健康 A=H 不变量。已并入 R1-S3 目标/验收标准。
-5. **【待 T-A-003 终裁】contracts 边角三连**（对应审查报告 Minor-1~3 + C-1 未决 #2/#4）：(a) ID 前缀是否模型层强制（B 建议强制，TS 基准 `isStartingWith("evt_")`；含 EventDraft.version/DurableEvent.seq bool 穿透守卫 Minor-1）；(b) UserMessage `files` 字段路线（B 建议 `Field(default_factory=list, max_length=0)`，或修订契约"R1 不含 files"——已预写于 R1-S1 新增文件清单）；(c) `extra="forbid"` 与"同版本新增可选字段"的兼容路线声明（B 建议 py.* 事件新增字段一律升版本+upcaster）。A 裁决后由调度器派微调任务落实，C 席补丁+本方案同步。
+5. ~~contracts 边角三连~~ **【已决·T-A-003，见 CORE-CONTRACTS changelog/§10，具体 §1/§2.1/§3.1/§8】**：(a) ID 前缀=**四前缀强制**（evt_/msg_/ses_/run_ pattern 全量适用 draft/durable/ephemeral、typed data、嵌套消息、SessionRef/RunRef/游标及 metadata 保留键 run_id；request_id 例外仅非空字符串，§3.1）——B 建议采纳（原预写清单含 `req_`，终裁剔除）；M-1 bool 守卫升为 §1 仓库级规则（全部整数语义字段 before-validator 拒 bool），C 席 T-C1-002 补丁落实；(b) files=**方案 (b)**：R1 v1 无 files 字段、任何 files 键按未知字段拒绝，R2+ 升版本+upcaster 引入（§2.1/§8），现实现 e61cdd5 已合规无需改动——B 原预写倾向 (a)，未采纳；(c) extra-forbid=**封闭演进**：envelope/typed data/嵌套消息新增字段（含可选）一律升版本+upcaster，不走同版本可选字段路径（§8 新条款）——B 建议采纳。三处预写差异已由 T-B-004 全文对齐（§2 R1-S1/R1-S7/§3 差异表第 10 行）。
 6. **Alembic env 与测试库**：migrations 需在 async 环境跑（aiosqlite）；建议 env.py 用同步引擎跑迁移、运行时用 async 引擎（SQLite 文件级兼容）。C 席需验证此组合在 Windows 路径下无坑。
 7. **估算（T-B-003 更新）**：S1 已交付（30–60 min 循环成立）；余 7 切片 × 30–60 min C 循环 + 评审/返工，对照 doc/reestimate-r0.md §4 的 R1 目标 5 人日/上限 6 人日——纯实现约 1.5–2.5 个工作日，余量留给 S3/S4 事务故障注入深化、T-A-002 并入的水位/坏页/四步顺序测试点与 CI 双平台验证；若范围再扩大，优先加切片不加大单切片粒度。
 8. **目录锁与测试并行**：数据目录 OS 锁（单 writer）会让 pytest 并行/同目录多库受限；建议集成测试每用例独立 tmp_path 目录（现行 R0 测试已如此）。
