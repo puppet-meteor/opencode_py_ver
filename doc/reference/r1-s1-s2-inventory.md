@@ -1,9 +1,9 @@
-# R1-S1..R1-S3 已交付公共面静态清单（滚动更新）
+# R1-S1..R1-S4 已交付公共面静态清单（滚动更新）
 
-> 范围：覆盖 **R1-S1..R1-S3 已并入主树的交付面**（滚动更新：S4 并入后另行滚动）——`src/opencode/contracts/` 与 `src/opencode/storage/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
-> 符号总数：**69** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）。
-> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`REASON_*` 均**未进** `__all__`。
-> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；工作树状态见 §3 注。
+> 范围：覆盖 **R1-S1..R1-S4 已并入主树的交付面**（滚动更新：S5 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
+> 符号总数：**79** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6；`session/__init__.py` 仅再导出、0 个新定义）。
+> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9，S4 前后不变）；`session.__all__` 5 项（`apply`/`IllegalTransitionError`/`SessionProjector`/`SessionState`/`SessionStatus`）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 的 `REASON_*`、`session/projector.py` 的 `REASON_*` 均**未进** `__all__`。
+> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；2026-11-02 S4 滚动；工作树状态见 §3 注。
 
 ## 1. 公共面清单
 
@@ -86,10 +86,38 @@
 | `opencode.storage.txn.Diagnostic` | class (dataclass, frozen, slots) | `reason: str; first_bad_seq: int \| None = None; first_bad_event_id: str \| None = None; applied_seq: int = 0; to_json() -> JsonObject` | 脱敏 §3.2.1 诊断载荷 | `src/opencode/storage/txn.py:203` | 不导出 |
 | `opencode.storage.txn.TransactionWriter` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]`（另有 per-session asyncio 锁 + 进程级写锁） | §3.2 事务序列与 §3.2.1 隔离实现；**不导出，S4 私有** | `src/opencode/storage/txn.py:258` | **不导出（S4 私有）** |
 
+### 1.3 R1-S4（session/state.py、session/projector.py）
+
+S4 说明：`session/__init__.py` 仅再导出（`__all__` 5 项），无模块级新定义，故不单独计符号。`session/projector.py` 的 `REASON_*` 为模块级公共名但**不导出**（沿用 `TransactionWriter` 的标注方式）。
+
+| 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 | 导出性 |
+|---|---|---|---|---|---|
+| `opencode.session.state.SessionStatus` | class (StrEnum) | `ACTIVE="active"; READ_ONLY_DIAGNOSTIC="read_only_diagnostic"; CLEANUP_FAILED="cleanup_failed"; CLOSED="closed"` | §3.2 四种 session 状态（`.value` 即存储文本） | `src/opencode/session/state.py:37` | 导出 |
+| `opencode.session.state.IllegalTransitionError` | exception | `class IllegalTransitionError(ValueError)` | 事件无法合法延展当前状态（fold 失败关闭） | `src/opencode/session/state.py:46` | 导出 |
+| `opencode.session.state.SessionState` | class (dataclass, frozen, slots) | `session_id: str \| None = None; status: SessionStatus \| None = None; applied_seq: int = 0; working_dir: str \| None = None; config_snapshot: ConfigSnapshot \| None = None; snapshot_hash: str \| None = None; messages: tuple[UserMessage, ...] = (); property created -> bool` | 单 session 的折叠状态（created 前为空态） | `src/opencode/session/state.py:56` | 导出 |
+| `opencode.session.state.apply` | function | `(state: SessionState, event: DurableEvent[Any]) -> SessionState` | 纯函数折叠：created 建态、prompt 追加消息；其余类型 fail closed | `src/opencode/session/state.py:79` | 导出 |
+| `opencode.session.projector.REASON_DUPLICATE_SESSION_PROJECTION` | constant | `"duplicate_session_projection"` | sessions 行重复投影 | `src/opencode/session/projector.py:58` | 不导出 |
+| `opencode.session.projector.REASON_PROMPT_WITHOUT_SESSION` | constant | `"prompt_accepted_without_session"` | prompt 事件缺少 sessions 行 | `src/opencode/session/projector.py:59` | 不导出 |
+| `opencode.session.projector.REASON_ILLEGAL_TRANSITION` | constant | `"illegal_projection_transition"` | fold 抛出的非法转移/不可投影类型 | `src/opencode/session/projector.py:60` | 不导出 |
+| `opencode.session.projector.REASON_UNKNOWN_SESSION_STATUS` | constant | `"unknown_session_status"` | 存储的 status 非法 | `src/opencode/session/projector.py:61` | 不导出 |
+| `opencode.session.projector.REASON_DUPLICATE_MESSAGE_ID` | constant | `"duplicate_message_id"` | 同 session 内 message_id 重复 | `src/opencode/session/projector.py:62` | 不导出 |
+| `opencode.session.projector.SessionProjector` | class | `async apply(connection: AsyncConnection, event: DurableEvent[Any]) -> None`（无状态；内部 `_project_created`/`_project_prompt`/`_advance_applied_seq` 为私有） | §3.2 真实读模型投影器：sessions/messages 落库并在事务内推进 `applied_seq` | `src/opencode/session/projector.py:94` | 导出 |
+
+**S4 对 `storage/txn.py` 的核对（N-1/N-3/M-1/Nit-2）**：逐条比对 `git diff 72de622 077caf6`（N-1/N-3）与 `git diff 077caf6 698b456`（M-1/Nit-2）——**均未新增模块级公共符号**，结论如下：
+
+| 项 | 改动实质 | 是否新增公共符号 |
+|---|---|---|
+| N-1 | 隔离持久化失败时由 `pass` 改为 `raise corruption from persist_error`（显式异常链） | 否（`commit` 内部行为） |
+| N-3 | `epoch_ms` docstring 补充毫秒截断语义 | 否（仅注释；符号已在 §1.2 收录） |
+| M-1 | 幂等比较循环内按行解码 JSON，`ValueError` → `StorageCorruptError`（`REASON_STORED_DECODE_FAILED`） | 否（`_idempotent_replay` 内部，私有） |
+| Nit-2 | 重放解码改为逐行，诊断定位坏行并携带 `applied` | 否（`_idempotent_replay` 内部，私有） |
+
+附带核对：`txn.py` 公共名集合与 S3 完全一致（8 个 `REASON_*`、`epoch_ms`/`from_epoch_ms`、9 个错误类、`Diagnostic`、`TransactionWriter`；行号因改动顺移）；`src/opencode/storage/__init__.py` 的 `__all__` 仍为 **21** 项，无变化。
+
 ## 2. 错误码三方对照表
 
 契约来源：`doc/CORE-CONTRACTS.md` §8，全部 22 个码位于**同一行 L340**（逐个直读，非记忆）。实现：`CoreErrorCode` 成员，`src/opencode/contracts/errors.py:24-45`。
-**测试引用数注**：统计 `tests/` 下全部 `*.py`（含 S3 新增 `tests/integration/test_store_commit.py`），口径 = 该码**引号字符串字面量**出现次数（`Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches`，按 `Matches` 计数） + **枚举成员名**出现次数（`-CaseSensitive -Pattern '\b<MEMBER_NAME>\b' -AllMatches`）；两者互斥，合计即表列数字。S3 测试主要经 `StoreError` 子类断言，本表只计**码字面量/枚举成员**，故增量低于异常类引用量。
+**测试引用数注**：统计 `tests/` 下全部 `*.py`（含 S3 `tests/integration/test_store_commit.py` 与 S4 `tests/integration/test_projector.py`），口径 = 该码**引号字符串字面量**出现次数（`Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches`，按 `Matches` 计数） + **枚举成员名**出现次数（`-CaseSensitive -Pattern '\b<MEMBER_NAME>\b' -AllMatches`）；两者互斥，合计即表列数字。错误类断言（如 `pytest.raises(StorageCorruptError)`）不计入本列，仅计码字面量/枚举成员。
 
 | 码名 | 契约行 | 实现位置 | 测试引用数 | 一致性结论 |
 |---|---|---|---|---|
@@ -110,13 +138,13 @@
 | `ProviderStreamInterrupted` | L340 | `errors.py:38`（`PROVIDER_STREAM_INTERRUPTED`） | 3（R0 spike 断言） | 一致 |
 | `ContextLimitExceeded` | L340 | `errors.py:39`（`CONTEXT_LIMIT_EXCEEDED`） | 1 | 一致 |
 | `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 2 | 一致 |
-| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 6（1 + 5） | 一致 |
+| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 14（1 + 13） | 一致 |
 | `MigrationRequired` | L340 | `errors.py:42`（`MIGRATION_REQUIRED`） | 2 | 一致 |
 | `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 3（1 + 2） | 一致 |
 | `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 1 | 一致 |
 | `LifecycleCleanupFailed` | L340 | `errors.py:45`（`LIFECYCLE_CLEANUP_FAILED`） | 1 | 一致 |
 
-汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **53**（首派 45 → 本次 53，+8，全部来自 S3 测试）。
+汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **61**（首派 45 → S3 53 → 本次 61，+8，全部来自 S4 新增 `test_projector.py` 与 `test_store_commit.py` 直测的 `STORAGE_CORRUPT` 枚举引用）。
 
 ## 3. 盘点方法注记（可复现）
 
@@ -131,8 +159,12 @@
 9. S3 滚动（T-C2-002）定义行号：`Get-ChildItem src/opencode/storage/store.py,src/opencode/storage/txn.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(class |def |REASON_[A-Z_]+|@dataclass)' }`。
 10. S3 导出面核对：`ctx_read src/opencode/storage/__init__.py mode=full`，逐项比对 `__all__`（21 项）与源码定义处公共名，标出 `TransactionWriter`/`Diagnostic`/`epoch_ms`/`from_epoch_ms`/`REASON_*` 为不导出。
 11. S3 错误码引用重算：沿用第 6 条同一命令与同一口径，仅扩到含 `tests/integration/test_store_commit.py` 的全 `tests/` 树；`Select-String` 全部显式 `-CaseSensitive`。
+12. S4 滚动（T-C2-003）定义行号：`Get-ChildItem -Recurse src/opencode/session -Filter *.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(class |def |type |[A-Za-z_][A-Za-z0-9_]*\s*(:|=)|@dataclass)' }`；`storage/txn.py` 用 `-Pattern '^(class |def |REASON_[A-Z_]+)'` 复核公共名集合。
+13. S4 导出面核对：`ctx_read src/opencode/session/__init__.py mode=full` 得 `__all__` 5 项；`Select-String -Path src/opencode/storage/__init__.py -Pattern '^    "'` 计数得 21 项（与 S3 相同）。
+14. S4 对 `txn.py` 的改动核对：`git diff 72de622 077caf6 -- src/opencode/storage/txn.py`（N-1/N-3）与 `git diff 077caf6 698b456 -- src/opencode/storage/txn.py`（M-1/Nit-2），逐行判断是否新增模块级公共符号。
+15. S4 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/integration/test_projector.py` 的全 `tests/` 树，显式 `-CaseSensitive`。
 
 ### 观测到的非本任务差异（仅报告，未处理）
 
-- 门禁 `ruff format --check .` 本次输出 **77 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；首派记录为 68，变化来自扫描集合（工作树新增 S3 文件），无格式问题。
-- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（首派的 ` M doc/plans/r1-slices.md` 已随 merge #30 落库，不再出现）。本任务只修改本文件，未触碰该路径。
+- 门禁 `ruff format --check .` 本次输出 **88 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S3 滚动记录为 77，变化来自扫描集合（工作树新增 S4 文件），无格式问题。
+- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（S3 滚动时的 ` M doc/plans/r1-slices.md` 已随 merge #30 落库；S4 已随 merge #41 落库，无新增源码改动）。本任务只修改本文件，未触碰该路径。
