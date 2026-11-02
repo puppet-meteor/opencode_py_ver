@@ -600,3 +600,177 @@ async def test_same_request_id_across_sessions_yields_distinct_runs(tmp_path: Pa
         assert status_b.session_id == session_b
         assert _event_count(db_path, session_a) == 2
         assert _event_count(db_path, session_b) == 2
+
+
+# -- T-C1-012: the empty log branches and the A > H invariant (fail closed) --
+
+
+async def test_minimal_record_over_empty_log_is_preserved_verbatim(tmp_path: Path) -> None:
+    """The §3.2.1 L193 minimal diagnostic record over an empty log is the
+    one surviving row a rebuild leaves untouched: a true no-op (no DELETE
+    executes; the empty transaction commits), so every field keeps its value
+    verbatim (status/diagnostic/applied_seq/active_run_id/config), the mark
+    is never auto-cleared (L196), and writes keep answering SessionReadOnly.
+    Reached only through SQL tampering of events (protocol-unreachable)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with _service(db_path) as service:
+        session_id, _ = await _create_prompted(service)
+
+        # Build the minimal record through the real isolation path (the
+        # first-event-damage construction), then empty the log entirely.
+        _execute(db_path, "DELETE FROM messages WHERE session_id = ?", (session_id,))
+        _execute(db_path, "DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        _execute(db_path, "DELETE FROM events WHERE session_id = ? AND type = 'py.session.created'", (session_id,))
+        with pytest.raises(StorageCorruptError):
+            await service.rebuild(session_id)
+        record = _session_row(db_path, session_id)
+        assert record[:5] == ("read_only_diagnostic", None, None, None, 0)
+        diagnostic = _diagnostic_payload(db_path, session_id)
+
+        _execute(db_path, "DELETE FROM events WHERE session_id = ?", (session_id,))
+        assert _event_count(db_path, session_id) == 0
+
+        # Rebuild over the record + the empty log: a true no-op.
+        await service.rebuild(session_id)
+        assert _session_row(db_path, session_id) == record  # all six fields verbatim
+        assert _diagnostic_payload(db_path, session_id) == diagnostic
+        assert _event_count(db_path, session_id) == 0  # no business events appended
+
+        # The mark survives; reads keep working; writes keep being refused.
+        assert await service.session_status(session_id) is SessionStatus.READ_ONLY_DIAGNOSTIC
+        with pytest.raises(SessionReadOnlyError):
+            await service.prompt(session_id, "hello", "req_1")
+
+
+async def test_active_row_over_cleared_log_isolates_projection_ahead(tmp_path: Path) -> None:
+    """An active row whose log has been cleared entirely is A > H = 0: the
+    log cannot prove the stored applied_seq, so rebuild fails closed --
+    StorageCorrupt (reason=projection_ahead_of_log, first_bad_seq=1=H+1,
+    applied_seq=the discovery-time A), the whole transaction rolled back
+    (the row and its messages survive untouched apart from the
+    administrative mark), the session isolated, and later writes (same
+    request_id retries included) refused."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with _service(db_path) as service:
+        session_id, _ = await _create_prompted(service)
+        original_row = _session_row(db_path, session_id)
+        original_messages = _fetch_all(db_path, _MESSAGE_ROWS, (session_id,))
+        assert original_row[4] == 2  # A = H = 2 before the damage
+
+        _execute(db_path, "DELETE FROM events WHERE session_id = ?", (session_id,))
+
+        with pytest.raises(StorageCorruptError) as error:
+            await service.rebuild(session_id)
+        details = error.value.core.details
+        assert details["reason"] == "projection_ahead_of_log"
+        assert details["first_bad_seq"] == 1  # H + 1 = 0 + 1
+        assert details["applied_seq"] == 2  # A at discovery
+
+        # The rollback preserved the projection; isolation flipped the status only.
+        after = _session_row(db_path, session_id)
+        assert after[0] == "read_only_diagnostic"
+        assert after[1:5] == original_row[1:5]
+        assert _fetch_all(db_path, _MESSAGE_ROWS, (session_id,)) == original_messages
+        assert _diagnostic_payload(db_path, session_id) == {
+            "reason": "projection_ahead_of_log",
+            "first_bad_seq": 1,
+            "applied_seq": 2,
+        }
+
+        assert await service.session_status(session_id) is SessionStatus.READ_ONLY_DIAGNOSTIC
+        with pytest.raises(SessionReadOnlyError):
+            await service.prompt(session_id, "hello", "req_1")  # same request_id, same text
+        with pytest.raises(SessionReadOnlyError):
+            await service.prompt(session_id, "another", "req_2")
+        assert _event_count(db_path, session_id) == 0  # no business events appended
+
+
+async def test_projection_ahead_of_a_self_consistent_log_isolates(tmp_path: Path) -> None:
+    """A > H over a NON-empty, self-consistent log (the tail events
+    deleted, the log still running 1..k): the stored applied_seq claims
+    progress the log cannot prove -- rebuild isolates
+    (reason=projection_ahead_of_log, first_bad_seq=H+1 locating the first
+    missing tail event) instead of silently normalizing A := H; the row
+    survives the rollback and writes are refused. The 3-event log is
+    committed through the real store directly (the §7 busy gate would
+    reject the second prompt) -- the S3/S4-tested legal way."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        repos = ReadRepositories(database.engine)
+        service = SessionService(store=store, repos=repos, bus=VolatileBus(), working_dir="C:/work")
+        session_id = (await service.create(_SNAPSHOT)).session_id
+        await service.prompt(session_id, "first", "req_1")
+        draft = EventDraft[PromptAcceptedData](
+            id="evt_direct_3",
+            type=PY_PROMPT_ACCEPTED,
+            version=1,
+            session_id=session_id,
+            created_at=_CREATED_AT,
+            data=PromptAcceptedData(
+                request_id="req_2",
+                run_id="run_direct",
+                message=UserMessage(id="msg_direct", type="user", created_at=_CREATED_AT, metadata={}, text="second"),
+            ),
+            metadata={"run_id": "run_direct"},
+        )
+        await store.commit(session_id, EventBatch("batch_direct", (draft,)), await repos.log_high(session_id))
+
+        # Truncate the tail (the log stays self-consistent at 1..2) and push
+        # the stored applied_seq beyond it: A = 4 > H = 2.
+        _execute(db_path, "DELETE FROM events WHERE session_id = ? AND seq = 3", (session_id,))
+        _execute(db_path, "UPDATE sessions SET applied_seq = 4 WHERE session_id = ?", (session_id,))
+        original_row = _session_row(db_path, session_id)
+        original_messages = _fetch_all(db_path, _MESSAGE_ROWS, (session_id,))
+        assert len(original_messages) == 2
+        assert _event_count(db_path, session_id) == 2  # H = 2
+
+        with pytest.raises(StorageCorruptError) as error:
+            await service.rebuild(session_id)
+        details = error.value.core.details
+        assert details["reason"] == "projection_ahead_of_log"
+        assert details["first_bad_seq"] == 3  # H + 1: the first missing tail event
+        assert details["applied_seq"] == 4  # A at discovery
+
+        # The rollback preserved the projection; isolation flipped the status only.
+        after = _session_row(db_path, session_id)
+        assert after[0] == "read_only_diagnostic"
+        assert after[1:5] == original_row[1:5]
+        assert _fetch_all(db_path, _MESSAGE_ROWS, (session_id,)) == original_messages
+        assert _diagnostic_payload(db_path, session_id) == {
+            "reason": "projection_ahead_of_log",
+            "first_bad_seq": 3,
+            "applied_seq": 4,
+        }
+        with pytest.raises(SessionReadOnlyError):
+            await service.prompt(session_id, "third", "req_3")
+        assert _event_count(db_path, session_id) == 2  # no business events appended
+
+
+async def test_closed_status_is_carried_over_verbatim_by_rebuild(tmp_path: Path) -> None:
+    """T-B-013 nit-1 microtest: a successful rebuild carries a surviving
+    row's administrative status over verbatim -- a 'closed' row (R1 has no
+    protocol command that produces one; SQL-set here) rebuilds with the
+    data plane restored and every sessions field identical."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with _service(db_path) as service:
+        session_id, _ = await _create_prompted(service)
+        original_messages = (await service.messages(session_id)).items
+
+        _execute(db_path, "UPDATE sessions SET status = 'closed' WHERE session_id = ?", (session_id,))
+        closed_row = _session_row(db_path, session_id)
+        assert closed_row[0] == "closed"
+
+        await service.rebuild(session_id)
+
+        assert _session_row(db_path, session_id) == closed_row  # status verbatim + data plane rebuilt
+        assert (await service.messages(session_id)).items == original_messages
+        assert await service.session_status(session_id) is SessionStatus.CLOSED

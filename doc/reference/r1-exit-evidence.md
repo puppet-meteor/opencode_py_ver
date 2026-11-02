@@ -61,12 +61,12 @@
 
 | 命令 | 结果 |
 |---|---|
-| `uv run pytest -q` | **206 passed**（基线 194 无回归 + R1-S8 新增 12） |
+| `uv run pytest -q` | **210 passed**（R1-S8 基线 206 无回归 + T-C1-012 修复新增 4） |
 | `uv run ruff check .` | **All checks passed!** |
-| `uv run ruff format --check .` | **117 files already formatted** |
+| `uv run ruff format --check .` | **118 files already formatted**（42 .py + 76 .md；ruff 0.17.3 format 计入 Markdown，口径与 check 侧的 43 文件不同） |
 | `uv run mypy src tools/r0 tests/r0 tests/contract tests/integration` | **Success: no issues found in 40 source files** |
 
-- 206 分布（`pytest --collect-only` 可核对）：`tests/contract` 82（test_events 58 + test_bus 24）；`tests/integration` 92（migrations 4 / store_commit 16 / projector 11 / eventlog 20 / service 28 / bus_commit 1 / rebuild 12）；`tests/r0` 32（platform_probe 8 + provider_spike 24）。
+- 210 分布（`pytest --collect-only` 可核对）：`tests/contract` 82（test_events 58 + test_bus 24）；`tests/integration` 96（migrations 4 / store_commit 16 / projector 11 / eventlog 20 / service 28 / bus_commit 1 / rebuild 16 = S8 主体 12 + T-C1-012 修复 4）；`tests/r0` 32（platform_probe 8 + provider_spike 24）。
 - CI 对齐（`.github/workflows/ci.yml`，R1-S8 任务⑤）：Test 步 = `uv run pytest -q`（全量；原仅 `pytest -q tests/r0`）、Type check 步 = `uv run mypy src tools/r0 tests/r0 tests/contract tests/integration`（对齐本地门禁；原仅 `mypy src tools/r0 tests/r0`）；双 OS matrix（ubuntu-latest/windows-latest）+ `timeout-minutes: 15` + 单 job 结构不变；Lock check / 平台探针证据步骤不变。
 
 ## 6. 已知边界（后续轮次台账；非 R1 退出条件缺口）
@@ -77,4 +77,4 @@
 - **fold 不拒第二个 prompt.accepted**（T-C1-010 未决 7，已浮报调度器）：基线 S3/S4/S6 测试依赖同 session 多 accepted 可提交；run 槽是服务协议级门禁（§7 L323）；R2 需要持久不变量时再评估 events 层约束。
 - **TS readAfter 跳过行为显式不沿用**（r1-slices §3 差异 5/9；T-A-002）：未知类型 fail closed 进只读诊断（§3.2.1 L198 依据段），`test_read_unknown_version_or_type_fails_closed_instead_of_skipping` 钉定。
 - **跨进程串行化**：Phase 1 每 data directory 单 writer（OS 文件锁串行化 writer 进程，R0-B `tests/r0/test_platform_probe.py::test_probe_sqlite_writer_lock_conflict_without_writes`）；rebuild 与 commit 共享同一对锁（per-session asyncio lock + 进程写锁）。
-- **S8 实现内边界注记**（`txn.py` `_rebuild_sequence` L716-722）：空日志 + 幸存 sessions 行 → no-op 返回（最小诊断记录原样保留，不转可执行会话——§3.2.1 L193）；最小诊断记录之后的再次 rebuild 未单独设测（重放语义同路）；`REASON_REBUILD_DUPLICATE_MESSAGE`（重复 message id，正常提交面经 messages 唯一索引不可达，SQL 篡改日志才可达）与 `REASON_REBUILD_INVARIANT`（后验不变量，仅事务内回滚不隔离）为防御路径，未单独设测——二者失败面与已测路径同构（回滚/隔离同款入口）。
+- **S8 实现内边界注记**（`txn.py` `_rebuild_sequence`；T-C1-012 修复后语义）：空日志三分支——无幸存行=防御性 no-op；幸存行具 §3.2.1 L193 最小诊断记录特征（applied_seq==0 ∧ read_only_diagnostic ∧ diagnostic 非空）=**真 no-op 保留**（不执行任何 DELETE；`test_minimal_record_over_empty_log_is_preserved_verbatim`）；其他任何幸存行=StorageCorrupt+隔离。**A>H 统一不变量**（调度器 T-C1-012 裁决）：幸存行 applied_seq 超过日志水位 H（空日志 H=0 与尾部事件被删的自洽日志 1..k 两形）→ StorageCorrupt+隔离（reason=`projection_ahead_of_log`、first_bad_seq=H+1），**不静默规范化 A:=H**——A<H=投影可从日志无损重建（blessed 修复），A>H=日志被截（append-only 证据缺失，§3.2 L183）归人工裁决；`test_active_row_over_cleared_log_isolates_projection_ahead`/`test_projection_ahead_of_a_self_consistent_log_isolates` 钉定；closed 行 verbatim 携带由 `test_closed_status_is_carried_over_verbatim_by_rebuild` 直测。`REASON_REBUILD_DUPLICATE_MESSAGE`（重复 message id，正常提交面经 messages 唯一索引不可达，SQL 篡改日志才可达）与 `REASON_REBUILD_INVARIANT`（后验不变量，仅事务内回滚不隔离）为防御路径，未单独设测——失败面与已测路径同构（回滚/隔离同款入口）。

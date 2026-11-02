@@ -86,6 +86,14 @@ REASON_REBUILD_DUPLICATE_MESSAGE = "rebuild_duplicate_message_id"
 #: The rebuild's post-projection invariant: the rebuilt sessions row must land
 #: at applied_seq = H, the last replayed event seq (mirrors the commit check).
 REASON_REBUILD_INVARIANT = "rebuild_applied_seq_mismatch"
+#: The surviving projection is ahead of the log (A > H at discovery, an empty
+#: log being H = 0): the log cannot prove the stored applied_seq -- tail
+#: events are missing (append-only damage, §3.2 L183), or a row survives an
+#: empty log without the §3.2.1 L193 minimal-record signature. Rebuild never
+#: silently normalizes A := H; the session is isolated instead (§3.2 L165/
+#: §3.2.1 L191, T-C1-012 scheduler ruling). first_bad_seq = H + 1 locates the
+#: first event the projection applied that the log no longer has.
+REASON_PROJECTION_AHEAD_OF_LOG = "projection_ahead_of_log"
 
 _SELECT_SESSION_STATUS = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
 _SELECT_SESSION_APPLIED = sa.text("SELECT applied_seq FROM sessions WHERE session_id = :sid")
@@ -669,7 +677,23 @@ class TransactionWriter:
                 raise
 
     async def _rebuild_sequence(self, connection: AsyncConnection, session_id: str) -> None:
-        """§3.3 replay: clear the read model, fold the log, re-project, verify.
+        """§3.3 replay: validate the log, clear the read model, fold, re-project.
+
+        The log is read and checked against the surviving sessions row
+        BEFORE any clearing, so no successful return ever commits a deleted
+        row. An empty log has three branches: a missing row is a defensive
+        no-op (the service face already answered NotFound); a surviving
+        §3.2.1 L193 minimal diagnostic record (applied_seq == 0 +
+        read_only_diagnostic + a persisted diagnostic) is preserved verbatim
+        as a true no-op -- it is not a py.session.created and must not become
+        an executable session, and rebuild never clears the management mark
+        (L196); any other surviving row is A > H = 0 -- the log cannot prove
+        the stored applied_seq -- and isolates. A non-empty log with A > H
+        (tail events deleted; append-only damage, §3.2 L183) isolates the
+        same way: the log cannot prove the stored applied_seq, and rebuild
+        must not silently normalize A := H -- the mirror image of the blessed
+        A < H repair (§3.2 L165/§3.2.1 L191; scheduler ruling T-C1-012;
+        REASON_PROJECTION_AHEAD_OF_LOG, first_bad_seq = H + 1).
 
         Fail-closed replay validation (§3.2.1 L191 detection scope over the
         rebuild path): unknown type/version, invalid JSON or a snapshot-hash
@@ -707,19 +731,56 @@ class TransactionWriter:
             diagnostic = management.diagnostic
             applied_at_discovery = int(management.applied_seq)
 
+        # The log is read and checked against the surviving row BEFORE any
+        # clearing: no successful return may commit a deleted row (§3.3).
+        rows = (await connection.execute(_SELECT_SESSION_EVENTS, {"sid": session_id})).fetchall()
+        if not rows:
+            # Empty log, three fail-closed branches: a missing row is the
+            # never-created session the service-level gate already answered
+            # (a defensive no-op here); a surviving §3.2.1 L193 minimal
+            # diagnostic record (applied_seq == 0 + read_only_diagnostic + a
+            # persisted diagnostic) is preserved as a true no-op -- it is not
+            # a py.session.created and must not become an executable session,
+            # and rebuild never clears the management mark (L196); any other
+            # surviving row is A > H = 0 -- the log cannot prove the stored
+            # applied_seq, which is stored corruption like every A > H case
+            # (or a protocol-impossible row over an empty log), isolated.
+            if management is None:
+                return
+            if applied_at_discovery == 0 and status == SessionStatus.READ_ONLY_DIAGNOSTIC.value and diagnostic:
+                return
+            raise _corruption(
+                REASON_PROJECTION_AHEAD_OF_LOG,
+                Diagnostic(
+                    reason=REASON_PROJECTION_AHEAD_OF_LOG,
+                    first_bad_seq=1,
+                    applied_seq=applied_at_discovery,
+                ),
+            )
+
+        # A > H over a non-empty log: tail events are missing (append-only
+        # damage, §3.2 L183), so the log cannot prove the stored applied_seq.
+        # Rebuild isolates instead of silently normalizing A := H -- the
+        # mirror image of the blessed A < H repair, where the projection is
+        # reconstructible from the log; integrity doubt goes to human
+        # adjudication (§3.2 L165/§3.2.1 L191; scheduler ruling T-C1-012).
+        # first_bad_seq = H + 1 locates the first event the projection
+        # applied that the log no longer has.
+        log_high = max(int(row.seq) for row in rows)
+        if applied_at_discovery > log_high:
+            raise _corruption(
+                REASON_PROJECTION_AHEAD_OF_LOG,
+                Diagnostic(
+                    reason=REASON_PROJECTION_AHEAD_OF_LOG,
+                    first_bad_seq=log_high + 1,
+                    applied_seq=applied_at_discovery,
+                ),
+            )
+
         # Clear the read model inside the transaction: any later failure rolls
         # the clearing back with everything else (§3.3 全部回滚).
         await connection.execute(_DELETE_SESSION_MESSAGES, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_ROW, {"sid": session_id})
-
-        rows = (await connection.execute(_SELECT_SESSION_EVENTS, {"sid": session_id})).fetchall()
-        if not rows:
-            # An empty log has nothing to replay: a surviving row is the §3.2.1
-            # minimal diagnostic record (kept as-is -- it is not a
-            # py.session.created and must not become an executable session),
-            # and a missing row is the never-created NotFound the service-level
-            # gate already answered before reaching here.
-            return
 
         state = SessionState()
         message_rows: list[dict[str, Any]] = []
