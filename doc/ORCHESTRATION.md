@@ -71,7 +71,7 @@
 | T-PROBE-C2 | C-2 | 冒烟测试 | 11:37 | ≈11:47 | 已验收（11:40） | doc/orchestration/probe/seat-C2.md |
 | T-B-001 | B | R1 切片拆分草稿 | 11:50 | ≈12:10 | 已验收（11:57） | doc/plans/r1-slices.md |
 | T-A-001 | A | R0 复估定稿 | 11:50（resume 续接） | ≈12:15 | 已验收（12:28） | doc/reestimate-r0.md |
-| T-A-002 | A | R1 契约裁决（4 项落条款） | 14:20（resume 续接） | 活性监控（1h 日志零增量） | 派发中 | doc/CORE-CONTRACTS.md（修订） |
+| T-A-002 | A | R1 契约裁决（4 项落条款） | 14:20（resume 续接） | 活性监控（1h 日志零增量） | 已验收（14:59） | doc/CORE-CONTRACTS.md（修订+§9 对照） |
 | T-C1-001 | C-1 | R1-S1 试点：最小 contracts+fixture | 14:20 | 活性监控（1h 日志零增量） | 已验收（14:55） | src/opencode/contracts/、tests/contract/ |
 | T-B-002 | B | R1-S1 结构化审查 | 15:00 | 活性监控（1h 日志零增量） | 派发中 | doc/reviews/R1-S1-review.md（待） |
 
@@ -87,7 +87,8 @@
 - 14:20 暂停点① 用户全部同意（5/5；答复于 12:35–14:20 间到达，调度器 14:20 续接处理）：①接受 A 基线 R1–R5 目标 24/上限 30 人日（超目标 30% 触发复估）②prompt() 保留在 R1（仅持久化 py.prompt.accepted+返回 RunRef，不调度）③真实 MAAS smoke 凭据推迟至 R2 前单独补齐 ④R1-S1 试点批准、主树直做（纯新增文件）、S2 起切独立 worktree ⑤技术性契约裁决授权 A 直接落条款。据此派发：T-A-002（4 项裁决落 CORE-CONTRACTS，30min 名义）、T-C1-001（试点 R1-S1，45min 名义）并行。调整：pydantic 依赖引入由 S2 前移至 S1（S1 需 Pydantic v2 wire model，B 方案边界笔误；已授权 C-1 仅经 `uv add "pydantic>=2"` 修改 pyproject/uv.lock）。检查点#5 提交。
 - 14:47 用户指示（14:20–14:47 间到达，调度器 14:47 续接处理）：watchdog 放宽为活性监控——名义时长仅参考（A 席可能数小时），**判卡死唯一标准=子 shell 输出日志 1 小时零增量**→kill→恢复阶梯。§3/任务表已改；调度器为 T-A-002/T-C1-001 挂后台活性监视器（10min 检查、1h 零增量报警退出、6h 到期重挂；每次唤醒后按仍存活任务刷新）。检查点#6 提交。
 - 14:55 T-C1-001 回报"完成"（14:21 实启，~35min）。验收通过：门禁由调度器亲跑复核（contract 44 passed/全量 76 passed/ruff check+format/mypy 15 文件全绿）；8 fixtures=2 正例+6 反例；round-trip 与 py.*/version=1 原始可检；文件与授权清单一致（CORE-CONTRACTS.md 未提交修改属 A 席 T-A-002 并行任务，diff 已核非 C 越权）。亮点：C-1 在切片中途消化了 A 合入的 T-A-002 裁决（config_snapshot 精确形状/sha256 canonical/解码重算摘要/NaN 与重复键拒绝），A×C 并行对齐自动完成；自报 8 项方案审视发现+6 项未决问题，转 B 审查回应。检查点#7 提交（feat: R1-S1 contracts，不含 A 在飞契约修订与 logs/）；T-B-002（B 结构化审查）派发；监视器刷新为 A+B 两日志。
-- 下一事件：T-A-002 / T-B-002 回报 → T-A-002 验收（4 项裁决落条款+git 仅改 CORE-CONTRACTS+与 C-1 已对齐实现核一致）→ T-B-002 审查结论（blocker/major 修订项→派 T-C1-002）→ 试点流程收口 → S2（worktree）派发。
+- 14:59 T-A-002 回报"完成"（14:21 实启，~38min）。验收通过：4 项裁决全部落为正式条款无 TBD——§6.1 R1 最小快照精确形状（schema_version=Literal[1]+permission_rules=[] 唯一合法对象）、§6.2 canonical JSON+SHA-256+摘要常量钉死（77c932c3…f802）、§3.2 H/A 水位与 expected_seq 语义（A≠H=StorageCorrupt 而非 Conflict）、§3.2.1 只读诊断裁决+§4 read/follow 坏页 StorageCorrupt 边界、§7 prompt 固定顺序（状态门禁→幂等→busy）+RunRef 三字段；每项附 TS 行号引用或"TS 无对应物+Python 侧论证"；changelog 行在；§9 逐条 B 草案冲突对照+最终口径；git 仅修改 CORE-CONTRACTS.md（+80/-18）。交叉核对：C-1 已提交 R1-S1 实现与 §6.1/§6.2 最终口径逐项一致（无内嵌 hash/Literal[1]/空规则强制/摘要常量相同/decode 重算）——A×C 对齐闭环，无需修订任务。同刻补正：T-B-002 实际派发（上轮 commit 文案已声明但进程未发，调度器失误已纠正）。检查点#8 提交；监视器刷新为 T-B-002 日志。
+- 下一事件：T-B-002 回报 → 审查结论（blocker/major 修订项→派 T-C1-002）→ 试点全流程收口（B 对 r1-slices.md 的修订项一并落盘）→ S2（worktree）按依赖序派发。
 
 ## 待用户定夺（不阻塞冒烟）
 

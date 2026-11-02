@@ -3,6 +3,10 @@
 > 状态：设计契约，等待 Phase 1 用实现和测试验证。本文是接缝定义的唯一来源。
 > 路线：[ROADMAP](ROADMAP.md)；任务：[Phase 1](PHASE1-SLIM.md)；决策：[ADR-0001](adr/0001-core-architecture.md)。
 
+## Changelog（修订记录）
+
+- 2026-11-02 [T-A-002]：定稿 R1 最小配置快照及 canonical JSON/SHA-256、expected_seq 与 applied_seq 水位、仅持久化的 prompt/RunRef/幂等与拒绝顺序、坏事件只读诊断及投影/日志读取边界；与 B 草案的对齐见 §9。
+
 ## 1. 共同规则
 
 - wire/persisted model 用 Pydantic v2；运行时资源用 dataclass/Protocol。所有集合使用工厂默认值，不共享可变容器。
@@ -48,7 +52,7 @@ Run/step 状态约束：
 
 | 状态 | 允许的下一状态 | 规则 |
 |---|---|---|
-| run accepted | running / cancelling / interrupted | py.prompt.accepted 已提交但调度尚未开始时，cancel 可先把它置为 cancelling；进程退出恢复时可直接终止为 interrupted |
+| run accepted | running / cancelling / interrupted | py.prompt.accepted 已提交；R1 只保持 accepted，不调度、不补终态；R2 起 cancel 可先置为 cancelling，恢复协调器可终止为 interrupted（见 §7） |
 | run running | cancelling / succeeded / failed / interrupted | `py.run.cancel_requested` 只能从 accepted/running 产生一次；不覆盖已提交 py.run.finished |
 | run cancelling | interrupted / failed | 不再启动 step/tool；等待 provider、adapter、MCP 和子进程清理 |
 | step running | finished / failed / interrupted | cancel_requested 后 provider finish 可记录为 interrupted；已收到且已提交的 tool 终态保留 |
@@ -107,7 +111,7 @@ durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配
 
 | type | 必需 data（除表内字段均含 session 归属验证） |
 |---|---|
-| py.session.created | `working_dir, config_snapshot, snapshot_hash`；快照有 schema version 和敏感字段处理 |
+| py.session.created | `working_dir, config_snapshot, snapshot_hash`；R1 快照精确形状、版本与哈希按 §6.1/§6.2 验证，snapshot_hash 与 config_snapshot 同属 data 字段 |
 | py.prompt.accepted | `request_id, run_id, message: UserMessage` |
 | py.run.started | `run_id` |
 | py.run.cancel_requested | `run_id, reason: user/shutdown`；阻止后续 step/tool 启动，不覆盖已有结果 |
@@ -140,13 +144,21 @@ ephemeral 类型为 `py.text.delta/py.reasoning.delta`（message_id, part_id, de
 
 S4 的事务 writer 仅供此接口调用；Bus/工具适配器/查询 repo 无权写 events/messages。顺序：
 
-1. writer 锁 + SQLite 写事务，先按 ID/批次查询是否已提交；
-2. 整批已存在、内容/顺序/批次均一致则返回原事件，**先于 expected_seq 检查**；同 ID 内容不同或混合“已有 ID + 新 ID”的批次返回 IdempotencyConflict；
-3. 全是新事件时核对 expected_seq，校验归属、版本和合法状态迁移，分配连续 seq；
-4. 插入 events；用同一 projector 更新 sessions/messages/permissions 和 sessions.applied_seq，一起 commit，失败整体回滚；
+1. writer 锁 + SQLite 写事务，先检查 session 写入门禁（首次 create 除外）；只读诊断立即返回 SessionReadOnly，再按 ID/批次查询是否已提交；
+2. 整批已存在、内容/顺序/批次均一致则返回原事件，**先于 expected_seq 等值检查**；同 ID 内容不同或混合“已有 ID + 新 ID”的批次返回 IdempotencyConflict；
+3. 全是新事件时先验证下述 H/A 不变量，再核对 expected_seq，校验归属、版本和合法状态迁移，分配连续 seq；
+4. 插入 events；用同一 projector 更新 sessions/messages/tool_executions/permissions 和 sessions.applied_seq，一起 commit，失败整体回滚；
 5. 按 seq 发 Bus 已提交通知。重试返回已有提交时不再投影或重发通知，遗漏通知由 EventLog 补读。
 
 EventBatch.id 是稳定 batch_id，批内下标为 batch_ordinal；重试复用全部内容（含时间和 ID）。批量提交全有或全无；不得把两个旧批次拼成“同一重试”。全新批次的 expected_seq 不同才返回 Conflict。TransactionWriter 是 S4 私有实现名，外部模块只依赖 SessionStore.commit。
+
+水位裁决：`H = COALESCE(MAX(events.seq), 0)`，范围只含该 session 已提交行；`A = sessions.applied_seq` 是同一 projector 已完整投影的最大连续 seq。尚未创建的 session 在首次 create 时逻辑 H=A=0，expected_seq 必须为 0；已有日志却缺失 sessions 行属于读模型缺失，不能当作新建会话。健康 active session 在每次事务对外可见时恒有 A=H；包含 n 个新事件的提交分配 H+1..H+n，并原子地置 A=H+n。rebuild 内部的暂时水位不可对外可见。
+
+`expected_seq: int >= 0` 是调用方对提交前 H 的预期值，不是目标 seq，也不是独立水位；它可以因竞态落后，只有全新批次在写事务内满足 expected_seq=H 才能提交。健康时也等于 A，但不能只信 A 而不核对日志。A≠H、日志缺口/重复或非法 seq 是 StorageCorrupt，按 §3.2.1 隔离；它们不是调用方的 Conflict，不得通过改 expected_seq 继续写。健康库中旧批次的完全相同重试即使 expected_seq 落后仍返回原提交，不推进 A/H、不再次投影或通知。
+
+SessionService、runner 和所有合法的 SessionStore 调用方必须在同一会话提交锁内读取 H/A，并把观察到的 H 作为 expected_seq；active 且完整时该值就是 A。调用方不能用任意较新的值“跳过”事件，也不能把 applied_seq 当作无需核对日志的替代值。
+
+依据：锁定 TS `packages/core/src/bus.ts:321–327,338–395` 的 `commitDurableEvent` 读取 latest 并核对重放；`bus.ts:582–655` 的 `publishAll` 在同一事务分配连续 seq、执行 projector、保存事件；`packages/core/src/event/sql.ts:4–25` 的 `EventSequenceTable/EventTable` 保存聚合水位与唯一 seq。**TS 无对应物 + Python 侧论证**：TS 没有 expected_seq 或 sessions.applied_seq；Python 同步投影要求 A=H，显式乐观并发防止调用方把基于旧状态的新事件接到新日志上。
 
 SessionService 的每个 session 有一把短期提交锁：读取状态/当前 seq → 生成本次命令事件/expected_seq → commit → 交付本地通知，整个过程串行；prompt、approval/expiry、cancel、恢复和 runner 结果回调都走它。**不在等待模型、审批或 adapter 时持锁**，也不在命令处理里等待自己持有锁的回调。cancel 先设置取消信号并关闭 pending 审批，started 提交再次检查取消状态；若结果已先提交则保留原终态，后来的重复完成回调只作去重。权限 pending 的回复/过期/关闭只允许首个提交的合法迁移，迟到回复返回 ApprovalExpired/Conflict。
 
@@ -155,7 +167,7 @@ SessionService 的每个 session 有一把短期提交锁：读取状态/当前 
 初始迁移 `0001` 使用 Python 自己的最小 schema：
 
 - `events`：id 主键、session_id、seq、type、version、时间、data/metadata JSON、batch_id、batch_ordinal、可选 dedupe_key；unique(session_id, seq)、unique(session_id, batch_id, batch_ordinal)、unique(session_id, dedupe_key)；
-- `sessions`：状态、active_run_id、配置快照、applied_seq；事件创建时投影；
+- `sessions`：状态、active_run_id、配置快照及 snapshot_hash、applied_seq、可选 diagnostic；事件创建时投影，诊断隔离记录按 §3.2.1 保留；
 - `messages`：session_id、message_id、顺序、JSON；unique(session_id, message_id)；
 - `tool_executions`：session_id、execution_id、run_id、step_id、message_id、tool_call_id、input_hash、state；unique(session_id, execution_id)、unique(session_id, step_id, tool_call_id)，由 commit 校验其归属和终态不可逆；
 - `permissions`：待审批和保存决定的投影；input_hash、作用域、有效期、终态。
@@ -164,13 +176,24 @@ events 不依赖可重建的 messages 外键。创建 session 与其首条事件
 
 Phase 1 每个数据目录只允许一个 writer 进程（持有 OS 文件锁）；SQLite 使用 WAL、foreign_keys、busy_timeout，进程内写事务串行。第二个进程明确失败；asyncio/aiosqlite 本身不提供多 writer 正确性。M1 才增加租约/跨进程协调。
 
-`SessionStatus` 只有 `active`、`read_only_diagnostic`、`cleanup_failed`、`closed`。未知事件版本、损坏数据或序列冲突使 `active → read_only_diagnostic`；关闭阶段无法确认资源回收使 `active → cleanup_failed`。这两种诊断状态以及 `closed` 都不自动恢复为 active：`messages`、`run_status`、`EventLog.read/follow` 等读取仍可用，但 `prompt`、`cancel`、权限回复/撤销和任何新工具写入分别以 `SessionReadOnly`、`LifecycleCleanupFailed` 或 `SessionClosed` 拒绝。只有经过验证的备份恢复、迁移或人工修复命令才可清除诊断状态；Phase 1 不提供静默修复。`SessionService.close()` 是进程生命周期操作，不会把正常 session 永久标记为 `closed`；`closed` 仅供显式会话关闭/管理操作，若未提供该命令则不会产生该状态。
+`SessionStatus` 只有 `active`、`read_only_diagnostic`、`cleanup_failed`、`closed`。关闭阶段无法确认资源回收使 `active → cleanup_failed`；诊断隔离规则如下。三种非 active 状态都不自动恢复为 active：业务写命令分别以 SessionReadOnly、LifecycleCleanupFailed 或 SessionClosed 拒绝。只有经过验证的备份恢复、迁移或人工修复命令才可清除诊断状态；Phase 1 不提供静默修复。`SessionService.close()` 是进程生命周期操作，不会把正常 session 永久标记为 `closed`；`closed` 仅供显式会话关闭/管理操作，若未提供该命令则不会产生该状态。
+
+### 3.2.1 只读诊断裁决
+
+- 检测范围：打开/重建/读取已存日志时，未知 type 或 version、无效 JSON/必需字段/content type、快照哈希不符、归属/状态迁移损坏、seq 不从 1 连续递增（含缺口、重复、非法值），以及已存投影不一致，都使该 session 进入 read_only_diagnostic。会话首次允许写入前必须验证日志和投影水位；读模型缺失时先重建，失败即隔离。仅提交输入不合法时拒绝并回滚，不把调用方的坏输入当作已存损坏，也不隔离健康 session。
+- 隔离由 SessionStore 的私有 writer 在会话锁下完成；发现问题的业务/重建事务先整体回滚，再用独立短事务持久化 sessions.status 与脱敏 diagnostic（reason、可定位时的首个坏 seq/event_id、发现时的 applied_seq）。这是受控的管理状态写入，不追加业务事件、不推进 seq/applied_seq、不通知 Bus；EventLog/repo 只能请求该隔离入口，无权自行写表。DB 无法持久化隔离时保持内存写门禁并报告存储错误，下次打开重新验证，不声称隔离已持久化。
+- 保留最后一次已提交的读模型及其 applied_seq；它是历史投影水位，不再证明当前日志完整或 A=H。若 sessions 行已被删除，隔离入口可建立最小诊断记录（status、diagnostic、applied_seq=0，配置/active_run_id 为空）；这不是 py.session.created，也不能转为可执行会话。缺失投影不伪造为空历史或成功的 RunStatus。
+- “读取仍可用”指 session_status 和未损坏的已投影 messages/run_status 仍可查，查询不重放坏日志、不触发恢复或外部调用。读模型自身某条数据无法解码，或所需投影缺失，则该查询返回 StorageCorrupt（details.reason=projection_unavailable 或具体损坏原因）；其他可解码投影与状态查询仍可用。它不承诺磁盘/DB 不可读时仍能返回数据，也不保证现存投影与损坏后的日志相符。
+- typed EventLog 的坏日志读取按 §4 报 StorageCorrupt；不把原始坏行塞进 DurableEvent。进入诊断后 prompt（含重试）、cancel、权限回复/撤销、runner/tool 回调及所有新业务 commit 均以 SessionReadOnly 拒绝。健康库的幂等成功不构成绕过诊断门禁的例外。发现损坏的那次操作报 StorageCorrupt，后续写命令报 SessionReadOnly；显式读 API 用于查原结果。
+- 重新打开进程、成功读取旧投影或再次 rebuild 都不能自动清除诊断标记；重建须保留该管理标记。诊断期间只允许读取、资源释放和受控隔离管理，不能自动追加 interrupted/unknown 等“修复”事件。
+
+依据：锁定 TS `packages/schema/src/event.ts:28–34,174–186` 的 `Version/DurableEnvelope/versionedType/durableMap` 按版本辨认事件；`packages/core/src/bus.ts:674–703` 的 `replay` 对未知 durable 定义失败，但 `bus.ts:786–827` 的 `readAfter` 会跳过未注册类型并推进 raw seq。**TS 无对应物 + Python 侧论证**：TS 没有本节的持久只读诊断协议；Python 必须显式偏离跳过行为，避免把不完整历史当作可信执行依据，同时保留可解码投影供诊断。
 
 ### 3.3 重放、迁移与副作用
 
-projector 是确定的状态折叠：`apply(state, event) -> state`，不读时钟、不生成随机 ID、不执行工具、不发模型请求。消息创建时间取事件时间；idle ID 由 run_id 确定。rebuild 在会话锁和事务下清空该 session 的读模型、按 seq 重放并更新 applied_seq；不会再次发业务通知或生成新事件。未知事件版本、损坏数据或序列冲突使该会话进入只读诊断，不能跳过后继续“恢复”。
+projector 是确定的状态折叠：`apply(state, event) -> state`，不读时钟、不生成随机 ID、不执行工具、不发模型请求。消息创建时间取事件时间；idle ID 由 run_id 确定。rebuild 在会话锁和同一事务下重建该 session 的读模型、按 seq 重放并更新 applied_seq；不会再次发业务通知或生成新事件。仅在全量验证和投影成功后提交替换；失败时包括清空操作在内全部回滚，保留原投影，再按 §3.2.1 隔离，不能提交坏点前的半份读模型、跳过坏点或借重建清除诊断状态。
 
-恢复检查不是纯 replay 的一部分。获得独占运行权后，按已提交 py.step.generated 的完整计划处理：pending → cancelled/not_started，started 无 finished → unknown，已有 finished 原样保留。先追加待审批 py.permission.closed，再补工具终态、包含全部结果的 interrupted py.step.finished 和 py.run.finished；同一恢复批次使用稳定 ID，重复启动可幂等恢复。
+恢复检查不是纯 replay 的一部分，R1 只做日志/投影重建，不做下述运行恢复补写；read_only_diagnostic 时禁止运行恢复写入。运行恢复协调器获得独占运行权且会话通过完整性验证后，按已提交 py.step.generated 的完整计划处理：pending → cancelled/not_started，started 无 finished → unknown，已有 finished 原样保留。先追加待审批 py.permission.closed，再补工具终态、包含全部结果的 interrupted py.step.finished 和 py.run.finished；同一恢复批次使用稳定 ID，重复启动可幂等恢复。
 
 下一次生成前必须保证 assistant 的每个合法 tool_call_id 都有对应 tool result，包括 cancelled/ExecutionUnknown 的合成错误结果。已提交计划中的后续调用即使尚未 invoke，也补 cancelled 结果。未完成/非法 JSON 没有可执行调用计划，不把原始残片放入下一请求的 tool_calls，只保留诊断文本/错误。没有 generated 时，只用已提交 finalized 文本生成 interrupted 消息。unknown 终止当前 run，不自动继续下一轮生成；下次显式 prompt 会看到未知副作用说明。
 
@@ -191,7 +214,9 @@ DB 与外部副作用不能 exactly-once：
 `EventCursor = {session_id: str, seq: int >= 0}`；0 表示日志之前。`EventPage = {items: list[DurableEvent], next_cursor: EventCursor, has_more: bool}`。next_cursor 是最后一个 items 的 seq，空页保持输入 cursor；未建 session 返回 NotFound。
 
 `EventLog.read(session_id, after: EventCursor | None = None, limit=100) -> EventPage`：
-返回 seq>after.seq 的 durable 事件。None 等于本 session 的 seq=0；limit 为 1–1000。session 不同、负数或编码非法为 InvalidCursor；seq 超过当前高水位也明确报 InvalidCursor，不空等。Phase 1 不裁剪日志；M1 若裁剪必须新增 CursorExpired/重建协议，不能在旧协议中静默跳过。
+返回 seq>after.seq 的 durable 事件。None 等于本 session 的 seq=0；limit 为 1–1000。session 不同、负数或编码非法为 InvalidCursor；seq 超过当前高水位 H 也明确报 InvalidCursor，不空等。这里 H 是 §3.2 的已提交日志最大 seq，不以投影水位代替。Phase 1 不裁剪日志；M1 若裁剪必须新增 CursorExpired/重建协议，不能在旧协议中静默跳过。
+
+读取必须按原 seq 连续解码 type+version；发现 §3.2.1 所列损坏时，read 整页失败并报 `StorageCorrupt(retryable=false)`，不返回半页、不推进 next_cursor。details 包含脱敏 reason、session_id、可定位的坏 seq/event_id 及 last_confirmed_cursor，不含坏行原文；read 失败时该 cursor 等于输入 after（None 为 0），follow 则为最后已 yield 的事件游标，不取失败页内部已解码但未交付的 seq。发现前已经返回的健康页仍有效。进入 read_only_diagnostic 后，typed read/follow 都报 StorageCorrupt，不能凭更大的 after 或类型过滤绕过坏点；查看原始坏字节属于显式诊断工具，不在 DurableEvent/EventPage 接口内。
 
 `EventLog.follow(session_id, after: EventCursor | None = None) -> AsyncContextManager[AsyncIterator[LogItem]]`：
 
@@ -200,7 +225,9 @@ DB 与外部副作用不能 exactly-once：
 3. 此后始终查询 seq>last_seq，只把 Bus 当唤醒信号；重复信号合并、最长 1 秒轮询兜底。H 前后的 commit 由查询范围分开，不把通知 payload 再发送一遍；
 4. 同一连接按 seq 严格递增；重连允许 at-least-once，消费者按 session+seq/id 去重。补读、yield 和等待期间不持会话提交锁，不阻塞 runner。
 
-follow 只保证 durable，不回放 ephemeral token。实时 UI 可用 Bus 做预览，以 durable 完整值覆盖；M5 首版只保证 durable SSE。游标不可跨 session 使用。outbox、全局 cursor 和跨实例 wakeup 不在 Phase 1。
+follow 遇到坏页时可保留此前已 yield 的健康事件，随后抛 StorageCorrupt 并终止，退出时注销 wakeup；不得 yield 坏事件、后续事件或越过坏点的 Synced。若坏点发生在初始 H 之后，已经发出的 Synced(H) 仍只确认旧窗口；新窗口失败不能伪造新 marker。该错误和诊断状态不改变“已投影读取可用”的 §3.2.1 保证。
+
+follow 只保证 durable，不回放 ephemeral token。实时 UI 可用 Bus 做预览，以 durable 完整值覆盖；M5 首版只保证 durable SSE。游标不可跨 session 使用。outbox、全局 cursor 和跨实例 wakeup 不在 Phase 1。依据为 §3.2.1 引用的 TS readAfter/log 差异；Python 不沿用 TS 跳过未知类型并推进 cursor 的行为。
 
 ## 5. S3：工具、权限与生命周期
 
@@ -241,7 +268,20 @@ Phase 1 不做通用 before_execute hook。M3 若变更输入，必须发生在�
 
 标量后者覆盖，映射递归合并，列表替换；instructions 按来源由外到内追加，路径去重；permission 追加有序规则后再与宿主硬限制求交。未知结构字段报配置错误；endpoint、workspace roots、可执行 MCP 定义属于宿主配置，项目配置无权隐式扩大它们。
 
-`ConfigSnapshot` 含 schema_version、model/endpoint_ref、允许 roots、permission rules、指令文本+provenance、MCP ref+启动指纹、limits 和 hash。每份 AGENTS.md 上限 64 KiB、总指令 256 KiB，超限明确报错。指令按外到内排列，不提升系统权限；不自动执行文档里的命令或加载其中声明的插件/MCP。
+运行期 `ConfigSnapshot` 承载 schema_version、model/endpoint_ref、允许 roots、permission rules、指令文本+provenance、MCP ref+启动指纹和 limits；其摘要统一放创建事件的 snapshot_hash，不在快照内部重复存 hash。R1 使用下面的存储专用最小版本，不能冒充可执行配置。每份 AGENTS.md 上限 64 KiB、总指令 256 KiB，超限明确报错。指令按外到内排列，不提升系统权限；不自动执行文档里的命令或加载其中声明的插件/MCP。
+
+### 6.1 R1 最小快照
+
+R1 `config_snapshot` 的字段全集精确为 `schema_version: Literal[1]`、`permission_rules: list[JsonObject]`，且 permission_rules 必须为空；两字段都必须显式存在，版本号必须是整数 1，不接受额外键、null、字符串/布尔/浮点版本号或非空规则。最小且唯一合法对象为 `{"schema_version":1,"permission_rules":[]}`；事件 data 另含 working_dir 和 snapshot_hash。R1 不装载配置、不求值规则；空列表不授予工具权限。运行所需的 model/endpoint/roots/instructions/MCP/limits 不伪造默认值进入此版本。后续可执行快照使用新的 schema_version 并显式提供运行字段，保留版本 1 的解码和旧 fixture；不得在重启时读取当前配置来静默补齐旧快照。
+
+### 6.2 canonical JSON 与摘要
+
+1. 先对已完成敏感字段处理的快照验证 schema；拒绝重复 JSON 对象键、非字符串键、NaN/Infinity、非法 Unicode（含孤立 surrogate），不能先经类型强转“修复”再算 hash。
+2. 只序列化 config_snapshot 对象本身：对象键递归按 Unicode code point 升序；数组顺序保持；键值/元素分隔符固定 `":"`/`","`，无多余空白、缩进或末尾换行；非 ASCII 字符保持原 Unicode，不做 NFC/NFD、大小写或换行归一化，JSON 必需的引号/反斜杠/控制字符转义仍保留。UTF-8 编码，无 BOM。规范算法为 Python 3.12+ `json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")`；R1 值域只有整数 1 和空数组，无浮点格式差异。
+3. `snapshot_hash = hashlib.sha256(canonical_bytes).hexdigest()`，恰为 64 位小写十六进制，无 `sha256:` 前缀。hash 不纳入 config_snapshot；working_dir、事件 id/时间/metadata 也不参与。create 从快照计算摘要；提交和读取 py.session.created 时重新验证，输入不符为 ValidationError，已存不符为 StorageCorrupt 并隔离。
+4. 版本 1 的 canonical 文本固定为 `{"permission_rules":[],"schema_version":1}`，对应摘要固定为 `77c932c31585517c128479af02c40cd377e26d4d25ce57df197fc8509e14f802`。键输入顺序或 JSON 表面空白改变不改变摘要；合法内容改变则按重新规范化后的字节计算，不能沿用旧摘要。
+
+依据：锁定 TS `packages/schema/src/session-event.ts:39–57` 的 `Created` 含 permissions/model 等创建字段，`packages/core/src/config/discovery.ts:15–25,59–145` 的 `Sources/discover` 定义发现来源；它们都没有 Python 的最小快照和 canonical hash。**TS 无对应物 + Python 侧论证**：R1 未接入 ConfigLoader/模型/工具，用关闭扩展字段的最小存储版本即可验证持久化，不制造运行权限；摘要仅覆盖非秘密配置内容，排除自身可避免递归，固定序列化字节可重启重算并检测漂移。
 
 快照是运行行为基线：存可重建的非秘密配置及指令文本，凭据只存引用；URL userinfo/query 和敏感键不能原样入库。恢复若工作目录失效、凭据引用失效或 MCP 启动指纹变化，明确停住并要求宿主重新配置/批准，不能静默换一套权限。Phase 1 无热重载。
 
@@ -255,7 +295,7 @@ MCP 只支持显式用户配置的 stdio server，argv 直接 exec、不拼 shel
 |---|---|
 | `create(config_snapshot) -> SessionRef` | 创建并持久化 session |
 | `session_status(session_id) -> SessionStatus` | 返回 active/只读诊断/清理失败/closed；不触发恢复或外部调用 |
-| `prompt(session_id, text, request_id) -> RunRef` | 返回 run_id；相同 request_id+相同输入返回原 run，输入不同则冲突 |
+| `prompt(session_id, text, request_id) -> RunRef` | R1 仅原子持久化 py.prompt.accepted 并返回 RunRef，不调度；幂等、输入冲突及状态门禁按下文 |
 | `cancel(run_id) -> RunStatus` | 提交 cancel_requested、幂等请求取消；释放提交锁后等待资源清理和持久终态 |
 | `reply_permission(permission_id, reply) -> DecisionReceipt` | 宿主输入通道；与运行锁分离，避免等待审批时死锁 |
 | `revoke_permission(decision_id) -> None` | 宿主撤销已保存规则；不撤销已完成副作用 |
@@ -263,15 +303,24 @@ MCP 只支持显式用户配置的 stdio server，argv 直接 exec、不拼 shel
 | `run_status(run_id) -> RunStatus` | 运行、完成、失败、中断及错误信息 |
 | `close() -> None` | 按下述顺序取消并收回自有任务，关闭 provider/MCP/DB；不得遗留后台任务 |
 
-`SessionRef={session_id}`；`RunRef={session_id, run_id, request_id}`；`RunStatus` 含上述标识及 `status: accepted/running/cancelling/succeeded/failed/interrupted`、可选 error。`MessagePage` 含 items、next_message_id 和 has_more；消息游标按投影顺序分页。`DecisionReceipt` 含 permission_id、decision 和 execution_id，不携带可复用执行权限。
+`SessionRef={session_id: str}`；`RunRef={session_id: str, run_id: str, request_id: str}`，三项均为非空字符串，分别指向原 session、首次接受时生成的 run 和调用方请求，不含调度承诺；`RunStatus` 含上述标识及 `status: accepted/running/cancelling/succeeded/failed/interrupted`、可选 error。`MessagePage` 含 items、next_message_id 和 has_more；消息游标按投影顺序分页。`DecisionReceipt` 含 permission_id、decision 和 execution_id，不携带可复用执行权限。
 
-同一 session 最多一个 active run：不同 request_id 并发 prompt 返回 SessionBusy；Phase 1 不支持 steering/inbox。SessionService 持有强引用任务表；端点/CLI 结束不任由任务脱离管理。重复 prompt 在重启后也查 durable request_id/dedupe_key，不创建第二条用户消息。
+同一 session 最多一个 active run，包含 accepted/running/cancelling；Phase 1 不支持 steering/inbox。R1 的 prompt 只提交一个 `py.prompt.accepted(version=1)`，data 中 request_id/run_id 与返回 RunRef 一致，message 为本次 text 创建的 UserMessage，metadata 含同一 run_id/request_id；其 projector 同事务插入一条 UserMessage、置 active_run_id 并得到 accepted 的 RunStatus。只有事务提交成功才返回；不产生 run.started、assistant/idle 或调度任务，不调用 provider/工具。
 
-先持久 py.prompt.accepted（dedupe_key=prompt:request_id）再调度；此后若进程退出，恢复将未结束 run 标 interrupted，**不会重新自动调度**。重复 prompt 的身份/输入检查先于 SessionBusy 判断。RunRef 只代表已接受，不代表一定成功执行。CLI 等待 RunStatus，使用 Bus 看实时输出、EventLog 看可靠历史。
+prompt 在每 session 提交锁下按以下固定顺序处理：
+
+1. 验证 session_id/request_id 是非空字符串、text 是字符串（不隐式转换）；检查 session 存在及其写入门禁。尚不存在返回 NotFound；read_only_diagnostic 时始终返回 SessionReadOnly，包括同 request_id 的重试；cleanup_failed/closed 分别返回 LifecycleCleanupFailed/SessionClosed。session 为 active 后再检查 service 的 closing/closed gate，关闭中或已关闭返回 SessionClosed。
+2. 在 durable 日志中以 `(session_id, dedupe_key)` 查原接受记录；key 精确为 `"prompt:" + request_id`，大小写敏感，不是字面字符串 prompt:request_id。key 是存储字段，由 py.prompt.accepted 的 request_id 派生，并受 §3.2 唯一约束保护，不要求调用方传 event ID。相同 request_id 可用于不同 session。
+3. 已存在且原 message.text 与本次 text 逐 Unicode code point 相同，则直接返回原 RunRef，不生成新 message/run/event/batch ID，不重投影或重发通知；不 trim、不归一化换行/Unicode。run 已终结时也返回首次的 RunRef，当前状态另查 run_status。相同 key 的输入不同则 IdempotencyConflict，即使当前 busy；比较不使用新生成的 ID/时间，也不只依赖摘要。
+4. 无原记录时才检查 active_run_id：存在则 SessionBusy；不存在才生成并固定 message/run/event/batch ID 与时间，按 §3.2 读取 H 作为 expected_seq 并提交。完全相同的提交重试复用这些值；提交失败/回滚不留下 request_id、消息或 active run。不同 request_id 的并发 prompt 最多一个成功；相同请求并发成功后都指向同一个 RunRef。
+
+R1 的 accepted 持续占用 active-run 槽，关闭并重开后保持 accepted；新 request_id 仍返回 SessionBusy，同一请求仍按上述规则幂等返回。R1 close 只释放其 storage/Bus 等自有资源，不为存储专用 accepted 追加取消/终态；R1 不实现下述运行 cancel/恢复协调器。R2 接入调度后仍先提交 accepted 再调度，只调度本次新接受的请求，幂等重试不能再次调度；启动恢复将未结束 run 终止为 interrupted 的行为由运行恢复协调器实现，绝不自动续跑 R1 遗留 accepted。SessionService 对实际调度任务持有强引用；CLI 等待 RunStatus，用 Bus 看实时输出、EventLog 看可靠历史。
+
+依据：锁定 TS `packages/schema/src/session-event.ts:213–228` 的 `InboxDelivered/InboxEnqueued` 将输入接收独立记录，`:244–263` 的 `Execution.Started/Interrupted` 定义执行生命周期。**TS 无对应物 + Python 侧论证**：TS 无本节 SessionService.prompt/RunRef/request_id 幂等协议；Python 不实现 TS inbox，使用独立接受事件使 R1 无模型依赖即可验证用户消息与请求身份持久化；accepted 占槽可防止尚无调度/恢复协调器时静默积压多个 run。
 
 cancel 的 dedupe_key 为 cancel:run_id；已结束 run 直接返回原 RunStatus。未结束则提交取消意图并关闭待审批/未开始的调用，状态改为 cancelling；已开始工具仍如实保存已确定的结果，不把成功伪装成“未执行”。如果 py.run.finished 先提交，迟到 cancel 不覆盖；取消意图先提交时不再启动新 step/tool，清理后 run 结束 interrupted。重复 cancel 等待同一清理任务；迟到完成回调按 execution_id 去重。若清理无法确认，报告 LifecycleCleanupFailed，保持该 session 不可再执行，不能假装已回收并启动下一 run。
 
-`close()` 生命周期：首次调用先原子地进入 closing gate，拒绝新的 prompt、工具调度和权限写入；为每个活动 run 提交 `py.run.cancel_requested(reason=shutdown)`，并为 pending approval 提交 `py.permission.closed(outcome=cancelled)`。随后释放提交锁，等待 provider stream、adapter、MCP 和子进程结束；等待期间仍允许通过同一 `SessionStore.commit` 写入已确定的 tool/step/run 终态。达到关闭超时而外部结果仍不确定时，若 DB 可写则提交 `tool.finished(effect_status=unknown)`、interrupted 的 step/run 终态并把 session 置为 `cleanup_failed`；若 DB 也不可写则保留未完成记录，交由下次启动恢复，不得报告已清理。只有所有自有任务已退出或已被 durable 标记后，才依次关闭 MCP、provider、DB，并把 service 标记为 closed；这不改变可恢复 session 的 `SessionStatus`。并发或重复 `close()` 复用同一个清理任务，返回相同结果/错误且不重复提交关闭事件。
+R2 起的 `close()` 运行生命周期（R1 按上文只释放资源）：首次调用先原子地进入 closing gate，拒绝新的 prompt、工具调度和权限写入；为每个可写 session 的活动 run 提交 `py.run.cancel_requested(reason=shutdown)`，并为 pending approval 提交 `py.permission.closed(outcome=cancelled)`。随后释放提交锁，等待 provider stream、adapter、MCP 和子进程结束；等待期间仍允许通过同一 `SessionStore.commit` 为可写 session 写入已确定的 tool/step/run 终态。诊断 session 只清理资源，不能越过 SessionReadOnly 追加业务事件。达到关闭超时而外部结果仍不确定时，若 session/DB 可写则提交 `tool.finished(effect_status=unknown)`、interrupted 的 step/run 终态并把 session 置为 `cleanup_failed`；若不可写则保留未完成记录供显式诊断或下次通过完整性验证后的恢复，不得报告已清理。只有所有自有任务已退出或已被 durable 标记后，才依次关闭 MCP、provider、DB，并把 service 标记为 closed；这不改变可恢复 session 的 `SessionStatus`。并发或重复 `close()` 复用同一个清理任务，返回相同结果/错误且不重复提交关闭事件。
 
 ContextBuilder 保留完整工具 call/result 配对，只接受 provider 支持的内容；预留输出 token + 安全余量。R0 获取模型上下文上限；未知时要求宿主配置。达到预算时返回 ContextLimitExceeded，保留历史、提示新建会话；Phase 1 不静默裁剪或做无边界摘要。
 
@@ -287,3 +336,16 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 只有一个 retry owner：MAAS adapter 关闭 SDK 默认重试，未收到首个内容且明确可重试的 429/短暂网络错误最多 2 次重试（尊重 Retry-After、带抖动、受总超时限制）。部分流已到达则结束并标 interrupted，不能把旧流和新流拼接。用户要求重试生成时创建新 attempt；既有 tool.finished 绝不重新执行。MCP、shell、文件变更默认不自动重试。
 
 版本演进以旧 JSON fixture/旧 DB fixture 能读取为最低门槛。新增 event/content/capability 不等于旧消费者自动支持；不支持时显式协商或报 UnsupportedCapability，不能只靠“字段可选”声称向后兼容。
+
+## 9. T-A-002 与 B 草案的冲突及最终口径
+
+本节对照只读的 `doc/plans/r1-slices.md` §2/§4；本契约为最终实现依据。与 `doc/reestimate-r0.md` §2 的同事务、幂等优先、坏数据隔离取向一致；R1 保留 prompt 是本次用户授权的范围澄清。
+
+| B 草案假设/冲突点 | 最终口径与实现对齐 |
+|---|---|
+| §4.2“schema_version+空规则+hash”，未定义字段名/字节算法；并行 R1-S1 已采用 ConfigSnapshot.hash、宽版本号与可省略/非空规则 | 支持空规则与 SHA-256 方向；§6.1 的快照只有显式 schema_version=1、permission_rules=[]，hash 仅在创建事件 data.snapshot_hash。C 的 R1-S1 模型/fixture/测试须移除内嵌 hash，拒绝省略规则、额外字段、非空规则和非整数 1；既有最小对象的摘要字节不变。R3 不可静默改变版本 1 的含义。 |
+| §4.4“expected_seq 恒等 applied_seq”，未区分陈旧调用参数和损坏投影 | 健康已提交状态 A=H；expected_seq 是预期旧 H，新批次不匹配报 Conflict，旧批次完全相同重试先于等值检查；A≠H 是损坏而非乐观并发冲突。S3/S4 按 §3.2 对齐。 |
+| §4.1 提议 prompt 仅持久化，并列出删去 prompt 的备选 | 正式保留 prompt，备选不采用；R1 不调度，与草案主方案一致。补全 RunRef、精确 key/输入比较、状态门禁→幂等→busy 顺序；R1 accepted 重启后仍占槽，不自动补终态。S4/S7 对齐。 |
+| §4.3 提议坏日志 read 返回 StorageCorrupt，但 S8 笼统称 EventLog.read 仍可用 | 采纳 §4.3 的错误取向；“读取可用”专指可解码的已有投影/状态，诊断后的 typed read/follow 报 StorageCorrupt。坏页不返回半页、不推进游标，follow 不发越界 Synced，重建失败保留原投影且诊断不自动清除。S6/S8 对齐。 |
+
+上述都是 Python 契约补充/有意差异，TS 证据及 Python 侧理由分别见 §3.2、§3.2.1、§6、§7；不据此宣称实现或 TS wire 兼容已验证。
