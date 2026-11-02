@@ -1,9 +1,9 @@
-# R1-S1..R1-S5 已交付公共面静态清单（滚动更新）
+# R1-S1..R1-S6 已交付公共面静态清单（滚动更新）
 
-> 范围：覆盖 **R1-S1..R1-S5 已并入主树的交付面**（滚动更新：S6 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/`、`src/opencode/bus/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
-> 符号总数：**83** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6；`session/__init__.py` 仅再导出、0 个新定义）+ S5 新增 4（`bus/bus.py` 4；`bus/__init__.py` 仅再导出、0 个新定义）。
-> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9，S4/S5 前后不变）；`session.__all__` 5 项（`apply`/`IllegalTransitionError`/`SessionProjector`/`SessionState`/`SessionStatus`，S5 前后不变）；`bus.__all__` 4 项（`DEFAULT_QUEUE_LIMIT`/`Event`/`SlowConsumerError`/`VolatileBus`）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 的 `REASON_*`、`session/projector.py` 的 `REASON_*` 均**未进** `__all__`。
-> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；2026-11-02 S4 滚动；2026-11-02 S5 滚动；工作树状态见 §3 注。
+> 范围：覆盖 **R1-S1..R1-S6 已并入主树的交付面**（滚动更新：S7 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/`、`src/opencode/bus/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
+> 符号总数：**107** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6；`session/__init__.py` 仅再导出、0 个新定义）+ S5 新增 4（`bus/bus.py` 4；`bus/__init__.py` 仅再导出、0 个新定义）+ S6 新增 24（`bus/eventlog.py` 13 + `storage/repos.py` 11；`storage/__init__.py` 仅追加再导出、0 个新定义）。
+> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` **26** 项（S3 的 21 + S6 追加 5：`ReadRepositories`/`SessionRecord`/`MessagePage`/`NotFoundError`/`InvalidCursorError`，纯追加、无删除）；`session.__all__` 5 项（`apply`/`IllegalTransitionError`/`SessionProjector`/`SessionState`/`SessionStatus`，S5/S6 前后不变）；`bus.__all__` 4 项（`DEFAULT_QUEUE_LIMIT`/`Event`/`SlowConsumerError`/`VolatileBus`，**S6 不变**）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 的 `REASON_*`、`session/projector.py` 的 `REASON_*`、**`bus/eventlog.py` 的全部公共名**均**未进** 各自包的 `__all__`（eventlog 属 DB 耦合面，使用方直连 `from opencode.bus.eventlog import ...`）。
+> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；2026-11-02 S4 滚动；2026-11-02 S5 滚动；2026-11-02 S6 滚动；工作树状态见 §3 注。
 
 ## 1. 公共面清单
 
@@ -127,6 +127,39 @@ S5 说明：`bus/__init__.py` 仅再导出（`__all__` 4 项），无模块级�
 
 **S5 对 `storage/`、`session/` 的核对**：`git diff 18f74ff f45f880 --stat` 显示源码改动仅 `src/opencode/bus/__init__.py`、`src/opencode/bus/bus.py` 与两个新测试文件；其余为文档/任务/进度文件（`doc/ORCHESTRATION.md`、`doc/orchestration/{progress/T-C1-007,tasks/T-B-010}.md`、`doc/reviews/R1-S5-review.md`、本 inventory）。**`storage/` 与 `session/` 零触碰**；`storage.__all__` 仍 **21** 项、`session.__all__` 仍 **5** 项，均无变化。
 
+### 1.5 R1-S6（bus/eventlog.py、storage/repos.py）
+
+S6 说明：`bus/eventlog.py` 是 **DB 耦合面**，`bus/__init__.py` 有意**不 re-export**（volatile 出口保持 4 项），其全部公共名标为「不导出（直连 import）」。`storage/repos.py` 的 5 个类型/异常经 `storage/__init__.py` 追加导出，其余常量与 `clamp_page_limit` 未导出。两文件的下划线前缀私有名（`_Follow`/`_resolve_cursor`/`_corrupt` 等）不收。
+
+| 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 | 导出性 |
+|---|---|---|---|---|---|
+| `opencode.bus.eventlog.MIN_READ_LIMIT` | constant | `1` | §4 读 limit 下界 | `src/opencode/bus/eventlog.py:93` | 不导出（直连 import） |
+| `opencode.bus.eventlog.MAX_READ_LIMIT` | constant | `1000` | §4 读 limit 上界 | `src/opencode/bus/eventlog.py:94` | 不导出（直连 import） |
+| `opencode.bus.eventlog.DEFAULT_READ_LIMIT` | constant | `100` | §4 默认页大小 | `src/opencode/bus/eventlog.py:95` | 不导出（直连 import） |
+| `opencode.bus.eventlog.DEFAULT_FOLLOW_PAGE_SIZE` | constant | `512` | follow 内部追平/实时页大小（TS `logReadPageSize`） | `src/opencode/bus/eventlog.py:98` | 不导出（直连 import） |
+| `opencode.bus.eventlog.MAX_POLL_INTERVAL` | constant | `1.0` | 轮询兜底上限（秒，契约不超过 1s） | `src/opencode/bus/eventlog.py:101` | 不导出（直连 import） |
+| `opencode.bus.eventlog.STATUS_READ_ONLY_DIAGNOSTIC` | constant | `"read_only_diagnostic"` | 隔离 session 的 status wire 字面量 | `src/opencode/bus/eventlog.py:104` | 不导出（直连 import） |
+| `opencode.bus.eventlog.REASON_SESSION_READ_ONLY` | constant | `"session_read_only_diagnostic"` | 隔离 session 的 typed read/follow 拒绝原因 | `src/opencode/bus/eventlog.py:107` | 不导出（直连 import） |
+| `opencode.bus.eventlog.REASON_NON_INCREASING_SEQ` | constant | `"non_increasing_seq"` | follow 连接内 seq 非严格递增 | `src/opencode/bus/eventlog.py:108` | 不导出（直连 import） |
+| `opencode.bus.eventlog.EventCursor` | class (dataclass, frozen, slots) | `session_id: str; seq: int` | §4 游标 `{session_id, seq>=0}`；0 表示日志起点 | `src/opencode/bus/eventlog.py:124` | 不导出（直连 import） |
+| `opencode.bus.eventlog.EventPage` | class (dataclass, frozen, slots) | `items: list[DurableEvent[Any]]; next_cursor: EventCursor; has_more: bool` | §4 单次读取页 | `src/opencode/bus/eventlog.py:139` | 不导出（直连 import） |
+| `opencode.bus.eventlog.Synced` | class (dataclass, frozen, slots) | `cursor: EventCursor` | follow 的追平标记（每次 follow 恰好一次） | `src/opencode/bus/eventlog.py:152` | 不导出（直连 import） |
+| `opencode.bus.eventlog.LogItem` | type alias | `type LogItem = DurableEvent[Any] \| Synced` | follow 产出项 | `src/opencode/bus/eventlog.py:164` | 不导出（直连 import） |
+| `opencode.bus.eventlog.EventLog` | class | `__init__(engine: AsyncEngine, *, bus: VolatileBus \| None = None, registry: EventRegistry \| None = None, repos: ReadRepositories \| None = None, poll_interval: float = 1.0, page_size: int = DEFAULT_FOLLOW_PAGE_SIZE); async read(session_id: str, after: EventCursor \| None = None, limit: int = DEFAULT_READ_LIMIT) -> EventPage; follow(session_id: str, after: EventCursor \| None = None) -> AbstractAsyncContextManager[AsyncIterator[LogItem]]` | §4 durable feed：分页读取 + 四步 follow（先注册唤醒→取 H→追平+Synced→实时轮询兜底） | `src/opencode/bus/eventlog.py:217` | 不导出（直连 import） |
+| `opencode.storage.repos.MIN_PAGE_LIMIT` | constant | `1` | 读侧页 limit 下界 | `src/opencode/storage/repos.py:48` | 不导出 |
+| `opencode.storage.repos.MAX_PAGE_LIMIT` | constant | `1000` | 读侧页 limit 上界 | `src/opencode/storage/repos.py:49` | 不导出 |
+| `opencode.storage.repos.DEFAULT_PAGE_LIMIT` | constant | `100` | 读侧默认页大小 | `src/opencode/storage/repos.py:50` | 不导出 |
+| `opencode.storage.repos.REASON_MESSAGE_ROW_DECODE_FAILED` | constant | `"message_row_decode_failed"` | 投影消息行解码失败原因 | `src/opencode/storage/repos.py:53` | 不导出 |
+| `opencode.storage.repos.REASON_SESSION_ROW_DECODE_FAILED` | constant | `"session_row_decode_failed"` | sessions 行 JSON 解码失败原因 | `src/opencode/storage/repos.py:56` | 不导出 |
+| `opencode.storage.repos.NotFoundError` | exception | `class NotFoundError(StoreError)`；`code = CoreErrorCode.NOT_FOUND` | 未创建 session | `src/opencode/storage/repos.py:69` | 导出 |
+| `opencode.storage.repos.InvalidCursorError` | exception | `class InvalidCursorError(StoreError)`；`code = CoreErrorCode.INVALID_CURSOR` | 游标非法/不属本 session 或本查询 | `src/opencode/storage/repos.py:75` | 导出 |
+| `opencode.storage.repos.SessionRecord` | class (dataclass, frozen, slots) | `session_id: str; status: str; applied_seq: int; active_run_id: str \| None = None; config_snapshot: JsonObject \| None = None; snapshot_hash: str \| None = None; diagnostic: JsonObject \| None = None` | 只读 sessions 行视图 | `src/opencode/storage/repos.py:82` | 导出 |
+| `opencode.storage.repos.MessagePage` | class (dataclass, frozen, slots) | `items: list[UserMessage]; next_after_message_id: str \| None; has_more: bool` | 按 seq 排序的投影消息页 | `src/opencode/storage/repos.py:95` | 导出 |
+| `opencode.storage.repos.clamp_page_limit` | function | `(limit: int) -> int` | 将 limit 夹到 1..1000；bool/非整数拒绝 | `src/opencode/storage/repos.py:108` | 不导出 |
+| `opencode.storage.repos.ReadRepositories` | class | `__init__(engine: AsyncEngine); async session(session_id: str) -> SessionRecord \| None; async messages(session_id: str, *, after_message_id: str \| None = None, limit: int = DEFAULT_PAGE_LIMIT) -> MessagePage` | 只读查询面（sessions/messages），不写、不加锁、不依赖 bus | `src/opencode/storage/repos.py:115` | 导出 |
+
+**S6 对既有面的核对**：`git diff 35bc781 f8ce8f6 --stat` 显示源码改动仅 `src/opencode/bus/eventlog.py`（新增）、`src/opencode/storage/repos.py`（新增）、`src/opencode/storage/__init__.py`（+12 行，纯追加 5 导出）与 `tests/integration/test_eventlog.py`（新增）；`bus/bus.py`、`bus/__init__.py`、`storage/txn.py`、`storage/store.py`、`storage/db.py`、`src/opencode/session/` **零触碰**。导出面核对：`storage.__all__` **26**（21+5，无删除）、`bus.__all__` **4**、`session.__all__` **5**。
+
 ## 2. 错误码三方对照表
 
 契约来源：`doc/CORE-CONTRACTS.md` §8，全部 22 个码位于**同一行 L340**（逐个直读，非记忆）。实现：`CoreErrorCode` 成员，`src/opencode/contracts/errors.py:24-45`。
@@ -140,11 +173,11 @@ S5 说明：`bus/__init__.py` 仅再导出（`__all__` 4 项），无模块级�
 |---|---|---|---|---|
 | `ValidationError` | L340 | `errors.py:24`（`VALIDATION_ERROR`） | 6（4 + 2） | 一致 |
 | `UnsupportedCapability` | L340 | `errors.py:25`（`UNSUPPORTED_CAPABILITY`） | 1 | 一致 |
-| `NotFound` | L340 | `errors.py:26`（`NOT_FOUND`） | 4（2 + 2） | 一致 |
+| `NotFound` | L340 | `errors.py:26`（`NOT_FOUND`） | 6（2 + 4） | 一致 |
 | `SessionBusy` | L340 | `errors.py:27`（`SESSION_BUSY`） | 2 | 一致 |
 | `Conflict` | L340 | `errors.py:28`（`CONFLICT`） | 4（1 + 3） | 一致 |
 | `IdempotencyConflict` | L340 | `errors.py:29`（`IDEMPOTENCY_CONFLICT`） | 4（1 + 3） | 一致 |
-| `InvalidCursor` | L340 | `errors.py:30`（`INVALID_CURSOR`） | 2 | 一致 |
+| `InvalidCursor` | L340 | `errors.py:30`（`INVALID_CURSOR`） | 6（1 + 5） | 一致 |
 | `PermissionDenied` | L340 | `errors.py:31`（`PERMISSION_DENIED`） | 1 | 一致 |
 | `ApprovalUnavailable` | L340 | `errors.py:32`（`APPROVAL_UNAVAILABLE`） | 1 | 一致 |
 | `ApprovalExpired` | L340 | `errors.py:33`（`APPROVAL_EXPIRED`） | 1 | 一致 |
@@ -155,13 +188,13 @@ S5 说明：`bus/__init__.py` 仅再导出（`__all__` 4 项），无模块级�
 | `ProviderStreamInterrupted` | L340 | `errors.py:38`（`PROVIDER_STREAM_INTERRUPTED`） | 3（R0 spike 断言） | 一致 |
 | `ContextLimitExceeded` | L340 | `errors.py:39`（`CONTEXT_LIMIT_EXCEEDED`） | 1 | 一致 |
 | `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 3（1 + 2） | 一致 |
-| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 14（1 + 13） | 一致 |
+| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 20（1 + 19） | 一致 |
 | `MigrationRequired` | L340 | `errors.py:42`（`MIGRATION_REQUIRED`） | 2 | 一致 |
 | `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 3（1 + 2） | 一致 |
 | `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 1 | 一致 |
 | `LifecycleCleanupFailed` | L340 | `errors.py:45`（`LIFECYCLE_CLEANUP_FAILED`） | 1 | 一致 |
 
-汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **62**（首派 45 → S3 53 → S4 61 → 本次 62，+1：仅 `SLOW_CONSUMER` 2→3，来自 S5 `tests/contract/test_bus.py` / `tests/integration/test_bus_commit.py`；其余 21 码不变）。
+汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **74**（首派 45 → S3 53 → S4 61 → S5 62 → 本次 74，+12）：`NotFound` 4→6（+2）、`InvalidCursor` 2→6（+4）、`StorageCorrupt` 14→20（+6），全部来自 S6 新增 `tests/integration/test_eventlog.py`；其余 19 码不变。
 
 ## 3. 盘点方法注记（可复现）
 
@@ -183,8 +216,11 @@ S5 说明：`bus/__init__.py` 仅再导出（`__all__` 4 项），无模块级�
 16. S5 滚动（T-C2-004）定义行号：`Select-String -Path src/opencode/bus/bus.py -Pattern '^(type |class |def |[A-Z_]+ = )'`；公共名 4 个（`Event`/`DEFAULT_QUEUE_LIMIT`/`SlowConsumerError`/`VolatileBus`）。
 17. S5 导出面与零触碰核对：`Select-String -Path src/opencode/{storage,session,bus}/__init__.py -Pattern '^    "'` 计数得 21/5/4；`git diff 18f74ff f45f880 --stat` 确认源码改动仅 `bus/` 两文件 + 两测试文件。
 18. S5 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/contract/test_bus.py`、`tests/integration/test_bus_commit.py` 的全 `tests/` 树，显式 `-CaseSensitive`。
+19. S6 滚动（T-C2-005）定义行号：`Get-ChildItem src/opencode/bus/eventlog.py,src/opencode/storage/repos.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(type |class |def |[A-Z_]+ = |@dataclass)' }`；公共名 13 + 11。
+20. S6 导出面与零触碰核对：`Select-String -Path src/opencode/{storage,session,bus}/__init__.py -Pattern '^    "'` 计数得 26/5/4；`git diff 35bc781 f8ce8f6 --stat` 确认源码改动仅 `bus/eventlog.py`、`storage/repos.py`、`storage/__init__.py`（纯追加 5 导出）+ 一测试文件。
+21. S6 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/integration/test_eventlog.py` 的全 `tests/` 树，显式 `-CaseSensitive`。
 
 ### 观测到的非本任务差异（仅报告，未处理）
 
-- 门禁 `ruff format --check .` 本次输出 **97 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S4 滚动记录为 88，变化来自扫描集合（工作树新增 S5 文件），无格式问题。
-- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（调度器常驻未跟踪目录；S5 已随 merge #46 `f45f880` 落库，源码无待提交改动）。本任务只修改本文件，未触碰该路径。
+- 门禁 `ruff format --check .` 本次输出 **106 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S5 滚动记录为 97，变化来自扫描集合（工作树新增 S6 文件），无格式问题。
+- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（调度器常驻未跟踪目录；S6 已随 merge #52 `f8ce8f6` 落库，源码无待提交改动）。本任务只修改本文件，未触碰该路径。
