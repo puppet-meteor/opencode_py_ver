@@ -30,12 +30,18 @@ the r1-slices R1-S6 acceptance list over ``opencode.bus.eventlog.EventLog`` and
   missing read model with a surviving log -> StorageCorrupt (never faked
   empty), undecodable message rows fail closed with the bad row located;
 - queries and reads make no external calls (socket/subprocess banned under
-  monkeypatch, the S4 assertion pattern).
+  monkeypatch, the S4 assertion pattern);
+- structure: ``opencode.storage.repos`` and the ``opencode.storage`` package
+  import nothing bus-flavored -- the bus-freedom ``repos.py`` claims is
+  pinned here, while ``opencode.bus.eventlog`` stays out of scope by design
+  (it is the DB+bus-coupled durable read face).
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import socket
 import sqlite3
@@ -43,7 +49,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -876,3 +882,34 @@ async def test_reads_and_queries_make_no_external_calls(tmp_path: Path, monkeypa
             received = [await anext(items) for _ in range(5)]
             assert [item.seq for item in received if isinstance(item, DurableEvent)] == [1, 2, 3, 4]
             assert isinstance(received[-1], Synced)
+
+
+# -- structure: storage stays bus-free ---------------------------------------------
+
+
+def _imported_module_names(module: ModuleType) -> list[str]:
+    """All module names imported by ``module`` (imports only, not docstrings)."""
+    tree = ast.parse(inspect.getsource(module))
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.append(node.module or "")
+    return names
+
+
+def test_repos_and_storage_package_are_structurally_bus_free() -> None:
+    """The ``repos.py`` docstring claims storage's bus-freedom is "asserted
+    structurally by tests/integration/test_eventlog.py"; this is that
+    assertion (the S3 store/txn AST walk, helper copied locally): neither
+    ``opencode.storage.repos`` nor the ``opencode.storage`` package may
+    import any bus-flavored name. ``opencode.bus.eventlog`` is deliberately
+    out of scope -- it is the DB+bus-coupled durable read face by design
+    (the S5 structural test pins the bus-side modules instead)."""
+    import opencode.storage as storage_package
+    import opencode.storage.repos as repos_module
+
+    for module in (repos_module, storage_package):
+        for name in _imported_module_names(module):
+            assert "bus" not in name.lower(), f"{module.__name__} must not import {name}"
