@@ -21,6 +21,7 @@ from opencode.storage.db import (
     open_database,
 )
 from opencode.storage.repos import (
+    AcceptedPrompt,
     InvalidCursorError,
     MessagePage,
     NotFoundError,
@@ -43,6 +44,7 @@ from opencode.storage.txn import (
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "WRITER_LOCK_NAME",
+    "AcceptedPrompt",
     "ConflictError",
     "Database",
     "DatabaseNotFoundError",
