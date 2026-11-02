@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-PROBE_VERSION = "r0b-1"
+PROBE_VERSION = "r0b-2"
 GRACE_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.1
 MARKER_TIMEOUT_SECONDS = 20.0
@@ -299,12 +299,20 @@ _PS_TREE_SCRIPT = (
     "  Start-Sleep -Milliseconds 50\n"
     "}\n"
     "if (Test-Path -LiteralPath $ProceedMarker) {\n"
-    "  $gc = Start-Process -FilePath 'powershell.exe' "
+    "  $gc = Start-Process -FilePath '__R0B_INTERPRETER__' "
     "-ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 300' -PassThru -WindowStyle Hidden\n"
     '  Set-Content -LiteralPath $GrandchildMarker -Value ("grandchild=" + $gc.Id)\n'
     "}\n"
     "Start-Sleep -Seconds 300\n"
 )
+
+
+def _ps_tree_script(interpreter_exe: str) -> str:
+    """Materialize the tree script with the SAME interpreter the probe selected
+    (powershell.exe or the pwsh.exe fallback) -- the grandchild must never
+    hardcode a different shell than the child."""
+    escaped = interpreter_exe.replace("'", "''")
+    return _PS_TREE_SCRIPT.replace("__R0B_INTERPRETER__", escaped)
 
 
 def _wait_for_tree_markers(child_marker: Path, grandchild_marker: Path, timeout: float) -> dict[str, int]:
@@ -369,7 +377,7 @@ def _run_tree_scenario(scenario_dir: Path, scenario: str, interpreter_exe: str) 
         if sys.platform == "win32":
             job = _win_create_kill_on_close_job()
             script_path = scenario_dir / "tree.ps1"
-            script_path.write_text(_PS_TREE_SCRIPT, encoding="utf-8")
+            script_path.write_text(_ps_tree_script(interpreter_exe), encoding="utf-8")
             child = subprocess.Popen(
                 [
                     interpreter_exe,
@@ -993,7 +1001,10 @@ def _leak_self_check(evidence: dict[str, Any]) -> None:
 
 
 def build_evidence(checks: list[CheckResult], unsupported: list[dict[str, str]], generated_by: str) -> dict[str, Any]:
-    verified_names = [check.name for check in checks if check.status in ("verified", "restricted")]
+    # Only fully-verified checks may appear in ci_verified/manual_verified;
+    # restricted checks are recorded separately and never masquerade as verified.
+    verified_names = [check.name for check in checks if check.status == "verified"]
+    restricted_names = [check.name for check in checks if check.status == "restricted"]
     evidence: dict[str, Any] = {
         "probe_version": PROBE_VERSION,
         "platform": {
@@ -1009,6 +1020,7 @@ def build_evidence(checks: list[CheckResult], unsupported: list[dict[str, str]],
         },
         "ci_verified": verified_names if generated_by == "ci" else [],
         "manual_verified": verified_names if generated_by == "manual" else [],
+        "restricted": restricted_names,
         "unsupported": unsupported,
         "checks": {check.name: check.to_dict() for check in checks},
         "notes": [

@@ -1,9 +1,10 @@
 # 平台支持（R0-B 探针实测）
 
 > 状态：R0-B 平台与本地存储探针的实测结论。
-> 证据：[evidence/r0/platform.json](evidence/r0/platform.json)（本地 Windows 全量重跑生成，probe_version `r0b-1`）；
+> 证据：[evidence/r0/platform.json](evidence/r0/platform.json)（本地 Windows 全量重跑生成，probe_version `r0b-2`）；
 > 测试：`tests/r0/test_platform_probe.py`（8 项）；探针：`tools/r0/platform_probe.py`。
 > CI 证据：run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)（ubuntu+windows 全绿，artifact `platform-probe-<os>`）；本地结果只记 `manual_verified`，CI 结果只在 CI 侧记 `ci_verified`，互不冒充。
+> `r0b-2` 语义修正：`ci_verified`/`manual_verified` 只收录 status=verified 的检查项；restricted 检查项单独记入顶层 `restricted` 名单（配 `unsupported` 原因），绝不混入 verified 名单；进程树孙进程统一使用探针选中的解释器（含 pwsh 回退），不再硬编码。
 
 ## 1. 已验证平台（实测）
 

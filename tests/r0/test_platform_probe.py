@@ -190,7 +190,14 @@ def test_cli_writes_sanitized_evidence() -> None:
     for name, check in evidence["checks"].items():
         assert check["status"] in {"verified", "restricted"}, (name, check)
     if any(check["status"] == "restricted" for check in evidence["checks"].values()):
+        assert evidence["restricted"]
         assert evidence["unsupported"]
+        # Restricted checks are never listed as verified.
+        for name in evidence["restricted"]:
+            assert name not in evidence["manual_verified"]
+            assert name not in evidence["ci_verified"]
+    else:
+        assert evidence["restricted"] == []
     assert evidence["ci_verified"] == []
     assert evidence["manual_verified"]
 
@@ -206,18 +213,46 @@ def test_cli_writes_sanitized_evidence() -> None:
 
 
 def test_evidence_generation_modes_and_leak_guard() -> None:
+    from tools.r0.platform_probe import _leak_self_check, _ps_tree_script
+
     checks = [CheckResult("interpreter", "verified", {"version": "1"})]
 
     ci = build_evidence(checks, [], "ci")
     assert ci["ci_verified"] == ["interpreter"]
     assert ci["manual_verified"] == []
+    assert ci["restricted"] == []
     assert ci["generated"]["by"] == "ci"
 
     manual = build_evidence(checks, [], "manual")
     assert manual["manual_verified"] == ["interpreter"]
     assert manual["ci_verified"] == []
 
-    from tools.r0.platform_probe import _leak_self_check
+    # Regression: a restricted check must never masquerade as verified in
+    # ci_verified/manual_verified; it is recorded in its own `restricted` list.
+    mixed = [
+        CheckResult("interpreter", "verified", {}),
+        CheckResult(
+            "path_containment", "restricted", {"unsupported_capabilities": [{"capability": "symlink creation"}]}
+        ),
+    ]
+    evidence = build_evidence(
+        mixed, [{"check": "path_containment", "capability": "symlink creation", "reason": "x"}], "ci"
+    )
+    assert evidence["ci_verified"] == ["interpreter"]
+    assert evidence["manual_verified"] == []
+    assert "path_containment" not in evidence["ci_verified"]
+    assert evidence["restricted"] == ["path_containment"]
+    assert evidence["unsupported"]
+
+    # Regression: the grandchild is spawned with the SAME interpreter the
+    # probe selected (powershell.exe or the pwsh.exe fallback), never a
+    # hardcoded one, and the placeholder is fully materialized.
+    pwsh = "C:/Program Files/PowerShell/7/pwsh.exe"
+    script = _ps_tree_script(pwsh)
+    assert f"-FilePath '{pwsh}'" in script
+    assert "__R0B_INTERPRETER__" not in script
+    assert "powershell.exe" not in script
+    assert "''" in _ps_tree_script("C:/it's/pwsh.exe")  # single quotes are escaped
 
     leaky = build_evidence([CheckResult("path_containment", "verified", {"detail": str(Path.home())})], [], "manual")
     with pytest.raises(ValueError, match="leak"):
