@@ -99,3 +99,21 @@ class SessionStore:
         idempotency replay).
         """
         return await self._writer.commit(session_id, batch, expected_seq)
+
+    async def rebuild(self, session_id: str) -> None:
+        """§3.3 management rebuild: restore one session's read model from the log.
+
+        A controlled administrative write, not a §3.2 business commit: one
+        transaction under the writer's per-session lock replays the session's
+        full log through the S4 fold and replaces the read model only after
+        the whole log validates and projects (§3.3: full validation before the
+        replacement commits). Any failure rolls the whole transaction back --
+        the clearing included, the original projection preserved -- and the
+        session is isolated (§3.2.1), with the discovering call raising
+        :class:`~opencode.storage.txn.StorageCorruptError`. Rebuild appends no
+        events, never advances seq, never notifies, is idempotent (same log ->
+        same final state), and carries a surviving row's administrative
+        status/diagnostic over verbatim (a read_only_diagnostic session
+        rebuilds to a restored but still read-only state, §3.2.1 L196).
+        """
+        await self._writer.rebuild(session_id)

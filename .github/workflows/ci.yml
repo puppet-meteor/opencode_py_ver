@@ -24,8 +24,8 @@ jobs:
         run: uv lock --check
       - name: Sync locked environment
         run: uv sync --locked
-      - name: Provider contract tests
-        run: uv run pytest -q tests/r0
+      - name: Test suite (R0 contracts + R1 integration, full)
+        run: uv run pytest -q
       - name: Platform probe (R0-B)
         # Sanitized evidence only: the probe records <WORKSPACE>/<TEMP>
         # placeholders, no host paths, usernames, PIDs, secrets or endpoints.
@@ -43,4 +43,4 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
       - name: Type check
-        run: uv run mypy src tools/r0 tests/r0
+        run: uv run mypy src tools/r0 tests/r0 tests/contract tests/integration

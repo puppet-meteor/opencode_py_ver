@@ -27,6 +27,14 @@ differences per §3.2: idempotency key = EventBatch.id + event id + content,
 checked BEFORE expected_seq; expected_seq is the caller's expected pre-commit
 H (equality only, never "catch up"); TS owner/strictOwner replay semantics
 are not implemented.
+
+The R1-S8 rebuild (§3.3) also lives here: :meth:`TransactionWriter.rebuild`
+replaces one session's read model under the same lock pair in one transaction
+(clear -> fail-closed replay through the S4 fold -> re-project -> verify ->
+commit; administrative marks carried over verbatim) and shares the §3.2.1
+isolation entry with the commit path. The fold itself is imported at call
+time from ``opencode.session.state`` -- a module-level import would cycle
+(``opencode.session`` imports this package via the projector).
 """
 
 from __future__ import annotations
@@ -68,6 +76,16 @@ REASON_ILLEGAL_SEQ = "illegal_seq"
 REASON_UNKNOWN_STATUS = "unknown_session_status"
 REASON_STORED_DECODE_FAILED = "stored_event_decode_failed"
 REASON_PROJECTION_INVARIANT = "applied_seq_not_advanced_after_projection"
+#: R1-S8 rebuild replay: the log cannot produce a legal session through the
+#: fold (first event not py.session.created, prompt before create, a second
+#: create) -- ownership/transition damage over the stored log (§3.2.1 L191).
+REASON_REPLAY_ILLEGAL_TRANSITION = "replay_illegal_transition"
+#: A message id repeated across replayed events (reachable only through a
+#: hand-tampered log; the commit path rejects the second projection inline).
+REASON_REBUILD_DUPLICATE_MESSAGE = "rebuild_duplicate_message_id"
+#: The rebuild's post-projection invariant: the rebuilt sessions row must land
+#: at applied_seq = H, the last replayed event seq (mirrors the commit check).
+REASON_REBUILD_INVARIANT = "rebuild_applied_seq_mismatch"
 
 _SELECT_SESSION_STATUS = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
 _SELECT_SESSION_APPLIED = sa.text("SELECT applied_seq FROM sessions WHERE session_id = :sid")
@@ -100,6 +118,22 @@ _UPDATE_SESSION_DIAGNOSTIC = sa.text(
 )
 _INSERT_SESSION_DIAGNOSTIC = sa.text(
     "INSERT INTO sessions (session_id, status, applied_seq, diagnostic) VALUES (:sid, 'read_only_diagnostic', 0, :diag)"
+)
+# -- R1-S8 rebuild (§3.3): the read-model replacement runs in one transaction --
+_SELECT_SESSION_EVENTS = sa.text(
+    "SELECT id, session_id, seq, type, version, created, data, metadata "
+    "FROM events WHERE session_id = :sid ORDER BY seq"
+)
+_SELECT_REBUILD_SESSION = sa.text("SELECT status, applied_seq, diagnostic FROM sessions WHERE session_id = :sid")
+_DELETE_SESSION_MESSAGES = sa.text("DELETE FROM messages WHERE session_id = :sid")
+_DELETE_SESSION_ROW = sa.text("DELETE FROM sessions WHERE session_id = :sid")
+_INSERT_REBUILT_SESSION = sa.text(
+    "INSERT INTO sessions (session_id, status, config_snapshot, snapshot_hash, "
+    "active_run_id, applied_seq, diagnostic) VALUES "
+    "(:sid, :status, :config_snapshot, :snapshot_hash, :active_run_id, :applied_seq, :diagnostic)"
+)
+_INSERT_REBUILT_MESSAGE = sa.text(
+    "INSERT INTO messages (session_id, message_id, seq, data) VALUES (:sid, :message_id, :seq, :data)"
 )
 
 
@@ -305,6 +339,50 @@ class TransactionWriter:
                             # in-memory write gate holds and the original
                             # corruption error is re-raised, explicitly
                             # chained to the persistence failure (N-1).
+                            raise corruption from persist_error
+                    raise
+
+    async def rebuild(self, session_id: str) -> None:
+        """§3.3 rebuild: replay the session's log onto a fresh read model.
+
+        R1-S8. One write transaction under the per-session lock plus the
+        process-wide write lock (the commit pattern): clear the session's
+        read-model rows, read the full log in seq order, decode + fold every
+        event (fail closed on unknown type/version, undecodable JSON, seq
+        gaps/duplicates/illegal values, snapshot-hash mismatch, illegal fold
+        transitions), re-project the sessions/messages rows from the fold's
+        final state, verify applied_seq = H, and only then commit. Any
+        failure rolls the whole transaction back -- the clearing included, so
+        the original projection survives untouched (§3.3: no half read model
+        before a bad point, no bad-point skipping) -- then isolates the
+        session (§3.2.1) in an independent short transaction and re-raises
+        the StorageCorrupt. Rebuild appends no business events, never
+        advances seq, and never notifies (§3.3; structurally guaranteed --
+        this module cannot reach a bus). Idempotent: the same log replays to
+        the same final state. A projection lag (A<H) is NOT corruption:
+        applied_seq := H is exactly the rebuild's job. A surviving sessions
+        row's administrative face (status, diagnostic) is carried over
+        verbatim -- rebuild restores data, it never clears a management mark
+        (§3.2.1 L196), so a read_only_diagnostic session rebuilds to a
+        restored but still read-only state.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            raise StoreValidationError("session_id must be a non-empty string")
+        async with self._session_lock(session_id):
+            async with self._write_lock:
+                try:
+                    await self._rebuild_transaction(session_id)
+                except StorageCorruptError as corruption:
+                    if corruption.isolate:
+                        # The rebuild transaction already rolled back entirely
+                        # (the clearing included); isolation runs in an
+                        # independent short transaction (§3.2.1/§3.3).
+                        try:
+                            await self._isolate_locked(session_id, _diagnostic_from(corruption))
+                        except StorageError as persist_error:
+                            # Same N-1 contract as the commit path: the
+                            # in-memory write gate holds, the original
+                            # corruption error stays caller-facing.
                             raise corruption from persist_error
                     raise
 
@@ -579,6 +657,191 @@ class TransactionWriter:
         for event in durables:
             await self._projector.apply(connection, event)
         return durables
+
+    async def _rebuild_transaction(self, session_id: str) -> None:
+        """One transaction: clear + replay + re-project; commit only on success."""
+        async with self._engine.connect() as connection:
+            try:
+                await self._rebuild_sequence(connection, session_id)
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+
+    async def _rebuild_sequence(self, connection: AsyncConnection, session_id: str) -> None:
+        """§3.3 replay: clear the read model, fold the log, re-project, verify.
+
+        Fail-closed replay validation (§3.2.1 L191 detection scope over the
+        rebuild path): unknown type/version, invalid JSON or a snapshot-hash
+        mismatch (§6.2 -- the ``DurableEvent[SessionCreatedData]`` envelope
+        itself re-verifies the hash, so all three surface at decode), seq not
+        starting at 1 and consecutive by 1 (gap/duplicate/illegal value), and
+        fold-transition damage (the first event not being
+        ``py.session.created`` included -- the fold is the single source of
+        transition rules, so that check IS the fold raising) all raise
+        StorageCorrupt with isolation; the transaction-local
+        post-projection invariant only rolls back. ``state.apply`` is
+        imported at call time on purpose: ``opencode.session`` imports this
+        package (session.projector -> storage), so a module-level import
+        would cycle; every rebuild caller (the session service / composition
+        root) already has the session package loaded by then.
+        """
+        from opencode.session.state import IllegalTransitionError, SessionState, SessionStatus, apply
+
+        # The administrative face of a surviving row is carried over verbatim
+        # (§3.2.1 L196); an unknown stored status is stored-projection
+        # corruption with the commit/read gates' classification (fail closed).
+        management = (await connection.execute(_SELECT_REBUILD_SESSION, {"sid": session_id})).first()
+        status = SessionStatus.ACTIVE.value
+        diagnostic: str | None = None
+        applied_at_discovery = 0
+        if management is not None:
+            try:
+                SessionStatus(str(management.status))
+            except ValueError as error:
+                raise _corruption(
+                    REASON_UNKNOWN_STATUS,
+                    Diagnostic(reason=REASON_UNKNOWN_STATUS, applied_seq=int(management.applied_seq)),
+                ) from error
+            status = str(management.status)
+            diagnostic = management.diagnostic
+            applied_at_discovery = int(management.applied_seq)
+
+        # Clear the read model inside the transaction: any later failure rolls
+        # the clearing back with everything else (§3.3 全部回滚).
+        await connection.execute(_DELETE_SESSION_MESSAGES, {"sid": session_id})
+        await connection.execute(_DELETE_SESSION_ROW, {"sid": session_id})
+
+        rows = (await connection.execute(_SELECT_SESSION_EVENTS, {"sid": session_id})).fetchall()
+        if not rows:
+            # An empty log has nothing to replay: a surviving row is the §3.2.1
+            # minimal diagnostic record (kept as-is -- it is not a
+            # py.session.created and must not become an executable session),
+            # and a missing row is the never-created NotFound the service-level
+            # gate already answered before reaching here.
+            return
+
+        state = SessionState()
+        message_rows: list[dict[str, Any]] = []
+        expected_seq = 1
+        for row in rows:
+            seq = int(row.seq)
+            if seq < 1:
+                raise _corruption(
+                    REASON_ILLEGAL_SEQ,
+                    Diagnostic(
+                        reason=REASON_ILLEGAL_SEQ,
+                        first_bad_seq=seq,
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied_at_discovery,
+                    ),
+                )
+            if seq > expected_seq:
+                # The first missing seq locates the gap (mirrors the commit
+                # path's _SELECT_FIRST_GAP_SEQ semantics).
+                raise _corruption(
+                    REASON_SEQ_GAP,
+                    Diagnostic(reason=REASON_SEQ_GAP, first_bad_seq=expected_seq, applied_seq=applied_at_discovery),
+                )
+            if seq < expected_seq:
+                # Defensive: unique(session_id, seq) makes duplicate seqs
+                # unreachable through storage; kept fail closed regardless.
+                raise _corruption(
+                    REASON_DUPLICATE_SEQ,
+                    Diagnostic(
+                        reason=REASON_DUPLICATE_SEQ,
+                        first_bad_seq=seq,
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied_at_discovery,
+                    ),
+                )
+            try:
+                event = self._decode_stored(row)
+            except (EventDecodeError, ValueError) as error:
+                raise _corruption(
+                    REASON_STORED_DECODE_FAILED,
+                    Diagnostic(
+                        reason=REASON_STORED_DECODE_FAILED,
+                        first_bad_seq=seq,
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+            try:
+                appended_from = len(state.messages)
+                state = apply(state, event)
+                for message in state.messages[appended_from:]:
+                    message_rows.append(
+                        {
+                            "sid": session_id,
+                            "message_id": message.id,
+                            "seq": seq,
+                            "data": canonical_json(message.model_dump(mode="json")),
+                        }
+                    )
+            except IllegalTransitionError as error:
+                raise _corruption(
+                    REASON_REPLAY_ILLEGAL_TRANSITION,
+                    Diagnostic(
+                        reason=REASON_REPLAY_ILLEGAL_TRANSITION,
+                        first_bad_seq=seq,
+                        first_bad_event_id=str(row.id),
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+            expected_seq += 1
+
+        if (
+            state.session_id is None
+            or state.status is None
+            or state.config_snapshot is None
+            or state.snapshot_hash is None
+        ):
+            # Unreachable for a non-empty legal log (the fold created the
+            # session above); kept so every failure surfaces as a StoreError.
+            raise _corruption(
+                REASON_REPLAY_ILLEGAL_TRANSITION,
+                Diagnostic(reason=REASON_REPLAY_ILLEGAL_TRANSITION, applied_seq=applied_at_discovery),
+            )
+        await connection.execute(
+            _INSERT_REBUILT_SESSION,
+            {
+                "sid": session_id,
+                "status": status,
+                "config_snapshot": canonical_json(state.config_snapshot.model_dump(mode="json")),
+                "snapshot_hash": state.snapshot_hash,
+                "active_run_id": state.active_run_id,
+                "applied_seq": state.applied_seq,
+                "diagnostic": diagnostic,
+            },
+        )
+        for message_row in message_rows:
+            try:
+                # One INSERT per row so a violation locates the offending row.
+                await connection.execute(_INSERT_REBUILT_MESSAGE, message_row)
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_MESSAGE,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_MESSAGE,
+                        first_bad_seq=int(message_row["seq"]),
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+
+        # Post-projection invariant (mirrors the commit path's A=H+n check):
+        # the rebuilt row must land at applied_seq = H, the last replayed seq.
+        after = (await connection.execute(_SELECT_SESSION_APPLIED, {"sid": session_id})).first()
+        if after is None or int(after.applied_seq) != state.applied_seq:
+            raise StorageCorruptError(
+                "rebuild did not set sessions.applied_seq to the log watermark",
+                isolate=False,
+                details={
+                    "reason": REASON_REBUILD_INVARIANT,
+                    "session_id": session_id,
+                    "expected_applied_seq": state.applied_seq,
+                },
+            )
 
     async def _isolate_locked(self, session_id: str, diagnostic: Diagnostic) -> None:
         """Short independent transaction persisting the diagnostic state (§3.2.1).
