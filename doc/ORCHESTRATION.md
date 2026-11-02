@@ -75,7 +75,7 @@
 | T-C1-001 | C-1 | R1-S1 试点：最小 contracts+fixture | 14:20 | 活性监控（1h 日志零增量） | 已验收（14:55） | src/opencode/contracts/、tests/contract/ |
 | T-B-002 | B | R1-S1 结构化审查 | 14:59 | 活性监控（1h 日志零增量） | 已验收（15:07） | doc/reviews/R1-S1-review.md |
 | T-A-003 | A | 契约微裁决（审查遗留 7 项） | 15:14（resume 续接） | 活性监控（1h 日志零增量） | 派发中 | doc/CORE-CONTRACTS.md、doc/parity.md（修订） |
-| T-B-003 | B | r1-slices.md 修订（审查报告 §4 九条） | 15:14 | 活性监控（1h 日志零增量） | 派发中 | doc/plans/r1-slices.md（修订） |
+| T-B-003 | B | r1-slices.md 修订（审查报告 §4 九条） | 15:14 | 活性监控（1h 日志零增量） | 已验收（15:22） | doc/plans/r1-slices.md（修订） |
 
 ## 7. 调度日志
 
@@ -92,7 +92,8 @@
 - 14:59 T-A-002 回报"完成"（14:21 实启，~38min）。验收通过：4 项裁决全部落为正式条款无 TBD——§6.1 R1 最小快照精确形状（schema_version=Literal[1]+permission_rules=[] 唯一合法对象）、§6.2 canonical JSON+SHA-256+摘要常量钉死（77c932c3…f802）、§3.2 H/A 水位与 expected_seq 语义（A≠H=StorageCorrupt 而非 Conflict）、§3.2.1 只读诊断裁决+§4 read/follow 坏页 StorageCorrupt 边界、§7 prompt 固定顺序（状态门禁→幂等→busy）+RunRef 三字段；每项附 TS 行号引用或"TS 无对应物+Python 侧论证"；changelog 行在；§9 逐条 B 草案冲突对照+最终口径；git 仅修改 CORE-CONTRACTS.md（+80/-18）。交叉核对：C-1 已提交 R1-S1 实现与 §6.1/§6.2 最终口径逐项一致（无内嵌 hash/Literal[1]/空规则强制/摘要常量相同/decode 重算）——A×C 对齐闭环，无需修订任务。同刻补正：T-B-002 实际派发（上轮 commit 文案已声明但进程未发，调度器失误已纠正）。检查点#8 提交；监视器刷新为 T-B-002 日志。
 - 15:07 T-B-002 回报"完成"（14:59 实启，~8min）。验收通过：结论**通过**（0 blocker/0 major/4 minor/3 nit）；发现逐条带严重度+位置+理由+建议；C-1 六项未决问题逐项回应；git 仅新增 doc/reviews/R1-S1-review.md。B 复验扎实：独立重跑 44 测试+ruff、stdlib 独立复算摘要常量、实测 EventDraft(version=True) 探出 M-1 bool 穿透。**试点全流程闭环达成**（派发→实现→验收#7→A 裁决#8→B 审查通过）。后续分派：T-A-003（A 裁决 M-2 files/M-3 extra-forbid 兼容路线/ID 前缀/bool-int 约定/JSON Schema 归属/Ephemeral 时点 + parity 两行）∥ T-B-003（B 按审查 §4 九条修订 r1-slices.md，A 待裁项按 B 建议预写并标注）；两者回报后→T-C1-002（contracts 修补批次：M-1/M-4/N-2+裁决落地）→ 建 worktree → T-C1-003（R1-S2）。检查点#9 提交；监视器刷新为 A-003+B-003。
 - 15:17 用户确认停止节奏：**维持现状**（自主推进到 R1 退出条件；复估触发/升级链/网络故障自动暂停，R2 前天然停找用户要 MAAS 凭据；用户随时可手动喊停=无损冻结在最近检查点）。同刻观察：B 席已在修改其授权文件 doc/plans/r1-slices.md（T-B-003 实际开工证据）。
-- 下一事件：T-A-003 / T-B-003 回报 → 各自验收 → T-C1-002（contracts 修补）+ worktree 创建 → T-C1-003（R1-S2 迁移 0001+引擎打开）→ S3 起按依赖序。
+- 15:22 T-B-003 回报"完成"（15:14 实启，~8min）。验收通过：九条修订逐条核对落实——①S2 依赖更正（仅 alembic/sqlalchemy/aiosqlite，pydantic 前移注记）②S1 交付追认（ConfigSnapshot/canonical_json/compute_snapshot_hash/RUN_SCOPED_EVENT_TYPES/22 错误码全锁/8 fixture/摘要常量钉死测试）③files 按 B 建议 (a) 预写并标"待 T-A-003 终裁"（含备选 (b)）④S3 并入 H/A 水位不变量+写入门禁先于幂等+§3.2.1 隔离入口归 S3/全量检测归 S8+水位/隔离测试点⑤S6 坏页语义七项断言（整页 StorageCorrupt/无半页/next_cursor 不推进/cursor 回退/follow 保健康后终止/H=日志水位/details 脱敏）⑥S7 四步固定顺序+RunRef 三非空字段+ID 生成器对齐 TS ascending() 注记（前缀强制待裁）+accepted 占槽/close 只释放自有资源⑦S8 rebuild 同事务全验证/失败回滚含清空/诊断标记跨 reopen 保留/诊断期禁恢复补写⑧§3 差异表补第 7-9 三行⑨开放问题 #1-#4 标已决引 CORE-CONTRACTS §9、新增 #5 待 T-A-003 三连、原 #5-#7 顺移 #6-#8 并更新估算（R1 目标 5 人日/上限 6）。文件头 [T-B-003] 修订行在；git 仅改 r1-slices.md（+44/-30）；过时行号引用已替换为章节引用。检查点#11 提交；监视器刷新为仅盯 T-A-003。
+- 下一事件：T-A-003 回报 → 验收（7 项裁决全落无 TBD/TS 引用或 Python-only 论证/changelog+parity 两行/git 仅改 CORE-CONTRACTS+parity）→ 若与 B 预写（r1-slices #5/§2 S1/S7）不同派 B 微调 → T-C1-002（contracts 修补批次：M-1 bool 守卫/M-4 反例补测/N-2 边界断言+A-003 裁决落地）→ 建 C-1 worktree → T-C1-003（R1-S2：Alembic 0001+引擎打开）。
 
 ## 待用户定夺（不阻塞冒烟）
 
