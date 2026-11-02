@@ -1,9 +1,9 @@
-# R1-S1..R1-S4 已交付公共面静态清单（滚动更新）
+# R1-S1..R1-S5 已交付公共面静态清单（滚动更新）
 
-> 范围：覆盖 **R1-S1..R1-S4 已并入主树的交付面**（滚动更新：S5 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
-> 符号总数：**79** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6；`session/__init__.py` 仅再导出、0 个新定义）。
-> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9，S4 前后不变）；`session.__all__` 5 项（`apply`/`IllegalTransitionError`/`SessionProjector`/`SessionState`/`SessionStatus`）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 的 `REASON_*`、`session/projector.py` 的 `REASON_*` 均**未进** `__all__`。
-> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；2026-11-02 S4 滚动；工作树状态见 §3 注。
+> 范围：覆盖 **R1-S1..R1-S5 已并入主树的交付面**（滚动更新：S6 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/`、`src/opencode/bus/` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
+> 符号总数：**83** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6；`session/__init__.py` 仅再导出、0 个新定义）+ S5 新增 4（`bus/bus.py` 4；`bus/__init__.py` 仅再导出、0 个新定义）。
+> 包级再导出：`contracts.__all__` 27 项（与本包定义一一对应）；`storage.__all__` 21 项（db 9 + store 3 + txn 9，S4/S5 前后不变）；`session.__all__` 5 项（`apply`/`IllegalTransitionError`/`SessionProjector`/`SessionState`/`SessionStatus`，S5 前后不变）；`bus.__all__` 4 项（`DEFAULT_QUEUE_LIMIT`/`Event`/`SlowConsumerError`/`VolatileBus`）——`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 的 `REASON_*`、`session/projector.py` 的 `REASON_*` 均**未进** `__all__`。
+> 扫描时间：2026-11-02（首派）；2026-11-02 S3 滚动；2026-11-02 S4 滚动；2026-11-02 S5 滚动；工作树状态见 §3 注。
 
 ## 1. 公共面清单
 
@@ -114,10 +114,27 @@ S4 说明：`session/__init__.py` 仅再导出（`__all__` 5 项），无模块�
 
 附带核对：`txn.py` 公共名集合与 S3 完全一致（8 个 `REASON_*`、`epoch_ms`/`from_epoch_ms`、9 个错误类、`Diagnostic`、`TransactionWriter`；行号因改动顺移）；`src/opencode/storage/__init__.py` 的 `__all__` 仍为 **21** 项，无变化。
 
+### 1.4 R1-S5（bus/bus.py）
+
+S5 说明：`bus/__init__.py` 仅再导出（`__all__` 4 项），无模块级新定义，故不单独计符号。与源码核对结果：`bus/bus.py` 公共名恰为预期的 4 个（`_Terminated`/`_Subscription` 为下划线私有，不收）。
+
+| 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 | 导出性 |
+|---|---|---|---|---|---|
+| `opencode.bus.bus.Event` | type alias | `type Event = DurableEvent[Any] \| EphemeralEvent[Any]` | live 订阅可产出的事件（committed durable + ephemeral）；契约无统一别名，由 bus 自持 | `src/opencode/bus/bus.py:53` | 导出 |
+| `opencode.bus.bus.DEFAULT_QUEUE_LIMIT` | constant | `1000` | 每订阅有界队列默认上限（§4） | `src/opencode/bus/bus.py:56` | 导出 |
+| `opencode.bus.bus.SlowConsumerError` | exception | `class SlowConsumerError(Exception)`；`__init__(message: str, *, details: JsonObject \| None = None)`，`self.core: CoreError`（`code=SLOW_CONSUMER`、`retryable=False`） | 订阅队列溢出 → 断开并向迭代器抛错 | `src/opencode/bus/bus.py:59` | 导出 |
+| `opencode.bus.bus.VolatileBus` | class | `__init__(*, queue_limit: int = DEFAULT_QUEUE_LIMIT, registry: EventRegistry \| None = None); property subscription_count -> int; subscribe(session_id: str, types: Iterable[str] \| None = None) -> AbstractAsyncContextManager[AsyncIterator[Event]]; notify(session_id: str, events: Sequence[Event]) -> None` | 纯内存 live 总线：订阅/通知、类型过滤、溢出断开；不持久化、不重放 | `src/opencode/bus/bus.py:190` | 导出 |
+
+**S5 对 `storage/`、`session/` 的核对**：`git diff 18f74ff f45f880 --stat` 显示源码改动仅 `src/opencode/bus/__init__.py`、`src/opencode/bus/bus.py` 与两个新测试文件；其余为文档/任务/进度文件（`doc/ORCHESTRATION.md`、`doc/orchestration/{progress/T-C1-007,tasks/T-B-010}.md`、`doc/reviews/R1-S5-review.md`、本 inventory）。**`storage/` 与 `session/` 零触碰**；`storage.__all__` 仍 **21** 项、`session.__all__` 仍 **5** 项，均无变化。
+
 ## 2. 错误码三方对照表
 
 契约来源：`doc/CORE-CONTRACTS.md` §8，全部 22 个码位于**同一行 L340**（逐个直读，非记忆）。实现：`CoreErrorCode` 成员，`src/opencode/contracts/errors.py:24-45`。
-**测试引用数注**：统计 `tests/` 下全部 `*.py`（含 S3 `tests/integration/test_store_commit.py` 与 S4 `tests/integration/test_projector.py`），口径 = 该码**引号字符串字面量**出现次数（`Select-String -CaseSensitive -Pattern '"<Code>"' -AllMatches`，按 `Matches` 计数） + **枚举成员名**出现次数（`-CaseSensitive -Pattern '\b<MEMBER_NAME>\b' -AllMatches`）；两者互斥，合计即表列数字。错误类断言（如 `pytest.raises(StorageCorruptError)`）不计入本列，仅计码字面量/枚举成员。
+**测试引用数注（口径）**：统计 `tests/` 下全部 `*.py`，表列数字 = 两个**互斥**分量之和：
+1. **码名引号字面量**次数：码名作为字符串字面量出现，例如双引号形式 `"ValidationError"`、单引号形式 `'ValidationError'`，亦覆盖 `"NotFound"` 等被 `CoreError.model_validate` 直接解析的 wire 值；命令 `Select-String -CaseSensitive -Pattern '"<CodeName>"' -AllMatches`（单引号字面量另以 `"'<CodeName>'"` 统计），按 `Matches` 计数。
+2. **枚举成员名**次数：例如 `'\bVALIDATION_ERROR\b'`（`CoreErrorCode.VALIDATION_ERROR` 的成员名形态），命令 `Select-String -CaseSensitive -Pattern '\b(MEMBER_NAME)\b' -AllMatches`，按 `Matches` 计数。
+
+两分量针对不同文本形态（字符串值 vs 成员标识符），不重复计数；合计即表列数字。错误类断言（如 `pytest.raises(StorageCorruptError)`）不计入本列，仅计码字面量/枚举成员。
 
 | 码名 | 契约行 | 实现位置 | 测试引用数 | 一致性结论 |
 |---|---|---|---|---|
@@ -137,14 +154,14 @@ S4 说明：`session/__init__.py` 仅再导出（`__all__` 5 项），无模块�
 | `ProviderUnavailable` | L340 | `errors.py:37`（`PROVIDER_UNAVAILABLE`） | 5（R0 spike 断言） | 一致 |
 | `ProviderStreamInterrupted` | L340 | `errors.py:38`（`PROVIDER_STREAM_INTERRUPTED`） | 3（R0 spike 断言） | 一致 |
 | `ContextLimitExceeded` | L340 | `errors.py:39`（`CONTEXT_LIMIT_EXCEEDED`） | 1 | 一致 |
-| `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 2 | 一致 |
+| `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 3（1 + 2） | 一致 |
 | `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 14（1 + 13） | 一致 |
 | `MigrationRequired` | L340 | `errors.py:42`（`MIGRATION_REQUIRED`） | 2 | 一致 |
 | `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 3（1 + 2） | 一致 |
 | `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 1 | 一致 |
 | `LifecycleCleanupFailed` | L340 | `errors.py:45`（`LIFECYCLE_CLEANUP_FAILED`） | 1 | 一致 |
 
-汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **61**（首派 45 → S3 53 → 本次 61，+8，全部来自 S4 新增 `test_projector.py` 与 `test_store_commit.py` 直测的 `STORAGE_CORRUPT` 枚举引用）。
+汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **62**（首派 45 → S3 53 → S4 61 → 本次 62，+1：仅 `SLOW_CONSUMER` 2→3，来自 S5 `tests/contract/test_bus.py` / `tests/integration/test_bus_commit.py`；其余 21 码不变）。
 
 ## 3. 盘点方法注记（可复现）
 
@@ -163,8 +180,11 @@ S4 说明：`session/__init__.py` 仅再导出（`__all__` 5 项），无模块�
 13. S4 导出面核对：`ctx_read src/opencode/session/__init__.py mode=full` 得 `__all__` 5 项；`Select-String -Path src/opencode/storage/__init__.py -Pattern '^    "'` 计数得 21 项（与 S3 相同）。
 14. S4 对 `txn.py` 的改动核对：`git diff 72de622 077caf6 -- src/opencode/storage/txn.py`（N-1/N-3）与 `git diff 077caf6 698b456 -- src/opencode/storage/txn.py`（M-1/Nit-2），逐行判断是否新增模块级公共符号。
 15. S4 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/integration/test_projector.py` 的全 `tests/` 树，显式 `-CaseSensitive`。
+16. S5 滚动（T-C2-004）定义行号：`Select-String -Path src/opencode/bus/bus.py -Pattern '^(type |class |def |[A-Z_]+ = )'`；公共名 4 个（`Event`/`DEFAULT_QUEUE_LIMIT`/`SlowConsumerError`/`VolatileBus`）。
+17. S5 导出面与零触碰核对：`Select-String -Path src/opencode/{storage,session,bus}/__init__.py -Pattern '^    "'` 计数得 21/5/4；`git diff 18f74ff f45f880 --stat` 确认源码改动仅 `bus/` 两文件 + 两测试文件。
+18. S5 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/contract/test_bus.py`、`tests/integration/test_bus_commit.py` 的全 `tests/` 树，显式 `-CaseSensitive`。
 
 ### 观测到的非本任务差异（仅报告，未处理）
 
-- 门禁 `ruff format --check .` 本次输出 **88 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S3 滚动记录为 77，变化来自扫描集合（工作树新增 S4 文件），无格式问题。
-- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（S3 滚动时的 ` M doc/plans/r1-slices.md` 已随 merge #30 落库；S4 已随 merge #41 落库，无新增源码改动）。本任务只修改本文件，未触碰该路径。
+- 门禁 `ruff format --check .` 本次输出 **97 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S4 滚动记录为 88，变化来自扫描集合（工作树新增 S5 文件），无格式问题。
+- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（调度器常驻未跟踪目录；S5 已随 merge #46 `f45f880` 落库，源码无待提交改动）。本任务只修改本文件，未触碰该路径。
