@@ -6,25 +6,29 @@
 ## Changelog（修订记录）
 
 - 2026-11-02 [T-A-002]：定稿 R1 最小配置快照及 canonical JSON/SHA-256、expected_seq 与 applied_seq 水位、仅持久化的 prompt/RunRef/幂等与拒绝顺序、坏事件只读诊断及投影/日志读取边界；与 B 草案的对齐见 §9。
+- 2026-11-02 [T-A-003]：裁决 R1 UserMessage 不含 files、py.* v1 严格 forbid 并以版本升级+upcaster 演进、evt_/msg_/ses_/run_ ID 前缀及整数拒绝 bool（§1/§2.1/§3.1/§8）；JSON Schema 由 R5 统一产出，各切片先以 fixture 锁定形状；ephemeral 生产类型注册留 R2，R1 不注册；CoreError.details 与解码异常家族差异追加至 parity.md，实施交接见 §10。
 
 ## 1. 共同规则
 
 - wire/persisted model 用 Pydantic v2；运行时资源用 dataclass/Protocol。所有集合使用工厂默认值，不共享可变容器。
 - Python 属性使用 snake_case；序列化名称在下面固定。SDK/ORM 对象不能跨接缝。
-- JSON 扩展值只允许 JSON 数据，禁止任意 Python 对象。未知的可选扩展字段可保存在 metadata；未知事件版本/必需 content type 不能默默忽略。
-- 本文的接口形状是实现约束；非完整可运行源码。每个切片产出真实类型和 JSON Schema，替换占位结构后才可称“契约已验证”。
+- JSON 扩展值只允许 JSON 数据，禁止任意 Python 对象。wire/persisted model 的 envelope、typed data 和嵌套消息采用 `extra="forbid"`，未知结构字段一律拒绝；只有已声明为 JsonObject 的 metadata 等扩展对象内部允许自由键，不能把未知结构字段自动移入 metadata 来容错。未知事件版本/必需 content type 不能默默忽略，演进路线见 §8。
+- 仓库级规则：所有整数语义字段（整数 Literal，如 `Literal[1]`，或裸 `int`，含 version/seq/schema_version/expected_seq/ordinal/attempt/index 等）必须用 `field_validator(..., mode="before")` 在类型转换前显式拒绝 Python `True/False`（JSON `true/false`），模型构造与解码路径保持一致。依据：TS `packages/schema/src/event.ts:21–32` 的 `Event.Seq/Event.Version` 使用 `Schema.Int`；**TS 无对应物 + Python 侧论证**：Pydantic 的 bool→int/Literal 相等陷阱及其 before-validator 守卫是 Python 特有问题，必须阻止 lax 转换将布尔值伪装为 1/0。
+- 本文的接口形状是实现约束；非完整可运行源码。每个切片产出真实类型并以正/反例 JSON fixture 锁定 wire 形状；统一 JSON Schema 在 R5 由实际模型的 `model_json_schema()` 汇总生成并锁定差异，R1 不要求逐切片落盘 schema。
 
 ## 2. S1：历史、模型输入和流式输出
 
 ### 2.1 历史消息
 
-`SessionMessage` 的公共字段：`id: str`、`type`、`created_at: UTC datetime`、`metadata: JsonObject`。消息归属和排序由其 session 投影记录，不依赖 ID 字典序。
+`SessionMessage` 的公共字段：`id: str`（模型层强制 `pattern=r"^msg_"`，见 §3.1）、`type`、`created_at: UTC datetime`、`metadata: JsonObject`。消息归属和排序由其 session 投影记录，不依赖 ID 字典序。
 
 | type | 必需数据 | 可选数据 |
 |---|---|---|
-| user | `text: str` | `files: list[FileContent]`，Phase 1 非空则拒绝 UnsupportedCapability |
+| user | `text: str` | R1 v1 wire 无可选 files 字段；`files: list[FileContent]` 留到 R2+ 的新版本引入 |
 | assistant | `model: ModelRef`、`parts: list[AssistantPart]`、`status: running/completed/failed/interrupted` | `finish`、`raw_finish`、`usage`、`cost_usd`、`error`、`completed_at` |
 | idle | `run_id`、`outcome: succeeded/failed/interrupted` | `error` |
+
+R1 `UserMessage` v1 字段全集为 id/type/created_at/metadata/text；缺省不补 files，出现 `files` 键（包括 `files: []`）即按未知字段拒绝。新输入是校验错误；已存日志内出现则按 §3.2.1/§8 处理为损坏。R2+ 引入 files 时须升级承载该消息的持久事件版本并保留 v1 解码/upcaster；字段可编码不等于媒体已启用，未启用时非空文件请求仍报 UnsupportedCapability。依据：TS `packages/schema/src/session-message.ts:76–84` 的 `SessionMessage.User` 包含 `Prompt.fields.files`；Python R1 只有文本 prompt，以不含 files 的最小 v1 保持已交付 fixture，避免为仅接受空列表提前引入 FileContent 占位模型。这是有意缩小 R1 范围，不宣称 TS wire 等价。
 
 `AssistantPart` 是 text、reasoning、tool 三种 tagged union。text/reasoning 含 `part_id`、`text`；reasoning 可选、不能假定每个端点都会返回。tool 含 `tool_call_id`、`execution_id`、`name`、`input: JsonObject`、`state`、`effect_status`、`content: list[ToolContent]`、可选 `structured_output` 和 `error`。
 
@@ -103,9 +107,13 @@ adapter 按 call_index 聚合工具 ID/名称碎片；runner 按同一 index 聚
 
 Python 使用自己的 `py.*` 域事件；与 TS 的对应关系在 [parity](parity.md)，不冒充 TS wire schema。
 
-`EventDraft` 公共字段为 `id: str, type: str, version: int, session_id: str, created_at: UTC datetime, data: typed event data, metadata: JsonObject`；时间序列化为 ISO 8601 UTC。ID 在重试前生成并复用，draft 不含 seq。运行内事件 metadata 必须含 run_id，其他可含 request_id/execution_id/correlation_id/causation_id，不能含凭据。
+`EventDraft` 公共字段为 `id: str`（`pattern=r"^evt_"`）、`type: str, version: int, session_id: str`（`pattern=r"^ses_"`）、`created_at: UTC datetime, data: typed event data, metadata: JsonObject`；时间序列化为 ISO 8601 UTC。ID 在重试前生成并复用，draft 不含 seq。运行内事件 metadata 必须含 run_id，其他可含 request_id/execution_id/correlation_id/causation_id，不能含凭据。
 
 durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配；只有 durable 有 seq。ephemeral envelope 为 `id, type, session_id, created_at, data, metadata`，没有 durable cursor。
+
+模型层统一强制四类 ID 前缀：事件 id 为 `pattern=r"^evt_"`，消息 id/message_id 为 `pattern=r"^msg_"`，session_id 为 `pattern=r"^ses_"`，run_id 为 `pattern=r"^run_"`。同一规则适用于 draft/durable/ephemeral、typed data、嵌套消息及 SessionRef/RunRef/游标；metadata 中的保留身份键 run_id 一旦出现，也必须是符合该 pattern 的字符串。request_id 由调用方给定，仍只要求非空字符串。前缀检查不替代归属验证或 seq/投影排序。
+
+依据：TS `packages/schema/src/event.ts:9–14` 的 `Event.ID` 和 `packages/schema/src/session-message.ts:21–29` 的 `SessionMessage.ID` 分别强制 evt_/msg_。补充只读参照 `packages/schema/src/session-id.ts:5–11` 的 `SessionID` 校验以 `ses` 开头、工厂生成 `ses_`；Python 明确收紧为 ses_，统一领域标识以减少错传。**TS 无对应物 + Python 侧论证**：Python 的显式 run_id 及 run_ 模型约束没有直接 TS 对应；单独标识 run 可区分接受请求与执行身份，并使 data/metadata/返回引用使用同一身份域。
 
 所有持久事件当前 version=1，`data` 必须按 type+version 解码为对应 Pydantic 模型：
 
@@ -129,7 +137,7 @@ durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配
 | py.permission.revoked / py.permission.expired | `decision_id, reason`；前者是宿主撤销，后者是到期检查产生 |
 | py.run.finished | `run_id, outcome, error?`；投影 idle 消息并释放 active run |
 
-ephemeral 类型为 `py.text.delta/py.reasoning.delta`（message_id, part_id, delta）、`py.tool.input.delta`（call_index, delta）、`py.tool.progress`（execution_id, metadata）。delta 不落库；finalized/finished 必须含恢复所需的完整值。
+ephemeral 类型为 `py.text.delta/py.reasoning.delta`（message_id, part_id, delta）、`py.tool.input.delta`（call_index, delta）、`py.tool.progress`（execution_id, metadata）。delta 不落库；finalized/finished 必须含恢复所需的完整值。生产类型注册留 R2 随流式生产者落地；R1 生产注册表仅含 py.session.created/py.prompt.accepted 两个 durable 类型，ephemeral 只保留 envelope/注册机制和测试局部定义。
 
 正常取消时尽量提交已收到的完整文本和中断终态；kill 时仍在内存的 delta 可能丢失。恢复保证已提交历史，不保证恢复未提交 token。
 
@@ -303,13 +311,13 @@ MCP 只支持显式用户配置的 stdio server，argv 直接 exec、不拼 shel
 | `run_status(run_id) -> RunStatus` | 运行、完成、失败、中断及错误信息 |
 | `close() -> None` | 按下述顺序取消并收回自有任务，关闭 provider/MCP/DB；不得遗留后台任务 |
 
-`SessionRef={session_id: str}`；`RunRef={session_id: str, run_id: str, request_id: str}`，三项均为非空字符串，分别指向原 session、首次接受时生成的 run 和调用方请求，不含调度承诺；`RunStatus` 含上述标识及 `status: accepted/running/cancelling/succeeded/failed/interrupted`、可选 error。`MessagePage` 含 items、next_message_id 和 has_more；消息游标按投影顺序分页。`DecisionReceipt` 含 permission_id、decision 和 execution_id，不携带可复用执行权限。
+`SessionRef={session_id: str}`；`RunRef={session_id: str, run_id: str, request_id: str}`，三项均为非空字符串，session_id/run_id 另须满足 §3.1 的 ses_/run_ pattern，分别指向原 session、首次接受时生成的 run 和调用方请求，不含调度承诺；`RunStatus` 含上述标识及 `status: accepted/running/cancelling/succeeded/failed/interrupted`、可选 error。`MessagePage` 含 items、next_message_id 和 has_more；消息游标按投影顺序分页。`DecisionReceipt` 含 permission_id、decision 和 execution_id，不携带可复用执行权限。
 
 同一 session 最多一个 active run，包含 accepted/running/cancelling；Phase 1 不支持 steering/inbox。R1 的 prompt 只提交一个 `py.prompt.accepted(version=1)`，data 中 request_id/run_id 与返回 RunRef 一致，message 为本次 text 创建的 UserMessage，metadata 含同一 run_id/request_id；其 projector 同事务插入一条 UserMessage、置 active_run_id 并得到 accepted 的 RunStatus。只有事务提交成功才返回；不产生 run.started、assistant/idle 或调度任务，不调用 provider/工具。
 
 prompt 在每 session 提交锁下按以下固定顺序处理：
 
-1. 验证 session_id/request_id 是非空字符串、text 是字符串（不隐式转换）；检查 session 存在及其写入门禁。尚不存在返回 NotFound；read_only_diagnostic 时始终返回 SessionReadOnly，包括同 request_id 的重试；cleanup_failed/closed 分别返回 LifecycleCleanupFailed/SessionClosed。session 为 active 后再检查 service 的 closing/closed gate，关闭中或已关闭返回 SessionClosed。
+1. 验证 session_id/request_id 是非空字符串、session_id 符合 §3.1 的 ses_ pattern、text 是字符串（不隐式转换）；检查 session 存在及其写入门禁。尚不存在返回 NotFound；read_only_diagnostic 时始终返回 SessionReadOnly，包括同 request_id 的重试；cleanup_failed/closed 分别返回 LifecycleCleanupFailed/SessionClosed。session 为 active 后再检查 service 的 closing/closed gate，关闭中或已关闭返回 SessionClosed。
 2. 在 durable 日志中以 `(session_id, dedupe_key)` 查原接受记录；key 精确为 `"prompt:" + request_id`，大小写敏感，不是字面字符串 prompt:request_id。key 是存储字段，由 py.prompt.accepted 的 request_id 派生，并受 §3.2 唯一约束保护，不要求调用方传 event ID。相同 request_id 可用于不同 session。
 3. 已存在且原 message.text 与本次 text 逐 Unicode code point 相同，则直接返回原 RunRef，不生成新 message/run/event/batch ID，不重投影或重发通知；不 trim、不归一化换行/Unicode。run 已终结时也返回首次的 RunRef，当前状态另查 run_status。相同 key 的输入不同则 IdempotencyConflict，即使当前 busy；比较不使用新生成的 ID/时间，也不只依赖摘要。
 4. 无原记录时才检查 active_run_id：存在则 SessionBusy；不存在才生成并固定 message/run/event/batch ID 与时间，按 §3.2 读取 H 作为 expected_seq 并提交。完全相同的提交重试复用这些值；提交失败/回滚不留下 request_id、消息或 active run。不同 request_id 的并发 prompt 最多一个成功；相同请求并发成功后都指向同一个 RunRef。
@@ -328,7 +336,7 @@ max_steps 默认 20；超限结束为 failed。工具默认串行，调用异常
 
 ## 8. 错误、重试和兼容
 
-`CoreError = {code, message, retryable, details?: JsonObject}`。code 至少区分：
+`CoreError = {code, message, retryable, details: JsonObject}`；构造/输入时可省略 details，wire 输出恒包含 details，缺省值为工厂创建的 `{}`，有信息时保留脱敏对象。code 至少区分：
 `ValidationError, UnsupportedCapability, NotFound, SessionBusy, Conflict, IdempotencyConflict, InvalidCursor, PermissionDenied, ApprovalUnavailable, ApprovalExpired, ToolTimeout, ToolFailed, ExecutionUnknown, ProviderUnavailable, ProviderStreamInterrupted, ContextLimitExceeded, SlowConsumer, StorageCorrupt, MigrationRequired, SessionReadOnly, SessionClosed, LifecycleCleanupFailed`。
 
 details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire。用户错误与内部故障分别日志记录，但对外错误结构相同。
@@ -336,6 +344,10 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 只有一个 retry owner：MAAS adapter 关闭 SDK 默认重试，未收到首个内容且明确可重试的 429/短暂网络错误最多 2 次重试（尊重 Retry-After、带抖动、受总超时限制）。部分流已到达则结束并标 interrupted，不能把旧流和新流拼接。用户要求重试生成时创建新 attempt；既有 tool.finished 绝不重新执行。MCP、shell、文件变更默认不自动重试。
 
 版本演进以旧 JSON fixture/旧 DB fixture 能读取为最低门槛。新增 event/content/capability 不等于旧消费者自动支持；不支持时显式协商或报 UnsupportedCapability，不能只靠“字段可选”声称向后兼容。
+
+`py.*` v1 采用封闭 wire 形状：envelope、typed data 或嵌套消息新增字段（包括可选字段）一律升级受影响事件的 version，并提供显式、确定性的 upcaster；不走同版本新增可选字段路径。新版读者先用保留的旧版本模型校验旧记录，再转换为当前内部形状；旧 fixture 保持可读，原日志不改写。已声明 JsonObject 内的诊断扩展键不是新增结构字段，但不得借此增加执行/恢复所必需的语义来绕过版本升级。
+
+未知结构字段在已存日志中等同 schema 损坏，由 S4/S6 映射为 StorageCorrupt 并按 §3.2.1 进入只读诊断；新提交输入非法仅拒绝/回滚，不隔离健康 session。旧读者遇新版本仍明确失败，不声称可自动读取新字段。依据：TS `packages/schema/src/event.ts:28–32,174–187` 的 `Version/versionedType/durableMap` 按类型与版本区分定义，`packages/core/src/bus.ts:74–88` 的 `decodeStoredData/decodeSerializedEvent` 集中转换并校验旧载荷；**TS 无对应物 + Python 侧论证**：全量 forbid 与逐版本 upcaster 的闭合演进协议是 Python 裁决，严格版本边界避免旧读者将同版本新增字段误判为已存损坏，或静默丢字段后继续执行。
 
 ## 9. T-A-002 与 B 草案的冲突及最终口径
 
@@ -349,3 +361,9 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 | §4.3 提议坏日志 read 返回 StorageCorrupt，但 S8 笼统称 EventLog.read 仍可用 | 采纳 §4.3 的错误取向；“读取可用”专指可解码的已有投影/状态，诊断后的 typed read/follow 报 StorageCorrupt。坏页不返回半页、不推进游标，follow 不发越界 Synced，重建失败保留原投影且诊断不自动清除。S6/S8 对齐。 |
 
 上述都是 Python 契约补充/有意差异，TS 证据及 Python 侧理由分别见 §3.2、§3.2.1、§6、§7；不据此宣称实现或 TS wire 兼容已验证。
+
+## 10. T-A-003 与 B 审查的对齐及实施交接
+
+对照 `doc/reviews/R1-S1-review.md` §2/§3/§5：M-2 选择 B 给出的方案 (b)，以最小文本 v1 避免空列表/FileContent 占位；M-3、四类 ID 前缀、整数拒绝 bool、R5 JSON Schema、R2 ephemeral 注册与两项 parity 记录均采纳 B 建议，无裁决方向分歧。ses_ 相比 TS 校验更严格及 run_ 为 Python 专有约束已在 §3.1 明示，不以“对齐 TS”隐去差异。
+
+本次完成契约定稿，不表示 S1 已实现新增约束；后续由 B 将裁决并入方案、C 在获授权的 contracts 补丁中落实 ID pattern、version/seq before-validator 与相应反例，更新 UserMessage 的 files 阶段说明，并一并处理 B 的 M-4/N-2 补测。现有 R1 files 拒绝行为与裁决一致，无需引入 FileContent；本任务不修改实现或测试。

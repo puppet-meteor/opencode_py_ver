@@ -66,3 +66,6 @@ TS 路径相对参考目录；Python 路径是预定落点，不是已有文件�
 - SQLite + OS 单 writer（CORE-CONTRACTS L165）：WAL、`foreign_keys=ON`、`busy_timeout=5000` 实测生效（FK 违规 IntegrityError 实测）；OS 数据目录锁（Windows `msvcrt.locking`/POSIX `fcntl.flock`）先于 DB 打开；第二 writer 在写事务前锁失败返回 conflict 且无任何写入（数据目录快照一致 + writer 1 行数稳定）；持锁 writer 异常退出后 OS 自动释放锁。Windows 本地与 CI、ubuntu CI（fcntl）均已实测（CI run 41182347042）。
 - 进程树回收（CORE-CONTRACTS L234）：Windows Job Object（KILL_ON_CLOSE + proceed-gate 保证 Assign 先于孙进程创建）cancel/timeout 两场景子+孙进程均在 grace 内退出、临时目录清理验证；POSIX process group（bash 5.3.9）经 ubuntu CI 实测同样成立（两场景 ~100ms）；POSIX zombie（已退出未收割）按已退出处理。
 - 平台结果与限制（restricted ≠ 失败；CI 与本地分开记录）：见 [platform-support.md](platform-support.md)。
+
+- [T-A-003] Python `CoreError.details` 在 wire 层恒出现；输入省略时序列化为 `{}`（有内容时保留脱敏对象），对应 CORE §8 的“输入可选、输出固定”约定；TS 无对应 wire 形状。
+- [T-A-003] Python `DurabilityMismatchError`/`EventDecodeError` 家族细化 TS `InvalidDurableEventError`（`packages/core/src/bus.ts:60–66,78–90`），区分未知 type/version、durability 错配与坏 envelope；已存日志统一映射 `StorageCorrupt`/只读诊断。
