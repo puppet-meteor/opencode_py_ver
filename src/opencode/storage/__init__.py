@@ -20,6 +20,13 @@ from opencode.storage.db import (
     WriterLockHeldError,
     open_database,
 )
+from opencode.storage.repos import (
+    InvalidCursorError,
+    MessagePage,
+    NotFoundError,
+    ReadRepositories,
+    SessionRecord,
+)
 from opencode.storage.store import EventBatch, Projector, SessionStore
 from opencode.storage.txn import (
     ConflictError,
@@ -41,12 +48,17 @@ __all__ = [
     "DatabaseNotFoundError",
     "EventBatch",
     "IdempotencyConflictError",
+    "InvalidCursorError",
     "IsolationPersistFailedError",
     "LifecycleCleanupFailedError",
+    "MessagePage",
+    "NotFoundError",
     "OpenMode",
     "Projector",
+    "ReadRepositories",
     "SessionClosedError",
     "SessionReadOnlyError",
+    "SessionRecord",
     "SessionStore",
     "StorageCorruptError",
     "StorageError",
