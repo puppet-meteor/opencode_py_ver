@@ -69,6 +69,7 @@ class SessionState:
     config_snapshot: ConfigSnapshot | None = None
     snapshot_hash: str | None = None
     messages: tuple[UserMessage, ...] = ()
+    active_run_id: str | None = None
 
     @property
     def created(self) -> bool:
@@ -115,11 +116,26 @@ def _apply_created(state: SessionState, event: DurableEvent[Any]) -> SessionStat
 
 
 def _apply_prompt(state: SessionState, event: DurableEvent[Any]) -> SessionState:
-    """``py.prompt.accepted``: active -> active, user message appended (§2.1)."""
+    """``py.prompt.accepted``: active -> active, user message appended (§2.1).
+
+    The fold also carries the accepted run slot (§7 L316: the projector sets
+    ``active_run_id`` in the same transaction): ``active_run_id`` becomes the
+    event's ``run_id`` (last accepted run wins in the log order). The fold
+    does NOT reject a second ``py.prompt.accepted`` while the slot is held --
+    the one-active-run invariant is a §7 SessionService protocol gate, not a
+    §3.2 store/fold write gate; see the T-C1-010 progress file for the full
+    rationale (the merged S3/S4/S6 read+rebuild surfaces legitimately fold
+    logs with several accepted prompts per session).
+    """
     if not isinstance(event.data, PromptAcceptedData):
         raise IllegalTransitionError(
             f"event {event.id} carries {type(event.data).__name__} data, expected PromptAcceptedData"
         )
     if not state.created or state.status is not SessionStatus.ACTIVE:
         raise IllegalTransitionError(f"py.prompt.accepted requires an active session (event {event.id})")
-    return replace(state, applied_seq=event.seq, messages=(*state.messages, event.data.message))
+    return replace(
+        state,
+        applied_seq=event.seq,
+        active_run_id=event.data.run_id,
+        messages=(*state.messages, event.data.message),
+    )

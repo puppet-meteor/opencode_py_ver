@@ -174,7 +174,7 @@ async def test_projector_writes_session_and_message_rows(tmp_path: Path) -> None
         "FROM sessions WHERE session_id = 'ses_a'",
     )[0]
     assert session_row[0] == "active"
-    assert session_row[1] is None  # R1-S4 does not occupy the run slot (progress file)
+    assert session_row[1] == "run_1"  # §7 L316 wiring (T-C1-010): the projector sets the active-run slot
     assert session_row[2] == '{"permission_rules":[],"schema_version":1}'
     assert session_row[3] == SNAPSHOT_HASH
     assert session_row[4] == 2  # A = H: the projector advanced per event

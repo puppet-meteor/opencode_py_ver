@@ -61,7 +61,7 @@ REASON_ILLEGAL_TRANSITION = "illegal_projection_transition"
 REASON_UNKNOWN_SESSION_STATUS = "unknown_session_status"
 REASON_DUPLICATE_MESSAGE_ID = "duplicate_message_id"
 
-_SELECT_SESSION = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
+_SELECT_SESSION = sa.text("SELECT status, applied_seq, active_run_id FROM sessions WHERE session_id = :sid")
 _INSERT_SESSION = sa.text(
     "INSERT INTO sessions (session_id, status, config_snapshot, snapshot_hash, applied_seq) "
     "VALUES (:sid, :status, :config_snapshot, :snapshot_hash, :applied_seq)"
@@ -69,6 +69,7 @@ _INSERT_SESSION = sa.text(
 _INSERT_MESSAGE = sa.text(
     "INSERT INTO messages (session_id, message_id, seq, data) VALUES (:sid, :message_id, :seq, :data)"
 )
+_SET_ACTIVE_RUN = sa.text("UPDATE sessions SET active_run_id = :run_id WHERE session_id = :sid")
 _ADVANCE_APPLIED_SEQ = sa.text("UPDATE sessions SET applied_seq = :applied_seq WHERE session_id = :sid")
 
 
@@ -134,7 +135,14 @@ class SessionProjector:
             ) from error
 
     async def _project_prompt(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
-        """``py.prompt.accepted`` -> INSERT the messages row, then advance A."""
+        """``py.prompt.accepted`` -> INSERT the messages row, set the run slot, advance A.
+
+        §7 L316: the same transaction that inserts the UserMessage also sets
+        ``sessions.active_run_id``. The value is taken from the fold output
+        (``projected.active_run_id``), keeping the transition-rule ownership
+        in :mod:`opencode.session.state` -- the projector only translates
+        fold output into rows.
+        """
         row = (await connection.execute(_SELECT_SESSION, {"sid": event.session_id})).first()
         if row is None:
             # Through the commit path this is a batch whose first event is not
@@ -151,7 +159,12 @@ class SessionProjector:
         except ValueError as error:
             raise _corrupt(REASON_UNKNOWN_SESSION_STATUS, event, f"unknown session status {row.status!r}") from error
         projected = _fold(
-            SessionState(session_id=event.session_id, status=status, applied_seq=int(row.applied_seq)),
+            SessionState(
+                session_id=event.session_id,
+                status=status,
+                applied_seq=int(row.applied_seq),
+                active_run_id=row.active_run_id,
+            ),
             event,
         )
         message = projected.messages[-1]
@@ -171,7 +184,18 @@ class SessionProjector:
                 event,
                 f"message id {message.id} is already projected for session {event.session_id}",
             ) from error
+        await self._set_active_run_id(connection, event, projected.active_run_id)
         await self._advance_applied_seq(connection, event)
+
+    async def _set_active_run_id(
+        self, connection: AsyncConnection, event: DurableEvent[Any], run_id: str | None
+    ) -> None:
+        """Set ``sessions.active_run_id`` from the fold output (§7 L316 wiring).
+
+        A separate method (mirroring ``_advance_applied_seq``) so the write
+        stays independently overridable for fault-injection tests.
+        """
+        await connection.execute(_SET_ACTIVE_RUN, {"sid": event.session_id, "run_id": run_id})
 
     async def _advance_applied_seq(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
         """Advance ``sessions.applied_seq`` to the projected event's seq.
