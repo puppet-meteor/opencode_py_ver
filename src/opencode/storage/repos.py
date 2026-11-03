@@ -26,7 +26,7 @@ rows with the sanitized reason pattern below.
 Fail-closed semantics (§3.2.1 "读取仍可用" boundary): a sessions row missing
 while the event log exists is NOT faked as an empty history -- it raises
 StorageCorrupt (``sessions_row_missing_with_log``); a message row whose data
-no longer decodes into a :class:`~opencode.contracts.UserMessage` raises
+no longer decodes into the §2.1 message union (user/assistant/idle) raises
 StorageCorrupt locating the offending row. Unknown cursor message ids raise
 InvalidCursor; a never-created session raises NotFound.
 
@@ -50,6 +50,11 @@ from opencode.contracts import (
     CoreErrorCode,
     JsonObject,
     PromptAcceptedData,
+)
+from opencode.contracts.messages import (
+    AssistantMessage,
+    IdleMessage,
+    SessionMessage,
     UserMessage,
 )
 from opencode.storage.txn import (
@@ -59,6 +64,14 @@ from opencode.storage.txn import (
     StoreError,
     _json_column,
 )
+
+#: §2.1 message-union dispatch: the stored ``data["type"]`` tag selects the
+#: wire model; a missing or unknown tag is a corrupt row (fail closed below).
+_MESSAGE_MODELS: dict[str, type[SessionMessage]] = {
+    "user": UserMessage,
+    "assistant": AssistantMessage,
+    "idle": IdleMessage,
+}
 
 #: Read-side limit bounds (symmetric with the EventLog read contract, §4).
 MIN_PAGE_LIMIT = 1
@@ -136,7 +149,7 @@ class SessionRecord:
 class MessagePage:
     """One ordered page of projected messages (cursor-paginated by message id)."""
 
-    items: list[UserMessage]
+    items: list[SessionMessage]
     next_after_message_id: str | None
     has_more: bool
 
@@ -294,7 +307,7 @@ class ReadRepositories:
                 )
             ).fetchall()
 
-        items: list[UserMessage] = []
+        items: list[SessionMessage] = []
         for row in rows:
             items.append(self._decode_message_row(session_id, row))
         has_more = len(items) > page_limit
@@ -309,12 +322,20 @@ class ReadRepositories:
             row = (await connection.execute(_SELECT_LOG_HIGH, {"sid": session_id})).first()
         return int(row.h) if row is not None else 0
 
-    def _decode_message_row(self, session_id: str, row: Any) -> UserMessage:
-        """Decode one projected message row, fail closed (§3.2.1 read boundary)."""
+    def _decode_message_row(self, session_id: str, row: Any) -> SessionMessage:
+        """Decode one projected message row, fail closed (§3.2.1 read boundary).
+
+        The §2.1 union dispatches on the stored ``data["type"]`` tag
+        (user/assistant/idle); a missing or unknown tag is a corrupt row, not a
+        different page shape, and fails the whole page like any decode error.
+        """
         try:
             data = _json_column(row.data)
-            message = UserMessage.model_validate(data)
-        except (ValueError, TypeError) as error:
+            model = _MESSAGE_MODELS.get(str(data["type"]))
+            if model is None:
+                raise ValueError(f"unknown projected message type tag {data['type']!r}")
+            message = model.model_validate(data)
+        except (KeyError, ValueError, TypeError) as error:
             raise _corrupt(
                 REASON_MESSAGE_ROW_DECODE_FAILED,
                 f"session {session_id} has an undecodable projected message row",

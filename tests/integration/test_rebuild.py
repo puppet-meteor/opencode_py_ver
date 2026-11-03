@@ -56,6 +56,7 @@ from opencode.contracts import PY_PROMPT_ACCEPTED, CoreErrorCode, EventDraft, Pr
 from opencode.session import SessionBusyError, SessionProjector, SessionService, SessionStatus
 from opencode.storage import (
     EventBatch,
+    MessagePage,
     NotFoundError,
     ReadRepositories,
     SessionClosedError,
@@ -77,6 +78,16 @@ _SESSION_ROW = (
     "FROM sessions WHERE session_id = ?"
 )
 _MESSAGE_ROWS = "SELECT message_id, seq, data FROM messages WHERE session_id = ?"
+
+
+def _user_texts(page: MessagePage) -> list[str]:
+    """User-text projection over a page; every item must be a UserMessage
+    (T-C1-023b #95: static narrowing over the union face -- runtime-true pin)."""
+    texts: list[str] = []
+    for message in page.items:
+        assert isinstance(message, UserMessage)
+        texts.append(message.text)
+    return texts
 
 
 def _upgrade_head(db_path: Path) -> subprocess.CompletedProcess[str]:
@@ -592,8 +603,8 @@ async def test_same_request_id_across_sessions_yields_distinct_runs(tmp_path: Pa
         assert run_b.session_id == session_b
 
         # Each session sees its own message and its own active run.
-        assert [m.text for m in (await service.messages(session_a)).items] == ["hello"]
-        assert [m.text for m in (await service.messages(session_b)).items] == ["hello"]
+        assert _user_texts(await service.messages(session_a)) == ["hello"]
+        assert _user_texts(await service.messages(session_b)) == ["hello"]
         status_a = await service.run_status(run_a.run_id)
         status_b = await service.run_status(run_b.run_id)
         assert status_a.session_id == session_a

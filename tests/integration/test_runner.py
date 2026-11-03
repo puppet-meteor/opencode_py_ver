@@ -1533,8 +1533,11 @@ async def test_interrupted_after_usage_without_text_keeps_the_observed_usage(tmp
     error after a usage chunk with zero text parts commits nothing finalized,
     so the open step carries no generated plan and the terminal is rebuilt
     from the (empty) finalized truth: parts stay empty while the observed
-    usage/cost survive (the symmetric counterpart of the generated-branch
-    tests above)."""
+    usage/cost survive. m-4 attribution: like the three A-009③ tests above,
+    this exercises the non-generated branch -- ``py.step.generated`` commits
+    only on the success path and ``_apply_finalized`` never sets
+    ``step.generated``; the generated branch is pinned separately by the m-4
+    test at the end of this file."""
     db_path = tmp_path / "runner.db"
     _require_success(_upgrade_head(db_path))
     boom = CoreError(code=CoreErrorCode.PROVIDER_UNAVAILABLE, message="maas is down", retryable=False)
@@ -1648,3 +1651,68 @@ async def test_cancel_between_step_finished_and_run_finished_interrupts_the_run(
         assert message.raw_finish is None
         assert message.usage == Usage(input=5, output=7)
         assert message.cost_usd == "0.0012"
+
+
+# ---------------------------------------------------------------------------
+# T-C1-023 (T-B-023 m-4): the generated branch of the interrupted terminal
+# ---------------------------------------------------------------------------
+
+
+async def test_interrupted_from_generated_plan_keeps_observed_usage_and_finish(tmp_path: Path) -> None:
+    """m-4: cancel lands while the planned tools execute, AFTER the generation
+    batch committed ``py.step.generated`` -- the interrupted terminal is then
+    rebuilt from the generated plan (the L1097-1152 branch): the observed
+    finish/raw_finish/usage/cost ride the plan verbatim (the L1146-1149
+    application face) while the unfinished tool parts are synthesized."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    slow = _GatedAdapter()
+    arguments_a = '{"tag": "A"}'
+    arguments_b = '{"tag": "B"}'
+    script = (
+        _Script()
+        .text("p1", "let me check")
+        .call_start(0, tool_call_id="call_A", name="app.slow")
+        .call_args(arguments_a, 0)
+        .call_end("call_A", "app.slow", arguments_a, call_index=0)
+        .call_start(1, tool_call_id="call_B", name="app.slow")
+        .call_args(arguments_b, 1)
+        .call_end("call_B", "app.slow", arguments_b, call_index=1)
+        .usage()
+        .finish(FinishReason.TOOL_CALLS)
+    )
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, provider, [slow])
+        await _bootstrap(harness)
+        task = asyncio.create_task(harness.runner.run(_SESSION_ID, _RUN_ID))
+        await _wait_until(lambda: slow.executions == ["A"])
+        await _commit_cancel(harness)
+        harness.runner.cancel_event(_RUN_ID).set()
+        slow.gate.set()
+
+        result = await task
+
+        assert result == RunResult(outcome="interrupted", steps=1)
+        assert len(provider.requests) == 1  # single provider request (§8 L350 no resend)
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        step = state.steps["step_r2s6_0001"]
+        assert step.generated  # the plan committed before the cancel: generated branch
+        assert len(state.tools) == 2  # A executed, B synthesized cancelled-before-start
+        message = _assistant(state, step.message_id)
+        assert message.status == "interrupted"
+        assert message.finish is FinishReason.TOOL_CALLS  # observed, kept verbatim
+        assert message.raw_finish is None
+        assert message.usage == Usage(input=5, output=7)
+        assert message.cost_usd == "0.0012"
+        assert [part.type for part in message.parts] == ["text", "tool", "tool"]
+        tool_a = next(
+            part for part in message.parts if isinstance(part, AssistantToolPart) and part.tool_call_id == "call_A"
+        )
+        tool_b = next(
+            part for part in message.parts if isinstance(part, AssistantToolPart) and part.tool_call_id == "call_B"
+        )
+        assert tool_a.state == "succeeded"
+        assert tool_b.state == "cancelled"
+        assert tool_b.effect_status == "not_started"

@@ -4,7 +4,7 @@
 :class:`~opencode.contracts.llm.GenerationRequest` (the S1 face pins it): it
 turns projected session history plus injected runtime settings into the
 request. §2.2 L80 red line -- history arrives as contract-internal messages
-(the §2.1 union aliased below) and tools as ``ToolSpec``; the output is
+(the §2.1 union aliased in ``opencode.contracts.messages``) and tools as ``ToolSpec``; the output is
 contract types. ``SessionMessage``-shaped storage rows, openai/SDK types or
 provider wire formats never cross this boundary (the MAAS adapter owns the
 OpenAI translation).
@@ -97,15 +97,12 @@ from opencode.contracts.messages import (
     AssistantTextPart,
     AssistantToolPart,
     IdleMessage,
+    SessionMessage,
     ToolTextContent,
     UserMessage,
 )
 from opencode.contracts.tools import ToolSpec
 from opencode.storage import StoreError, StoreValidationError
-
-#: §2.1 history union (S1 face) as the builder consumes it: user / assistant /
-#: idle. This is an alias over the S1 models, not a new wire model.
-type SessionMessage = UserMessage | AssistantMessage | IdleMessage
 
 #: Deterministic input estimate: ~4 characters per token (TS model-request.ts
 #: L51: "Prompt text is estimated at about 4 characters per token, which can
