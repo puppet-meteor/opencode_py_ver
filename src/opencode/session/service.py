@@ -1,13 +1,16 @@
-"""Application command surface (R1-S7, CORE-CONTRACTS §7): SessionService.
+"""Application command surface (R1-S7 + R2-S7, CORE-CONTRACTS §7): SessionService.
 
 :class:`SessionService` is the single entry point for the CLI, same-process
-callers and a future HTTP face. R1 implements the §7 L298-312 subset:
-``create``/``session_status``/``messages``/``prompt``/``run_status``/``close``
--- ``cancel``/``reply_permission``/``revoke_permission`` are R2+ and no stubs
-are left behind (L325: R1 implements neither the run cancel nor the recovery
-coordinator). ``prompt`` only persists one ``py.prompt.accepted(version=1)``
-and returns the :class:`RunRef`; scheduling, run.started, assistant/idle
-messages, provider and tool calls are all R2 (§7 L316).
+callers and a future HTTP face. R2-S7 implements ``create``/``session_status``
+/``messages``/``prompt``/``run_status``/``cancel``/``close`` --
+``reply_permission``/``revoke_permission`` are R3+ and no stubs are left
+behind. ``prompt`` persists one ``py.prompt.accepted(version=1)`` and, when a
+scheduler is wired, creates the runner task with a strong reference (§7
+L331); ``cancel`` lands the cooperative cancel intent (§7 L335);
+``run_status`` resolves runs through the runs read model (§3.2 L187, OP-2);
+``close`` runs the R2 shutdown lifecycle (§7 L337). The R4 recovery
+coordinator (storage-only accepted runs, crash recovery) is deliberately not
+implemented here.
 
 The §7 L318-323 four-step fixed order (order IS semantics) runs under one
 short-lived per-session commit lock (TS ``bus.ts`` KeyedMutex L579 mapping;
@@ -30,8 +33,11 @@ are the fast path):
    5) and the RunRef is returned.
 
 R1 accepted runs hold the active-run slot across close/reopen (§7 L325): no
-terminal state, no automatic release; ``close()`` only releases the service's
-own resources and never appends cancel/terminal events.
+terminal state, no automatic release. R2 close releases *live scheduled*
+runs (cancel_requested + interrupted terminals, §7 L337); a storage-only
+accepted run (no live task -- pre-restart leftover or an accept that raced
+the closing gate) keeps its records untouched for the R4 recovery coordinator
+and is never auto-cancelled here (the L325 R1 rule survives the R2 lifecycle).
 
 TS mapping (behavioral, not isomorphic): ``Event.ID.create = "evt_" +
 ascending()`` (``packages/core/src/event.ts`` L9-14) -- the default ID
@@ -40,19 +46,25 @@ factory is time-ordered and lexicographically sortable (no random UUID);
 the per-session asyncio lock plus :class:`SessionStore`; the
 ``session/projector.ts`` Layer composition (deps [Bus.node, Database.node])
 lives in :mod:`opencode.app` (the non-Effect replacement of the
-``sqlite.bun.ts`` L100-103 Layer structure).
+``sqlite.bun.ts`` L100-103 Layer structure); ``run-coordinator.ts`` (run task
+coordination) maps onto the service-owned ``self._tasks`` strong references
+plus the §7 L337 close lifecycle (ADR-0001 decision 1: one coroutine state
+machine per run instead of an Effect services graph).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
+import sqlalchemy as sa
 from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from opencode.bus import VolatileBus
 from opencode.contracts import (
@@ -68,6 +80,7 @@ from opencode.contracts import (
     UserMessage,
     compute_snapshot_hash,
 )
+from opencode.contracts.events import PY_RUN_CANCEL_REQUESTED, RunCancelRequestedData
 from opencode.session.state import SessionStatus
 from opencode.storage import (
     EventBatch,
@@ -84,7 +97,7 @@ from opencode.storage import (
     StoreError,
     StoreValidationError,
 )
-from opencode.storage.txn import REASON_READ_MODEL_MISSING
+from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError
 
 #: §3.1 ID patterns enforced on the command surface (session/run identity).
 _SES_PREFIX = "ses_"
@@ -95,12 +108,58 @@ _RUN_PREFIX = "run_"
 #: on the event row and protected by the unique(session_id, dedupe_key) index).
 _DEDUPE_PREFIX = "prompt:"
 
+#: §7 L335: the cancel dedupe key is exactly ``"cancel:" + run_id``.
+_CANCEL_DEDUPE_PREFIX = "cancel:"
+
 #: Sanitized reason for a run_status read whose session holds an active-run
 #: slot with no matching accepted event (read model / log inconsistency).
 REASON_ACTIVE_RUN_WITHOUT_PROMPT = "active_run_without_prompt_event"
 
+#: §3.2 L187/§3.2.1 sanitized reasons for the runs-read-model faces.
+REASON_RUN_PROJECTION_MISSING = "run_projection_missing"
+REASON_RUN_STATUS_UNKNOWN = "run_status_unknown"
+REASON_RUN_OWNER_MISSING = "run_owner_row_missing"
+REASON_RUN_ERROR_UNDECODABLE = "run_error_undecodable"
+REASON_CANCEL_INTENT_ROW_UNEXPECTED = "cancel_intent_row_unexpected"
+REASON_CLEANUP_UNCONFIRMED = "cleanup_unconfirmed"
+REASON_CLOSE_TIMEOUT = "close_timeout"
+
+#: §7 L337: default wait for external shutdown (runner tasks, provider
+#: stream/adapter) before the timeout branch. The contract fixes the order,
+#: not the number (④ open question: the CLI face owns the tunable in R2-S8).
+DEFAULT_CLOSE_TIMEOUT_S = 30.0
+
+#: Grace period after a hard task cancel at close-timeout: the runner's
+#: CancelledError handler still commits the honest unknown/interrupted
+#: terminals through the same store (§7 L337), so the cleanup_failed mark
+#: must wait for it before it closes the write gate.
+_CLOSE_GRACE_S = 1.0
+
+#: §3.2: bounded ConflictError retries for the cancel-intent commit (the
+#: scheduled runner commits concurrently through its own EventCommitter locks,
+#: so a stale expected_seq is possible and is retried with the same batch).
+_COMMIT_ATTEMPTS = 3
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MILLISECOND = timedelta(milliseconds=1)
+
+# -- §3.2 L187 runs read model + §7 L335/L337 service-owned SQL -------------
+#
+# ReadRepositories (frozen face) has no runs-table query and no
+# cleanup_failed write; T-C1-014 deferred both to S7 *without* repos
+# authorization, so the service owns these direct single-row statements over
+# the injected engine (④ float report: recommend a repos micro-patch).
+_SELECT_RUN_BY_ID = sa.text("SELECT session_id, request_id, status, error FROM runs WHERE run_id = :rid")
+_SELECT_RUN_STATUS_BY_ID = sa.text("SELECT status FROM runs WHERE run_id = :rid")
+_SELECT_SESSION_EXISTS = sa.text("SELECT session_id, status FROM sessions WHERE session_id = :sid")
+_SELECT_SESSION_ID_BY_ACTIVE_RUN = sa.text("SELECT session_id FROM sessions WHERE active_run_id = :rid")
+_SELECT_MESSAGE_BY_ID = sa.text("SELECT session_id FROM messages WHERE message_id = :mid")
+_SELECT_EVENT_BY_CANCEL_DEDUPE = sa.text(
+    "SELECT id, type, version FROM events WHERE session_id = :sid AND dedupe_key = :dk"
+)
+_MARK_CLEANUP_FAILED = sa.text(
+    "UPDATE sessions SET status = 'cleanup_failed', diagnostic = :diag WHERE session_id = :sid AND status = 'active'"
+)
 
 
 def _utc_now() -> datetime:
@@ -154,6 +213,14 @@ class RunStatusValue(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self not in _RUN_STATUS_NON_TERMINAL
+
+
+#: The statuses a scheduled task may still be occupying (§7 L314; state.py mirrors).
+_RUN_STATUS_NON_TERMINAL = frozenset({RunStatusValue.ACCEPTED, RunStatusValue.RUNNING, RunStatusValue.CANCELLING})
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +307,23 @@ class AscendingIds:
         return "batch_" + self._next()
 
 
+class RunScheduler(Protocol):
+    """The S6 generation-loop face the service schedules onto (§7 L331).
+
+    Structural on purpose: :mod:`opencode.session.runner` imports
+    :class:`AscendingIds`/:class:`Clock`/:class:`IdFactory` from this module,
+    so the concrete runner can only be referenced here through a protocol
+    (the composition root in :mod:`opencode.app` passes the real object).
+    ``run`` drives one accepted run to its terminal (an opaque awaitable
+    result); ``cancel_event`` is the cooperative in-memory signal the host
+    sets only after the durable ``py.run.cancel_requested`` commit lands.
+    """
+
+    def run(self, session_id: str, run_id: str) -> Awaitable[object]: ...
+
+    def cancel_event(self, run_id: str) -> asyncio.Event: ...
+
+
 def _require_session_id_arg(session_id: Any) -> None:
     """§3.1/§7 step 1: session_id must be a non-empty string matching ^ses_."""
     if not isinstance(session_id, str) or not session_id:
@@ -267,6 +351,11 @@ def prompt_dedupe_key(request_id: str) -> str:
     return _DEDUPE_PREFIX + request_id
 
 
+def cancel_dedupe_key(run_id: str) -> str:
+    """§7 L335: the cancel dedupe key is exactly ``"cancel:" + run_id``."""
+    return _CANCEL_DEDUPE_PREFIX + run_id
+
+
 def _coerce_config_snapshot(config_snapshot: ConfigSnapshot | JsonObject) -> ConfigSnapshot:
     """Validate the §6.1 snapshot; an illegal one is ValidationError (§7 create)."""
     if isinstance(config_snapshot, ConfigSnapshot):
@@ -277,6 +366,32 @@ def _coerce_config_snapshot(config_snapshot: ConfigSnapshot | JsonObject) -> Con
         return ConfigSnapshot.model_validate(config_snapshot)
     except PydanticValidationError as error:
         raise StoreValidationError(f"invalid config_snapshot: {error}") from error
+
+
+def _decode_run_error(run_id: str, raw: Any) -> str | None:
+    """Decode the ``runs.error`` column into the RunStatus error message.
+
+    The projector stores ``canonical_json(CoreError.model_dump())``; the §7
+    RunStatus carries only the human-readable ``message``. Anything that does
+    not decode into a non-empty message is status corruption, fail closed
+    (§3.2.1), never a fabricated error text.
+    """
+    if raw is None:
+        return None
+    message: Any = None
+    try:
+        payload: Any = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
+        if isinstance(payload, dict):
+            message = payload.get("message")
+    except ValueError:
+        message = None
+    if not isinstance(message, str) or not message:
+        raise StorageCorruptError(
+            f"run {run_id} has an undecodable error payload",
+            isolate=True,
+            details={"reason": REASON_RUN_ERROR_UNDECODABLE, "run_id": run_id},
+        )
+    return message
 
 
 class SessionService:
@@ -300,9 +415,15 @@ class SessionService:
         working_dir: str,
         clock: Clock | None = None,
         ids: IdFactory | None = None,
+        engine: AsyncEngine | None = None,
+        runner: RunScheduler | None = None,
+        provider_close: Callable[[], Awaitable[None]] | None = None,
+        close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
     ) -> None:
         if not isinstance(working_dir, str) or not working_dir:
             raise StoreValidationError("working_dir must be a non-empty string")
+        if isinstance(close_timeout_s, bool) or not isinstance(close_timeout_s, int | float) or not close_timeout_s > 0:
+            raise StoreValidationError("close_timeout_s must be a positive number of seconds")
         self._store = store
         self._repos = repos
         self._bus = bus
@@ -311,10 +432,30 @@ class SessionService:
         self._ids: IdFactory = ids if ids is not None else AscendingIds(self._clock)
         self._locks: dict[str, asyncio.Lock] = {}
         self._closed = False
+        # R2-S7 wiring: the engine backs the runs-read-model faces
+        # (run_status/cancel) and the cleanup_failed management writes; the
+        # runner is the scheduled S6 face (None keeps the R1 behavior);
+        # provider_close is the §7 L337 provider shutdown seam.
+        self._engine = engine
+        self._runner = runner
+        self._provider_close = provider_close
+        self._close_timeout_s = float(close_timeout_s)
+        self._closing = False
+        self._close_task: asyncio.Task[None] | None = None
+        # §7 L331 end: strong references to the scheduled run tasks
+        # (run_id -> owning session + task) -- a task the registry drops would
+        # be garbage-collected mid-flight.
+        self._tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        self._schedule_errors: dict[str, BaseException] = {}
 
     @property
     def closed(self) -> bool:
-        """True once :meth:`close` has run (the service-level closing gate)."""
+        """True once :meth:`close` has finished its lifecycle (the closed gate).
+
+        The closing gate (``_closing``) is entered synchronously by the first
+        close call; write commands consult both, so an in-flight shutdown
+        already answers SessionClosed.
+        """
         return self._closed
 
     # -- §7 create ---------------------------------------------------------
@@ -330,7 +471,7 @@ class SessionService:
         bus is notified after the commit like every commit path (§3.2 L159
         step 5; open point E -- a session without subscribers is a no-op).
         """
-        if self._closed:
+        if self._closed or self._closing:
             raise SessionClosedError("service is closed")
         snapshot = _coerce_config_snapshot(config_snapshot)
         session_id = self._ids.session_id()
@@ -425,7 +566,7 @@ class SessionService:
             if status == SessionStatus.CLOSED:
                 raise SessionClosedError(f"session {session_id} is closed", details={"session_id": session_id})
             # The session is active; only now the service-level closing gate.
-            if self._closed:
+            if self._closed or self._closing:
                 raise SessionClosedError("service is closed")
 
             # -- step 2: durable idempotency (§7 L321-322) ------------------
@@ -475,21 +616,44 @@ class SessionService:
                 session_id, EventBatch(self._ids.batch_id(), (draft,), dedupe_key), expected_seq
             )
             self._bus.notify(session_id, committed)
+            # §7 L331: only a freshly accepted request is scheduled (the
+            # idempotent return above never reaches here); the strong task
+            # reference lives in self._tasks. The closing re-check shares this
+            # synchronous block with create_task, so a concurrent close either
+            # sees the task in the registry or makes this a no-op.
+            self._schedule_run(session_id, run_id)
             return RunRef(session_id=session_id, run_id=run_id, request_id=request_id)
 
     # -- §7 run_status -------------------------------------------------------
 
     async def run_status(self, run_id: str) -> RunStatus:
-        """Look up one run (§7 L311): R1 finds it by the active-run slot.
+        """Look up one run (§7 L311) through the runs read model (§3.2 L187).
 
-        Open point C: the sessions table's ``active_run_id`` is R1's only run
-        face; ``request_id`` comes from the matching accepted prompt's typed
-        data. A held slot with no matching event is read-model/log
-        inconsistency -> StorageCorrupt (fail closed). A run that is not (or
-        no longer) the active run is NotFound in R1 (no run history table
-        exists yet).
+        With the engine wired (the App composition), the run resolves by a
+        single-row ``runs`` lookup -- historical terminal runs included -- and
+        the normal query never scans the events log (OP-2, T-A-005). A missing
+        runs row over a surviving trace (the active-run slot or the idle
+        message) is a missing projection; a runs row over a missing sessions
+        row is ownership corruption; an unknown status value or an undecodable
+        error payload is status corruption -- all StorageCorrupt (§3.2.1),
+        never a fabricated RunStatus. Without the engine (R1 direct
+        construction) the R1 active-slot face is kept unchanged.
         """
         _require_run_id_arg(run_id)
+        if self._engine is None:
+            return await self._run_status_by_active_slot(run_id)
+        return await self._run_status_by_runs_table(run_id)
+
+    async def _run_status_by_active_slot(self, run_id: str) -> RunStatus:
+        """The R1 face (open point C): resolve the run by the active-run slot.
+
+        The sessions table's ``active_run_id`` is R1's only run face;
+        ``request_id`` comes from the matching accepted prompt's typed data. A
+        held slot with no matching event is read-model/log inconsistency ->
+        StorageCorrupt (fail closed). A run that is not (or no longer) the
+        active run is NotFound on this face (the runs read model is not
+        wired).
+        """
         record = await self._repos.session_by_active_run(run_id)
         if record is None:
             raise NotFoundError(f"run {run_id} does not exist", details={"run_id": run_id})
@@ -511,21 +675,180 @@ class SessionService:
             status=RunStatusValue.ACCEPTED,
         )
 
+    async def _run_status_by_runs_table(self, run_id: str) -> RunStatus:
+        """§3.2 L187: one PK lookup on ``runs`` + one ownership row check."""
+        assert self._engine is not None
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_RUN_BY_ID, {"rid": run_id})).first()
+            if row is None:
+                # Distinguish a never-existed run (NotFound) from a missing
+                # projection (StorageCorrupt) by the two surviving traces:
+                # the active-run slot and the idle message (msg_idle_{run_id}).
+                slot = (await connection.execute(_SELECT_SESSION_ID_BY_ACTIVE_RUN, {"rid": run_id})).first()
+                idle = (await connection.execute(_SELECT_MESSAGE_BY_ID, {"mid": f"msg_idle_{run_id}"})).first()
+                if slot is not None or idle is not None:
+                    raise StorageCorruptError(
+                        f"run {run_id} has surviving traces but no runs row",
+                        isolate=True,
+                        details={"reason": REASON_RUN_PROJECTION_MISSING, "run_id": run_id},
+                    )
+                raise NotFoundError(f"run {run_id} does not exist", details={"run_id": run_id})
+            session_id = str(row.session_id)
+            owner = (await connection.execute(_SELECT_SESSION_EXISTS, {"sid": session_id})).first()
+        if owner is None:
+            raise StorageCorruptError(
+                f"run {run_id} belongs to session {session_id} which has no sessions row",
+                isolate=True,
+                details={"reason": REASON_RUN_OWNER_MISSING, "run_id": run_id, "session_id": session_id},
+            )
+        try:
+            SessionStatus(str(owner.status))
+        except ValueError as error:
+            raise StorageCorruptError(
+                f"session {session_id} has unknown status {owner.status!r}",
+                isolate=True,
+                details={"reason": REASON_RUN_OWNER_MISSING, "run_id": run_id, "session_id": session_id},
+            ) from error
+        try:
+            status = RunStatusValue(str(row.status))
+        except ValueError as error:
+            raise StorageCorruptError(
+                f"run {run_id} has unknown status {row.status!r}",
+                isolate=True,
+                details={"reason": REASON_RUN_STATUS_UNKNOWN, "run_id": run_id, "status": str(row.status)},
+            ) from error
+        return RunStatus(
+            session_id=session_id,
+            run_id=run_id,
+            request_id=str(row.request_id),
+            status=status,
+            error=_decode_run_error(run_id, row.error),
+        )
+
+    # -- §7 cancel (R2-S7) ----------------------------------------------------
+
+    async def cancel(self, run_id: str) -> RunStatus:
+        """Cancel one run (§7 L335): one intent, one cleanup wait, honest terminals.
+
+        An already-terminal run returns its original RunStatus unchanged (a
+        late cancel never overwrites a committed result). A non-terminal run
+        commits exactly one ``py.run.cancel_requested`` under the session
+        commit lock (dedupe key ``cancel:run_id``, check-first, so repeated
+        cancels never re-commit), then -- outside the lock, after the
+        cooperative signal -- awaits the same scheduled task every repeated
+        cancel awaits. A run without a live task (a storage-only accept or a
+        pre-restart leftover) keeps its cancelling state for the R4 recovery
+        coordinator; a task that already crashed is a cleanup that cannot be
+        confirmed: the session is marked ``cleanup_failed`` and
+        :class:`LifecycleCleanupFailedError` is raised. The runner consumes
+        the intent at its step/tool boundaries (an in-flight provider stream
+        is not aborted mid-chunk); late completion callbacks are deduped by
+        execution id on the S5 invoker face.
+        """
+        _require_run_id_arg(run_id)
+        if self._engine is None:
+            # The R1 fallback face cannot observe cancelling honestly; a
+            # cancel that returned a fabricated status would lie (④ float).
+            raise StoreValidationError("cancel requires the runs read model (engine not wired)")
+        current = await self._run_status_by_runs_table(run_id)
+        if current.status.is_terminal:
+            return current
+        session_id = current.session_id
+        async with self._session_lock(session_id):
+            # Re-read under the lock: the scheduled task may have committed
+            # its terminal while we waited for the lock (late cancel).
+            current = await self._run_status_by_runs_table(run_id)
+            if current.status.is_terminal:
+                return current
+            await self._commit_cancel_intent(session_id, run_id, "user")
+        # §7 L313: the lock is released before waiting for the cleanup.
+        if self._runner is not None:
+            self._runner.cancel_event(run_id).set()
+        entry = self._tasks.get(run_id)
+        if entry is not None:
+            _, task = entry
+            await task
+            final = await self._run_status_by_runs_table(run_id)
+            if final.status.is_terminal:
+                return final
+            await self._fail_cleanup(
+                session_id, run_id, REASON_CLEANUP_UNCONFIRMED, "the scheduled task exited without a terminal run"
+            )
+        crash = self._schedule_errors.get(run_id)
+        if crash is not None:
+            await self._fail_cleanup(
+                session_id,
+                run_id,
+                REASON_CLEANUP_UNCONFIRMED,
+                f"the scheduled task crashed: {type(crash).__name__}",
+                cause=crash,
+            )
+        # No live task: the intent is durable, there are no in-process
+        # resources to reclaim, and R4 owns the terminal.
+        return await self._run_status_by_runs_table(run_id)
+
     # -- §7 close -------------------------------------------------------------
 
     async def close(self) -> None:
-        """Release the service's own resources (§7 L312, R1 semantics).
+        """The §7 L337 R2 close lifecycle (R1 semantics without a scheduler).
 
-        Sets the service-level closing/closed gate first (afterwards
-        ``prompt``/``create`` answer SessionClosed; reads keep working while
-        the composition root keeps the engine open). R1 has no scheduler
-        tasks, no run recovery (R4) and no service-owned bus subscriptions
-        (subscriptions are caller-managed contexts), so the gate plus the
-        lock-registry cleanup is the whole resource release; the engine and
-        writer lock are owned by :class:`opencode.app.App`, which disposes
-        them after this (task ②: service.close -> engine dispose). Repeat
-        calls are safe no-ops.
+        The first call atomically enters the closing gate (``_closing`` is
+        set synchronously; afterwards ``prompt``/``create``/``rebuild``
+        answer SessionClosed) and starts the one cleanup task. Concurrent or
+        repeated calls await that same task -- the same result or error, never
+        a duplicate shutdown event. The lifecycle: commit
+        ``py.run.cancel_requested(reason=shutdown)`` for every live scheduled
+        run (R2 has no pending approvals: the ``permission.closed`` branch is
+        protocol-unreachable, ③ disclosure), release the commit locks, wait
+        for the scheduled tasks while their terminals still flow through the
+        same :meth:`SessionStore.commit`; on timeout hard-cancel the
+        stragglers, let their CancelledError handlers commit the honest
+        ``tool.finished(effect_status=unknown)`` + interrupted terminals,
+        then mark those sessions ``cleanup_failed``; finally close the
+        provider and set the service closed. Storage-only accepted runs (no
+        live task) keep their records for R4 and are never claimed cleaned.
+        The engine and writer lock stay owned by the composition root.
         """
+        if self._close_task is not None:
+            await self._close_task
+            return
+        self._closing = True
+        self._close_task = asyncio.create_task(self._close_lifecycle())
+        await self._close_task
+
+    async def _close_lifecycle(self) -> None:
+        """The single cleanup-task body (§7 L337 full order)."""
+        # Phase 1: one shutdown intent per live scheduled run, each under its
+        # session's commit lock (released immediately -- "随后释放提交锁").
+        # The task registry snapshot is safe: prompt's scheduling decision is
+        # a synchronous block that re-checks _closing, so every task here was
+        # registered before the gate and no later one can appear.
+        scheduled = list(self._tasks.items())
+        for _run_id, (session_id, _task) in scheduled:
+            await self._commit_cancel_intent(session_id, _run_id, "shutdown")
+            if self._runner is not None:
+                self._runner.cancel_event(_run_id).set()
+        # Phase 2: wait for the tasks (their determined tool/step/run
+        # terminals still commit through the same store); on timeout
+        # hard-cancel the stragglers and let the grace period carry their
+        # CancelledError handlers' final commits, then mark every timed-out
+        # session cleanup_failed (§7 L337: an unconfirmed shutdown is never
+        # reported as cleaned). Tasks still stuck after the grace are
+        # abandoned -- records kept, no further in-process claim (③ float).
+        if scheduled:
+            by_task = {task: (run_id, session_id) for run_id, (session_id, task) in scheduled}
+            _done, pending = await asyncio.wait(set(by_task), timeout=self._close_timeout_s)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.wait(pending, timeout=_CLOSE_GRACE_S)
+                for task in pending:
+                    run_id, session_id = by_task[task]
+                    await self._mark_cleanup_failed(session_id, run_id, REASON_CLOSE_TIMEOUT)
+        # Phase 3: every own task has exited or is durably marked -- close the
+        # provider, then the service gate. The DB/engine stays with the App.
+        if self._provider_close is not None:
+            await self._provider_close()
         self._closed = True
         self._locks.clear()
 
@@ -551,7 +874,7 @@ class SessionService:
         """
         _require_session_id_arg(session_id)
         async with self._session_lock(session_id):
-            if self._closed:
+            if self._closed or self._closing:
                 # Open point E, conservative reading: the service-level gate
                 # is uniform with prompt/create -- a closed service answers
                 # SessionClosed on every management face too.
@@ -599,3 +922,175 @@ class SessionService:
                 details={"session_id": session_id, "status": record.status},
             ) from error
         return record
+
+    # -- R2-S7 internals: scheduling, cancel, cleanup ---------------------------
+
+    def _schedule_run(self, session_id: str, run_id: str) -> None:
+        """Create the runner task holding a strong reference (§7 L331 end).
+
+        Called inside the prompt commit lock right after the accepted batch
+        commits; the idempotent retry path never reaches here (only this
+        freshly accepted request is scheduled). The ``_closing`` re-check
+        shares the synchronous block with ``create_task``: a concurrent close
+        either sees this task in the registry or makes this call a no-op --
+        never a scheduled run the close lifecycle would miss.
+        """
+        if self._runner is None or self._closing or self._closed:
+            return
+        task = asyncio.create_task(self._drive_run(session_id, run_id))
+        self._tasks[run_id] = (session_id, task)
+
+    async def _drive_run(self, session_id: str, run_id: str) -> None:
+        """The scheduled task body: drive the runner, record its failure.
+
+        A crashed task is swallowed here (never re-raised into the loop as an
+        unretrieved-exception warning) and recorded so :meth:`cancel` reports
+        the unconfirmable cleanup as LifecycleCleanupFailed. CancelledError is
+        the close-timeout path's own signal -- the runner's handler has
+        finalized the run (or left the open step to recovery) -- and is not
+        an error.
+        """
+        assert self._runner is not None
+        try:
+            await self._runner.run(session_id, run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # recorded here; surfaced by cancel/close
+            self._schedule_errors[run_id] = error
+        finally:
+            self._tasks.pop(run_id, None)
+
+    async def _commit_cancel_intent(self, session_id: str, run_id: str, reason: Literal["user", "shutdown"]) -> None:
+        """Commit one ``py.run.cancel_requested`` under the session lock.
+
+        Check-first idempotency: the ``(session_id, "cancel:"+run_id)`` row is
+        queried before committing (the store replays only same-batch retries),
+        so repeated cancels and a cancel/close overlap never re-commit the
+        intent. Each ConflictError retry re-checks the run state first -- the
+        scheduled runner commits concurrently and may have committed the
+        terminal while we retried, and an intent must never land on a
+        terminal run (late cancel never overwrites, §7 L335).
+        """
+        assert self._engine is not None
+        if await self._cancel_intent_row(session_id, run_id):
+            return
+        batch = EventBatch(
+            self._ids.batch_id(),
+            (self._cancel_intent_draft(session_id, run_id, reason),),
+            cancel_dedupe_key(run_id),
+        )
+        conflict: ConflictError | None = None
+        for _ in range(_COMMIT_ATTEMPTS):
+            status = await self._runs_status_value(run_id)
+            if status is not None and status.is_terminal:
+                # The runner finished first; the caller re-reads and returns
+                # the original terminal status (no intent, no overwrite).
+                return
+            expected_seq = await self._repos.log_high(session_id)
+            try:
+                committed = await self._store.commit(session_id, batch, expected_seq)
+            except ConflictError as error:
+                conflict = error
+                continue
+            self._bus.notify(session_id, committed)
+            return
+        assert conflict is not None
+        raise conflict
+
+    async def _cancel_intent_row(self, session_id: str, run_id: str) -> bool:
+        """True when a row already sits under the cancel dedupe key.
+
+        A row under the key that is not ``py.run.cancel_requested`` v1 is
+        stored corruption on this read path, fail closed (mirrors the prompt
+        dedupe face's classification).
+        """
+        assert self._engine is not None
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    _SELECT_EVENT_BY_CANCEL_DEDUPE, {"sid": session_id, "dk": cancel_dedupe_key(run_id)}
+                )
+            ).first()
+        if row is None:
+            return False
+        if str(row.type) != PY_RUN_CANCEL_REQUESTED or int(row.version) != EVENT_VERSION:
+            raise StorageCorruptError(
+                f"session {session_id} dedupe row for run {run_id} is not {PY_RUN_CANCEL_REQUESTED} v{EVENT_VERSION}",
+                isolate=True,
+                details={
+                    "reason": REASON_CANCEL_INTENT_ROW_UNEXPECTED,
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "event_id": str(row.id),
+                },
+            )
+        return True
+
+    def _cancel_intent_draft(
+        self, session_id: str, run_id: str, reason: Literal["user", "shutdown"]
+    ) -> EventDraft[RunCancelRequestedData]:
+        """One ``py.run.cancel_requested`` v1 draft (§3.1 L125, run metadata)."""
+        return EventDraft[RunCancelRequestedData](
+            id=self._ids.event_id(),
+            type=PY_RUN_CANCEL_REQUESTED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=self._clock(),
+            data=RunCancelRequestedData(run_id=run_id, reason=reason),
+            metadata={"run_id": run_id},
+        )
+
+    async def _runs_status_value(self, run_id: str) -> RunStatusValue | None:
+        """The current ``runs.status`` of one run by PK (None = no row)."""
+        assert self._engine is not None
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_RUN_STATUS_BY_ID, {"rid": run_id})).first()
+        if row is None:
+            return None
+        try:
+            return RunStatusValue(str(row.status))
+        except ValueError as error:
+            raise StorageCorruptError(
+                f"run {run_id} has unknown status {row.status!r}",
+                isolate=True,
+                details={"reason": REASON_RUN_STATUS_UNKNOWN, "run_id": run_id, "status": str(row.status)},
+            ) from error
+
+    async def _fail_cleanup(
+        self,
+        session_id: str,
+        run_id: str,
+        reason: str,
+        detail: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Mark the session cleanup_failed and report LifecycleCleanupFailed (§7 L335)."""
+        await self._mark_cleanup_failed(session_id, run_id, reason)
+        error = LifecycleCleanupFailedError(
+            f"run {run_id} cleanup could not be confirmed: {detail}",
+            details={"session_id": session_id, "run_id": run_id, "reason": reason},
+        )
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    async def _mark_cleanup_failed(self, session_id: str, run_id: str, reason: str) -> None:
+        """Persist ``sessions.status = cleanup_failed`` (management write).
+
+        Mirrors the S4 isolation-write discipline (§3.2.1): one direct engine
+        UPDATE scoped to still-active rows -- no business events, no seq or
+        applied_seq advance, no bus notify. The store's write gate then
+        answers every later commit on this session with
+        LifecycleCleanupFailed (该 session 不可再执行). The ``status = 'active'``
+        guard makes repeats and already-marked rows no-ops.
+        """
+        if self._engine is None:
+            return
+        diagnostic = json.dumps(
+            {"reason": reason, "session_id": session_id, "run_id": run_id},
+            sort_keys=True,
+        )
+        async with self._engine.connect() as connection:
+            await connection.execute(_MARK_CLEANUP_FAILED, {"sid": session_id, "diag": diagnostic})
+            await connection.commit()
