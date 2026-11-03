@@ -250,9 +250,9 @@ follow 只保证 durable，不回放 ephemeral token。实时 UI 可用 Bus 做�
 `ToolSpec`：`namespace, name, version, description, input_schema, supported_content_types, side_effects, idempotency_support`。
 `ToolAdapter.execute(context, validated_input) -> ToolResult` 仅注册中心内部可访问。`ToolResult` 为 `content, structured_output?, metadata, error?`；不用字符串承担所有结果。
 
-`ToolRegistry` 只公开 `register(adapter)`、`snapshot(session) -> ToolCatalog`、`invoke(context, tool_ref, input, execution_id) -> ToolOutcome`。重复 namespace/name/version 拒绝；模型名通过可逆/碰撞检测映射，MCP server ID 必须参与命名。每次 provider 请求固定 catalog 快照，只能调用已展示且有 capability 的工具。
+`ToolRegistry` 只公开 `register(adapter)`、`snapshot(session) -> ToolCatalog`、`invoke(context, tool_ref, input, execution_id) -> ToolOutcome`。重复 namespace/name/version 拒绝；模型名通过可逆/碰撞检测映射，MCP server ID 必须参与命名。每次 provider 请求固定 catalog 快照，只能调用已展示且有 capability 的工具。`invoke` 的 `tool_ref` 参数接收调用接缝保留的原始 requested name（S5 catalog 接缝为 wire 名，如 `fs__read`；模型层点分名按 §2.2 转换），由 `invoke` 在当前 catalog 快照内解析；调用方不得预解析，未知名仍产生 requested→finished(not_started) 配对，事件中的 `requested_name` 保留原值，解析成功时才填可选 `tool_ref`。
 
-`ToolContext` 是运行时 dataclass：session_id、message_id、working_dir、limits、取消信号和 progress callback；PermissionPolicy 注入 Invoker，工具不能自行批准自己。
+`ToolContext` 是运行时 dataclass：session_id、run_id、message_id、tool_call_id、working_dir、limits、取消信号和 progress callback；run_id 用于工具事件 metadata，tool_call_id 用于 `py.tool.requested` 身份。这些是运行时上下文字段，不扩展已版本化的 wire 形状。PermissionPolicy 注入 Invoker，工具不能自行批准自己。
 
 整批 py.step.generated 提交后，`invoke` 先把相应调用记为 requested（含原始 requested_name、可选解析后的 tool_ref、canonical input/hash），再做 catalog/schema 校验。输入严格验证，不隐式类型转换或修改参数；失败生成 failed/not_started 结果。成功再走 policy/审批 → started 提交确认 → adapter 执行 → 结果限额/归一化 → finished 提交。只有 Invoker 的事件回调可提交，adapter 不拿 Store/DB。py.step.finished 中的终态必须与工具事件折叠一致，不能用旧 snapshot 覆盖新结果。
 
@@ -345,6 +345,8 @@ max_steps 默认 20；超限结束为 failed。工具默认串行，调用异常
 `CoreError = {code, message, retryable, details: JsonObject}`；构造/输入时可省略 details，wire 输出恒包含 details，缺省值为工厂创建的 `{}`，有信息时保留脱敏对象。code 至少区分：
 `ValidationError, UnsupportedCapability, NotFound, SessionBusy, Conflict, IdempotencyConflict, InvalidCursor, PermissionDenied, ApprovalUnavailable, ApprovalExpired, ToolTimeout, ToolFailed, ExecutionUnknown, ProviderUnavailable, ProviderStreamInterrupted, ContextLimitExceeded, SlowConsumer, StorageCorrupt, MigrationRequired, SessionReadOnly, SessionClosed, LifecycleCleanupFailed`。
 
+R2 文件读取只支持文件目标；目录目标因此返回 `UnsupportedCapability`（消息可保留 “Path is not a file” 语义），不得将目录拒绝归为 `NotFound`。
+
 details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire。用户错误与内部故障分别日志记录，但对外错误结构相同。
 
 只有一个 retry owner：MAAS adapter 关闭 SDK 默认重试，未收到首个内容且明确可重试的 429/短暂网络错误最多 2 次重试（尊重 Retry-After；Phase 1 使用确定性的 `min(retry_after, remaining)` 等待，无 Retry-After 按 0 处理，不加入抖动，并受总超时限制）。部分流已到达则结束并标 interrupted，不能把旧流和新流拼接。用户要求重试生成时创建新 attempt；既有 tool.finished 绝不重新执行。MCP、shell、文件变更默认不自动重试。
@@ -385,3 +387,11 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 同次 ④-3 选 A：§2.2 L80 明定 `LLMToolCallPart.name` 为 `namespace.name`，避免 S4 产出裸 `read` 或误传 wire 名使 namespace 丢失。依据为 `doc/reviews/R2-S3-review.md:117–121,129,133`、`doc/evidence/r0/provider.md:73,144`、`src/opencode/ai/maas.py:99–119,325–335`；TS `packages/core/src/aisdk.ts:784–812` 原样携带工具名，Python 的双向命名映射须在本地接缝明确。B/调度器须让 S4/S6 任务书引用 §2.2，S4 核对请求 part 的点分名及 `fs.read ↔ fs__read` 往返，S6 核对 chunk→计划→请求回放的一致性并承接跨响应重复 tool_call_id 查重（`doc/evidence/r0/provider.md:154–155`），满足 PHASE1-SLIM L80–83 的调用/结果配对；adapter 对不可反解 provider 名的原样保留、未知工具 not_started 失败语义和 S5 注册面已有的 `__`-free 约束不变。
 
 排期建议（非新增实现授权）：M-1 注释、M-2 连接建立失败补测和 OP-8/③-3 的 500 补测合为独立 adapter 微补丁，在当前 S4 窗口安排、S6 接入前验收，不留到 S8。M-1 仅记录 `asyncio.timeout(header_s)` 与 connect timeout 竞争及两路径皆合法失败的理由（`doc/reviews/R2-S3-review.md:19–28,130–132`）；M-2 用立即拒绝的未监听端口避开计时竞态，核对单个终止 error、ProviderUnavailable/retryable=True、attempts=3，并直接计数初次加两次重试，不以耗时下界推断零等待重试次数。两项补测同落 `tests/contract/test_ai_adapter.py`，M-1 注释落 maas.py；此处只记交接，冻结的实现、测试、方案及任务书由下游另行获授权后处理。
+
+`[T-A-007] 2026-11-03`：A 席位终审追认 R2 五项，依据 `doc/reviews/R2-S2-review.md` §5–§6、`doc/reviews/R2-S5-review.md` §5–§6 及已冻结契约/迁移/测试证据：
+
+1. **S2 ④-2 `runs.run_id` 主键：维持 GLOBAL 单列主键。** §3.2 已明确该主键，§7 的 `run_status(run_id)` 以 `run_id` 直接定位单行；T-A-005 已明确 Python 读模型按自身接口补充、不承担 TS 表结构同构义务。保留该不变量不触发迁移或测试联动；跨 session 撞键的 `_write_accepted_run` 诊断文案属于后置小修，不改变本裁决。
+2. **S2 ④-3 idle ID：确认 `msg_idle_{run_id}`，关闭为“契约已裁”。** §3.3 已规定 idle ID 由 `run_id` 确定，Python projector 的构造与之相符；TS 侧以事件 ID 实现是实现差异，不改 Python 契约或投影。
+3. **S5 ④-13 目录读取错误码：追认为 `UnsupportedCapability`。** R2 读取能力面不提供目录列举，目录目标是能力类型不支持而非资源缺失；§8 已补充该选型及 “Path is not a file” 消息语义。该裁决与 `PathKindError` 锚点及目录测试保持一致。
+4. **S5 ④-1 `ToolContext`：确认增补 `run_id` 与 `tool_call_id`。** 两字段分别满足工具事件 metadata 的 `run_id` 和 `py.tool.requested` 的 `tool_call_id`，并与 TS Context 的 call ID 对齐；§5.1 已注明它们属于运行时上下文，不是 wire 版本字段。
+5. **S5 ④-3 `invoke` 的 `tool_ref`：确认接收原始 requested name，并在 `invoke` 内解析。** S5 catalog 接缝保留 wire 名（如 `fs__read`），模型层点分名按 §2.2 在接缝转换；§5.1 已明确解析使用当前 catalog 快照。未知工具仍可先提交 requested、再提交 `finished(not_started)`，同时保留原始 `requested_name`，因此满足未知工具配对契约。本裁决不替代 S5 M-1 的命名碰撞热修，namespace 单下划线边界仍由 T-C1-018 处理。
