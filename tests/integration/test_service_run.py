@@ -825,11 +825,15 @@ async def test_concurrent_close_reuses_one_cleanup_task(tmp_path: Path) -> None:
         assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
 
 
-async def test_close_timeout_injects_unknown_and_marks_cleanup_failed(tmp_path: Path) -> None:
-    """Close timeout with an unkillable-in-time tool: the started tool gets
-    its honest unknown/unknown terminal, the run ends interrupted, the
-    session is marked cleanup_failed (never reported as cleaned), and the
-    session is no longer executable after reopen."""
+async def test_close_timeout_grace_exit_keeps_session_executable(tmp_path: Path) -> None:
+    """Close timeout with a tool that exits inside the grace: the started
+    tool still gets its honest unknown/unknown terminal and the run ends
+    interrupted, but a task exiting within the grace with committed
+    terminals is a CONFIRMED cleanup (#90: m-2) -- the session is not marked
+    cleanup_failed, stays executable after reopen, and prompt succeeds; only
+    tasks still stuck after the grace are marked (that branch needs an
+    uncancellable tool and is untestable under the test discipline, ③
+    float)."""
     db_path = tmp_path / "app.db"
     _require_success(_upgrade_head(db_path))
     provider = _ScriptedProvider([[_tool_script("app.slow", "t1")]])
@@ -846,14 +850,14 @@ async def test_close_timeout_injects_unknown_and_marks_cleanup_failed(tmp_path: 
         assert terminals[0]["state"] == "unknown"
         assert terminals[0]["effect_status"] == "unknown"
         assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
-        assert _session_status_value(db_path, session_id) == "cleanup_failed"
+        assert _session_status_value(db_path, session_id) == "active"
         assert app.service.closed is True
         assert provider.close_count == 1
 
     async with _plain_app(db_path) as reopened:  # the writer lock was released
-        assert (await reopened.service.session_status(session_id)) is SessionStatus.CLEANUP_FAILED
-        with pytest.raises(LifecycleCleanupFailedError):
-            await reopened.service.prompt(session_id, "more", "req_2")
+        assert (await reopened.service.session_status(session_id)) is SessionStatus.ACTIVE
+        reopened_ref = await reopened.service.prompt(session_id, "more", "req_2")
+        assert (await reopened.service.run_status(reopened_ref.run_id)).status is RunStatusValue.ACCEPTED
 
 
 async def test_close_keeps_storage_only_accepted_runs_for_recovery(tmp_path: Path) -> None:
@@ -874,3 +878,209 @@ async def test_close_keeps_storage_only_accepted_runs_for_recovery(tmp_path: Pat
 
     async with _plain_app(db_path) as reopened:
         assert (await reopened.service.run_status(run_ref.run_id)).status is RunStatusValue.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# T-C1-022 (R2-S7 review follow-up): untested defenses, close patches
+# ---------------------------------------------------------------------------
+
+
+class _CrashingProvider(_ScriptedProvider):
+    """A provider whose stream raises a non-CoreError mid-stream.
+
+    The scheduled task crashes (the runner lets unexpected exceptions
+    propagate); _drive_run records the crash for cancel() to report.
+    """
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.crashed = asyncio.Event()
+
+    async def stream(self, request: GenerationRequest) -> AsyncIterator[ProviderChunk]:
+        self.requests.append(request)
+        yield TextDeltaChunk(type="text_delta", request_id="req_script", index=1, part_id="p1", delta="partial")
+        self.crashed.set()
+        raise RuntimeError("provider exploded")
+
+
+class _GatedCloseProvider(_ScriptedProvider):
+    """A provider whose close() parks until the test releases it.
+
+    Keeps the engine alive while close() sits in its Phase 3 provider wait so
+    a concurrent cancel() can still re-read the runs table (the m-1
+    determinism window: the re-read must finish before the engine goes away).
+    """
+
+    def __init__(self, scripts: Sequence[Sequence[BaseModel | _Gate | _Script]]) -> None:
+        super().__init__(scripts)
+        self._close_gate = asyncio.Event()
+
+    async def close(self) -> None:
+        await self._close_gate.wait()
+        await super().close()
+
+    def release_close(self) -> None:
+        self._close_gate.set()
+
+
+async def test_cancel_reports_a_crashed_task_with_the_original_cause(tmp_path: Path) -> None:
+    """M-1①: a scheduled task that crashes (a non-CoreError escaping the
+    runner) is reported by cancel() as LifecycleCleanupFailedError chained to
+    the original exception; the session is marked cleanup_failed with the
+    sanitized diagnostic and the run keeps its honest cancelling state."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    provider = _CrashingProvider()
+
+    async with _run_app(db_path, provider) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        await provider.crashed.wait()
+        await asyncio.sleep(0.1)  # the crash reaches _drive_run's recorder
+
+        with pytest.raises(LifecycleCleanupFailedError) as failed:
+            await app.service.cancel(run_ref.run_id)
+
+        assert "RuntimeError" in str(failed.value)
+        assert isinstance(failed.value.__cause__, RuntimeError)
+        assert str(failed.value.__cause__) == "provider exploded"
+        assert _session_status_value(db_path, session_id) == "cleanup_failed"
+        row = _fetch_scalar(db_path, "SELECT diagnostic FROM sessions WHERE session_id = ?", (session_id,))
+        assert row is not None
+        diagnostic = json.loads(str(row[0]))
+        assert diagnostic["reason"] == "cleanup_unconfirmed"
+        assert _run_status_value(db_path, run_ref.run_id) == "cancelling"
+
+
+async def test_cancel_without_a_live_task_commits_exactly_one_intent(tmp_path: Path) -> None:
+    """M-1②: a storage-only accepted run (no live task) cancels to CANCELLING
+    with exactly one durable cancel_requested event -- repeated cancels never
+    re-commit the intent (R4 owns the terminal)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with _plain_app(db_path) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+
+        final = await app.service.cancel(run_ref.run_id)
+        again = await app.service.cancel(run_ref.run_id)
+
+        assert final.status is RunStatusValue.CANCELLING
+        assert again.status is RunStatusValue.CANCELLING
+        intents = _event_data(db_path, session_id, "py.run.cancel_requested")
+        assert len(intents) == 1
+        assert intents[0]["reason"] == "user"
+        assert _run_status_value(db_path, run_ref.run_id) == "cancelling"
+
+
+async def test_run_status_fails_closed_on_unknown_owner_status(tmp_path: Path) -> None:
+    """M-1③: a runs row whose owner session carries an unknown status is
+    StorageCorrupt with the sanitized owner reason (§3.2.1 fail-closed --
+    never fabricated, never skipped)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    provider = _ScriptedProvider([[_Script().text("p1", "hello").usage().finish()]])
+
+    async with _run_app(db_path, provider) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        await _await_run_status(app.service, run_ref.run_id, frozenset({RunStatusValue.SUCCEEDED}))
+
+        with sqlite3.connect(db_path) as connection:  # quiesced run: sync mutation is safe
+            connection.execute("UPDATE sessions SET status = 'bogus' WHERE session_id = ?", (session_id,))
+        with pytest.raises(StorageCorruptError) as corrupt:
+            await app.service.run_status(run_ref.run_id)
+        assert corrupt.value.core.details["reason"] == REASON_RUN_OWNER_MISSING
+
+
+async def test_close_timeout_s_rejects_non_finite_numbers(tmp_path: Path) -> None:
+    """n-2: +inf (and NaN, and -inf) close timeouts are rejected at
+    construction -- the close lifecycle's waits must stay bounded."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        for bad in (float("inf"), float("nan"), float("-inf")):
+            with pytest.raises(StoreValidationError):
+                SessionService(
+                    store=SessionStore(database.engine, projector=SessionProjector()),
+                    repos=ReadRepositories(database.engine),
+                    bus=VolatileBus(),
+                    working_dir="C:/work",
+                    close_timeout_s=bad,
+                )
+
+
+async def test_cancel_survives_a_hard_cancelled_runnable_task(tmp_path: Path) -> None:
+    """m-1: awaiting a scheduled task that exits through its own hard cancel
+    (the close-timeout path) must not tear down cancel() -- the CancelledError
+    from the awaited task is distinguished from the caller's own cancellation
+    and the re-read reports the committed interrupted terminal."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    provider = _GatedCloseProvider([[_tool_script("app.slow", "t1")]])
+    slow = _GatedAdapter()
+
+    async with _run_app(db_path, provider, adapters=[slow], close_timeout_s=0.2) as app:
+        _session_id, run_ref = await _create_prompted(app.service)
+        await _await_tool_start(slow)
+
+        cancel_task = asyncio.create_task(app.service.cancel(run_ref.run_id))
+        await _await_run_status(app.service, run_ref.run_id, frozenset({RunStatusValue.CANCELLING}))
+        close_task = asyncio.create_task(app.close())
+
+        final = await cancel_task  # must NOT raise CancelledError
+
+        assert final.status is RunStatusValue.INTERRUPTED
+        provider.release_close()
+        await close_task
+        assert provider.close_count == 1
+        assert app.service.closed is True
+
+
+async def test_close_tolerates_a_quarantined_session(tmp_path: Path) -> None:
+    """④-4 (A-010): a session quarantined mid-run must not break close -- the
+    shutdown intent commit raises SessionReadOnlyError, close skips that
+    session and still drains the run, closes the provider and the gates; the
+    quarantined session keeps its records and watermarks untouched."""
+    from opencode.storage import SessionReadOnlyError
+
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    provider = _ScriptedProvider([[_tool_script("app.wait", "t1")]])
+    waiter = _CancellableAdapter()
+
+    async with _run_app(db_path, provider, adapters=[waiter]) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        await _await_tool_start(waiter)
+
+        # Quarantine mid-run through the async engine (the sync sqlite3
+        # discipline forbids mutations beside a live runner).
+        async with app.database.engine.connect() as connection:
+            await connection.exec_driver_sql(
+                "UPDATE sessions SET status = 'read_only_diagnostic', diagnostic = ? WHERE session_id = ?",
+                ('{"reason": "test_quarantine"}', session_id),
+            )
+            await connection.commit()
+        events_before = _event_count(db_path, session_id)
+        applied_before = _fetch_scalar(db_path, "SELECT applied_seq FROM sessions WHERE session_id = ?", (session_id,))
+
+        await app.close()  # must not raise despite the quarantined session
+
+        assert _event_count(db_path, session_id) == events_before
+        assert (
+            _fetch_scalar(db_path, "SELECT applied_seq FROM sessions WHERE session_id = ?", (session_id,))
+            == applied_before
+        )
+        assert "py.run.cancel_requested" not in _event_types(db_path, session_id)
+        assert "py.tool.finished" not in _event_types(db_path, session_id)
+        assert _run_status_value(db_path, run_ref.run_id) == "running"
+        assert _session_status_value(db_path, session_id) == "read_only_diagnostic"
+        assert provider.close_count == 1
+        assert app.service.closed is True
+        assert app.database.closed is True
+
+        # The quarantine gate (step 1) precedes the service-level closed gate.
+        with pytest.raises(SessionReadOnlyError):
+            await app.service.prompt(session_id, "more", "req_2")
+
+        await app.close()  # repeated close reuses the finished cleanup task
+        assert provider.close_count == 1

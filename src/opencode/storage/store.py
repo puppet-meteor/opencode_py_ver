@@ -117,3 +117,16 @@ class SessionStore:
         rebuilds to a restored but still read-only state, §3.2.1 L196).
         """
         await self._writer.rebuild(session_id)
+
+    async def cleanup_failed(self, session_id: str, run_id: str, reason: str) -> None:
+        """S7 management mark: ``sessions.status = cleanup_failed`` (T-C1-022 ④-3).
+
+        Thin delegate to :meth:`TransactionWriter.cleanup_failed` -- one short
+        independent transaction scoped to still-active rows, no business
+        events, no seq advance, no notify, no asyncio locks (the
+        close-timeout call sites never held any). The guard makes repeats and
+        already-marked rows no-ops; the store's write gate afterwards answers
+        every later commit on this session with
+        :class:`~opencode.storage.txn.LifecycleCleanupFailedError`.
+        """
+        await self._writer.cleanup_failed(session_id, run_id, reason)

@@ -94,6 +94,17 @@ _SELECT_PROMPT_EVENTS = sa.text(
     "SELECT id, session_id, seq, type, version, data FROM events "
     "WHERE session_id = :sid AND type = 'py.prompt.accepted' ORDER BY seq"
 )
+# -- T-C1-022 (R2-S7 ④-3): the service's consolidated single-row statements --
+# verbatim column sets/WHERE clauses (the pre-consolidation sa.text block in
+# session/service.py; existence probes intentionally lighter than the full-row
+# faces -- no JSON column decode, classification stays with the caller).
+_SELECT_RUN_BY_ID = sa.text("SELECT session_id, request_id, status, error FROM runs WHERE run_id = :rid")
+_SELECT_RUN_STATUS_BY_ID = sa.text("SELECT status FROM runs WHERE run_id = :rid")
+_SELECT_SESSION_OWNER = sa.text("SELECT session_id, status FROM sessions WHERE session_id = :sid")
+_SELECT_MESSAGE_SESSION_ID = sa.text("SELECT session_id FROM messages WHERE message_id = :mid")
+_SELECT_EVENT_ENVELOPE_BY_DEDUPE = sa.text(
+    "SELECT id, type, version FROM events WHERE session_id = :sid AND dedupe_key = :dk"
+)
 
 
 class NotFoundError(StoreError):
@@ -142,6 +153,38 @@ class AcceptedPrompt:
     request_id: str
     run_id: str
     message_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunRow:
+    """One runs row's raw columns (T-C1-022 ④-3 consolidated run probe).
+
+    ``error`` is passed through exactly as stored (no decode, no coercion) --
+    deciding whether a stored error payload decodes is the service caller's
+    job, matching the pre-consolidation inline read this replaces.
+    """
+
+    session_id: str
+    request_id: str
+    status: str
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionOwnerRow:
+    """A sessions row's identity/status pair (④-3 light owner probe)."""
+
+    session_id: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class DedupeEventRow:
+    """An events row's envelope columns only (④-3 cancel-intent probe)."""
+
+    id: str
+    type: str
+    version: int
 
 
 def _corrupt(reason: str, message: str, details: JsonObject) -> StorageCorruptError:
@@ -368,6 +411,94 @@ class ReadRepositories:
         if row is None:
             return None
         return await self.session(str(row.session_id))
+
+    # -- T-C1-022 (R2-S7 ④-3): the service's consolidated single-row probes ------
+
+    async def run_by_id(self, run_id: str) -> RunRow | None:
+        """One runs row by primary key; ``None`` when the row does not exist.
+
+        The S7 run-status owner probe (④-3): raw columns only, ``error``
+        passed through as stored -- classifying it is the caller's job (the
+        same split the pre-consolidation inline read had).
+        """
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_RUN_BY_ID, {"rid": run_id})).first()
+        if row is None:
+            return None
+        return RunRow(
+            session_id=str(row.session_id),
+            request_id=str(row.request_id),
+            status=str(row.status),
+            error=row.error if row.error is None else str(row.error),
+        )
+
+    async def run_status_by_id(self, run_id: str) -> str | None:
+        """The stored ``runs.status`` of one run by PK; ``None`` when absent."""
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_RUN_STATUS_BY_ID, {"rid": run_id})).first()
+        return None if row is None else str(row.status)
+
+    async def session_owner(self, session_id: str) -> SessionOwnerRow | None:
+        """The ``(session_id, status)`` pair of one sessions row (light probe).
+
+        Deliberately lighter than :meth:`session`: no JSON column decode, so
+        an undecodable ``config_snapshot``/``diagnostic`` does not fail this
+        probe -- matching the pre-consolidation inline read it replaces.
+        """
+        _require_session_id(session_id)
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_SESSION_OWNER, {"sid": session_id})).first()
+        if row is None:
+            return None
+        return SessionOwnerRow(session_id=str(row.session_id), status=str(row.status))
+
+    async def session_id_by_active_run(self, run_id: str) -> str | None:
+        """The session id whose active-run slot holds ``run_id`` (existence probe).
+
+        Same statement as :meth:`session_by_active_run` without the full row
+        decode -- the ④-3 owner-existence probe only needs the id (the
+        ``.first()`` existence semantics of the inline read it replaces).
+        """
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_SESSION_ID_BY_RUN, {"rid": run_id})).first()
+        return None if row is None else str(row.session_id)
+
+    async def session_id_by_message_id(self, message_id: str) -> str | None:
+        """The owning session of one projected message row; ``None`` when absent.
+
+        The ④-3 surviving-trace probe: a projected ``msg_idle_{run_id}`` row
+        proves the run once existed even when its ``runs`` row is gone.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("message_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_MESSAGE_SESSION_ID, {"mid": message_id})).first()
+        return None if row is None else str(row.session_id)
+
+    async def event_by_dedupe_key(self, session_id: str, dedupe_key: str) -> DedupeEventRow | None:
+        """The envelope ``(id, type, version)`` of one dedupe-keyed events row.
+
+        The S7 cancel-intent probe (④-3): the envelope is returned
+        unclassified -- deciding whether it is the expected
+        ``py.run.cancel_requested`` v1 shape stays with the caller, matching
+        the pre-consolidation inline read.
+        """
+        _require_session_id(session_id)
+        if not isinstance(dedupe_key, str) or not dedupe_key:
+            raise ValueError("dedupe_key must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (
+                await connection.execute(_SELECT_EVENT_ENVELOPE_BY_DEDUPE, {"sid": session_id, "dk": dedupe_key})
+            ).first()
+        if row is None:
+            return None
+        return DedupeEventRow(id=str(row.id), type=str(row.type), version=int(row.version))
 
     def _decode_prompt_row(self, session_id: str, row: Any) -> AcceptedPrompt:
         """Decode one events row into AcceptedPrompt, fail closed (§3.2.1 read boundary).

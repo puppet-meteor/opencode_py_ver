@@ -1426,3 +1426,93 @@ async def test_max_steps_ctor_validation(tmp_path: Path) -> None:
             _wire(database, _ScriptedProvider([]), max_steps=0)
         with pytest.raises(ValueError, match="max_steps"):
             _wire(database, _ScriptedProvider([]), max_steps=True)
+
+
+# ---------------------------------------------------------------------------
+# T-C1-022 (R2-S7 review A-009③): observed finish/usage survive an interrupt
+# ---------------------------------------------------------------------------
+
+
+async def test_interrupted_after_usage_keeps_the_observed_usage(tmp_path: Path) -> None:
+    """A-009③: an error chunk after a usage chunk must not lose the observed
+    usage/cost on the interrupted terminal message (mirroring the succeeded
+    read); finish stays None -- none was observed."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    boom = CoreError(code=CoreErrorCode.PROVIDER_UNAVAILABLE, message="maas is down", retryable=False)
+    script = _Script().text("p1", "so far").usage().error(boom)
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, provider)
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result.outcome == "interrupted"
+        assert result.error == boom  # verbatim, never synthesized
+        assert len(provider.requests) == 1  # §8 L350: no resend
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        assert state.runs[_RUN_ID].error == boom
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.status == "interrupted"
+        assert message.error == boom
+        assert message.usage == Usage(input=5, output=7)
+        assert message.cost_usd == "0.0012"
+        assert message.finish is None
+        assert message.raw_finish is None
+
+
+async def test_interrupted_after_finish_and_usage_keeps_both_observations(tmp_path: Path) -> None:
+    """A-009③: an error chunk after finish+usage still interrupts (the
+    defense is not relaxed) AND both observations survive onto the terminal."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    boom = CoreError(code=CoreErrorCode.PROVIDER_UNAVAILABLE, message="maas is down", retryable=False)
+    script = _Script().text("p1", "so far").usage().finish().error(boom)
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, provider)
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result.outcome == "interrupted"
+        assert result.error == boom
+        assert len(provider.requests) == 1
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.status == "interrupted"
+        assert message.error == boom
+        assert message.usage == Usage(input=5, output=7)
+        assert message.cost_usd == "0.0012"
+        assert message.finish is FinishReason.STOP
+        assert message.raw_finish is None
+
+
+async def test_eof_without_terminal_keeps_the_terminal_fields_conservative(tmp_path: Path) -> None:
+    """A-009③ (defense): an EOF without finish/usage chunks observes nothing
+    -- the interrupted terminal keeps all four fields conservative None."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    script = _Script().text("p1", "partial")  # no finish/error/usage chunk: EOF face
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, provider)
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result.outcome == "interrupted"
+        assert result.error is not None
+        assert result.error.code is CoreErrorCode.PROVIDER_STREAM_INTERRUPTED
+        assert len(provider.requests) == 1
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.status == "interrupted"
+        assert message.usage is None
+        assert message.cost_usd is None
+        assert message.finish is None
+        assert message.raw_finish is None
