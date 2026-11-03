@@ -1,0 +1,64 @@
+{
+  "id": "evt_0000000000000000000000000029",
+  "type": "py.step.finished",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:18Z",
+  "data": {
+    "step_id": "step_0000000000000000000000000002",
+    "message": {
+      "id": "msg_0000000000000000000000000012",
+      "type": "assistant",
+      "created_at": "2026-11-03T08:00:14Z",
+      "metadata": {},
+      "model": {
+        "provider": "maas",
+        "model": "glm-4.6"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "part_id": "part_0000000000000000000000000001",
+          "text": "Reading notes.md now."
+        },
+        {
+          "type": "tool",
+          "tool_call_id": "call_0000000000000000000000000001",
+          "execution_id": "exec_0000000000000000000000000001",
+          "name": "read",
+          "input": {
+            "path": "notes.md",
+            "limit": 50
+          },
+          "state": "succeeded",
+          "effect_status": "completed",
+          "content": [
+            {
+              "type": "text",
+              "text": "(1) # Project notes"
+            }
+          ],
+          "structured_output": {
+            "line_count": 7
+          }
+        }
+      ],
+      "status": "completed",
+      "finish": "tool_calls",
+      "raw_finish": "tool_calls",
+      "usage": {
+        "input": 128,
+        "output": 42,
+        "reasoning": null,
+        "cache_read": null,
+        "cache_write": null
+      },
+      "cost_usd": "0.001234",
+      "completed_at": "2026-11-03T08:00:18Z"
+    }
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 11
+}

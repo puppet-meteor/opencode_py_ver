@@ -1,0 +1,17 @@
+{
+  "id": "evt_0000000000000000000000000024",
+  "type": "py.reasoning.finalized",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:13Z",
+  "data": {
+    "message_id": "msg_0000000000000000000000000012",
+    "part_id": "part_0000000000000000000000000002",
+    "ordinal": 1,
+    "text": "User asked about notes.md; the read tool fits."
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 6
+}

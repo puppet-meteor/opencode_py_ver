@@ -1,0 +1,15 @@
+{
+  "id": "evt_0000000000000000000000000027",
+  "type": "py.tool.started",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:16Z",
+  "data": {
+    "permission_decision": "allow",
+    "input_hash": "5b8160c3ef7a2aa5fc1207a2740b1d783068c96fd850a1bbb969107e32c2d625"
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 9
+}

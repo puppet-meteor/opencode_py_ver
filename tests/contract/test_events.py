@@ -40,6 +40,42 @@ from opencode.contracts import (
     default_event_registry,
     versioned_type,
 )
+from opencode.contracts.events import (
+    EVENT_VERSION,
+    PY_REASONING_DELTA,
+    PY_REASONING_FINALIZED,
+    PY_RUN_CANCEL_REQUESTED,
+    PY_RUN_FINISHED,
+    PY_RUN_STARTED,
+    PY_STEP_FINISHED,
+    PY_STEP_GENERATED,
+    PY_STEP_STARTED,
+    PY_TEXT_DELTA,
+    PY_TEXT_FINALIZED,
+    PY_TOOL_FINISHED,
+    PY_TOOL_INPUT_DELTA,
+    PY_TOOL_PROGRESS,
+    PY_TOOL_REQUESTED,
+    PY_TOOL_STARTED,
+    R1_EVENT_DEFINITIONS,
+    R2_EVENT_DEFINITIONS,
+    RUN_SCOPED_EVENT_TYPES,
+    ReasoningDeltaData,
+    ReasoningFinalizedData,
+    RunCancelRequestedData,
+    RunFinishedData,
+    StepStartedData,
+    TextDeltaData,
+    TextFinalizedData,
+    ToolFinishedData,
+    ToolInputDeltaData,
+    ToolProgressData,
+    ToolRequestedData,
+    ToolStartedData,
+)
+from opencode.contracts.llm import ModelRef
+from opencode.contracts.messages import AssistantMessage, AssistantToolPart, ToolFileContent, ToolTextContent
+from opencode.contracts.tools import ToolRef
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -579,3 +615,398 @@ class TestContractHardening:
             message=valid,
         )
         assert data.request_id == "client-chosen-id-without-prefix"
+
+
+# ---------------------------------------------------------------------------
+# R2-S1 (plan §2): the 15 new event types — fixtures, registration, data shapes.
+# ---------------------------------------------------------------------------
+
+R2_DURABLE_FIXTURES = {
+    PY_RUN_STARTED: "events_run_started_valid.json",
+    PY_RUN_CANCEL_REQUESTED: "events_run_cancel_requested_valid.json",
+    PY_RUN_FINISHED: "events_run_finished_valid.json",
+    PY_STEP_STARTED: "events_step_started_valid.json",
+    PY_STEP_GENERATED: "events_step_generated_valid.json",
+    PY_STEP_FINISHED: "events_step_finished_valid.json",
+    PY_TEXT_FINALIZED: "events_text_finalized_valid.json",
+    PY_REASONING_FINALIZED: "events_reasoning_finalized_valid.json",
+    PY_TOOL_REQUESTED: "events_tool_requested_valid.json",
+    PY_TOOL_STARTED: "events_tool_started_valid.json",
+    PY_TOOL_FINISHED: "events_tool_finished_valid.json",
+}
+
+R2_EPHEMERAL_FIXTURES = {
+    PY_TEXT_DELTA: "events_text_delta_valid.json",
+    PY_REASONING_DELTA: "events_reasoning_delta_valid.json",
+    PY_TOOL_INPUT_DELTA: "events_tool_input_delta_valid.json",
+    PY_TOOL_PROGRESS: "events_tool_progress_valid.json",
+}
+
+R2_ALL_FIXTURES = {**R2_DURABLE_FIXTURES, **R2_EPHEMERAL_FIXTURES}
+
+R2_EPHEMERAL_TYPES = frozenset(R2_EPHEMERAL_FIXTURES)
+
+
+def _decode_r2(registry: EventRegistry, event_type: str, raw: Any) -> Any:
+    """Decode through the durability path the type is registered under."""
+    if event_type in R2_EPHEMERAL_TYPES:
+        return registry.decode_ephemeral(raw)
+    return registry.decode_durable(raw)
+
+
+class TestR2PositiveFixtures:
+    """R2 positive fixtures: decode with every field present and round-trip equal."""
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_round_trip_is_lossless(self, event_type: str, fixture_name: str) -> None:
+        registry = default_event_registry()
+        event = _decode_r2(registry, event_type, _load_fixture(fixture_name))
+        assert event.type == event_type
+        if event_type in R2_EPHEMERAL_TYPES:
+            assert not hasattr(event, "seq")
+            assert not hasattr(event, "version")
+        else:
+            assert event.version == 1
+            assert event.seq >= 1
+        assert _decode_r2(registry, event_type, event.model_dump_json()) == event
+
+    def test_fixtures_expose_py_naming_version_and_run_metadata(self) -> None:
+        """All 15 R2 types are run-internal: producers write run_id into metadata (§3.1 L110)."""
+        for fixture_name in R2_ALL_FIXTURES.values():
+            raw = _load_fixture(fixture_name)
+            assert raw["type"].startswith("py.")
+            assert raw["metadata"]["run_id"] == "run_0000000000000000000000000002"
+        for fixture_name in R2_DURABLE_FIXTURES.values():
+            assert _load_fixture(fixture_name)["version"] == 1
+        for fixture_name in R2_EPHEMERAL_FIXTURES.values():
+            raw = _load_fixture(fixture_name)
+            assert "version" not in raw
+            assert "seq" not in raw
+
+    def test_run_metadata_matches_data_run_id(self) -> None:
+        registry = default_event_registry()
+        for event_type in (PY_RUN_STARTED, PY_RUN_CANCEL_REQUESTED, PY_RUN_FINISHED, PY_STEP_STARTED):
+            event = _decode_r2(registry, event_type, _load_fixture(R2_ALL_FIXTURES[event_type]))
+            assert event.metadata["run_id"] == event.data.run_id
+
+    def test_step_fixtures_carry_assistant_messages(self) -> None:
+        registry = default_event_registry()
+        generated = registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_STEP_GENERATED]))
+        finished = registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_STEP_FINISHED]))
+        for event in (generated, finished):
+            message = event.data.message
+            assert isinstance(message, AssistantMessage)
+            assert message.model.provider == "maas"
+        plan_part = generated.data.message.parts[-1]
+        assert isinstance(plan_part, AssistantToolPart)
+        assert plan_part.state == "pending" and plan_part.effect_status == "not_started"
+        assert finished.data.message.status == "completed"
+
+    def test_tool_finished_fixture_is_model_readable(self) -> None:
+        registry = default_event_registry()
+        event = registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_TOOL_FINISHED]))
+        assert event.data.state == "succeeded"
+        assert any(isinstance(content, ToolTextContent) for content in event.data.content)
+        assert any(isinstance(content, ToolFileContent) for content in event.data.content)
+
+
+class TestR2NegativeFixtures:
+    """R2 negative fixtures: every rejection is loud (§1; never silently skipped)."""
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_missing_required_field_rejected(self, event_type: str, fixture_name: str) -> None:
+        stem = fixture_name.removesuffix("_valid.json")
+        with pytest.raises(ValidationError):
+            _decode_r2(default_event_registry(), event_type, _load_fixture(f"{stem}_missing_field.json"))
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_unknown_data_field_rejected(self, event_type: str, fixture_name: str) -> None:
+        stem = fixture_name.removesuffix("_valid.json")
+        with pytest.raises(ValidationError):
+            _decode_r2(default_event_registry(), event_type, _load_fixture(f"{stem}_bad_extension.json"))
+
+    def test_durability_mismatch_rejected_both_directions(self) -> None:
+        registry = default_event_registry()
+        with pytest.raises(DurabilityMismatchError):
+            registry.decode_ephemeral(_load_fixture(R2_ALL_FIXTURES[PY_RUN_STARTED]))
+        with pytest.raises(DurabilityMismatchError):
+            registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_TEXT_DELTA]) | {"version": 1})
+
+    def test_ephemeral_version_key_rejected(self) -> None:
+        raw = _load_fixture(R2_ALL_FIXTURES[PY_TOOL_PROGRESS]) | {"version": 1}
+        with pytest.raises(ValidationError):
+            default_event_registry().decode_ephemeral(raw)
+
+
+class TestR2RunScopedMetadata:
+    """run_id metadata correlation: current semantics plus the whenever-present rule.
+
+    The RUN_SCOPED expansion to the R2 types is blocked by frozen R1 tests that
+    construct py.run.started/py.text.delta envelopes without metadata.run_id
+    (test_bus.py, test_eventlog.py, test_projector.py) — see the T-C1-013
+    progress file, open question 1. Producers still write run_id into every
+    new type's metadata, and a run_id key that appears anywhere stays validated.
+    """
+
+    def test_run_scoped_set_is_pinned_to_r1_pending_arbitration(self) -> None:
+        assert RUN_SCOPED_EVENT_TYPES == frozenset({PY_PROMPT_ACCEPTED})
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_missing_run_id_metadata_currently_decodes(self, event_type: str, fixture_name: str) -> None:
+        """Pins the current (unexpanded) state loudly: any expansion must flip this test."""
+        raw = _load_fixture(fixture_name)
+        del raw["metadata"]["run_id"]
+        _decode_r2(default_event_registry(), event_type, raw)  # no raise expected today
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_bad_run_id_metadata_rejected_whenever_present(self, event_type: str, fixture_name: str) -> None:
+        for bad in ("rn_1", None, 1, ""):
+            raw = _load_fixture(fixture_name)
+            raw["metadata"]["run_id"] = bad
+            with pytest.raises(ValidationError):
+                _decode_r2(default_event_registry(), event_type, raw)
+
+
+class TestR2Registration:
+    """R1 definitions untouched; R2 definitions additive; registry resolution."""
+
+    def test_r1_definitions_unchanged(self) -> None:
+        assert R1_EVENT_DEFINITIONS == (
+            EventDefinition(event_type=PY_SESSION_CREATED, durability="durable", data_model=SessionCreatedData),
+            EventDefinition(event_type=PY_PROMPT_ACCEPTED, durability="durable", data_model=PromptAcceptedData),
+        )
+
+    def test_r2_definitions_shape(self) -> None:
+        assert len(R2_EVENT_DEFINITIONS) == 15
+        durable = [definition for definition in R2_EVENT_DEFINITIONS if definition.durability == "durable"]
+        ephemeral = [definition for definition in R2_EVENT_DEFINITIONS if definition.durability == "ephemeral"]
+        assert len(durable) == 11
+        assert len(ephemeral) == 4
+        assert all(definition.version == EVENT_VERSION for definition in R2_EVENT_DEFINITIONS)
+
+    def test_r1_and_r2_types_are_disjoint_and_permission_rows_absent(self) -> None:
+        r1_types = {definition.event_type for definition in R1_EVENT_DEFINITIONS}
+        r2_types = {definition.event_type for definition in R2_EVENT_DEFINITIONS}
+        assert r1_types & r2_types == set()
+        # py.permission.* belongs to R3 (plan §0.1): it must not have leaked in.
+        assert not any(event_type.startswith("py.permission.") for event_type in r2_types)
+
+    def test_default_registry_resolves_all_r2_types(self) -> None:
+        registry = default_event_registry()
+        for definition in R2_EVENT_DEFINITIONS:
+            if definition.durability == "durable":
+                assert registry.resolve_durable(definition.event_type, EVENT_VERSION) is definition
+            else:
+                assert registry.resolve_ephemeral(definition.event_type) is definition
+
+    def test_unknown_version_for_r2_type_rejected(self) -> None:
+        with pytest.raises(UnknownEventVersionError):
+            default_event_registry().resolve_durable(PY_RUN_STARTED, 2)
+
+    def test_unknown_type_still_rejected(self) -> None:
+        with pytest.raises(UnknownEventTypeError):
+            default_event_registry().resolve_durable("py.permission.requested", 1)
+
+
+class TestR2DataShapes:
+    """Typed data field rules: ID prefixes, vocabularies, bool guards, tool-content rule."""
+
+    def _step_started_raw(self, **overrides: Any) -> dict[str, Any]:
+        raw: dict[str, Any] = {
+            "run_id": "run_0000000000000000000000000002",
+            "step_id": "step_0000000000000000000000000002",
+            "message_id": "msg_0000000000000000000000000012",
+            "model": {"provider": "maas", "model": "glm-4.6"},
+            "attempt": 1,
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_step_started_shape_and_model_ref(self) -> None:
+        data = StepStartedData.model_validate(self._step_started_raw())
+        assert data.model == ModelRef(provider="maas", model="glm-4.6")
+        with pytest.raises(ValidationError):
+            StepStartedData.model_validate(self._step_started_raw(model={"provider": "", "model": "x"}))
+        with pytest.raises(ValidationError):
+            StepStartedData.model_validate(self._step_started_raw(message_id="message_1"))
+        with pytest.raises(ValidationError):
+            StepStartedData.model_validate(self._step_started_raw(run_id="rn_1"))
+
+    @pytest.mark.parametrize("model", [TextFinalizedData, ReasoningFinalizedData])
+    @pytest.mark.parametrize("bad", [True, False])
+    def test_finalized_ordinal_rejects_bool(self, model: type[BaseModel], bad: bool) -> None:
+        with pytest.raises(ValidationError):
+            model.model_validate(
+                {
+                    "message_id": "msg_0000000000000000000000000012",
+                    "part_id": "part_0000000000000000000000000001",
+                    "ordinal": bad,
+                    "text": "hi",
+                }
+            )
+
+    @pytest.mark.parametrize("bad", [True, False])
+    def test_step_started_attempt_rejects_bool(self, bad: bool) -> None:
+        with pytest.raises(ValidationError):
+            StepStartedData.model_validate(self._step_started_raw(attempt=bad))
+
+    @pytest.mark.parametrize("bad", [True, False])
+    def test_tool_input_delta_call_index_rejects_bool(self, bad: bool) -> None:
+        with pytest.raises(ValidationError):
+            ToolInputDeltaData.model_validate({"call_index": bad, "delta": "{"})
+
+    def test_finalized_ids_are_located_by_message_and_part(self) -> None:
+        for model in (TextFinalizedData, ReasoningFinalizedData):
+            data = model.model_validate(
+                {
+                    "message_id": "msg_0000000000000000000000000012",
+                    "part_id": "part_0000000000000000000000000001",
+                    "ordinal": 0,
+                    "text": "hi",
+                }
+            )
+            assert data.ordinal == 0
+            with pytest.raises(ValidationError):
+                model.model_validate(
+                    {
+                        "message_id": "message_1",
+                        "part_id": "part_0000000000000000000000000001",
+                        "ordinal": 0,
+                        "text": "hi",
+                    }
+                )
+
+    def _tool_finished_raw(self, **overrides: Any) -> dict[str, Any]:
+        raw: dict[str, Any] = {
+            "execution_id": "exec_0000000000000000000000000001",
+            "state": "succeeded",
+            "effect_status": "completed",
+            "content": [{"type": "text", "text": "ok"}],
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_tool_finished_requires_model_readable_text(self) -> None:
+        with pytest.raises(ValidationError):
+            ToolFinishedData.model_validate(
+                self._tool_finished_raw(
+                    content=[{"type": "file", "uri": "file:///D:/work/demo/notes.md", "mime": "text/markdown"}]
+                )
+            )
+        with pytest.raises(ValidationError):
+            ToolFinishedData.model_validate(self._tool_finished_raw(content=[]))
+        data = ToolFinishedData.model_validate(
+            self._tool_finished_raw(
+                content=[
+                    {"type": "file", "uri": "file:///D:/work/demo/notes.md", "mime": "text/markdown"},
+                    {"type": "text", "text": "see attachment"},
+                ]
+            )
+        )
+        assert len(data.content) == 2
+
+    def test_tool_finished_state_is_terminal_only(self) -> None:
+        for good in ("succeeded", "failed", "denied", "cancelled", "unknown"):
+            assert ToolFinishedData.model_validate(self._tool_finished_raw(state=good)).state == good
+        for bad in ("pending", "running", ""):
+            with pytest.raises(ValidationError):
+                ToolFinishedData.model_validate(self._tool_finished_raw(state=bad))
+
+    def test_tool_finished_effect_status_vocabulary(self) -> None:
+        for good in ("not_started", "completed", "unknown"):
+            assert ToolFinishedData.model_validate(self._tool_finished_raw(effect_status=good)).effect_status == good
+        for bad in ("started", "partial"):
+            with pytest.raises(ValidationError):
+                ToolFinishedData.model_validate(self._tool_finished_raw(effect_status=bad))
+
+    def test_tool_finished_error_nests_core_error(self) -> None:
+        data = ToolFinishedData.model_validate(
+            self._tool_finished_raw(
+                state="failed",
+                effect_status="not_started",
+                error={"code": "ToolFailed", "message": "schema mismatch", "retryable": False},
+            )
+        )
+        assert data.error is not None and data.error.code is not None
+        assert data.error.code.value == "ToolFailed"
+
+    def test_tool_started_permission_decision_vocabulary(self) -> None:
+        for good in ("allow", "ask", "deny"):
+            data = ToolStartedData.model_validate(
+                {
+                    "execution_id": "exec_0000000000000000000000000001",
+                    "permission_decision": good,
+                    "input_hash": "0" * 64,
+                }
+            )
+            assert data.permission_decision == good
+        with pytest.raises(ValidationError):
+            ToolStartedData.model_validate(
+                {
+                    "execution_id": "exec_0000000000000000000000000001",
+                    "permission_decision": "maybe",
+                    "input_hash": "0" * 64,
+                }
+            )
+
+    def test_run_finished_outcome_and_error(self) -> None:
+        for good in ("succeeded", "failed", "interrupted"):
+            assert RunFinishedData.model_validate({"run_id": "run_1", "outcome": good}).outcome == good
+        for bad in ("cancelling", "cancelled", ""):
+            with pytest.raises(ValidationError):
+                RunFinishedData.model_validate({"run_id": "run_1", "outcome": bad})
+        failed = RunFinishedData.model_validate(
+            {
+                "run_id": "run_0000000000000000000000000002",
+                "outcome": "failed",
+                "error": {"code": "ProviderUnavailable", "message": "endpoint down", "retryable": True},
+            }
+        )
+        assert failed.error is not None and failed.error.retryable is True
+
+    def test_run_cancel_requested_reason_vocabulary(self) -> None:
+        for good in ("user", "shutdown"):
+            assert RunCancelRequestedData.model_validate({"run_id": "run_1", "reason": good}).reason == good
+        with pytest.raises(ValidationError):
+            RunCancelRequestedData.model_validate({"run_id": "run_1", "reason": "timeout"})
+
+    def test_tool_requested_shape_ref_and_hash(self) -> None:
+        base: dict[str, Any] = {
+            "message_id": "msg_0000000000000000000000000012",
+            "tool_call_id": "call_0000000000000000000000000001",
+            "execution_id": "exec_0000000000000000000000000001",
+            "requested_name": "read",
+            "input": {"path": "notes.md", "limit": 50},
+            "input_hash": "5b8160c3ef7a2aa5fc1207a2740b1d783068c96fd850a1bbb969107e32c2d625",
+        }
+        data = ToolRequestedData.model_validate(base | {"tool_ref": {"namespace": "fs", "name": "read", "version": 1}})
+        assert data.tool_ref == ToolRef(namespace="fs", name="read", version=1)
+        assert ToolRequestedData.model_validate(base).tool_ref is None  # unresolved catalog name stays null
+        with pytest.raises(ValidationError):
+            ToolRequestedData.model_validate(base | {"input_hash": "xyz"})
+        with pytest.raises(ValidationError):
+            ToolRequestedData.model_validate(base | {"tool_ref": {"namespace": "fs", "name": "read", "version": True}})
+        with pytest.raises(ValidationError):
+            ToolRequestedData.model_validate(base | {"requested_name": ""})
+
+    def test_step_generated_and_finished_locate_by_step_id(self) -> None:
+        registry = default_event_registry()
+        generated = registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_STEP_GENERATED]))
+        finished = registry.decode_durable(_load_fixture(R2_ALL_FIXTURES[PY_STEP_FINISHED]))
+        assert generated.data.step_id == finished.data.step_id == "step_0000000000000000000000000002"
+
+    def test_delta_and_progress_shapes(self) -> None:
+        for model in (TextDeltaData, ReasoningDeltaData):
+            data = model.model_validate(
+                {
+                    "message_id": "msg_0000000000000000000000000012",
+                    "part_id": "part_0000000000000000000000000001",
+                    "delta": "Rea",
+                }
+            )
+            assert data.delta == "Rea"
+        progress = ToolProgressData.model_validate(
+            {"execution_id": "exec_0000000000000000000000000001", "metadata": {"bytes_read": 512}}
+        )
+        assert progress.metadata == {"bytes_read": 512}
+        assert ToolProgressData.model_validate({"execution_id": "exec_0000000000000000000000000001"}).metadata == {}

@@ -1,4 +1,4 @@
-"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1 event subset.
+"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2 event subsets.
 
 Decode is fail closed: unknown type/version, wrong durability, malformed JSON, or any
 schema violation raises and nothing is silently skipped or coerced. Field-level failures
@@ -20,16 +20,52 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
-from opencode.contracts.messages import JsonObject, UserMessage, UtcDateTime
+from opencode.contracts.errors import CoreError
+from opencode.contracts.llm import ModelRef
+from opencode.contracts.messages import (
+    AssistantMessage,
+    JsonObject,
+    ToolContent,
+    ToolTextContent,
+    UserMessage,
+    UtcDateTime,
+)
+from opencode.contracts.tools import ToolRef
 
 Durability = Literal["durable", "ephemeral"]
 
 PY_SESSION_CREATED = "py.session.created"
 PY_PROMPT_ACCEPTED = "py.prompt.accepted"
 
+# R2 event domain (§3.1 L124-140): run/step/text/reasoning/tool durable rows
+# plus the four ephemeral live-preview types.
+PY_RUN_STARTED = "py.run.started"
+PY_RUN_CANCEL_REQUESTED = "py.run.cancel_requested"
+PY_RUN_FINISHED = "py.run.finished"
+PY_STEP_STARTED = "py.step.started"
+PY_STEP_GENERATED = "py.step.generated"
+PY_STEP_FINISHED = "py.step.finished"
+PY_TEXT_FINALIZED = "py.text.finalized"
+PY_REASONING_FINALIZED = "py.reasoning.finalized"
+PY_TOOL_REQUESTED = "py.tool.requested"
+PY_TOOL_STARTED = "py.tool.started"
+PY_TOOL_FINISHED = "py.tool.finished"
+PY_TEXT_DELTA = "py.text.delta"
+PY_REASONING_DELTA = "py.reasoning.delta"
+PY_TOOL_INPUT_DELTA = "py.tool.input.delta"
+PY_TOOL_PROGRESS = "py.tool.progress"
+
 EVENT_VERSION = 1
 
 #: Event types that belong to a run; their envelope metadata must carry run_id (§3.1).
+#: Deliberately still R1-only in this slice: expanding to the R2 types would
+#: retroactively require metadata.run_id on py.run.started/py.text.delta
+#: envelopes that frozen R1 tests construct without it (test_bus.py
+#: _ephemeral, test_eventlog.py _ephemeral, test_projector.py "future"), so the
+#: expansion awaits arbitration on patching those helpers (T-C1-013 float
+#: report, open question 1). R2 producers still write run_id into every new
+#: type's metadata (fixtures pin this), and the whenever-present check below
+#: stays active for any metadata.run_id that appears.
 RUN_SCOPED_EVENT_TYPES: frozenset[str] = frozenset({PY_PROMPT_ACCEPTED})
 
 _SHA256_HEX = r"^[0-9a-f]{64}$"
@@ -37,6 +73,7 @@ _SHA256_HEX = r"^[0-9a-f]{64}$"
 _EVT_ID = r"^evt_"
 _SES_ID = r"^ses_"
 _RUN_ID = r"^run_"
+_MSG_ID = r"^msg_"
 
 
 def _reject_bool(field: str, value: Any) -> Any:
@@ -119,6 +156,224 @@ class PromptAcceptedData(BaseModel):
     request_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1, pattern=_RUN_ID)
     message: UserMessage
+
+
+# ---------------------------------------------------------------------------
+# R2 event data models (§3.1 rows L124-132 + ephemeral L140; plan §2 R2-S1).
+# ID rules: message_id carries the ^msg_ pattern (§3.1 L114); step_id/part_id/
+# execution_id/tool_call_id are internal conventions — plain non-empty strings,
+# no pattern (OP-3 conservative reading; generation conventions land in S6).
+# ---------------------------------------------------------------------------
+
+
+class RunStartedData(BaseModel):
+    """``py.run.started`` v1 data (§3.1 L124): run identity only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
+
+
+class RunCancelRequestedData(BaseModel):
+    """``py.run.cancel_requested`` v1 data (§3.1 L125): user/shutdown intent; never overrides a result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
+    reason: Literal["user", "shutdown"]
+
+
+class RunFinishedData(BaseModel):
+    """``py.run.finished`` v1 data (§3.1 L138): folded outcome; idle messages project from this."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
+    outcome: Literal["succeeded", "failed", "interrupted"]
+    error: CoreError | None = None
+
+
+class StepStartedData(BaseModel):
+    """``py.step.started`` v1 data (§3.1 L126): one generation attempt begins.
+
+    ``attempt`` >= 1; R2 always writes 1 (OP-6: no user-facing retry command,
+    a retry is a new prompt; attempt > 1 is reserved for recovery/retry faces).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
+    step_id: str = Field(min_length=1)
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    model: ModelRef
+    attempt: int = Field(ge=1)
+
+    @field_validator("attempt", mode="before")
+    @classmethod
+    def _attempt_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("attempt", value)
+
+
+class TextFinalizedData(BaseModel):
+    """``py.text.finalized`` v1 data (§3.1 L127): full final text at message_id+part_id.
+
+    ``ordinal`` is 0-based and unique within the generation batch; batch ordering
+    and second-finalized idempotency are commit-time rules (§3.1 L144, R2-S2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    part_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=0)
+    text: str
+
+    @field_validator("ordinal", mode="before")
+    @classmethod
+    def _ordinal_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("ordinal", value)
+
+
+class ReasoningFinalizedData(BaseModel):
+    """``py.reasoning.finalized`` v1 data (§3.1 L127): same shape as text, batch-ordered by ordinal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    part_id: str = Field(min_length=1)
+    ordinal: int = Field(ge=0)
+    text: str
+
+    @field_validator("ordinal", mode="before")
+    @classmethod
+    def _ordinal_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("ordinal", value)
+
+
+class StepGeneratedData(BaseModel):
+    """``py.step.generated`` v1 data (§3.1 L128): the last event of the generation batch.
+
+    The embedded AssistantMessage is the complete call plan with every tool
+    part pending/not_started; batch atomicity and consistency with the finalized
+    parts are commit-time validation (§3.1 L144, R2-S2), not wire shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1)
+    message: AssistantMessage
+
+
+class StepFinishedData(BaseModel):
+    """``py.step.finished`` v1 data (§3.1 L132): self-contained terminal message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1)
+    message: AssistantMessage
+
+
+class ToolRequestedData(BaseModel):
+    """``py.tool.requested`` v1 data (§3.1 L129): raw request, resolved ref, canonical hash.
+
+    ``tool_ref`` is optional because the raw requested_name may fail catalog
+    resolution (unknown tool); the failed/not_started terminal then lands on
+    py.tool.finished. Identity/ownership constraints (§2.1 L37) are commit-time
+    validation (R2-S2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    tool_call_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    requested_name: str = Field(min_length=1)
+    tool_ref: ToolRef | None = None
+    input: JsonObject
+    input_hash: str = Field(pattern=_SHA256_HEX)
+
+
+class ToolStartedData(BaseModel):
+    """``py.tool.started`` v1 data (§3.1 L130): execution confirmed after the permission decision.
+
+    permission_decision uses the §5.2 effect vocabulary; R2 has no policy layer
+    (read defaults to allow), so R2 producers always write "allow" — ask/deny
+    become producible only from R3+ (float-reported, T-C1-013).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_id: str = Field(min_length=1)
+    permission_decision: Literal["allow", "ask", "deny"]
+    input_hash: str = Field(pattern=_SHA256_HEX)
+
+
+class ToolFinishedData(BaseModel):
+    """``py.tool.finished`` v1 data (§3.1 L131): terminal state + model-readable content.
+
+    ``state`` is terminal-only — pending/running live on AssistantToolPart and
+    the fold, never on the finished event. §2.1 L72: every terminal state carries
+    at least one text content, including denied/cancelled/unknown explanations;
+    file-only content is rejected here, not at display time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_id: str = Field(min_length=1)
+    state: Literal["succeeded", "failed", "denied", "cancelled", "unknown"]
+    effect_status: Literal["not_started", "completed", "unknown"]
+    content: list[ToolContent] = Field(min_length=1)
+    structured_output: JsonValue | None = None
+    error: CoreError | None = None
+
+    @model_validator(mode="after")
+    def _has_model_readable_text(self) -> ToolFinishedData:
+        if not any(isinstance(part, ToolTextContent) for part in self.content):
+            raise ValueError("tool terminal state requires at least one text content (§2.1 L72)")
+        return self
+
+
+class TextDeltaData(BaseModel):
+    """``py.text.delta`` ephemeral data (§3.1 L140): live preview only, never persisted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    part_id: str = Field(min_length=1)
+    delta: str
+
+
+class ReasoningDeltaData(BaseModel):
+    """``py.reasoning.delta`` ephemeral data (§3.1 L140): live preview only, never persisted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1, pattern=_MSG_ID)
+    part_id: str = Field(min_length=1)
+    delta: str
+
+
+class ToolInputDeltaData(BaseModel):
+    """``py.tool.input.delta`` ephemeral data (§3.1 L140): raw argument fragments by call_index."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    call_index: int = Field(ge=0)
+    delta: str
+
+    @field_validator("call_index", mode="before")
+    @classmethod
+    def _call_index_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("call_index", value)
+
+
+class ToolProgressData(BaseModel):
+    """``py.tool.progress`` ephemeral data (§3.1 L140): adapter progress metadata by execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_id: str = Field(min_length=1)
+    metadata: JsonObject = Field(default_factory=dict)
 
 
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
@@ -333,7 +588,28 @@ R1_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
     EventDefinition(event_type=PY_PROMPT_ACCEPTED, durability="durable", data_model=PromptAcceptedData),
 )
 
+#: R2 additions (§3.1 R2 subset): 11 durable rows + 4 ephemeral live types.
+#: py.permission.* stays out (R3, PHASE1-SLIM §4); registration is additive so
+#: R1 logs and fixtures decode identically (plan §0.2).
+R2_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_RUN_STARTED, durability="durable", data_model=RunStartedData),
+    EventDefinition(event_type=PY_RUN_CANCEL_REQUESTED, durability="durable", data_model=RunCancelRequestedData),
+    EventDefinition(event_type=PY_RUN_FINISHED, durability="durable", data_model=RunFinishedData),
+    EventDefinition(event_type=PY_STEP_STARTED, durability="durable", data_model=StepStartedData),
+    EventDefinition(event_type=PY_STEP_GENERATED, durability="durable", data_model=StepGeneratedData),
+    EventDefinition(event_type=PY_STEP_FINISHED, durability="durable", data_model=StepFinishedData),
+    EventDefinition(event_type=PY_TEXT_FINALIZED, durability="durable", data_model=TextFinalizedData),
+    EventDefinition(event_type=PY_REASONING_FINALIZED, durability="durable", data_model=ReasoningFinalizedData),
+    EventDefinition(event_type=PY_TOOL_REQUESTED, durability="durable", data_model=ToolRequestedData),
+    EventDefinition(event_type=PY_TOOL_STARTED, durability="durable", data_model=ToolStartedData),
+    EventDefinition(event_type=PY_TOOL_FINISHED, durability="durable", data_model=ToolFinishedData),
+    EventDefinition(event_type=PY_TEXT_DELTA, durability="ephemeral", data_model=TextDeltaData),
+    EventDefinition(event_type=PY_REASONING_DELTA, durability="ephemeral", data_model=ReasoningDeltaData),
+    EventDefinition(event_type=PY_TOOL_INPUT_DELTA, durability="ephemeral", data_model=ToolInputDeltaData),
+    EventDefinition(event_type=PY_TOOL_PROGRESS, durability="ephemeral", data_model=ToolProgressData),
+)
+
 
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1 event subset (the two §3.1 rows R1 implements)."""
-    return EventRegistry(R1_EVENT_DEFINITIONS)
+    """Fresh registry over the R1+R2 event subsets (all §3.1 rows through R2-S1)."""
+    return EventRegistry((*R1_EVENT_DEFINITIONS, *R2_EVENT_DEFINITIONS))

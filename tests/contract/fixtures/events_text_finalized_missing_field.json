@@ -1,0 +1,16 @@
+{
+  "id": "evt_0000000000000000000000000023",
+  "type": "py.text.finalized",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:12Z",
+  "data": {
+    "part_id": "part_0000000000000000000000000001",
+    "ordinal": 0,
+    "text": "Reading notes.md now."
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 5
+}
