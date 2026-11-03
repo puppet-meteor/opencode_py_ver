@@ -825,11 +825,15 @@ async def test_concurrent_close_reuses_one_cleanup_task(tmp_path: Path) -> None:
         assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
 
 
-async def test_close_timeout_injects_unknown_and_marks_cleanup_failed(tmp_path: Path) -> None:
-    """Close timeout with an unkillable-in-time tool: the started tool gets
-    its honest unknown/unknown terminal, the run ends interrupted, the
-    session is marked cleanup_failed (never reported as cleaned), and the
-    session is no longer executable after reopen."""
+async def test_close_timeout_grace_exit_keeps_session_executable(tmp_path: Path) -> None:
+    """Close timeout with a tool that exits inside the grace: the started
+    tool still gets its honest unknown/unknown terminal and the run ends
+    interrupted, but a task exiting within the grace with committed
+    terminals is a CONFIRMED cleanup (#90: m-2) -- the session is not marked
+    cleanup_failed, stays executable after reopen, and prompt succeeds; only
+    tasks still stuck after the grace are marked (that branch needs an
+    uncancellable tool and is untestable under the test discipline, ③
+    float)."""
     db_path = tmp_path / "app.db"
     _require_success(_upgrade_head(db_path))
     provider = _ScriptedProvider([[_tool_script("app.slow", "t1")]])
@@ -846,14 +850,14 @@ async def test_close_timeout_injects_unknown_and_marks_cleanup_failed(tmp_path: 
         assert terminals[0]["state"] == "unknown"
         assert terminals[0]["effect_status"] == "unknown"
         assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
-        assert _session_status_value(db_path, session_id) == "cleanup_failed"
+        assert _session_status_value(db_path, session_id) == "active"
         assert app.service.closed is True
         assert provider.close_count == 1
 
     async with _plain_app(db_path) as reopened:  # the writer lock was released
-        assert (await reopened.service.session_status(session_id)) is SessionStatus.CLEANUP_FAILED
-        with pytest.raises(LifecycleCleanupFailedError):
-            await reopened.service.prompt(session_id, "more", "req_2")
+        assert (await reopened.service.session_status(session_id)) is SessionStatus.ACTIVE
+        reopened_ref = await reopened.service.prompt(session_id, "more", "req_2")
+        assert (await reopened.service.run_status(reopened_ref.run_id)).status is RunStatusValue.ACCEPTED
 
 
 async def test_close_keeps_storage_only_accepted_runs_for_recovery(tmp_path: Path) -> None:

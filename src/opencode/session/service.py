@@ -812,9 +812,11 @@ class SessionService:
         for the scheduled tasks while their terminals still flow through the
         same :meth:`SessionStore.commit`; on timeout hard-cancel the
         stragglers, let their CancelledError handlers commit the honest
-        ``tool.finished(effect_status=unknown)`` + interrupted terminals,
-        then mark those sessions ``cleanup_failed``; finally close the
-        provider and set the service closed. Storage-only accepted runs (no
+        ``tool.finished(effect_status=unknown)`` + interrupted terminals, and
+        mark only the sessions still stuck after the grace period
+        ``cleanup_failed`` (a grace exit with committed terminals is a
+        confirmed cleanup, #90); finally close the provider and set the
+        service closed. Storage-only accepted runs (no
         live task) keep their records for R4 and are never claimed cleaned.
         The engine and writer lock stay owned by the composition root.
         """
@@ -849,23 +851,23 @@ class SessionService:
         # Phase 2: wait for the tasks (their determined tool/step/run
         # terminals still commit through the same store); on timeout
         # hard-cancel the stragglers and let the grace period carry their
-        # CancelledError handlers' final commits, then mark every timed-out
-        # session cleanup_failed (§7 L337: an unconfirmed shutdown is never
-        # reported as cleaned). Tasks still stuck after the grace are
-        # abandoned -- records kept, no further in-process claim (③ float).
-        # m-2 NOT applied (T-C1-022 ④ float): marking only the tasks still
-        # pending after the grace leaves every discipline-compliant straggler
-        # unmarked (empirically the branch goes unreachable) and contradicts
-        # the frozen close-timeout integration test -- scheduler to re-rule
-        # (flip the test expectation or withdraw m-2).
+        # CancelledError handlers' final commits. Only the tasks still
+        # pending after the grace are marked cleanup_failed (§7 L337: an
+        # unconfirmed shutdown is never reported as cleaned -- conversely a
+        # grace exit with committed terminals is a confirmed cleanup, #90:
+        # marking it failed would lie and fence the reopen face). Tasks still
+        # stuck after the grace are abandoned -- records kept, no further
+        # in-process claim (③ float); that pending2 marking branch is
+        # unreachable under the test discipline (it would need a tool that
+        # survives task.cancel(), T-C1-022 ③-4) -- disclosed, not tested.
         if scheduled:
             by_task = {task: (run_id, session_id) for run_id, (session_id, task) in scheduled}
             _done, pending = await asyncio.wait(set(by_task), timeout=self._close_timeout_s)
             if pending:
                 for task in pending:
                     task.cancel()
-                await asyncio.wait(pending, timeout=_CLOSE_GRACE_S)
-                for task in pending:
+                _done2, pending2 = await asyncio.wait(pending, timeout=_CLOSE_GRACE_S)
+                for task in pending2:
                     run_id, session_id = by_task[task]
                     await self._mark_cleanup_failed(session_id, run_id, REASON_CLOSE_TIMEOUT)
         # Phase 3: every own task has exited or is durably marked -- close the
