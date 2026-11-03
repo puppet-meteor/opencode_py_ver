@@ -52,9 +52,13 @@ from opencode.tools.invoker import (
     validate_schema_supported,
 )
 
-#: §5.1 L250 / TS normalizedName: each half of the reversible wire name
-#: ``namespace__name`` is restricted to URL-safe characters with no ``__``,
-#: so the wire name splits back into exactly (namespace, name).
+#: §5.1 L250 / TS normalizedName: each half of the wire name
+#: ``namespace__name`` is restricted to URL-safe characters. Reversibility
+#: under a first-"__" partition holds iff the namespace contains no ``__``
+#: and does not end with "_" (the name side needs no constraint: a single
+#: leading "_" stays unambiguous) -- the pattern below rejects the ``__``
+#: halves and the register() partition guard enforces the rest
+#: (T-B-017 M-1, §6-1 scheduler ruling).
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -161,6 +165,16 @@ class ToolRegistry:
                 raise RegistrationError(
                     f"tool {label} {part!r} must match ^[A-Za-z0-9_-]+$ and contain no '__' (wire-name reversibility)"
                 )
+        # T-B-017 M-1 (§6-1 pre-merge hotfix): the wire name must split back
+        # into exactly (namespace, name) at the first "__". Given the pattern
+        # check above (no "__" in either half), this guard's only new
+        # interception is a namespace ending in a single "_" -- ("fs_", "read")
+        # would wire to the same "fs___read" as ("fs", "_read") (silent
+        # shadowing in the snapshot + a broken first-__ round trip).
+        if f"{spec.namespace}__{spec.name}".partition("__") != (spec.namespace, "__", spec.name):
+            raise RegistrationError(
+                f"tool namespace {spec.namespace!r} must not end with '_' (wire-name reversibility)"
+            )
         wire_name = f"{spec.namespace}__{spec.name}"
         try:
             validate_schema_supported(spec.input_schema, root=True)

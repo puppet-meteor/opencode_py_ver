@@ -229,6 +229,19 @@ async def test_read_directory_is_unsupported(tmp_path: Path) -> None:
     assert "Path is not a file: adir" in _text(outcome)
 
 
+async def test_read_nul_in_path_is_validation_error(tmp_path: Path) -> None:
+    """T-B-017 ③-9: JSON can legally carry a NUL in the path string; the
+    parse-point rejection (nul_byte_in_path) is a VALIDATION_ERROR -- a
+    different checkpoint from the read-point binary-window NUL
+    (TOOL_FAILED, pinned by test_read_binary_file_is_tool_failed)."""
+    outcome = await _run(tmp_path, {"path": "a\x00b"})
+
+    assert outcome.state == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == CoreErrorCode.VALIDATION_ERROR
+    assert "Path contains NUL bytes" in _text(outcome)
+
+
 async def test_read_absolute_path_outside_root_is_denied(tmp_path: Path, tmp_path_factory: Any) -> None:
     outside = tmp_path_factory.mktemp("outside")
     (outside / "secret.txt").write_bytes(b"secret\n")

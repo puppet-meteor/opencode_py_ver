@@ -405,10 +405,6 @@ def _normalize_result(
     return content, structured
 
 
-def _noop_progress(_metadata: JsonObject) -> None:
-    """Progress with no runner callback: adapters may always call it."""
-
-
 def _bounded_progress(
     progress: Callable[[JsonObject], Awaitable[None]] | None,
     limits: ToolLimits,

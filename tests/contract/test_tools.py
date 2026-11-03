@@ -254,9 +254,54 @@ async def test_register_rejects_wire_name_version_collision() -> None:
 
 async def test_register_rejects_invalid_names() -> None:
     registry = _registry()
-    for bad_spec in (_spec(namespace="bad ns"), _spec(name="a__b"), _spec(name="a/b")):
+    # T-B-017 n-1: the "__" rejection is pinned on both sides ("a__b" as a
+    # name and as a namespace), not just the namespace pattern failure.
+    for bad_spec in (
+        _spec(namespace="bad ns"),
+        _spec(name="a__b"),
+        _spec(name="a/b"),
+        _spec(namespace="a__b"),
+    ):
         with pytest.raises(RegistrationError, match="wire-name reversibility"):
             registry.register(_FakeAdapter(bad_spec))
+
+
+async def test_register_rejects_namespace_ending_with_underscore() -> None:
+    """T-B-017 M-1: ("fs_", "read") wires to "fs___read" -- the same wire name
+    as ("fs", "_read") -- and would silently shadow it in the snapshot
+    (provider-visible but not callable) and break the first-__ round trip.
+    The partition guard rejects it."""
+    registry = _registry()
+    with pytest.raises(RegistrationError, match="must not end with '_'"):
+        registry.register(_FakeAdapter(_spec(namespace="fs_")))
+
+
+async def test_register_leading_underscore_name_round_trips_over_wire() -> None:
+    """T-B-017 M-1 pinning: ("fs", "_read") stays registrable (a single
+    leading "_" in the name is legal) and is the unique surviving
+    interpretation of the wire name "fs___read" on both sides of the S5<->S3
+    seam (registry snapshot/invoke + the maas first-__ reverse parse)."""
+    from opencode.ai.maas import parse_tool_wire_name, tool_wire_name_from_dotted
+
+    registry = _registry(_RecordingSink())
+    spec = _spec(name="_read")
+    adapter = _FakeAdapter(spec)
+    registry.register(adapter)
+
+    # Snapshot-visible and resolvable back to exactly the registered pair.
+    catalog = registry.snapshot("ses_contract")
+    assert catalog.resolve("fs___read") == spec
+
+    # Invocable through the raw wire name the model would send.
+    outcome = await registry.invoke(_context(), "fs___read", {"text": "hi"}, "exec_001")
+    assert outcome.state == "succeeded"
+    assert outcome.tool_ref == ToolRef(namespace="fs", name="_read", version=1)
+    assert adapter.calls == [{"text": "hi"}]
+
+    # S3 adapter side: "fs___read" reverse-parses to the dotted "fs._read"
+    # (and the dotted form maps back), matching the registered (fs, _read).
+    assert parse_tool_wire_name("fs___read") == "fs._read"
+    assert tool_wire_name_from_dotted("fs._read") == "fs___read"
 
 
 async def test_register_rejects_schema_outside_validator_subset() -> None:
@@ -390,6 +435,29 @@ async def test_invoke_does_not_coerce_input_types() -> None:
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.VALIDATION_ERROR
     assert "expected an integer (no implicit conversion)" in outcome.error.message
+
+
+async def test_invoke_minimum_bound_is_enforced_before_adapter() -> None:
+    """T-B-017 ③-7: a JSON-legal integer 0 violates the schema-side minimum
+    (``minimum: 1`` on offset -- the Invoker's ``_bounds_issues`` path, "must
+    be >= 1"), a different checkpoint from the adapter's line-count check
+    (offset=99 in test_tool_read.py pins that one). The path value is inert:
+    the input is rejected before the adapter is ever reached."""
+    from opencode.tools.builtin.read import READ_INPUT_SCHEMA
+
+    registry = _registry(_RecordingSink())
+    adapter = _FakeAdapter(_spec(input_schema=READ_INPUT_SCHEMA))
+    registry.register(adapter)
+    registry.snapshot("ses_contract")
+
+    outcome = await registry.invoke(_context(), "fs__read", {"path": "notes.txt", "offset": 0}, "exec_001")
+
+    assert outcome.state == "failed"
+    assert outcome.effect_status == "not_started"
+    assert outcome.error is not None
+    assert outcome.error.code == CoreErrorCode.VALIDATION_ERROR
+    assert "offset: must be >= 1" in outcome.error.message
+    assert adapter.calls == []  # schema rejection: the adapter is never reached
 
 
 async def test_invoke_success_sequence() -> None:

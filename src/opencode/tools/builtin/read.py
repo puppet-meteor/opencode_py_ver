@@ -191,8 +191,6 @@ def _select_page(
             break
         selected.append(text)
         size += line_size
-    if next_offset is None and len(selected) >= limit and offset - 1 + len(selected) < len(lines):
-        next_offset = offset + len(selected)
     return selected, next_offset, size, total_bytes
 
 
