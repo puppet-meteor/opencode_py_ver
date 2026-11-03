@@ -395,3 +395,8 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 3. **S5 ④-13 目录读取错误码：追认为 `UnsupportedCapability`。** R2 读取能力面不提供目录列举，目录目标是能力类型不支持而非资源缺失；§8 已补充该选型及 “Path is not a file” 消息语义。该裁决与 `PathKindError` 锚点及目录测试保持一致。
 4. **S5 ④-1 `ToolContext`：确认增补 `run_id` 与 `tool_call_id`。** 两字段分别满足工具事件 metadata 的 `run_id` 和 `py.tool.requested` 的 `tool_call_id`，并与 TS Context 的 call ID 对齐；§5.1 已注明它们属于运行时上下文，不是 wire 版本字段。
 5. **S5 ④-3 `invoke` 的 `tool_ref`：确认接收原始 requested name，并在 `invoke` 内解析。** S5 catalog 接缝保留 wire 名（如 `fs__read`），模型层点分名按 §2.2 在接缝转换；§5.1 已明确解析使用当前 catalog 快照。未知工具仍可先提交 requested、再提交 `finished(not_started)`，同时保留原始 `requested_name`，因此满足未知工具配对契约。本裁决不替代 S5 M-1 的命名碰撞热修，namespace 单下划线边界仍由 T-C1-018 处理。
+
+`[T-A-008] 2026-11-03`：A 席位终审追认 R2-S4 两项收尾，依据 `doc/reviews/R2-S4-review.md` §7–§8、`src/opencode/session/context.py`、`src/opencode/session/service.py` 与 `src/opencode/contracts/errors.py` 的冻结证据：
+
+1. **S4 ④-5 `ContextLimitExceeded` 归属：维持 session 层定义。** 异常继续由 `session/context.py` 定义并继承 `StoreError`；`CoreErrorCode.CONTEXT_LIMIT_EXCEEDED` 仍由 contracts 提供 wire code，基类负责 `.core` 形状。该分层与 `SessionBusyError` 的 session 协议拒绝先例一致，当前不搬移代码、测试或契约条款。下游无需为此项排期变更，S6 继续消费标准 `.core` 面。
+2. **S4 ④-6 / m-3 CJK sizing：采纳方案 (a)。** R2 保留确定性的 chars/4 估算器和 `safety_margin` 语义；由 T-C1-020 在 `context.py` 估算器注释区补充宿主指引：CJK 主导文本可能系统性低估约 2–4 倍，宿主应显著增大 `safety_margin` 或下调可用预算。可配置乘数或真实 tokenizer 缓存留待 R3+ 决策与扩展，不在 R2 引入行为变更；现有 fail-visible、禁止静默裁剪的契约保持不变。
