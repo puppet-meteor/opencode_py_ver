@@ -74,6 +74,6 @@
 - **L85 三约束**（实现+测试落点）：① 工具按调用开始顺序串行=`tools/builtin/read.py` 模块 docstring（Phase-1 serial under registry lock）+ `test_tool_read.py` 串行顺序断言（S5 计划）；② 单 active run=service busy 门禁（`test_service_run.py` cancelling 占槽复验，S7 计划）；③ 无 steering/inbox=R2 无该面（L85 原文即约束声明）。
 - **read 工具量化偏差**（r2-slices §5.3 数字，float-reported；`read.py` 模块 docstring 逐条声明）：读窗口 1 MiB（非 TS 50 KiB）/输出预算 64 KiB/invalid UTF-8 直接失败（TS U+FFFD 替换）/目录=UnsupportedCapability。
 - **真实 SIGINT 挂起隐患（n-1）**：R3 P-1 必须+P-2/P-3 可选（checkpoint #97，T-B-024 裁决）。
-- **诊断清除命令 Phase 1/2 不提供**（R1 遗留，CORE-CONTRACTS §3.1 L187，归 R5/人工）。
+- **诊断清除命令 Phase 1/2 不提供**（R1 遗留，CORE-CONTRACTS §3.2 L195，归 R5/人工）。
 - **R3 增加 config 声明 roots**（`read.py` docstring：R2 唯一允许 root=working_dir）。
 - **TS 锚纪律**：CLI 链指纹已在 source-baseline.json（r2-slices L151）；`history.ts:125-150` 仅只读参照；本文件零"与 TS 同构"类未证断言（架构差异见 r2-slices §3）。
