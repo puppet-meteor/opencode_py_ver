@@ -10,14 +10,23 @@ module folds each event through :func:`opencode.session.state.apply` and
 translates the fold output into rows; it never inlines fold rules. The R1-S8
 rebuild reuses this projector over the same fold.
 
-Statelessness (§3.3): the projector keeps no per-session cache. The R1 faces
-(created/prompt) reconstruct the small pre-state from the sessions row; the R2
-faces reconstruct the fold pre-state by replaying the session's stored log
-prefix (events with ``seq < event.seq``, visible in the same transaction --
-the writer inserts the whole batch before projecting) through the same fold,
-then write the fold diff as rows. That replay is O(log length) per event --
-correctness first; an incremental projection cache is a later optimization
-(run_status queries read the runs table only and never replay, §3.2 L187).
+Statelessness and the incremental fold cache (§3.3; R2-S2-review m-1): the
+fold itself stays pure -- no clock, no randomness, no external calls -- and
+the R1 faces still reconstruct their small pre-state from the sessions row.
+The R2 faces now keep one per-session cache entry (last applied seq -> folded
+state) so an event folds onto its predecessor's state instead of re-replaying
+the whole stored prefix. Every cache use is guarded by an integrity digest:
+a blake2b chain over the raw columns each stored prefix row feeds the
+decoder. Each R2 projection re-reads the stored prefix and re-computes the
+chain (``_verify_prefix``), so a tampered stored row still fails the very
+next commit exactly as the stateless replay did -- on any mismatch or seq
+gap the projection falls back to the full decode+fold replay, which raises
+the same pinned ``stored_event_decode_failed`` / transition errors. The
+prompt face keeps the cache warm across run boundaries; the S8 rebuild never
+consults the projector and is untouched. Reads stay O(prefix length) per
+commit (airtight tamper detection requires re-reading every prefix row);
+the pydantic decode + fold work drops to O(new events) (run_status queries
+read the runs table only and never replay, §3.2 L187).
 
 TS mapping (``packages/core/src/session/projector.ts``):
 - ``SessionEvent.Created`` handler (L541-568): insert the SessionTable row,
@@ -42,8 +51,9 @@ over already-stored data (§3.2.1) and with the S8 rebuild.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any
+from typing import Any, NamedTuple
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -141,6 +151,10 @@ _SELECT_EVENTS_BEFORE = sa.text(
     "SELECT id, session_id, seq, type, version, created, data, metadata "
     "FROM events WHERE session_id = :sid AND seq < :seq ORDER BY seq"
 )
+_SELECT_EVENT_AT = sa.text(
+    "SELECT id, session_id, seq, type, version, created, data, metadata "
+    "FROM events WHERE session_id = :sid AND seq = :seq"
+)
 
 
 def _corrupt(reason: str, event: DurableEvent[Any], message: str) -> StorageCorruptError:
@@ -175,12 +189,81 @@ def _json_column(value: Any) -> Any:
     return value
 
 
+#: blake2b digest size for the stored-prefix integrity chain.
+_DIGEST_SIZE = 32
+
+
+class _FoldCacheEntry(NamedTuple):
+    """One session's incremental fold cache entry (module docstring).
+
+    ``state`` is the fold through ``last_seq`` inclusive; ``digest`` is the
+    blake2b chain over the raw stored rows [1..last_seq] in seq order -- the
+    exact bytes the decoder consumes, so any stored-row tampering (even a
+    same-length edit) breaks the chain and the next commit falls back to the
+    full replay.
+    """
+
+    last_seq: int
+    state: SessionState
+    digest: bytes
+
+
+def _column_bytes(value: Any) -> bytes:
+    """One stored column's bytes for fingerprinting, as the driver returned it."""
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, bytes | bytearray):
+        return bytes(value)
+    return canonical_json(value).encode("utf-8")
+
+
+def _row_fingerprint(row: Any) -> bytes:
+    """Unambiguous bytes over every column the prefix replay consumes.
+
+    Length-prefixed fields (no delimiter-collision ambiguity): session_id,
+    seq, id, type, version, created, data, metadata -- the columns
+    ``_replay_state`` feeds the decoder, so any edit the decoder could see
+    changes the fingerprint.
+    """
+    parts = (
+        str(row.session_id).encode("utf-8"),
+        str(row.seq).encode("utf-8"),
+        str(row.id).encode("utf-8"),
+        str(row.type).encode("utf-8"),
+        str(row.version).encode("utf-8"),
+        str(row.created).encode("utf-8"),
+        _column_bytes(row.data),
+        _column_bytes(row.metadata),
+    )
+    return b"".join(len(part).to_bytes(8, "big") + part for part in parts)
+
+
+def _chain(digest: bytes, row: Any) -> bytes:
+    """Extend the stored-prefix digest chain by one row (order-sensitive)."""
+    return hashlib.blake2b(digest + _row_fingerprint(row), digest_size=_DIGEST_SIZE).digest()
+
+
 class SessionProjector:
     """The real §3.2 projector over sessions/messages/tool_executions/runs.
 
-    Stateless -- no clock, no randomness, no external calls (§3.3) -- so one
-    instance may serve any session or be shared across stores.
+    No clock, no randomness, no external calls (§3.3). It keeps the
+    per-session incremental fold cache (module docstring); every entry is
+    re-validated against the stored log prefix before use, so one instance
+    may still serve any session or be shared across stores.
     """
+
+    #: Incremental fold cache (module docstring). Lazily allocated per
+    #: instance -- subclasses in the frozen test files define their own
+    #: ``__init__`` without a ``super().__init__()`` call, so the projector
+    #: itself must stay constructor-free.
+    _fold_cache: dict[str, _FoldCacheEntry] | None = None
+
+    def _cache(self) -> dict[str, _FoldCacheEntry]:
+        cache = self._fold_cache
+        if cache is None:
+            cache = {}
+            self._fold_cache = cache
+        return cache
 
     async def apply(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
         """Project one durable event inside the event-insert transaction."""
@@ -273,16 +356,24 @@ class SessionProjector:
         await self._write_accepted_run(connection, event)
         await self._set_active_run_id(connection, event, projected.active_run_id)
         await self._advance_applied_seq(connection, event)
+        await self._extend_fold_cache_after_r1(connection, event)
 
     async def _project_r2(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
-        """Replay-fold the stored prefix, fold this event, write the diff as rows.
+        """Fold onto the cached pre-state when it re-verifies, else full replay.
 
         The writer inserts the whole batch before projecting any of it, so the
         prefix read (``seq < event.seq``) sees the same-transaction rows of
         earlier batch events -- the finalized-before-generated consistency
         checks work inside one batch.
+
+        The incremental path (R2-S2-review m-1): a cache entry whose
+        ``last_seq`` is exactly ``event.seq - 1`` AND whose digest chain still
+        matches the re-read stored prefix is reused as the pre-state (one
+        fold, no re-decode of old rows). Anything else -- no entry, a seq gap,
+        a rolled-back batch, or one tampered byte anywhere in the prefix --
+        takes the stateless full replay, which also (re)builds the entry.
         """
-        pre = await self._replay_state(connection, event.session_id, event.seq)
+        pre, digest = await self._pre_state(connection, event)
         post = _fold(pre, event)
         await self._write_message_diff(connection, event, pre, post)
         await self._write_tool_diff(connection, event, pre, post)
@@ -290,12 +381,98 @@ class SessionProjector:
         if post.active_run_id != pre.active_run_id:
             await self._set_active_run_id(connection, event, post.active_run_id)
         await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
 
-    async def _replay_state(self, connection: AsyncConnection, session_id: str, before_seq: int) -> SessionState:
-        """Fold the session's stored log prefix (stateless pre-state reconstruction)."""
+    async def _pre_state(self, connection: AsyncConnection, event: DurableEvent[Any]) -> tuple[SessionState, bytes]:
+        """The fold pre-state plus the digest of the prefix it was derived from."""
+        entry = self._cache().get(event.session_id)
+        if entry is not None and event.seq == entry.last_seq + 1:
+            digest = await self._verify_prefix(connection, event.session_id, event.seq, entry.digest)
+            if digest is not None:
+                return entry.state, digest
+        return await self._replay_state(connection, event.session_id, event.seq)
+
+    async def _verify_prefix(
+        self, connection: AsyncConnection, session_id: str, before_seq: int, expected: bytes
+    ) -> bytes | None:
+        """Re-read the stored prefix and re-compute its digest chain.
+
+        Returns the recomputed chain when it still equals ``expected`` (the
+        stored rows are byte-identical to what the cached state folded), else
+        ``None`` -- the caller falls back to the full decode+fold replay,
+        which surfaces the damaged row with its pinned id/seq (③-9 semantics).
+        """
+        rows = (await connection.execute(_SELECT_EVENTS_BEFORE, {"sid": session_id, "seq": before_seq})).fetchall()
+        digest = b""
+        for row in rows:
+            digest = _chain(digest, row)
+        return digest if digest == expected else None
+
+    async def _remember_fold_state(
+        self, connection: AsyncConnection, event: DurableEvent[Any], post: SessionState, digest: bytes
+    ) -> None:
+        """Extend the digest with this event's own stored row and cache the state.
+
+        The read-back (not the in-memory event) is what gets chained, so the
+        next commit's verification compares against the true stored bytes;
+        the two are equal by construction (the writer serializes the same
+        model it passes to the projector). A row that vanished is
+        protocol-unreachable (the writer inserts the batch before projecting);
+        failing open here only skips the cache update -- the next event then
+        takes the full-replay path.
+        """
+        chained = await self._chain_event_row(connection, event.session_id, event.seq, digest)
+        if chained is not None:
+            self._cache()[event.session_id] = _FoldCacheEntry(event.seq, post, chained)
+
+    async def _chain_event_row(
+        self, connection: AsyncConnection, session_id: str, seq: int, previous_digest: bytes
+    ) -> bytes | None:
+        """Read back the row stored at ``seq`` (same transaction) and chain it."""
+        row = (await connection.execute(_SELECT_EVENT_AT, {"sid": session_id, "seq": seq})).first()
+        if row is None:
+            return None
+        return _chain(previous_digest, row)
+
+    async def _extend_fold_cache_after_r1(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Keep the fold cache warm across the R1 prompt face (multi-run sessions).
+
+        The prompt face reconstructs its minimal pre-state from the sessions
+        row; the cache entry instead needs the replay-faithful fold onto the
+        full cached state. Only a strictly consecutive extension applies, and
+        nothing is re-verified here: the next R2 projection re-verifies the
+        whole chain before any use. Any disagreement with the fold drops the
+        entry -- the next R2 event then takes the full-replay path, whose
+        semantics are exactly the pre-cache behaviour.
+        """
+        cache = self._cache()
+        entry = cache.get(event.session_id)
+        if entry is None or entry.last_seq != event.seq - 1:
+            return
+        try:
+            post = apply(entry.state, event)
+        except (IllegalTransitionError, ValueError):
+            cache.pop(event.session_id, None)
+            return
+        chained = await self._chain_event_row(connection, event.session_id, event.seq, entry.digest)
+        if chained is not None:
+            cache[event.session_id] = _FoldCacheEntry(event.seq, post, chained)
+
+    async def _replay_state(
+        self, connection: AsyncConnection, session_id: str, before_seq: int
+    ) -> tuple[SessionState, bytes]:
+        """Fold the session's stored log prefix; also return its digest chain.
+
+        Stateless pre-state reconstruction (and the fallback for every cache
+        miss or digest mismatch): each stored row is decoded and folded, and
+        its raw columns are chained into the digest that the incremental
+        path verifies on the next commit.
+        """
         state = SessionState()
+        digest = b""
         rows = (await connection.execute(_SELECT_EVENTS_BEFORE, {"sid": session_id, "seq": before_seq})).fetchall()
         for row in rows:
+            digest = _chain(digest, row)
             seq = int(row.seq)
             try:
                 envelope: dict[str, Any] = {
@@ -318,7 +495,7 @@ class SessionProjector:
                     f"stored event {row.id} does not decode during projection replay",
                 ) from error
             state = _fold(state, stored)
-        return state
+        return state, digest
 
     async def _write_message_diff(
         self, connection: AsyncConnection, event: DurableEvent[Any], pre: SessionState, post: SessionState

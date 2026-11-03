@@ -1361,3 +1361,197 @@ def test_r2_fold_step_started_duplicate_step_and_message_ids_are_rejected() -> N
     )
     with pytest.raises(IllegalTransitionError, match="is already used"):
         apply(terminal, duplicate_message)
+
+
+# -- T-C1-021a: S2 m-1 incremental fold cache (R2-S2-review §2) ------------------
+
+
+_R2_RUN3 = "run_0000000000000000000000000003"
+_R2_REQUEST3 = "req_0000000000000000000000000005"
+
+
+class _CountingProjector(SessionProjector):
+    """Real projector that counts full replays vs digest-verified cache hits."""
+
+    def __init__(self) -> None:
+        self.full_replays = 0
+        self.digest_verifies = 0
+
+    async def _replay_state(
+        self, connection: AsyncConnection, session_id: str, before_seq: int
+    ) -> tuple[SessionState, bytes]:
+        self.full_replays += 1
+        return await super()._replay_state(connection, session_id, before_seq)
+
+    async def _verify_prefix(
+        self, connection: AsyncConnection, session_id: str, before_seq: int, expected: bytes
+    ) -> bytes | None:
+        self.digest_verifies += 1
+        return await super()._verify_prefix(connection, session_id, before_seq, expected)
+
+
+def _read_model(db_path: Path) -> dict[str, list[tuple[Any, ...]]]:
+    """A full ordered snapshot of the four read-model faces for equality checks."""
+    return {
+        "sessions": _rows(
+            db_path,
+            "SELECT session_id, status, config_snapshot, snapshot_hash, applied_seq, active_run_id "
+            f"FROM sessions WHERE session_id = '{_R2_SESSION}'",
+        ),
+        "messages": _rows(db_path, "SELECT message_id, seq, data FROM messages ORDER BY message_id, seq"),
+        "runs": _rows(db_path, "SELECT run_id, request_id, status, error FROM runs ORDER BY run_id"),
+        "tool_executions": _rows(
+            db_path,
+            "SELECT execution_id, run_id, step_id, message_id, tool_call_id, input_hash, state "
+            "FROM tool_executions ORDER BY execution_id",
+        ),
+    }
+
+
+async def test_incremental_cache_projection_is_bit_identical_to_full_replay(tmp_path: Path) -> None:
+    """S2 m-1 (R2-S2-review §2): the incremental fold cache must be
+    observation-free. A 13-event session committed through one warm projector
+    (multi-event batches) lands the exact rows the stateless paths produce:
+
+    1. the store's own rebuild (full replay, the untouched S8 path) over the
+       same log re-derives identical rows;
+    2. the same drafts re-committed one event per batch through a FRESH
+       projector per commit (every event takes the pre-cache full-replay
+       path) land identical rows in a second database;
+    3. the batch partitioning itself leaks nothing (events compared
+       column-by-column, batch bookkeeping excluded)."""
+    warm_path = tmp_path / "warm.db"
+    cold_path = tmp_path / "cold.db"
+    _require_success(_upgrade_head(warm_path))
+    _require_success(_upgrade_head(cold_path))
+
+    async with open_database(warm_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        high = await _seed_created_and_prompt(store)
+        for batch_id, keys in (
+            ("w_run", ("run_started",)),
+            ("w_generation", ("step_started", "text_finalized", "reasoning_finalized", "step_generated")),
+            ("w_tools", ("tool_requested", "tool_started", "tool_finished")),
+            ("w_step_end", ("step_finished", "cancel_requested", "run_finished")),
+        ):
+            batch = EventBatch(batch_id, tuple(_r2_draft(key) for key in keys))
+            high = (await store.commit(_R2_SESSION, batch, high))[-1].seq
+        warm = _read_model(warm_path)
+
+        # Control 1: the full-replay rebuild over the same log (constraint 4).
+        await store.rebuild(_R2_SESSION)
+        assert _read_model(warm_path) == warm
+
+    async with open_database(cold_path, mode="create") as database:
+        high = 0
+        for batch_id, draft in [
+            ("c_created", _fixture_draft("events_session_created_valid.json")),
+            ("c_prompt", _r2_prompt_draft()),
+            *[(f"c_{key}", _r2_draft(key)) for key, _ in _R2_FIXTURES],
+        ]:
+            # A fresh projector per commit: every event full-replays (the exact
+            # pre-cache behaviour of the stateless projector).
+            cold = SessionStore(database.engine, projector=SessionProjector())
+            high = (await cold.commit(_R2_SESSION, EventBatch(batch_id, (draft,)), high))[-1].seq
+    assert _read_model(cold_path) == warm
+
+    # Control 3: identical durable log content across the two partitionings.
+    columns = "id, seq, type, version, created, data, metadata"
+    assert _rows(warm_path, f"SELECT {columns} FROM events ORDER BY seq") == _rows(
+        cold_path, f"SELECT {columns} FROM events ORDER BY seq"
+    )
+
+
+async def test_warm_fold_cache_still_detects_a_tampered_stored_event(tmp_path: Path) -> None:
+    """need-tests ③-9 re-verification under the warm incremental cache (S2
+    m-1): the digest chain must make a cache hit impossible over damaged
+    bytes. The tampered row sits well INSIDE the cached prefix (the prompt
+    event at seq 2 while the cache head is seq 3) and the very next commit --
+    a strict seq continuation that would otherwise hit the cache -- fails
+    with reason=stored_event_decode_failed and the pinned id/seq, exactly
+    like the stateless projector
+    (test_incremental_replay_of_a_tampered_stored_event)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        high = await _seed_created_and_prompt(store)
+        high = (await store.commit(_R2_SESSION, EventBatch("b_run_started", (_r2_draft("run_started"),)), high))[-1].seq
+
+        # The cache is warm through seq 3; tamper the stored prompt row (seq 2)
+        # outside every store face, then commit the event that would hit.
+        tampered = _fetch_scalar(db_path, "SELECT id FROM events WHERE session_id = ? AND seq = 2", (_R2_SESSION,))
+        assert tampered is not None
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("UPDATE events SET data = 'not-json' WHERE session_id = ? AND seq = 2", (_R2_SESSION,))
+
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit(_R2_SESSION, EventBatch("b_step_started", (_r2_draft("step_started"),)), high)
+        assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
+        assert error.value.core.details["reason"] == "stored_event_decode_failed"
+        assert error.value.core.details["event_id"] == tampered[0]
+        assert error.value.core.details["seq"] == 2
+
+    # The rejected batch left zero residue; the damaged log is untouched (3 rows).
+    assert _rows(db_path, f"SELECT COUNT(*) FROM events WHERE session_id = '{_R2_SESSION}'") == [(3,)]
+
+
+async def test_multi_event_batches_apply_once_through_the_fold_cache(tmp_path: Path) -> None:
+    """S2 m-1 (R2-S2-review §2): within one commit batch only the FIRST R2
+    event rebuilds the pre-state by full replay (O(prefix)); the rest fold
+    onto the cached state (O(1) each) -- the O(n*m) -> O(n+m) claim, observed
+    by counting. Later single-event commits and a second run's boundary stay
+    on the incremental path: the prompt face extends the cache, so the new
+    run's first R2 event verifies the digest instead of re-replaying."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        projector = _CountingProjector()
+        store = SessionStore(database.engine, projector=projector)
+        high = await _seed_created_and_prompt(store)
+        assert projector.full_replays == 0  # the R1 faces never replay
+
+        generation = ("run_started", "step_started", "text_finalized", "reasoning_finalized", "step_generated")
+        batch = EventBatch("b_generation", tuple(_r2_draft(key) for key in generation))
+        high = (await store.commit(_R2_SESSION, batch, high))[-1].seq
+        assert projector.full_replays == 1  # was 5 before the cache (one replay per event)
+        assert projector.digest_verifies == 4  # events 2..5 of the batch verified, not replayed
+
+        high = (await store.commit(_R2_SESSION, EventBatch("b_tool_requested", (_r2_draft("tool_requested"),)), high))[
+            -1
+        ].seq
+        assert projector.full_replays == 1
+        for key, batch_id in (
+            ("tool_started", "b_tool_started"),
+            ("tool_finished", "b_tool_finished"),
+            ("step_finished", "b_step_finished"),
+            ("cancel_requested", "b_cancel_requested"),
+            ("run_finished", "b_run_finished"),
+        ):
+            high = (await store.commit(_R2_SESSION, EventBatch(batch_id, (_r2_draft(key),)), high))[-1].seq
+        assert _rows(db_path, f"SELECT status FROM runs WHERE run_id = '{_R2_RUN}'") == [("interrupted",)]
+        assert _rows(db_path, f"SELECT applied_seq FROM sessions WHERE session_id = '{_R2_SESSION}'") == [(13,)]
+
+        # A second run: the prompt face keeps the cache warm across the R1
+        # boundary, so the new run's first R2 event is a digest-verified hit.
+        prompt2 = _fixture_raw("events_prompt_accepted_valid.json")
+        prompt2["id"] = "evt_0000000000000000000000000071"
+        prompt2["data"]["request_id"] = _R2_REQUEST3
+        prompt2["data"]["run_id"] = _R2_RUN3
+        prompt2["data"]["message"]["id"] = "msg_0000000000000000000000000014"
+        prompt2["metadata"] = {"run_id": _R2_RUN3, "request_id": _R2_REQUEST3}
+        high = (await store.commit(_R2_SESSION, EventBatch("b_prompt_2", (_draft_from_raw(prompt2),)), high))[-1].seq
+
+        run2_started = _fixture_raw("events_run_started_valid.json")
+        run2_started["id"] = "evt_0000000000000000000000000072"
+        run2_started["data"]["run_id"] = _R2_RUN3
+        run2_started["metadata"] = {"run_id": _R2_RUN3, "request_id": _R2_REQUEST3}
+        high = (await store.commit(_R2_SESSION, EventBatch("b_run_started_2", (_draft_from_raw(run2_started),)), high))[
+            -1
+        ].seq
+        assert projector.full_replays == 1  # the whole second-run boundary stayed incremental
+        assert projector.digest_verifies == 11  # seqs 4..13 (10) + the seq-15 hit
+        assert _rows(db_path, f"SELECT status FROM runs WHERE run_id = '{_R2_RUN3}'") == [("running",)]
+        assert _rows(db_path, f"SELECT active_run_id FROM sessions WHERE session_id = '{_R2_SESSION}'") == [(_R2_RUN3,)]
