@@ -95,10 +95,19 @@ R2 重建 `src/opencode/ai/` 时：**必须重跑** `tests/r0/` 全部用例与 
 
 ## 8. 真实 MAAS smoke 状态
 
-- **状态：R0-A 外部证据待补**（本地无 `OPENCODE_MAAS_BASE_URL` / `OPENCODE_MAAS_API_KEY` / `OPENCODE_MAAS_MODEL` 凭据，不得伪造）；
+- **状态：已补齐（2026-11-03，调度器亲跑，R2 前置收口）**——凭据经本地 opencode 运行配置（OpenAI 兼容网关）程序化注入进程环境变量三要素，key 不出现在命令行文本、不回显、不入日志或 CI（STEP-01-R0 L171 合规）；endpoint/model 真实值按本节脱敏规则不落库，下文以"实测模型"指代；
 - smoke 入口：`uv run python tools/r0/provider_spike.py`（显式命令触发，不在 pytest/CI 内）；
 - 与 fake 走同一 `MaasSpikeAdapter`；合成 prompt + 只读无副作用工具声明；只解析文本与调用计划，不执行任何工具；
 - 输出仅含摘要：chunk 计数、按类型计数、文本/参数的长度与 SHA-256 前 12 位、usage 数值、finish reason——不落任何原文；`endpoint` 与 `model` 字段打印为 `<REDACTED_ENDPOINT>` / `<REDACTED_MODEL>`，不回显真实值。
+
+### 8.1 实测结果（2026-11-03，实测模型值脱敏）
+
+- 退出码 0；两场景 `error=null`——满足 STEP-01-R0 L104-106 验收点（一次文本流+一次双交错 tool call 流+只解析计划不执行工具）。
+- **文本流**：chunk_count=2（usage×1+finish×1，无 `text_delta`）；finish reason=`length`；usage：input=19 / output=64 / reasoning=61 / cache_read=0。
+  - **行为注记（reasoning 计入 output 预算）**：`max_output_tokens=64` 被 reasoning 全额消耗（reasoning=61/output=64），流无正文、finish=`length`——R2 ContextBuilder/runner 的 token 预算语义必须把 reasoning 纳入设计注记（短预算+reasoning 模型可能零正文截断）。
+- **工具流**：chunk_count=36（`text_delta`×10 / `tool_call_start`×2 / `tool_call_args_delta`×20 / `usage`×1 / `tool_call_end`×2 / `finish`×1）；finish reason=`tool_calls`；tool_plan=2 个 `fs__read`（call_index 0/1，tool_call_id 唯一，arguments len=20、SHA-256 前 12 位各异）——单回复双交错 tool call 成立。
+- **端点能力注记**：`stream_options.include_usage` 透传成功（usage 帧到达）；reasoning_tokens 经 `completion_tokens_details.reasoning_tokens` 传递、`cache_write_tokens` 无对应字段为 null（与 §2 已记录字段映射一致）；SSE 无缓冲失真（36 chunk 逐帧到达，本地代理链路透传）。
+- 凭据纪律声明：本文件与仓库不含任何真实 endpoint/model/key 值；凭据保留在用户本地配置；复跑同样以环境变量注入，不落库。
 
 ## 9. CI 验证状态
 

@@ -41,7 +41,7 @@
 ## 5. 未验证项
 
 - ~~Linux 端实际运行~~ **已验证**:CI run [41177228445](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41177228445)(commit `edcf891`,2026-10-31)`ubuntu-latest` 与 `windows-latest` 两个 job 均 success,pytest 各 `23 passed`(详见 provider.md §9);
-- 真实 MAAS smoke:无凭据,标记“R0-A 外部证据待补”(见 provider.md §8)。
+- 真实 MAAS smoke:**已补齐**(2026-11-03,调度器亲跑;凭据经环境变量注入不落库,实测结果与行为注记见 provider.md §8)。
 
 ## 6. R0-B 补记(2026-10-31)
 
