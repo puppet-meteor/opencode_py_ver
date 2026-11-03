@@ -23,7 +23,15 @@ TS behaviour mapping (fingerprints in ``doc/source-baseline.json``):
   L318 (role/content conversion): ``idle`` contributes nothing (L243-244),
   empty user text yields no message, empty text/reasoning parts are dropped,
   and each tool result rides its own tool-role message after the assistant
-  message that issued the calls.
+  message that issued the calls. Two TS branches in that anchor are
+  deliberately not ported (precision note, T-C1-020 n-1): L206 keeps an
+  *empty* reasoning part when it carries ``providerMetadata`` -- the Python
+  §2.1 ``AssistantReasoningPart`` has no metadata field, so that case is
+  structurally unreachable here; and the L173-185 reasoning->text demotion
+  family (error/interrupt/model change) has no Python counterpart either --
+  replay reasoning never reaches the wire (the MAAS adapter drops it,
+  maas.py replay note / R2-S3-review ③-9), so demoting it for display is
+  the TUI layer's concern, not this request face.
 
 Runtime settings are the OP-1 injection face (r2-slices §4): model, context
 limit, output reserve, safety margin, temperature and timeout are
@@ -69,7 +77,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from typing import Any
 
 from opencode.contracts.errors import CoreErrorCode
@@ -103,6 +111,13 @@ type SessionMessage = UserMessage | AssistantMessage | IdleMessage
 #: L51: "Prompt text is estimated at about 4 characters per token, which can
 #: run low on dense text such as code"). The injected safety margin absorbs
 #: the estimator's error.
+#: Host guidance (m-3, R2-S4-review §2): chars/4 is calibrated for
+#: Latin-script text; CJK-dominant history underestimates the real token
+#: count by roughly 2-4x (actual ~1-2 chars/token), so CJK-session hosts
+#: must size ``safety_margin`` accordingly (or budget with a lower usable
+#: context_limit) -- otherwise the overflow surfaces from the provider, not
+#: this local gate. A configurable multiplier or a real tokenizer is an R3+
+#: decision (recorded with the A seat, T-A-008).
 _CHARS_PER_TOKEN = 4
 
 #: §2.1 L35 assistant tool-part states that already carry a result for
@@ -148,6 +163,10 @@ class RuntimeSettings:
     #: Explicit slack in tokens carved out with the reserve (>= 0); absorbs
     #: estimator error and chat-template/tool-schema overhead.
     safety_margin: int = 0
+    #: Optional sampling temperature; the contract §2.2 L78 sets no bounds for
+    #: it, so this face invents none -- out-of-range values are rejected by
+    #: the provider side, not here (a numeric bound would have no contract
+    #: basis; that ruling belongs to the A seat).
     temperature: float | None = None
     #: Optional system prompt text; ``None``/empty produces no system message
     #: (TS baseTranscript L99 anchor; see module docstring).
@@ -157,8 +176,13 @@ class RuntimeSettings:
         _require_int_setting("context_limit", self.context_limit, minimum=1)
         _require_int_setting("output_reserve", self.output_reserve, minimum=1)
         _require_int_setting("safety_margin", self.safety_margin, minimum=0)
-        if isinstance(self.timeout_s, bool) or not isinstance(self.timeout_s, int | float) or not self.timeout_s > 0:
-            raise ValueError(f"timeout_s must be a positive number, got {self.timeout_s!r}")
+        if (
+            isinstance(self.timeout_s, bool)
+            or not isinstance(self.timeout_s, int | float)
+            or not isfinite(self.timeout_s)
+            or not self.timeout_s > 0
+        ):
+            raise ValueError(f"timeout_s must be a finite positive number, got {self.timeout_s!r}")
         if self.temperature is not None and (
             isinstance(self.temperature, bool) or not isinstance(self.temperature, int | float)
         ):
