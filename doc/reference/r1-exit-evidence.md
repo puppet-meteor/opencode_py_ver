@@ -69,6 +69,7 @@
 
 - 210 分布（`pytest --collect-only` 可核对）：`tests/contract` 82（test_events 58 + test_bus 24）；`tests/integration` 96（migrations 4 / store_commit 16 / projector 11 / eventlog 20 / service 28 / bus_commit 1 / rebuild 16 = S8 主体 12 + T-C1-012 修复 4）；`tests/r0` 32（platform_probe 8 + provider_spike 24）。
 - CI 对齐（`.github/workflows/ci.yml`，R1-S8 任务⑤）：Test 步 = `uv run pytest -q`（全量；原仅 `pytest -q tests/r0`）、Type check 步 = `uv run mypy src tools/r0 tests/r0 tests/contract tests/integration`（对齐本地门禁；原仅 `mypy src tools/r0 tests/r0`）；双 OS matrix（ubuntu-latest/windows-latest）+ `timeout-minutes: 15` + 单 job 结构不变；Lock check / 平台探针证据步骤不变。
+- **CI 实测（R1 收官推送验证）**：run `41558180881`（push #63 `135d4a8`，2026-11-03T01:12:25Z 触发）conclusion=**success**——test (ubuntu-latest) 1m22s + test (windows-latest) 2m27s 双绿（全量 210 测+mypy 对齐门禁在双平台 CI 复现）；平台探针 artifact 双上传（platform-probe-ubuntu-latest / platform-probe-windows-latest）；annotations 仅 GitHub 平台侧警告（actions Node 20 弃用→forced Node 24；ubuntu-latest→Ubuntu 26 迁移预告），无仓库侧错误。
 
 ## 6. 已知边界（后续轮次台账；非 R1 退出条件缺口）
 
