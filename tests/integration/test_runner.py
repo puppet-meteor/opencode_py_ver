@@ -39,6 +39,7 @@ from opencode.contracts.events import (
     PY_REASONING_DELTA,
     PY_TEXT_DELTA,
     PY_TOOL_INPUT_DELTA,
+    DurableEvent,
     EventDraft,
     RunCancelRequestedData,
 )
@@ -1452,6 +1453,7 @@ async def test_interrupted_after_usage_keeps_the_observed_usage(tmp_path: Path) 
         assert result.error == boom  # verbatim, never synthesized
         assert len(provider.requests) == 1  # §8 L350: no resend
         state = await _fold(harness)
+        assert not state.tools  # zero tool executions
         assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
         assert state.runs[_RUN_ID].error == boom
         message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
@@ -1481,6 +1483,7 @@ async def test_interrupted_after_finish_and_usage_keeps_both_observations(tmp_pa
         assert result.error == boom
         assert len(provider.requests) == 1
         state = await _fold(harness)
+        assert not state.tools  # zero tool executions
         assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
         message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
         assert message.status == "interrupted"
@@ -1509,6 +1512,7 @@ async def test_eof_without_terminal_keeps_the_terminal_fields_conservative(tmp_p
         assert result.error.code is CoreErrorCode.PROVIDER_STREAM_INTERRUPTED
         assert len(provider.requests) == 1
         state = await _fold(harness)
+        assert not state.tools  # zero tool executions
         assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
         message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
         assert message.status == "interrupted"
@@ -1516,3 +1520,131 @@ async def test_eof_without_terminal_keeps_the_terminal_fields_conservative(tmp_p
         assert message.cost_usd is None
         assert message.finish is None
         assert message.raw_finish is None
+
+
+# ---------------------------------------------------------------------------
+# T-C1-022c (T-B-022 follow-ups): m-3 non-generated symmetry + the
+# succeeded->interrupted race window
+# ---------------------------------------------------------------------------
+
+
+async def test_interrupted_after_usage_without_text_keeps_the_observed_usage(tmp_path: Path) -> None:
+    """m-3: the non-generated construction of the interrupted terminal -- an
+    error after a usage chunk with zero text parts commits nothing finalized,
+    so the open step carries no generated plan and the terminal is rebuilt
+    from the (empty) finalized truth: parts stay empty while the observed
+    usage/cost survive (the symmetric counterpart of the generated-branch
+    tests above)."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    boom = CoreError(code=CoreErrorCode.PROVIDER_UNAVAILABLE, message="maas is down", retryable=False)
+    script = _Script().usage().error(boom)  # zero text chunks: nothing to finalize
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, provider)
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result == RunResult(outcome="interrupted", steps=1, error=boom)
+        assert len(provider.requests) == 1  # §8 L350: no resend
+        state = await _fold(harness)
+        assert not state.tools  # zero tool executions
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        assert state.runs[_RUN_ID].error == boom
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.status == "interrupted"
+        assert message.error == boom
+        assert message.parts == []
+        assert message.usage == Usage(input=5, output=7)
+        assert message.cost_usd == "0.0012"
+        assert message.finish is None
+        assert message.raw_finish is None
+
+
+class _CancelAfterStepFinishedCommitter(EventCommitter):
+    """A committer that injects ``py.run.cancel_requested`` right after the
+    first ``py.step.finished`` batch commits -- the deterministic construction
+    of the succeeded->interrupted race window (the cancel lands between
+    step.finished and run.finished(succeeded), making succeeded illegal from
+    cancelling)."""
+
+    armed: bool = True
+
+    async def commit(self, session_id: str, drafts: Sequence[EventDraft[Any]]) -> list[DurableEvent[Any]]:
+        events = await super().commit(session_id, drafts)
+        if self.armed and any(draft.type == "py.step.finished" for draft in drafts):
+            self.armed = False  # exactly one injection, never the finalize batch
+            high = await self._repos.log_high(session_id)
+            draft = EventDraft[RunCancelRequestedData](
+                id="evt_cancel_inject",
+                type="py.run.cancel_requested",
+                version=1,
+                session_id=session_id,
+                created_at=_CREATED_AT,
+                data=RunCancelRequestedData(run_id=_RUN_ID, reason="user"),
+                metadata={"run_id": _RUN_ID},
+            )
+            await self._store.commit(session_id, EventBatch("batch_cancel_inject", (draft,)), high)
+        return events
+
+
+async def test_cancel_between_step_finished_and_run_finished_interrupts_the_run(tmp_path: Path) -> None:
+    """T-C1-022c (#92): a cancel landing between ``py.step.finished`` and
+    ``run.finished(succeeded)`` makes succeeded illegal from cancelling
+    (§2.1 L59-61) -- the fallback finalizes the run interrupted while the step
+    keeps its already-committed completed terminal (the finish/usage survive
+    via the succeeded-path step.finished read; the ``observed=`` expansion is
+    inert on this branch because the step is already terminal)."""
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    script = _Script().text("p1", "hello").usage().finish()
+    provider = _ScriptedProvider([script.items])
+    async with open_database(db_path, mode="create") as database:
+        # _wire inlined with the injection committer (_wire hardcodes the
+        # plain EventCommitter; the runner only consumes its commit face).
+        engine = database.engine
+        store = SessionStore(engine, projector=SessionProjector())
+        repos = ReadRepositories(engine)
+        bus = VolatileBus()
+        eventlog = EventLog(engine, repos=repos, bus=bus)
+        ids = _FixedIds()
+        committer = _CancelAfterStepFinishedCommitter(repos, store, bus, ids=ids, clock=_clock)
+        registry = ToolRegistry(sink=committer.sink, clock=_clock, ids=ids)
+        runner = Runner(
+            provider=provider,
+            context_builder=ContextBuilder(_settings()),
+            registry=registry,
+            committer=committer,
+            log=eventlog,
+            bus=bus,
+            ids=ids,
+            clock=_clock,
+        )
+        harness = _Harness(
+            store=store,
+            repos=repos,
+            bus=bus,
+            eventlog=eventlog,
+            committer=committer,
+            registry=registry,
+            provider=provider,
+            runner=runner,
+        )
+        await _bootstrap(harness)
+
+        result = await runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result == RunResult(outcome="interrupted", steps=1)
+        assert len(provider.requests) == 1
+        state = await _fold(harness)
+        assert not state.tools  # zero tool executions
+        assert state.runs[_RUN_ID].status is RunStatus.INTERRUPTED
+        assert state.runs[_RUN_ID].error is None
+        # the step terminal is the succeeded-path completed read, kept verbatim
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.status == "completed"
+        assert message.finish is FinishReason.STOP
+        assert message.raw_finish is None
+        assert message.usage == Usage(input=5, output=7)
+        assert message.cost_usd == "0.0012"

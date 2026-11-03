@@ -935,7 +935,15 @@ async def test_cancel_reports_a_crashed_task_with_the_original_cause(tmp_path: P
     async with _run_app(db_path, provider) as app:
         session_id, run_ref = await _create_prompted(app.service)
         await provider.crashed.wait()
-        await asyncio.sleep(0.1)  # the crash reaches _drive_run's recorder
+        # n-2 (T-C1-022c): a determinism selector, not a fragile wait. Both
+        # orderings converge on LifecycleCleanupFailedError with a
+        # cleanup_failed session and an honestly cancelling run, but only
+        # this one chains the cause: the sleep lets the crash reach
+        # _drive_run's recorder and the task entry pop, so cancel() reads
+        # _schedule_errors; racing the recorder leaves the entry in place and
+        # the await-task branch reports "exited without a terminal run" --
+        # same failure, no chained cause.
+        await asyncio.sleep(0.1)
 
         with pytest.raises(LifecycleCleanupFailedError) as failed:
             await app.service.cancel(run_ref.run_id)
