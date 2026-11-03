@@ -1,9 +1,9 @@
-# R1-S1..R1-S7 已交付公共面静态清单（滚动更新）
+# R1-S1..R1-S8 已交付公共面静态清单（滚动更新）
 
-> 范围：覆盖 **R1-S1..R1-S7 已并入主树的交付面**（滚动更新：S8 并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/`、`src/opencode/bus/`、`src/opencode/app.py` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
-> 符号总数：**121** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6）+ S5 新增 4（`bus/bus.py` 4）+ S6 新增 24（`bus/eventlog.py` 13 + `storage/repos.py` 11）+ S7 新增 14（`session/service.py` 11 + `app.py` 1 + `storage/repos.py` 2：`AcceptedPrompt` 与 `REASON_DEDUPE_ROW_UNEXPECTED`）。各包的 `__init__.py` 均只追加再导出、0 个新定义。
-> 包级再导出：`contracts.__all__` 27 项；`storage.__all__` **27** 项（S6 的 26 + S7 追加 `AcceptedPrompt`，纯追加）；`session.__all__` **11** 项（S4 的 5 + S7 追加 `RunRef`/`RunStatus`/`RunStatusValue`/`SessionBusyError`/`SessionRef`/`SessionService`）；`bus.__all__` 4 项（S5/S6/S7 均不变）——未进各自 `__all__` 的公共名：`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 与 `session/projector.py` 的 `REASON_*`、`bus/eventlog.py` 全部公共名（直连 import）、`session/service.py` 的 `Clock`/`IdFactory`/`AscendingIds`/`prompt_dedupe_key`/`REASON_ACTIVE_RUN_WITHOUT_PROMPT`（直连 import）、`storage/repos.py` 的 `clamp_page_limit`/`REASON_*`/`MIN|MAX|DEFAULT_PAGE_LIMIT`。
-> 扫描时间：2026-11-02（首派）→ 当日 S3/S4/S5/S6 滚动；2026-11-03 S7 滚动；工作树状态见 §3 注。
+> 范围：覆盖 **R1-S1..R1-S8 已并入主树的交付面**（滚动更新：后续切片并入后另行滚动）——`src/opencode/contracts/`、`src/opencode/storage/`、`src/opencode/session/`、`src/opencode/bus/`、`src/opencode/app.py` 的**源码定义处**公共符号（不含 `import` 绑定、不含包 `__init__` 的再导出）。全部数据由源码直读/正则扫描得出，未做任何修改。
+> 符号总数：**125** = 首派 45（contracts 27 + storage 18）+ S3 新增 24（`store.py` 3 + `txn.py` 21）+ S4 新增 10（`session/state.py` 4 + `session/projector.py` 6）+ S5 新增 4（`bus/bus.py` 4）+ S6 新增 24（`bus/eventlog.py` 13 + `storage/repos.py` 11）+ S7 新增 14（`session/service.py` 11 + `app.py` 1 + `storage/repos.py` 2）+ S8 新增 4（`storage/txn.py` 4 个 `REASON_*` 常量；另 3 个公共重建方法入表但不计模块级符号，见 §1.7）。各包的 `__init__.py` 均只追加再导出、0 个新定义。
+> 包级再导出：`contracts.__all__` 27 项；`storage.__all__` **27** 项（S7 后不变，S8 未改）；`session.__all__` **11** 项（S7 后不变，S8 未改）；`bus.__all__` 4 项（S5/S6/S7/S8 均不变）——未进各自 `__all__` 的公共名：`TransactionWriter`、`Diagnostic`、`epoch_ms`/`from_epoch_ms`、`storage/txn.py` 与 `session/projector.py` 的 `REASON_*`、`bus/eventlog.py` 全部公共名（直连 import）、`session/service.py` 的 `Clock`/`IdFactory`/`AscendingIds`/`prompt_dedupe_key`/`REASON_ACTIVE_RUN_WITHOUT_PROMPT`（直连 import）、`storage/repos.py` 的 `clamp_page_limit`/`REASON_*`/`MIN|MAX|DEFAULT_PAGE_LIMIT`。
+> 扫描时间：2026-11-02（首派）→ 当日 S3/S4/S5/S6 滚动；2026-11-03 S7 滚动；2026-11-03 S8 滚动；工作树状态见 §3 注。
 
 ## 1. 公共面清单
 
@@ -63,28 +63,28 @@
 |---|---|---|---|---|---|
 | `opencode.storage.store.EventBatch` | class (dataclass, frozen, slots) | `id: str; events: tuple[EventDraft[Any], ...]; dedupe_key: str \| None = None` | 一次原子提交单元：batch 幂等键 + 有序草稿（+可选去重键） | `src/opencode/storage/store.py:31` | 导出 |
 | `opencode.storage.store.Projector` | Protocol | `async apply(connection: AsyncConnection, event: DurableEvent[Any]) -> None` | 读模型投影 seam，在提交事务内按批次顺序调用 | `src/opencode/storage/store.py:45` | 导出 |
-| `opencode.storage.store.SessionStore` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry \| None = None); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]` | 唯一提交接口，内部委托 `TransactionWriter` | `src/opencode/storage/store.py:62` | 导出 |
-| `opencode.storage.txn.REASON_READ_MODEL_MISSING` | constant | `"sessions_row_missing_with_log"` | 有日志行但 sessions 行缺失 | `src/opencode/storage/txn.py:63` | 不导出 |
-| `opencode.storage.txn.REASON_APPLIED_SEQ_MISMATCH` | constant | `"applied_seq_mismatch"` | A≠H | `src/opencode/storage/txn.py:64` | 不导出 |
-| `opencode.storage.txn.REASON_SEQ_GAP` | constant | `"seq_gap"` | seq 不连续 | `src/opencode/storage/txn.py:65` | 不导出 |
-| `opencode.storage.txn.REASON_DUPLICATE_SEQ` | constant | `"duplicate_seq"` | seq 重复 | `src/opencode/storage/txn.py:66` | 不导出 |
-| `opencode.storage.txn.REASON_ILLEGAL_SEQ` | constant | `"illegal_seq"` | seq < 1 | `src/opencode/storage/txn.py:67` | 不导出 |
-| `opencode.storage.txn.REASON_UNKNOWN_STATUS` | constant | `"unknown_session_status"` | sessions.status 非法 | `src/opencode/storage/txn.py:68` | 不导出 |
-| `opencode.storage.txn.REASON_STORED_DECODE_FAILED` | constant | `"stored_event_decode_failed"` | 已存事件解码失败 | `src/opencode/storage/txn.py:69` | 不导出 |
-| `opencode.storage.txn.REASON_PROJECTION_INVARIANT` | constant | `"applied_seq_not_advanced_after_projection"` | 投影后 A 未推进到 H+n | `src/opencode/storage/txn.py:70` | 不导出 |
-| `opencode.storage.txn.epoch_ms` | function | `(value: datetime) -> int` | datetime → 整数 epoch 毫秒（`events.created` 精度） | `src/opencode/storage/txn.py:106` | 不导出 |
-| `opencode.storage.txn.from_epoch_ms` | function | `(value: int) -> datetime` | `epoch_ms` 的逆函数（毫秒精度） | `src/opencode/storage/txn.py:112` | 不导出 |
-| `opencode.storage.txn.StoreError` | exception | `class StoreError(StorageError)`；`code: ClassVar[CoreErrorCode]; retryable: ClassVar[bool] = False; __init__(message: str, *, details: JsonObject \| None = None)`，携带 `self.core: CoreError` | 提交拒绝基类，锁定 §8 错误码 | `src/opencode/storage/txn.py:124` | 导出 |
-| `opencode.storage.txn.SessionReadOnlyError` | exception | `class SessionReadOnlyError(StoreError)`；`code = CoreErrorCode.SESSION_READ_ONLY` | session 已隔离（read_only_diagnostic） | `src/opencode/storage/txn.py:145` | 导出 |
-| `opencode.storage.txn.SessionClosedError` | exception | `class SessionClosedError(StoreError)`；`code = CoreErrorCode.SESSION_CLOSED` | session 已关闭 | `src/opencode/storage/txn.py:151` | 导出 |
-| `opencode.storage.txn.LifecycleCleanupFailedError` | exception | `class LifecycleCleanupFailedError(StoreError)`；`code = CoreErrorCode.LIFECYCLE_CLEANUP_FAILED` | 资源清理失败 | `src/opencode/storage/txn.py:157` | 导出 |
-| `opencode.storage.txn.StoreValidationError` | exception | `class StoreValidationError(StoreError)`；`code = CoreErrorCode.VALIDATION_ERROR` | 调用参数/所有权/版本/批次形状非法 | `src/opencode/storage/txn.py:163` | 导出 |
-| `opencode.storage.txn.ConflictError` | exception | `class ConflictError(StoreError)`；`code = CoreErrorCode.CONFLICT` | `expected_seq` 与健康日志水位不等 | `src/opencode/storage/txn.py:169` | 导出 |
-| `opencode.storage.txn.IdempotencyConflictError` | exception | `class IdempotencyConflictError(StoreError)`；`code = CoreErrorCode.IDEMPOTENCY_CONFLICT` | 批次身份冲突（混 id/内容漂移/跨 session） | `src/opencode/storage/txn.py:175` | 导出 |
-| `opencode.storage.txn.StorageCorruptError` | exception | `class StorageCorruptError(StoreError)`；`code = CoreErrorCode.STORAGE_CORRUPT`；`__init__(message: str, *, isolate: bool = True, details=None)` | 存储不变量破坏；`isolate` 决定是否进入 §3.2.1 隔离 | `src/opencode/storage/txn.py:181` | 导出 |
-| `opencode.storage.txn.IsolationPersistFailedError` | exception | `class IsolationPersistFailedError(StorageError)` | 诊断行落库失败（内存写门仍生效） | `src/opencode/storage/txn.py:198` | 导出 |
-| `opencode.storage.txn.Diagnostic` | class (dataclass, frozen, slots) | `reason: str; first_bad_seq: int \| None = None; first_bad_event_id: str \| None = None; applied_seq: int = 0; to_json() -> JsonObject` | 脱敏 §3.2.1 诊断载荷 | `src/opencode/storage/txn.py:203` | 不导出 |
-| `opencode.storage.txn.TransactionWriter` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]`（另有 per-session asyncio 锁 + 进程级写锁） | §3.2 事务序列与 §3.2.1 隔离实现；**不导出，S4 私有** | `src/opencode/storage/txn.py:258` | **不导出（S4 私有）** |
+| `opencode.storage.store.SessionStore` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry \| None = None); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]; async rebuild(session_id: str) -> None`（`rebuild` 为 S8 追加） | 唯一提交接口，内部委托 `TransactionWriter`；S8 追加 §3.3 重建管理入口 | `src/opencode/storage/store.py:62` | 导出 |
+| `opencode.storage.txn.REASON_READ_MODEL_MISSING` | constant | `"sessions_row_missing_with_log"` | 有日志行但 sessions 行缺失 | `src/opencode/storage/txn.py:71` | 不导出 |
+| `opencode.storage.txn.REASON_APPLIED_SEQ_MISMATCH` | constant | `"applied_seq_mismatch"` | A≠H | `src/opencode/storage/txn.py:72` | 不导出 |
+| `opencode.storage.txn.REASON_SEQ_GAP` | constant | `"seq_gap"` | seq 不连续 | `src/opencode/storage/txn.py:73` | 不导出 |
+| `opencode.storage.txn.REASON_DUPLICATE_SEQ` | constant | `"duplicate_seq"` | seq 重复 | `src/opencode/storage/txn.py:74` | 不导出 |
+| `opencode.storage.txn.REASON_ILLEGAL_SEQ` | constant | `"illegal_seq"` | seq < 1 | `src/opencode/storage/txn.py:75` | 不导出 |
+| `opencode.storage.txn.REASON_UNKNOWN_STATUS` | constant | `"unknown_session_status"` | sessions.status 非法 | `src/opencode/storage/txn.py:76` | 不导出 |
+| `opencode.storage.txn.REASON_STORED_DECODE_FAILED` | constant | `"stored_event_decode_failed"` | 已存事件解码失败 | `src/opencode/storage/txn.py:77` | 不导出 |
+| `opencode.storage.txn.REASON_PROJECTION_INVARIANT` | constant | `"applied_seq_not_advanced_after_projection"` | 投影后 A 未推进到 H+n | `src/opencode/storage/txn.py:78` | 不导出 |
+| `opencode.storage.txn.epoch_ms` | function | `(value: datetime) -> int` | datetime → 整数 epoch 毫秒（`events.created` 精度） | `src/opencode/storage/txn.py:148` | 不导出 |
+| `opencode.storage.txn.from_epoch_ms` | function | `(value: int) -> datetime` | `epoch_ms` 的逆函数（毫秒精度） | `src/opencode/storage/txn.py:159` | 不导出 |
+| `opencode.storage.txn.StoreError` | exception | `class StoreError(StorageError)`；`code: ClassVar[CoreErrorCode]; retryable: ClassVar[bool] = False; __init__(message: str, *, details: JsonObject \| None = None)`，携带 `self.core: CoreError` | 提交拒绝基类，锁定 §8 错误码 | `src/opencode/storage/txn.py:171` | 导出 |
+| `opencode.storage.txn.SessionReadOnlyError` | exception | `class SessionReadOnlyError(StoreError)`；`code = CoreErrorCode.SESSION_READ_ONLY` | session 已隔离（read_only_diagnostic） | `src/opencode/storage/txn.py:192` | 导出 |
+| `opencode.storage.txn.SessionClosedError` | exception | `class SessionClosedError(StoreError)`；`code = CoreErrorCode.SESSION_CLOSED` | session 已关闭 | `src/opencode/storage/txn.py:198` | 导出 |
+| `opencode.storage.txn.LifecycleCleanupFailedError` | exception | `class LifecycleCleanupFailedError(StoreError)`；`code = CoreErrorCode.LIFECYCLE_CLEANUP_FAILED` | 资源清理失败 | `src/opencode/storage/txn.py:204` | 导出 |
+| `opencode.storage.txn.StoreValidationError` | exception | `class StoreValidationError(StoreError)`；`code = CoreErrorCode.VALIDATION_ERROR` | 调用参数/所有权/版本/批次形状非法 | `src/opencode/storage/txn.py:210` | 导出 |
+| `opencode.storage.txn.ConflictError` | exception | `class ConflictError(StoreError)`；`code = CoreErrorCode.CONFLICT` | `expected_seq` 与健康日志水位不等 | `src/opencode/storage/txn.py:216` | 导出 |
+| `opencode.storage.txn.IdempotencyConflictError` | exception | `class IdempotencyConflictError(StoreError)`；`code = CoreErrorCode.IDEMPOTENCY_CONFLICT` | 批次身份冲突（混 id/内容漂移/跨 session） | `src/opencode/storage/txn.py:222` | 导出 |
+| `opencode.storage.txn.StorageCorruptError` | exception | `class StorageCorruptError(StoreError)`；`code = CoreErrorCode.STORAGE_CORRUPT`；`__init__(message: str, *, isolate: bool = True, details=None)` | 存储不变量破坏；`isolate` 决定是否进入 §3.2.1 隔离 | `src/opencode/storage/txn.py:228` | 导出 |
+| `opencode.storage.txn.IsolationPersistFailedError` | exception | `class IsolationPersistFailedError(StorageError)` | 诊断行落库失败（内存写门仍生效） | `src/opencode/storage/txn.py:245` | 导出 |
+| `opencode.storage.txn.Diagnostic` | class (dataclass, frozen, slots) | `reason: str; first_bad_seq: int \| None = None; first_bad_event_id: str \| None = None; applied_seq: int = 0; to_json() -> JsonObject` | 脱敏 §3.2.1 诊断载荷 | `src/opencode/storage/txn.py:250` | 不导出 |
+| `opencode.storage.txn.TransactionWriter` | class | `__init__(engine: AsyncEngine, *, projector: Projector, registry: EventRegistry); async commit(session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]; async rebuild(session_id: str) -> None`（另有 per-session asyncio 锁 + 进程级写锁；`rebuild` 为 S8 追加） | §3.2 事务序列与 §3.2.1 隔离实现；S8 §3.3 重建事务；**不导出，S4 私有** | `src/opencode/storage/txn.py:305` | **不导出（S4 私有）** |
 
 ### 1.3 R1-S4（session/state.py、session/projector.py）
 
@@ -112,7 +112,7 @@ S4 说明：`session/__init__.py` 仅再导出（`__all__` 5 项），无模块�
 | M-1 | 幂等比较循环内按行解码 JSON，`ValueError` → `StorageCorruptError`（`REASON_STORED_DECODE_FAILED`） | 否（`_idempotent_replay` 内部，私有） |
 | Nit-2 | 重放解码改为逐行，诊断定位坏行并携带 `applied` | 否（`_idempotent_replay` 内部，私有） |
 
-附带核对：`txn.py` 公共名集合与 S3 完全一致（8 个 `REASON_*`、`epoch_ms`/`from_epoch_ms`、9 个错误类、`Diagnostic`、`TransactionWriter`；行号因改动顺移）；`src/opencode/storage/__init__.py` 的 `__all__` 仍为 **21** 项，无变化。
+附带核对：`txn.py` 公共名集合与 S3 完全一致（8 个 `REASON_*`、`epoch_ms`/`from_epoch_ms`、9 个错误类、`Diagnostic`、`TransactionWriter`；行号因改动顺移；**此为 S4 时点结论，S8 后 `REASON_*` 增至 12 个并新增 `rebuild` 方法，见 §1.7**）；`src/opencode/storage/__init__.py` 的 `__all__` 仍为 **21** 项，无变化。
 
 ### 1.4 R1-S5（bus/bus.py）
 
@@ -175,8 +175,8 @@ S7 说明：`session/__init__.py` 与 `storage/__init__.py` 均只追加再导�
 | `opencode.session.service.Clock` | type alias | `type Clock = Callable[[], datetime]` | 可注入时钟（返回 aware UTC） | `src/opencode/session/service.py:171` | 不导出（直连 import） |
 | `opencode.session.service.IdFactory` | Protocol | `session_id() -> str; event_id() -> str; message_id() -> str; run_id() -> str; batch_id() -> str` | 可注入 ID 工厂（§7 step 4 / open point B） | `src/opencode/session/service.py:174` | 不导出（直连 import） |
 | `opencode.session.service.AscendingIds` | class | `__init__(clock: Clock \| None = None); session_id(); event_id(); message_id(); run_id(); batch_id()`；输出 `<prefix><13 位 ms><10 位计数>` | 默认 ID 工厂：时间有序、可字典序排序、进程内唯一（非 UUID） | `src/opencode/session/service.py:194` | 不导出（直连 import） |
-| `opencode.session.service.prompt_dedupe_key` | function | `(request_id: str) -> str`；返回 `"prompt:" + request_id` | §7 L321 幂等去重键（大小写敏感、跨 session 可复用） | `src/opencode/session/service.py:260` | 不导出（直连 import） |
-| `opencode.session.service.SessionService` | class | `__init__(*, store: SessionStore, repos: ReadRepositories, bus: VolatileBus, working_dir: str, clock: Clock \| None = None, ids: IdFactory \| None = None); property closed -> bool; async create(config_snapshot: ConfigSnapshot \| JsonObject) -> SessionRef; async session_status(session_id: str) -> SessionStatus; async messages(session_id: str, *, after_message_id: str \| None = None, limit: int = 100) -> MessagePage; async prompt(session_id: str, text: str, request_id: str) -> RunRef; async run_status(run_id: str) -> RunStatus; async close() -> None` | §7 应用命令面（R1 子集）；每 session 短命提交锁下的四步固定序 | `src/opencode/session/service.py:277` | 导出 |
+| `opencode.session.service.prompt_dedupe_key` | function | `(request_id: str) -> str`；返回 `"prompt:" + request_id` | §7 L321 幂等去重键（大小写敏感、跨 session 可复用） | `src/opencode/session/service.py:265` | 不导出（直连 import） |
+| `opencode.session.service.SessionService` | class | `__init__(*, store: SessionStore, repos: ReadRepositories, bus: VolatileBus, working_dir: str, clock: Clock \| None = None, ids: IdFactory \| None = None); property closed -> bool; async create(config_snapshot: ConfigSnapshot \| JsonObject) -> SessionRef; async session_status(session_id: str) -> SessionStatus; async messages(session_id: str, *, after_message_id: str \| None = None, limit: int = 100) -> MessagePage; async prompt(session_id: str, text: str, request_id: str) -> RunRef; async run_status(run_id: str) -> RunStatus; async close() -> None; async rebuild(session_id: str) -> None`（`rebuild` 为 S8 追加） | §7 应用命令面（R1 子集）；每 session 短命提交锁下的四步固定序；S8 §3.3 重建管理命令 | `src/opencode/session/service.py:282` | 导出 |
 | `opencode.app.App` | class | `__init__(db_path: str \| Path, *, mode: OpenMode = "create", working_dir: str \| None = None, bus: VolatileBus \| None = None, clock: Clock \| None = None, ids: IdFactory \| None = None); property database -> Database; property bus -> VolatileBus; property service -> SessionService; async close() -> None; async __aenter__/__aexit__` | R1 显式组合根：持有 Database/bus/service，按固定序关闭 | `src/opencode/app.py:30` | 不导出（模块级，无包 `__all__`） |
 | `opencode.storage.repos.AcceptedPrompt` | class (dataclass, frozen, slots) | `request_id: str; run_id: str; message_text: str` | 按 dedupe key / run id 定位的一条已提交 `py.prompt.accepted`（保留原文 `message.text`） | `src/opencode/storage/repos.py:134` | 导出 |
 | `opencode.storage.repos.REASON_DEDUPE_ROW_UNEXPECTED` | constant | `"dedupe_row_unexpected_type"` | 幂等/运行查询命中行形状异常的原因 | `src/opencode/storage/repos.py:76` | 不导出 |
@@ -188,6 +188,24 @@ S7 说明：`session/__init__.py` 与 `storage/__init__.py` 均只追加再导�
 - `session/state.py`（`SessionState.active_run_id` 字段）与 `session/projector.py`（`_SET_ACTIVE_RUN` 私有 helper/投影接线）**新增公共符号 0 个**。
 - **零触碰面**：`contracts/`、`storage/txn.py`、`storage/store.py`、`storage/db.py`、`bus/`、`storage/migrations/` 均未被 S7 改动；`storage.__all__` 26→27（+`AcceptedPrompt`）、`session.__all__` 5→11（+6）、`bus.__all__` 4 不变。
 - **与任务预期的差异（仅报告）**：任务书写 S7 diff 为“11 files（4 new + 7 modified）”，实际 `git diff 848031f ec24f3e --stat` 为 **15 files**（新增 3：`src/opencode/app.py`、`src/opencode/session/service.py`、`tests/integration/test_service.py`；修改 12，含 docs/进度文件）。本盘点以实际 diff 为准。
+
+### 1.7 R1-S8（storage/txn.py、storage/store.py、session/service.py 追加）
+
+S8 说明：merge #62 `90c5655`（分支 r1-s8 双提交 `28d6efa` + `eb19d55`）只动 3 个源码文件（`storage/txn.py`、`storage/store.py`、`session/service.py`）；**模块级新公共符号仅 `txn.py` 的 4 个 `REASON_*` 常量**。另新增 3 个**公共重建方法**（挂在既有类上），按任务要求入表但不计模块级符号；`_` 前缀私有名（`_LogStats`/`_corruption`/`_diagnostic_from`/`_rebuild_transaction`/`_rebuild_sequence`/`_decode_stored`/`_isolate_locked` 等）沿既例**不入表**，均为私有实现。各包 `__init__.py` 零改动。
+
+| 符号全名 | kind | 签名 / 值形态 | 职责 | 位置 | 导出性 |
+|---|---|---|---|---|---|
+| `opencode.storage.txn.REASON_REPLAY_ILLEGAL_TRANSITION` | constant | `"replay_illegal_transition"` | 重建重放时 fold 拒绝的非法转移（首个事件非 created、prompt 先于 create、二次 create） | `src/opencode/storage/txn.py:82` | 不导出 |
+| `opencode.storage.txn.REASON_REBUILD_DUPLICATE_MESSAGE` | constant | `"rebuild_duplicate_message_id"` | 重放事件中 message id 重复（仅手改日志可达；提交路径内联拒绝） | `src/opencode/storage/txn.py:85` | 不导出 |
+| `opencode.storage.txn.REASON_REBUILD_INVARIANT` | constant | `"rebuild_applied_seq_mismatch"` | 重建投影后 sessions 行必须落在 `applied_seq = H`（最后重放事件 seq） | `src/opencode/storage/txn.py:88` | 不导出 |
+| `opencode.storage.txn.REASON_PROJECTION_AHEAD_OF_LOG` | constant | `"projection_ahead_of_log"` | 存活投影超前于日志（A > H，空日志 H=0）无法由日志证明（append-only 尾部缺失/最小记录签名缺失）；选择隔离而非 `A := H`，`first_bad_seq = H + 1` | `src/opencode/storage/txn.py:96` | 不导出 |
+| `opencode.storage.txn.TransactionWriter.rebuild` | method（非模块级） | `async rebuild(session_id: str) -> None` | §3.3 单写事务重建：per-session 锁 + 进程写锁下清读模型→按 seq 重放全日志→解码/折叠校验→重投影→校验 `applied_seq = H`→提交；任何失败整体回滚（含清空）并隔离后重抛 `StorageCorruptError`；不追加事件、不推进 seq、不通知 bus、幂等 | `src/opencode/storage/txn.py:353` | 不导出（S4 私有类的方法） |
+| `opencode.storage.store.SessionStore.rebuild` | method（非模块级） | `async rebuild(session_id: str) -> None` | §3.3 管理重建入口，委托 `TransactionWriter.rebuild`；文档明确保留存活行的管理状态/诊断（`read_only_diagnostic` 重建后仍只读） | `src/opencode/storage/store.py:103` | 类导出；方法非模块级符号 |
+| `opencode.session.service.SessionService.rebuild` | method（非模块级） | `async rebuild(session_id: str) -> None` | §3.3 服务层管理命令（非 §7 业务方法）：锁内转发 `SessionStore.rebuild`；service 关闭 → `SessionClosed`；从未创建（无行且 `log_high == 0`）→ `NotFound`；`read_only_diagnostic` 允许数据面重建但 §3.2.1 管理标记保留 | `src/opencode/session/service.py:534` | 类导出；方法非模块级符号 |
+
+**S8 零触碰核对**：`git diff 90c5655^1 90c5655 --stat` 共 **7 files**——源码 3（`storage/txn.py` +324、`storage/store.py` +18、`session/service.py` +41/-5），测试 1（`tests/integration/test_rebuild.py` +776），其余 3 为 `.github/workflows/ci.yml` 与两份文档（`doc/orchestration/progress/T-C1-011.md`、`doc/reference/r1-exit-evidence.md`）。`contracts/`、`storage/repos.py`、`storage/db.py`、`session/state.py`、`session/projector.py`、`bus/`、`storage/migrations/` **均零触碰**。
+
+**导出面核对**：`storage.__all__` 仍 **27**、`session.__all__` 仍 **11**、`bus.__all__` 仍 **4**（S7 后无变化）；4 个新 `REASON_*` 与 3 个 `rebuild` 方法均**未进** `__all__`。`session/service.py` 的 `AscendingIds` 仅注释扩充（无签名变化）；`SessionService` 行号由 277→282、`prompt_dedupe_key` 260→265，已同步 §1.6。
 
 ## 2. 错误码三方对照表
 
@@ -202,7 +220,7 @@ S7 说明：`session/__init__.py` 与 `storage/__init__.py` 均只追加再导�
 |---|---|---|---|---|
 | `ValidationError` | L340 | `errors.py:24`（`VALIDATION_ERROR`） | 8（4 + 4） | 一致 |
 | `UnsupportedCapability` | L340 | `errors.py:25`（`UNSUPPORTED_CAPABILITY`） | 1 | 一致 |
-| `NotFound` | L340 | `errors.py:26`（`NOT_FOUND`） | 10（2 + 8） | 一致 |
+| `NotFound` | L340 | `errors.py:26`（`NOT_FOUND`） | 11（2 + 9） | 一致 |
 | `SessionBusy` | L340 | `errors.py:27`（`SESSION_BUSY`） | 3（1 + 2） | 一致 |
 | `Conflict` | L340 | `errors.py:28`（`CONFLICT`） | 4（1 + 3） | 一致 |
 | `IdempotencyConflict` | L340 | `errors.py:29`（`IDEMPOTENCY_CONFLICT`） | 5（1 + 4） | 一致 |
@@ -217,13 +235,13 @@ S7 说明：`session/__init__.py` 与 `storage/__init__.py` 均只追加再导�
 | `ProviderStreamInterrupted` | L340 | `errors.py:38`（`PROVIDER_STREAM_INTERRUPTED`） | 3（R0 spike 断言） | 一致 |
 | `ContextLimitExceeded` | L340 | `errors.py:39`（`CONTEXT_LIMIT_EXCEEDED`） | 1 | 一致 |
 | `SlowConsumer` | L340 | `errors.py:40`（`SLOW_CONSUMER`） | 3（1 + 2） | 一致 |
-| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 21（1 + 20） | 一致 |
+| `StorageCorrupt` | L340 | `errors.py:41`（`STORAGE_CORRUPT`） | 22（1 + 21） | 一致 |
 | `MigrationRequired` | L340 | `errors.py:42`（`MIGRATION_REQUIRED`） | 2 | 一致 |
-| `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 4（1 + 3） | 一致 |
-| `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 4（1 + 3） | 一致 |
+| `SessionReadOnly` | L340 | `errors.py:43`（`SESSION_READ_ONLY`） | 5（1 + 4） | 一致 |
+| `SessionClosed` | L340 | `errors.py:44`（`SESSION_CLOSED`） | 5（1 + 4） | 一致 |
 | `LifecycleCleanupFailed` | L340 | `errors.py:45`（`LIFECYCLE_CLEANUP_FAILED`） | 2（1 + 1） | 一致 |
 
-汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **89**（首派 45 → S3 53 → S4 61 → S5 62 → S6 74 → 本次 89，+15）：`ValidationError` 6→8（+2）、`NotFound` 6→10（+4）、`SessionBusy` 2→3（+1）、`IdempotencyConflict` 4→5（+1）、`InvalidCursor` 6→7（+1）、`StorageCorrupt` 20→21（+1）、`SessionReadOnly` 3→4（+1）、`SessionClosed` 1→4（+3）、`LifecycleCleanupFailed` 1→2（+1），全部来自 S7 新增 `tests/integration/test_service.py`；其余 13 码不变（含 `SlowConsumer` 3）。
+汇总：契约码数 **22** / 实现码数 **22** / 表行数 **22**。顺序、拼写、数量三方完全一致，无差异。测试引用合计 **93**（首派 45 → S3 53 → S4 61 → S5 62 → S6 74 → S7 89 → 本次 93，+4）：`NotFound` 10→11（+1）、`StorageCorrupt` 21→22（+1）、`SessionReadOnly` 4→5（+1）、`SessionClosed` 4→5（+1），全部来自 S8 新增 `tests/integration/test_rebuild.py`（L561 `NOT_FOUND`、L217 `STORAGE_CORRUPT`、L242 `SESSION_READ_ONLY`、L571 `SESSION_CLOSED`）；其余 18 码不变。
 
 ## 3. 盘点方法注记（可复现）
 
@@ -251,8 +269,12 @@ S7 说明：`session/__init__.py` 与 `storage/__init__.py` 均只追加再导�
 22. S7 滚动（T-C2-006）定义行号：`Get-ChildItem src/opencode/session/service.py,src/opencode/app.py,src/opencode/storage/repos.py,src/opencode/session/state.py,src/opencode/session/projector.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(type |class |def |[A-Z_]+ = |@dataclass)' }`；新公共名 11（service）+ 1（app）+ 2（repos 追加）。
 23. S7 导出面核对：`Select-String -Path src/opencode/{storage,session,bus}/__init__.py -Pattern '^    "'` 计数得 **27/11/4**；`Select-String -Path src/opencode/storage/repos.py -Pattern '^    async def '` 得 `ReadRepositories` 新增 4 方法（`log_high`/`prompt_by_dedupe_key`/`prompt_by_run_id`/`session_by_active_run`，不计入符号行）；`git diff 848031f ec24f3e --stat` 为 15 files（含 3 新增 + 12 修改，与任务书预期 11 files 不同，仅报告）。
 24. S7 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/integration/test_service.py` 的全 `tests/` 树，显式 `-CaseSensitive`；`state.py`/`projector.py` 的 `active_run_id` 接线另以 `git diff 848031f ec24f3e -- src/opencode/session/state.py src/opencode/session/projector.py` 逐行确认 0 个新公共名。
+25. S8 滚动（T-C2-007）定义行号：`Get-ChildItem src/opencode/storage/txn.py,src/opencode/storage/store.py,src/opencode/session/service.py | ForEach-Object { Select-String -Path $_.FullName -Pattern '^(class |def |REASON_|@dataclass|    async def |    def )' }`；模块级新公共名 4（`txn.py` 的 `REASON_*`），公共重建方法 3（`TransactionWriter.rebuild` :353、`SessionStore.rebuild` :103、`SessionService.rebuild` :534，入表不计模块级符号）。
+26. S8 导出面与零触碰核对：`Select-String -Path src/opencode/{storage,session,bus}/__init__.py -Pattern '^    "'` 计数得 **27/11/4**（无变化）；`git diff 90c5655^1 90c5655 --stat` 共 7 files（源码 3 + 测试 1 + CI 1 + 文档 2），确认 `contracts/`、`storage/repos.py`、`storage/db.py`、`session/state.py`、`session/projector.py`、`bus/`、`storage/migrations/` 零触碰。
+27. S8 错误码引用重算：沿用第 6 条命令与口径，扫描含 `tests/integration/test_rebuild.py` 的全 `tests/` 树，显式 `-CaseSensitive`；逐码定位新增引用（L217 `STORAGE_CORRUPT`、L242 `SESSION_READ_ONLY`、L561 `NOT_FOUND`、L571 `SESSION_CLOSED`）。
 
 ### 观测到的非本任务差异（仅报告，未处理）
 
-- 门禁 `ruff format --check .` 本次输出 **114 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S6 滚动记录为 106，变化来自扫描集合（工作树新增 S7 文件），无格式问题。
-- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（调度器常驻未跟踪目录；S7 已随 merge #57 `ec24f3e` 落库，源码无待提交改动）。本任务只修改本文件，未触碰该路径。
+- 门禁 `ruff format --check .` 本次输出 **122 files already formatted**、退出码 0（基线口径为退出码，计数不作口径）；S7 滚动记录为 114，变化来自扫描集合（工作树新增 S8 文件），无格式问题。
+- 门禁命令执行环境异常（仅报告）：直接 `uv run pytest -q` / `uv run mypy ...` 被 Windows 应用程序控制策略拦截（`Failed to spawn ... os error 4551`，两次复跑均同）；改用等价入口 `uv run python -m pytest -q` → **210 passed**、`uv run python -m mypy src tools/r0 tests/r0 tests/contract tests/integration` → **Success: no issues found in 40 source files**，四项结果与基线一致。`ruff check` / `ruff format --check` 直接命令正常。
+- `git status --short` 本次滚动前后均含他席位/调度器改动：仅 `?? doc/orchestration/logs/`（调度器常驻未跟踪目录；S8 已随 merge #62 `90c5655` 落库，源码无待提交改动）。本任务只修改本文件，未触碰该路径。
