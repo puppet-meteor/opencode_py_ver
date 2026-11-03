@@ -99,6 +99,8 @@ Phase 1 内置工具只产生 text；file 可编码往返，但未启用媒体�
 
 adapter 按 call_index 聚合工具 ID/名称碎片；runner 按同一 index 聚合参数。tool_call_end 才允许解析完整 JSON。**收到成功 finish 并把整批调用计划持久化后，才开始 invoke**；多个调用交错按开始顺序串行执行。重复 ID、超限/不完整 JSON 使本次生成失败且不执行任何工具，不猜测修复后执行；合法 JSON 但工具未知/参数不符 schema，则给该调用返回 not_started 的失败结果。
 
+同一次生成内，一个 text/reasoning part_id 只能对应一种 kind；同 kind 的连续 delta 按该 ID 聚合，跨 text/reasoning 复用时报 `ValidationError(details.violation=part_id_reused)`，本次生成失败且不执行任何工具，不猜测拆分或改名。
+
 一次请求最多一个终止 chunk：finish 或 error。EOF 没有终止 chunk 视为流被中断；取消通过 CancelledError 传播。adapter 可以暂存 SDK 的 finish_reason，读完末尾 usage 后再发逻辑 finish；不能让 finish 后的 usage 丢失。provider_metadata 不能成为执行权限或恢复真相，保存前按敏感字段规则处理。
 
 ## 3. S6 + S4：唯一事件写入、投影与数据库
@@ -400,3 +402,17 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 
 1. **S4 ④-5 `ContextLimitExceeded` 归属：维持 session 层定义。** 异常继续由 `session/context.py` 定义并继承 `StoreError`；`CoreErrorCode.CONTEXT_LIMIT_EXCEEDED` 仍由 contracts 提供 wire code，基类负责 `.core` 形状。该分层与 `SessionBusyError` 的 session 协议拒绝先例一致，当前不搬移代码、测试或契约条款。下游无需为此项排期变更，S6 继续消费标准 `.core` 面。
 2. **S4 ④-6 / m-3 CJK sizing：采纳方案 (a)。** R2 保留确定性的 chars/4 估算器和 `safety_margin` 语义；由 T-C1-020 在 `context.py` 估算器注释区补充宿主指引：CJK 主导文本可能系统性低估约 2–4 倍，宿主应显著增大 `safety_margin` 或下调可用预算。可配置乘数或真实 tokenizer 缓存留待 R3+ 决策与扩展，不在 R2 引入行为变更；现有 fail-visible、禁止静默裁剪的契约保持不变。
+
+`[T-A-009] 2026-11-03`：R2-S6 三项裁决、两项意见及一项消费面记档；对应 `doc/reviews/R2-S6-review.md:25–26,114–123` 与 `doc/orchestration/progress/T-C1-019.md:38–49,61–65`。本轮只追加本节，正式条款及实现变更由调度器另行落地；以下第 4/5 项为意见，不预写开放项裁决。
+
+1. **裁决：`part_id_reused` 纳入 §2.3 规范。** §2.3 L92 的 text/reasoning 共用 part_id，§3.1 L144 的持久定位键为 message_id+part_id，跨 kind 复用会使该身份歧义；`src/opencode/session/runner.py:674–678` 已拒绝，`tests/integration/test_runner.py:1047–1062` 已钉定整次生成失败、零 finalized/工具。拟在 §2.3 L100 后补：“同一次生成内，一个 text/reasoning part_id 只能对应一种 kind；同 kind 的连续 delta 按该 ID 聚合，跨 text/reasoning 复用时报 `ValidationError(details.violation=part_id_reused)`，本次生成失败且不执行任何工具，不猜测拆分或改名。”TS `packages/core/src/session/runner/publish-llm-event.ts:440–471` 将 text/reasoning 分开分派，未规定 Python 的共享持久身份键；本条是 Python 补充，不宣称 TS 有同名违规码。`doc/plans/r2-slices.md:126,133` 的生成前校验与零工具执行验收承接本条；调度器下轮检查点补正式 §2.3，现有实现无需修改。
+
+2. **裁决：无 durable cancel 的硬取消残留归 R4 启动恢复协调器。** `src/opencode/session/runner.py:450–458,747–757` 继续传播 CancelledError、尽力保存收文而不伪造取消意图；R2-S7 只按 §7 L335/L337 和 `doc/plans/r2-slices.md:138–143` 完成正常 cancel/close 的持久意图、资源清理及终态，不把任意 task.cancel 当作用户取消或直接释放未结束 run。R4 实现席位依 `doc/PHASE1-SLIM.md:98–104` 与 §3.3 L208–212，取得独占运行权、验证日志/投影且确认旧执行已退出后，补 pending→cancelled/not_started、started 无终态→unknown，保留已有终态；无 generated 时只用已提交 finalized，稳定批次 ID 保证重复恢复幂等，禁止重跑副作用或自动续生成，诊断会话不补业务事件。TS `packages/core/src/session/execution.ts:20–39,73–77` 区分进程内清理与 durable claim 恢复，`runner/step.ts:140–152` 保护终态清理；Python 按上述阶段交付，不移植 TS 启动续跑。调度器须将此项交接 R4 并安排开放 step/有无 generated/重复启动恢复验证；R2 期间残留明确保持非终态和占槽，不声称已恢复。
+
+3. **裁决：m-1 保留本 step 已收的 `finish/raw_finish/usage/cost_usd` 观测值，终态仍由 interrupted/error 决定。** §2.1 L28/L74、§2.3 L96/L102 与 §3.1 L144 已提供这些可选字段；已收费用不因随后中断变成未知，未收到或 crash 后未持久化的值仍为 None、不推断为 0。TS `packages/core/src/session/runner/step.ts:234–255` 在 failure 分支仍传 usage，`publish-llm-event.ts:412–427` 仍可携 rawFinish；这是观测事实与执行结果分离的依据，不宣称 TS 在所有失败中保留同一 normalized finish。`doc/plans/r2-slices.md:126,132–133` 的 interrupted、不拼接不重发及零非法工具执行语义不变；error-after-finish 是对非法双终止序列的防御，不据此放宽 §2.3 L102。当前 `runner.py:735–746,969–974` 的保守 None 不追溯判为旧契约违规；调度器另派微补丁保留已收值，并补 usage→error、finish/usage→error 与缺值对照，断言 interrupted、原错误、单次请求和零工具执行。本轮不修改代码或声称补测完成。
+
+4. **意见（非裁决）：`tool_ref` wire 转换倾向 R3 下沉到 registry/adapter 面，R2 维持过渡实现。** `runner.py:282–295` 与 `src/opencode/ai/maas.py:114–119` 都对点分名执行 `partition(".")` 镜像转换；§2.2 L80、§5.1 L253 及 T-A-006/007 的接缝边界仍有效，`doc/plans/r2-slices.md:118,126` 将命名映射与工具入口分工，TS `packages/core/src/tool/runtime.ts:287–292` 也将 effectiveName 放在工具运行层（不沿用其单下划线算法）。当前 runner 保持 provider-agnostic、接口冻结且未知名仍由 S5 catalog miss 走 `not_started`，因此 R2 零动作是合适边界；R3 接缝重构时指定单一转换 owner，保留点分名、wire 往返、畸形名原样透传和未知工具配对，不让 runner 引入具体 MAAS 依赖。最终方向由调度器裁决，不以本意见改写现有接口。
+
+5. **意见（非裁决）：R2-S8 倾向扩展现有 `ReadRepositories.messages()` 为完整消息联合读面。** 当前 `src/opencode/storage/repos.py:125–130,254–274` 将 `MessagePage.items` 和解码器锁定为 `UserMessage`，会把已投影的正常 Assistant/Idle 行误报为解码损坏；§2.1 L23–29 和 §7 L316/L320 要求按投影顺序读取消息，`doc/plans/r2-slices.md:148–153` 的 S8 历史显示需要完整对话。TS `packages/schema/src/session-message.ts:304–321` 以 `Info` 联合包含 User/Assistant/Idle，补充只读参照 `packages/core/src/session/history.ts:125–150` 集中按消息形状解码（该补充文件未列指纹台账，不据此宣称 TS 分页接口同构）。倾向在同一 `MessagePage`/解码器扩面，保留 seq/cursor 与整页 fail-closed，避免第二套分页规则；调度器须在 S8 排期前确定取向并授权兼容面核验：旧 User fixture、Assistant/Idle 混合分页、游标归属及坏行整页失败。本条只给意见。
+
+6. **记档：** §3.2 L177 和 `src/opencode/storage/migrations/versions/0001_initial.py:57–74` 的 `events` 表无独立 `run_id` 列，R2 消费面依 §3.1 L110 及 `runner.py:393,407` 写入的 `metadata.run_id` 做 JSON 查询；不追加列、迁移或跨 session 的身份推断。
