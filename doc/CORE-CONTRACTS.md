@@ -180,6 +180,12 @@ SessionService 的每个 session 有一把短期提交锁：读取状态/当前 
 - `tool_executions`：session_id、execution_id、run_id、step_id、message_id、tool_call_id、input_hash、state；unique(session_id, execution_id)、unique(session_id, step_id, tool_call_id)，由 commit 校验其归属和终态不可逆；
 - `permissions`：待审批和保存决定的投影；input_hash、作用域、有效期、终态。
 
+R2 在 `0001` 后追加 Alembic revision `0002`，新增第五个读模型；不改写 `0001`、既有事件或其 wire/version：
+
+- `runs`：`run_id` 主键、`session_id`、`request_id`、`status`、可选 `error`；unique(session_id, request_id)。`py.prompt.accepted` 投影 `accepted` 行，`py.run.started`、`py.run.cancel_requested`、`py.run.finished` 按 §2.1 合法迁移分别更新为 `running`、`cancelling` 和 `succeeded/failed/interrupted`。所有更新由同一纯 fold/projector 在 events、其他投影及 applied_seq 的同一 commit 事务中完成，失败整体回滚；rebuild 复用该 fold，events 仍是权威来源。
+
+`0001 → 0002` 升级须按 §3.3 备份并验证旧数据，在对外提供 runs 查询前按 session/seq 用同一 fold 回填全部 accepted。R1 多个 accepted 均保留为 accepted，原有消息、session 状态与最后一个 `active_run_id` 不变；不得新增“前一个 run 必须终态才接受下一个”的 fold 门禁，不补写终态、不自动调度。`run_status(run_id)` 通过 run_id 查表解析归属和状态，正常查询不扫描全量 events；所需投影缺失、归属或状态损坏遵循 §3.2.1 返回 `StorageCorrupt`，不得臆造 RunStatus。
+
 events 不依赖可重建的 messages 外键。创建 session 与其首条事件同事务。seq 在写事务内按已有最大值 + 1 分配，初值 1；不删除日志前缀、不重用 session ID。
 
 Phase 1 每个数据目录只允许一个 writer 进程（持有 OS 文件锁）；SQLite 使用 WAL、foreign_keys、busy_timeout，进程内写事务串行。第二个进程明确失败；asyncio/aiosqlite 本身不提供多 writer 正确性。M1 才增加租约/跨进程协调。
@@ -341,7 +347,7 @@ max_steps 默认 20；超限结束为 failed。工具默认串行，调用异常
 
 details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire。用户错误与内部故障分别日志记录，但对外错误结构相同。
 
-只有一个 retry owner：MAAS adapter 关闭 SDK 默认重试，未收到首个内容且明确可重试的 429/短暂网络错误最多 2 次重试（尊重 Retry-After、带抖动、受总超时限制）。部分流已到达则结束并标 interrupted，不能把旧流和新流拼接。用户要求重试生成时创建新 attempt；既有 tool.finished 绝不重新执行。MCP、shell、文件变更默认不自动重试。
+只有一个 retry owner：MAAS adapter 关闭 SDK 默认重试，未收到首个内容且明确可重试的 429/短暂网络错误最多 2 次重试（尊重 Retry-After；Phase 1 使用确定性的 `min(retry_after, remaining)` 等待，无 Retry-After 按 0 处理，不加入抖动，并受总超时限制）。部分流已到达则结束并标 interrupted，不能把旧流和新流拼接。用户要求重试生成时创建新 attempt；既有 tool.finished 绝不重新执行。MCP、shell、文件变更默认不自动重试。
 
 版本演进以旧 JSON fixture/旧 DB fixture 能读取为最低门槛。新增 event/content/capability 不等于旧消费者自动支持；不支持时显式协商或报 UnsupportedCapability，不能只靠“字段可选”声称向后兼容。
 
@@ -367,3 +373,7 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 对照 `doc/reviews/R1-S1-review.md` §2/§3/§5：M-2 选择 B 给出的方案 (b)，以最小文本 v1 避免空列表/FileContent 占位；M-3、四类 ID 前缀、整数拒绝 bool、R5 JSON Schema、R2 ephemeral 注册与两项 parity 记录均采纳 B 建议，无裁决方向分歧。ses_ 相比 TS 校验更严格及 run_ 为 Python 专有约束已在 §3.1 明示，不以“对齐 TS”隐去差异。
 
 本次完成契约定稿，不表示 S1 已实现新增约束；后续由 B 将裁决并入方案、C 在获授权的 contracts 补丁中落实 ID pattern、version/seq before-validator 与相应反例，更新 UserMessage 的 files 阶段说明，并一并处理 B 的 M-4/N-2 补测。现有 R1 files 拒绝行为与裁决一致，无需引入 FileContent；本任务不修改实现或测试。
+
+`[T-A-005] 2026-11-03`：OP-2 采纳 `0002` runs 读模型。§7 的 `run_status(run_id)` 需要保留历史 run 的归属和终态，sessions.active_run_id 单值不足；每次扫描 events 又无法直接使用 §3.2.1 要求保留的诊断读模型。TS `packages/core/src/session/projector.ts:481–535` 展示事件驱动的 message/idle 投影，Python 显式 run_id 的读模型按自身接口补充，不声称 TS 表结构同构。追加 revision 符合 `doc/PHASE1-SLIM.md:69–74`；§3.2 的同事务、回填及多 accepted 兼容约束承接 `doc/plans/r2-slices.md:25–33,73–84` 和 `doc/reviews/R1-S7-review.md:94–100`。B/调度器须将裁决并入 R2-S2/S7 方案与任务书，C 后续验证真实旧库升级、历史 run 查询、回滚和 rebuild 一致性。
+
+同次 OP-7 选 B：§8 原“带抖动”修订为 Phase 1 无 jitter 的确定性等待，保留 retry owner、次数、Retry-After 和总 deadline。jitter 用于打散并发调用者的重试时刻、减轻雷鸣群；TS `packages/core/src/model-retry.ts:22–35,62–103` 的通用 jittered schedule 由 buffered/one-shot 调用复用，兼顾服务端并发场景。Python 本阶段以本地单用户 CLI 和单 active run 为目标（`doc/PHASE1-SLIM.md:78–85`），通常串行发请求，尚无同步重试拥塞的证据，故保留 `doc/evidence/r0/provider.md:53–60`、`tools/r0/provider_spike.py:340–364` 已验证的有限确定性策略；R0 证明实际行为，不证明所有并发场景都不需要 jitter。单 writer 不保证跨 session 只有一个 provider 请求；若引入并发宿主/多进程，再评估并修订本条。§10 以本条记录显式契约变更；B/调度器须同步 S3 方案/任务书并安排确定性延迟、Retry-After/总 deadline 与两次重试上限验证，冻结的 R0 证据保留原文。
