@@ -1,0 +1,13 @@
+{
+  "id": "evt_0000000000000000000000000030",
+  "type": "py.run.cancel_requested",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:19Z",
+  "data": {
+    "run_id": "run_0000000000000000000000000002",
+    "reason": "user"
+  },
+  "metadata": {},
+  "seq": 12
+}

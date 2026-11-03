@@ -102,6 +102,7 @@ def _ephemeral(session_id: str, event_id: str, delta: str = "x") -> EphemeralEve
         session_id=session_id,
         created_at=_CREATED_AT,
         data=TextDeltaData(message_id="msg_1", part_id="part_1", delta=delta),
+        metadata={"run_id": "run_1"},
     )
 
 

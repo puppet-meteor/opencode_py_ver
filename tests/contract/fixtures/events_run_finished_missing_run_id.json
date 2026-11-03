@@ -1,0 +1,13 @@
+{
+  "id": "evt_0000000000000000000000000031",
+  "type": "py.run.finished",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:20Z",
+  "data": {
+    "run_id": "run_0000000000000000000000000002",
+    "outcome": "interrupted"
+  },
+  "metadata": {},
+  "seq": 13
+}

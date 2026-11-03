@@ -58,15 +58,35 @@ PY_TOOL_PROGRESS = "py.tool.progress"
 EVENT_VERSION = 1
 
 #: Event types that belong to a run; their envelope metadata must carry run_id (§3.1).
-#: Deliberately still R1-only in this slice: expanding to the R2 types would
-#: retroactively require metadata.run_id on py.run.started/py.text.delta
-#: envelopes that frozen R1 tests construct without it (test_bus.py
-#: _ephemeral, test_eventlog.py _ephemeral, test_projector.py "future"), so the
-#: expansion awaits arbitration on patching those helpers (T-C1-013 float
-#: report, open question 1). R2 producers still write run_id into every new
-#: type's metadata (fixtures pin this), and the whenever-present check below
-#: stays active for any metadata.run_id that appears.
-RUN_SCOPED_EVENT_TYPES: frozenset[str] = frozenset({PY_PROMPT_ACCEPTED})
+#: Flipped to the full R2 run-scoped set (scheduler ledger #71, T-C1-014):
+#: py.prompt.accepted plus every R2 type (11 durable + 4 ephemeral). The
+#: R1-only interim state (T-C1-013 float report, open question 1) is resolved
+#: -- the three frozen R1 test envelope constructors that built run-scoped
+#: types without metadata.run_id (test_bus.py _ephemeral, test_eventlog.py
+#: _ephemeral, test_projector.py "future") were patched with run_id envelopes
+#: in the same slice, so decode now rejects a missing run_id on every type in
+#: this set. py.session.created is not run-scoped and stays out. The
+#: whenever-present validation below also still guards any metadata.run_id.
+RUN_SCOPED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        PY_PROMPT_ACCEPTED,
+        PY_RUN_STARTED,
+        PY_RUN_CANCEL_REQUESTED,
+        PY_RUN_FINISHED,
+        PY_STEP_STARTED,
+        PY_STEP_GENERATED,
+        PY_STEP_FINISHED,
+        PY_TEXT_FINALIZED,
+        PY_REASONING_FINALIZED,
+        PY_TOOL_REQUESTED,
+        PY_TOOL_STARTED,
+        PY_TOOL_FINISHED,
+        PY_TEXT_DELTA,
+        PY_REASONING_DELTA,
+        PY_TOOL_INPUT_DELTA,
+        PY_TOOL_PROGRESS,
+    }
+)
 
 _SHA256_HEX = r"^[0-9a-f]{64}$"
 

@@ -774,3 +774,133 @@ async def test_closed_status_is_carried_over_verbatim_by_rebuild(tmp_path: Path)
         assert _session_row(db_path, session_id) == closed_row  # status verbatim + data plane rebuilt
         assert (await service.messages(session_id)).items == original_messages
         assert await service.session_status(session_id) is SessionStatus.CLOSED
+
+
+# -- R2-S2: the full R2 run lifecycle rebuilds byte-identically (plan §2/§0.2) --
+
+_R2_SESSION = "ses_0000000000000000000000000001"
+_R2_RUN = "run_0000000000000000000000000002"
+
+#: The 11-event legal R2 chain; created + the re-aimed prompt + these = 13.
+_R2_CHAIN: tuple[str, ...] = (
+    "events_run_started_valid.json",
+    "events_step_started_valid.json",
+    "events_text_finalized_valid.json",
+    "events_reasoning_finalized_valid.json",
+    "events_step_generated_valid.json",
+    "events_tool_requested_valid.json",
+    "events_tool_started_valid.json",
+    "events_tool_finished_valid.json",
+    "events_step_finished_valid.json",
+    "events_run_cancel_requested_valid.json",
+    "events_run_finished_valid.json",
+)
+
+_SESSIONS_FACE = (
+    "SELECT status, active_run_id, config_snapshot, snapshot_hash, applied_seq, diagnostic "
+    "FROM sessions WHERE session_id = ?"
+)
+_MESSAGES_FACE = "SELECT message_id, seq, data FROM messages WHERE session_id = ? ORDER BY seq"
+_TOOLS_FACE = (
+    "SELECT execution_id, run_id, step_id, message_id, tool_call_id, input_hash, state "
+    "FROM tool_executions WHERE session_id = ? ORDER BY execution_id"
+)
+_RUNS_FACE = "SELECT run_id, session_id, request_id, status, error FROM runs WHERE session_id = ? ORDER BY run_id"
+
+
+def _fixture_draft(name: str) -> EventDraft[Any]:
+    """One contract fixture as a commit-ready draft (seq stripped).
+
+    Local import: this section is appended after the frozen import block
+    (append-only extension), so the registry import stays function-local.
+    """
+    from opencode.contracts import default_event_registry
+
+    raw = json.loads((Path(__file__).resolve().parents[1] / "contract" / "fixtures" / name).read_text(encoding="utf-8"))
+    raw.pop("seq", None)
+    definition = default_event_registry().resolve_durable(str(raw["type"]), int(raw["version"]))
+    draft_model: Any = EventDraft  # runtime-parametrized generic; mypy stays out
+    return draft_model[definition.data_model].model_validate(raw)
+
+
+def _r2_prompt_draft() -> EventDraft[Any]:
+    """The R1 prompt fixture re-aimed at the R2 fixture run (run ...0002)."""
+    from opencode.contracts import default_event_registry
+
+    raw = json.loads(
+        (Path(__file__).resolve().parents[1] / "contract" / "fixtures" / "events_prompt_accepted_valid.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    raw.pop("seq", None)
+    raw["id"] = "evt_0000000000000000000000000009"
+    raw["data"]["request_id"] = "req_0000000000000000000000000002"
+    raw["data"]["run_id"] = _R2_RUN
+    raw["metadata"] = {"run_id": _R2_RUN, "request_id": "req_0000000000000000000000000002"}
+    definition = default_event_registry().resolve_durable(str(raw["type"]), int(raw["version"]))
+    draft_model: Any = EventDraft  # runtime-parametrized generic; mypy stays out
+    return draft_model[definition.data_model].model_validate(raw)
+
+
+async def test_r2_log_rebuilds_every_face_byte_identically(tmp_path: Path) -> None:
+    """The legal 13-event R2 run lifecycle (accepted -> running -> cancelling
+    -> interrupted, one tool execution pending -> succeeded, an assistant
+    message replaced at step.finished, an idle row at run.finished) rebuilds
+    from the log alone with every read-model face byte-identical: the
+    sessions/messages/tool_executions/runs rows, the first-appearance message
+    seq through the terminal replacement, and the terminal facts (interrupted
+    run, released slot, applied_seq 13)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        created = _fixture_draft("events_session_created_valid.json")
+        chain = tuple(_fixture_draft(name) for name in _R2_CHAIN)
+        committed = await store.commit(
+            _R2_SESSION, EventBatch("batch_r2_lifecycle", (created, _r2_prompt_draft(), *chain)), 0
+        )
+        assert [event.seq for event in committed] == list(range(1, 14))
+
+        sessions = _fetch_all(db_path, _SESSIONS_FACE, (_R2_SESSION,))
+        messages = _fetch_all(db_path, _MESSAGES_FACE, (_R2_SESSION,))
+        tools = _fetch_all(db_path, _TOOLS_FACE, (_R2_SESSION,))
+        runs = _fetch_all(db_path, _RUNS_FACE, (_R2_SESSION,))
+
+        # The incremental projection's terminal facts before the rebuild.
+        assert sessions[0][0] == "active"
+        assert sessions[0][1] is None  # the slot released at py.run.finished
+        assert sessions[0][4] == 13
+        assert [row[0] for row in messages] == [
+            "msg_0000000000000000000000000001",
+            "msg_0000000000000000000000000012",
+            f"msg_idle_{_R2_RUN}",
+        ]
+        assert messages[1][1] == 7  # first appearance (step.generated) kept through the replacement
+        assert tools == [
+            (
+                "exec_0000000000000000000000000001",
+                _R2_RUN,
+                "step_0000000000000000000000000002",
+                "msg_0000000000000000000000000012",
+                "call_0000000000000000000000000001",
+                "5b8160c3ef7a2aa5fc1207a2740b1d783068c96fd850a1bbb969107e32c2d625",
+                "succeeded",
+            )
+        ]
+        assert runs == [
+            ("run_0000000000000000000000000002", _R2_SESSION, "req_0000000000000000000000000002", "interrupted", None)
+        ]
+
+        await store.rebuild(_R2_SESSION)
+
+        assert _fetch_all(db_path, _SESSIONS_FACE, (_R2_SESSION,)) == sessions
+        assert _fetch_all(db_path, _MESSAGES_FACE, (_R2_SESSION,)) == messages
+        assert _fetch_all(db_path, _TOOLS_FACE, (_R2_SESSION,)) == tools
+        assert _fetch_all(db_path, _RUNS_FACE, (_R2_SESSION,)) == runs
+
+        # Idempotent: a second rebuild over the same log changes nothing.
+        await store.rebuild(_R2_SESSION)
+        assert _fetch_all(db_path, _MESSAGES_FACE, (_R2_SESSION,)) == messages
+        assert _fetch_all(db_path, _TOOLS_FACE, (_R2_SESSION,)) == tools
+        assert _fetch_all(db_path, _RUNS_FACE, (_R2_SESSION,)) == runs
