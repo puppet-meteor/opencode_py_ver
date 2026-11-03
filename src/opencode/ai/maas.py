@@ -430,6 +430,25 @@ class MaasAdapter:
             params["temperature"] = request.temperature
 
         state = _AttemptState()
+        # M-1 (R2-S3-review §2 M-1; pinned by T-C1-017a, 2026-11-03): a
+        # dual-timer race, accepted as-is. This asyncio.timeout(header_s)
+        # wrapper and the httpx2 connect timeout (httpx2.Timeout(connect=
+        # header_s) in __init__) share one base and start together, so on a
+        # real connect timeout (server never accepts) either may fire first
+        # and the winner picks the failure surface: asyncio.timeout ->
+        # TimeoutError -> header-timeout terminal (retryable=False, no
+        # retry) vs httpx2 connect -> APIConnectionError(cause=
+        # ConnectTimeout) -> _RetrySignal(None) -> up to 2 retries. Accepted
+        # because (1) both surfaces are contract-legal failure exits,
+        # terminally equivalent for the upper layer (each ends the request
+        # with one error chunk — fail, never splice, never restart); (2) the
+        # spike already had this structure (provider.md §3 L47 / §4 L56 —
+        # both branches coexist since R0, not introduced in R2-S3); (3)
+        # tested paths are unaffected (test_header_timeout's connection is
+        # established, so it deterministically maps to header; an
+        # immediately-refused ConnectError never waits on either timer).
+        # Possible follow-up: decouple the header-wrapper budget from the
+        # connect budget — annotated only, deliberately not implemented.
         try:
             async with asyncio.timeout(self._timeouts.header_s):
                 stream = await self._client.chat.completions.create(**params)
@@ -507,6 +526,13 @@ class MaasAdapter:
                 for mapped in self._map_chunk(raw, state, request.request_id, sequencer):
                     yield mapped
         finally:
+            # N-2 (R2-S3-review §2 N-2; pinned by T-C1-017a, 2026-11-03): if
+            # close() itself raised here it would mask the exception already
+            # propagating out of the read loop (a raise inside finally
+            # replaces the in-flight one). SDK stream cleanup is not expected
+            # to raise, so this defensive edge is annotated only — wrapping
+            # the close in try/except is the optional hardening,
+            # deliberately not implemented.
             await stream.close()
 
         if state.pending_finish is None:
