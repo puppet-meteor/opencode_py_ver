@@ -52,6 +52,7 @@ from opencode.storage import (
     IdempotencyConflictError,
     InvalidCursorError,
     LifecycleCleanupFailedError,
+    MessagePage,
     NotFoundError,
     ReadRepositories,
     SessionClosedError,
@@ -92,6 +93,16 @@ def _fetch_scalar(db_path: Path, statement: str, params: tuple[Any, ...] = ()) -
 def _event_count(db_path: Path, session_id: str) -> int:
     row = _fetch_scalar(db_path, "SELECT COUNT(*) FROM events WHERE session_id = ?", (session_id,))
     return int(row[0]) if row is not None else 0
+
+
+def _user_texts(page: MessagePage) -> list[str]:
+    """User-text projection over a page; every item must be a UserMessage
+    (T-C1-023b #95: static narrowing over the union face -- runtime-true pin)."""
+    texts: list[str] = []
+    for message in page.items:
+        assert isinstance(message, UserMessage)
+        texts.append(message.text)
+    return texts
 
 
 def _fetch_all(db_path: Path, statement: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
@@ -200,7 +211,7 @@ async def test_full_cycle_persists_and_reopens_identically(tmp_path: Path) -> No
         assert run_ref.run_id.startswith("run_")
 
         page = await app.service.messages(session_ref.session_id)
-        assert [message.text for message in page.items] == ["hello, agent"]
+        assert _user_texts(page) == ["hello, agent"]
         message = page.items[0]
         assert isinstance(message, UserMessage)
         assert message.type == "user"
@@ -433,7 +444,7 @@ async def test_concurrent_prompts_one_run_one_busy(tmp_path: Path) -> None:
         assert _event_count(db_path, session.session_id) == 2  # created + one accepted
         expected_text = "first" if winners[0].request_id == "req_1" else "second"
         page = await service.messages(session.session_id)
-        assert [message.text for message in page.items] == [expected_text]
+        assert _user_texts(page) == [expected_text]
         assert (await service.run_status(winners[0].run_id)).status is RunStatusValue.ACCEPTED
 
 
@@ -614,7 +625,7 @@ async def test_prompt_accepts_empty_string_text(tmp_path: Path) -> None:
     async with _service(db_path) as service:
         session_id, run_ref = await _create_prompted(service, text="", request_id="req_1")
         page = await service.messages(session_id)
-        assert [message.text for message in page.items] == [""]
+        assert _user_texts(page) == [""]
         assert run_ref.request_id == "req_1"
 
 
@@ -639,7 +650,7 @@ async def test_session_status_and_messages_read_faces(tmp_path: Path) -> None:
         assert (await service.session_status(session_a)) is SessionStatus.ACTIVE
 
         page = await service.messages(session_a)
-        assert [message.text for message in page.items] == ["hello"]
+        assert _user_texts(page) == ["hello"]
         assert page.has_more is False
         assert page.next_after_message_id == page.items[0].id
 

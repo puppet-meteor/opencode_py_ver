@@ -192,6 +192,12 @@ class IdleMessage(BaseModel):
     error: CoreError | None = None
 
 
+#: §2.1 L23-29 message union (user / assistant / idle); the canonical alias
+#: lives here and ``opencode.session.context`` imports and re-exports it for
+#: the builder faces. An alias over the models above, not a new wire model.
+type SessionMessage = UserMessage | AssistantMessage | IdleMessage
+
+
 def complete_deferred_models(types: Mapping[str, Any]) -> None:
     """Finish building the models that reference errors/llm types as strings.
 

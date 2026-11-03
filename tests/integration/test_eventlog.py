@@ -72,6 +72,7 @@ from opencode.session import SessionProjector
 from opencode.storage import (
     EventBatch,
     InvalidCursorError,
+    MessagePage,
     NotFoundError,
     ReadRepositories,
     SessionRecord,
@@ -163,6 +164,16 @@ async def _populate(store: SessionStore, session_id: str, *, prompts: int, run_i
         )
         await store.commit(session_id, EventBatch(f"batch_{session_id}_p{index}", (draft,)), 1 + index)
     return 1 + prompts
+
+
+def _user_texts(page: MessagePage) -> list[str]:
+    """User-text projection over a page; every item must be a UserMessage
+    (T-C1-023b #95: static narrowing over the union face -- runtime-true pin)."""
+    texts: list[str] = []
+    for message in page.items:
+        assert isinstance(message, UserMessage)
+        texts.append(message.text)
+    return texts
 
 
 class _TextDelta(BaseModel):
@@ -764,7 +775,7 @@ async def test_repos_messages_paginate_by_seq_not_id_order(tmp_path: Path) -> No
         repos = ReadRepositories(database.engine)
         first = await repos.messages("ses_a", limit=2)
         assert [message.id for message in first.items] == ["msg_z", "msg_a"]  # seq order, not id order
-        assert [message.text for message in first.items] == ["one", "two"]
+        assert _user_texts(first) == ["one", "two"]
         assert first.has_more is True
         assert first.next_after_message_id == "msg_a"
 
