@@ -57,6 +57,7 @@ from opencode.session import (
     SessionStatus,
     apply,
 )
+from opencode.session.state import EffectStatus, ToolState
 from opencode.storage import (
     EventBatch,
     SessionStore,
@@ -1097,3 +1098,266 @@ def test_r2_fold_idempotent_replays_change_nothing() -> None:
     assert replayed.messages == state.messages
     assert replayed.active_run_id == state.active_run_id
     assert replayed.applied_seq == 16
+
+
+# -- T-C1-020: S2 review follow-ups (m-2 collision messages + need-tests ③-9/10) --
+
+
+async def test_cross_session_run_id_reuse_reports_the_global_pk_collision(tmp_path: Path) -> None:
+    """S2 m-2 / item 7-i (R2-S2-review §2): runs.run_id is a GLOBAL primary
+    key (T-A-007 §10-1 keeps it). Re-using one run id across sessions
+    collides on that PK, and the request itself may be brand new -- the
+    diagnostic must blame the run id, not the request. Both collision
+    sources stay REASON_DUPLICATE_RUN with rollback (behaviour unchanged);
+    only the message is differentiated."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        await _seed_created_and_prompt(store)  # session ...0001 accepted run ...0002 under req ...0002
+
+        other = "ses_0000000000000000000000000002"
+        created = _fixture_raw("events_session_created_valid.json")
+        created["id"] = "evt_0000000000000000000000000061"
+        created["session_id"] = other
+        prompt = _fixture_raw("events_prompt_accepted_valid.json")
+        prompt["id"] = "evt_0000000000000000000000000062"
+        prompt["session_id"] = other
+        prompt["data"]["request_id"] = "req_0000000000000000000000000003"  # brand new: the run id is the clash
+        prompt["data"]["run_id"] = _R2_RUN
+        prompt["data"]["message"]["id"] = "msg_0000000000000000000000000003"
+        prompt["metadata"] = {"run_id": _R2_RUN, "request_id": "req_0000000000000000000000000003"}
+
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit(
+                other,
+                EventBatch("n_global_run_pk", (_draft_from_raw(created), _draft_from_raw(prompt))),
+                0,
+            )
+        assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
+        assert error.value.core.details["reason"] == "duplicate_run_projection"
+        assert (
+            error.value.core.message
+            == f"run {_R2_RUN} is already accepted under another session (global run_id collision)"
+        )
+
+        # Zero residue for the rejected batch; the healthy first session keeps its row.
+        assert _rows(db_path, f"SELECT COUNT(*) FROM events WHERE session_id = '{other}'") == [(0,)]
+        assert _rows(db_path, f"SELECT COUNT(*) FROM sessions WHERE session_id = '{other}'") == [(0,)]
+        assert _rows(db_path, "SELECT session_id, run_id FROM runs") == [(_R2_SESSION, _R2_RUN)]
+
+
+async def test_same_request_under_another_run_reports_the_identity_collision(tmp_path: Path) -> None:
+    """S2 m-2 / item 7-ii (R2-S2-review §2): the same request re-accepted
+    under a different run id in one session collides on
+    unique(session_id, request_id) (§2.1 L37). The reason was already
+    asserted in test_r2_runs_rows_share_the_event_transaction; this pins the
+    message text itself (it was never pinned before)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        high = await _seed_created_and_prompt(store)
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit(
+                _R2_SESSION, EventBatch("n_request_reuse_message", (_draft_from_raw(_foreign_request_prompt()),)), high
+            )
+        assert error.value.core.details["reason"] == "duplicate_run_projection"
+        assert error.value.core.message == (
+            f"request req_0000000000000000000000000002 is already accepted under another run for session {_R2_SESSION}"
+        )
+        assert _rows(db_path, f"SELECT COUNT(*) FROM events WHERE session_id = '{_R2_SESSION}'") == [(2,)]
+        assert _rows(db_path, "SELECT COUNT(*) FROM runs") == [(1,)]
+
+
+async def test_accepted_run_row_with_a_different_request_reports_identity_mismatch(tmp_path: Path) -> None:
+    """need-tests ③-10 (R2-S2-review §6): the runs row exists for this run id
+    but under a different request id -> REASON_DUPLICATE_RUN "already
+    projected with a different identity". The incremental prompt face folds
+    against an empty runs map, so the read-model row check (not the fold)
+    rejects this one; the unique-constraint branch next to it was already
+    tested -- this is the row-exists branch's first positive probe."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        high = await _seed_created_and_prompt(store)
+        raw = _fixture_raw("events_prompt_accepted_valid.json")
+        raw["id"] = "evt_0000000000000000000000000063"
+        raw["data"]["request_id"] = "req_0000000000000000000000000004"
+        raw["data"]["run_id"] = _R2_RUN  # the already-projected run id ...
+        raw["data"]["message"]["id"] = "msg_0000000000000000000000000004"
+        raw["metadata"] = {"run_id": _R2_RUN, "request_id": "req_0000000000000000000000000004"}
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit(_R2_SESSION, EventBatch("n_run_identity", (_draft_from_raw(raw),)), high)
+        assert error.value.core.details["reason"] == "duplicate_run_projection"
+        assert error.value.core.message == f"run {_R2_RUN} is already projected with a different identity"
+        assert _rows(db_path, f"SELECT COUNT(*) FROM events WHERE session_id = '{_R2_SESSION}'") == [(2,)]
+        assert _rows(db_path, "SELECT request_id FROM runs") == [("req_0000000000000000000000000002",)]
+
+
+async def test_incremental_replay_of_a_tampered_stored_event_is_storage_corrupt(tmp_path: Path) -> None:
+    """need-tests ③-9 (R2-S2-review §6): every R2 projection replays the
+    stored log prefix and DECODES each stored event (projector
+    ``_replay_state``) -- a stored event whose data no longer decodes makes
+    the next commit fail with reason=stored_event_decode_failed, pointing at
+    the damaged row. The rebuild twin of this defence is already tested; the
+    incremental-path reachability is confirmed here by construction."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        high = await _seed_created_and_prompt(store)
+        high = (await store.commit(_R2_SESSION, EventBatch("b_run_started", (_r2_draft("run_started"),)), high))[-1].seq
+
+    # Tamper the committed run.started row (seq 3) outside every store face.
+    tampered = _fetch_scalar(db_path, "SELECT id FROM events WHERE session_id = ? AND seq = 3", (_R2_SESSION,))
+    assert tampered is not None
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("UPDATE events SET data = 'not-json' WHERE session_id = ? AND seq = 3", (_R2_SESSION,))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        with pytest.raises(StorageCorruptError) as error:
+            await store.commit(_R2_SESSION, EventBatch("b_step_started", (_r2_draft("step_started"),)), high)
+        assert error.value.core.code == CoreErrorCode.STORAGE_CORRUPT
+        assert error.value.core.details["reason"] == "stored_event_decode_failed"
+        assert error.value.core.details["event_id"] == tampered[0]
+        assert error.value.core.details["seq"] == 3
+
+    # The rejected batch left zero residue; the damaged log is untouched (3 rows).
+    assert _rows(db_path, f"SELECT COUNT(*) FROM events WHERE session_id = '{_R2_SESSION}'") == [(3,)]
+
+
+# -- T-C1-020: fold-level need-tests (③-11/13/14/15/18, direct state.apply probes) --
+
+
+def _seeded_r2_state(*, through: int) -> tuple[SessionState, list[DurableEvent[Any]]]:
+    """created + the R2 prompt + the first ``through`` fixture events applied."""
+    created = _fixture_event("events_session_created_valid.json")
+    prompt = _r2_prompt_event()
+    events = [_fixture_event(dict(_R2_FIXTURES)[key]) for key, _ in _R2_FIXTURES]
+    state = apply(apply(SessionState(), created), prompt)
+    for event in events[:through]:
+        state = apply(state, event)
+    return state, events
+
+
+def test_r2_fold_known_run_with_a_different_request_is_rejected() -> None:
+    """need-tests ③-11 (R2-S2-review §6): the fold's own known-run branch --
+    an accepted run re-accepted under a DIFFERENT request id -- rejects at
+    the fold level. The incremental prompt face never sees it (its pre-state
+    carries an empty runs map, which is why ③-10 rejects at the read model
+    instead); so far only full replays surfaced this branch through
+    replay_illegal_transition."""
+    state, _ = _seeded_r2_state(through=0)
+    prompt = _r2_prompt_event()
+    drifted = prompt.model_copy(
+        update={
+            "id": "evt_9000000000000000000000000051",
+            "seq": 3,
+            "data": prompt.data.model_copy(update={"request_id": "req_0000000000000000000000000009"}),
+        }
+    )
+    with pytest.raises(IllegalTransitionError, match="already accepted under request"):
+        apply(state, drifted)
+
+    # The legal twin (same request id, legacy idempotent re-accept) still folds.
+    replay = prompt.model_copy(update={"id": "evt_9000000000000000000000000052", "seq": 3})
+    folded = apply(state, replay)
+    assert len(folded.runs) == 1
+    assert len(folded.messages) == 2  # the re-accepted user message appends
+    assert folded.active_run_id == _R2_RUN
+
+
+def test_r2_fold_tool_requested_identity_drift_is_rejected() -> None:
+    """need-tests ③-13 (R2-S2-review §6): tool.requested with a MATCHING
+    input_hash but a drifted message_id / tool_call_id rejects (foreign-run
+    and input_hash drift were already probed at the store level; the
+    identity pair was not)."""
+    state, events = _seeded_r2_state(through=6)  # through tool_requested: the tool is pending
+    drifted_message = events[5].model_copy(
+        update={
+            "id": "evt_9000000000000000000000000053",
+            "seq": 9,
+            "data": events[5].data.model_copy(update={"message_id": "msg_0000000000000000000000000099"}),
+        }
+    )
+    with pytest.raises(IllegalTransitionError, match="identity does not match execution"):
+        apply(state, drifted_message)
+    drifted_call = events[5].model_copy(
+        update={
+            "id": "evt_9000000000000000000000000054",
+            "seq": 9,
+            "data": events[5].data.model_copy(update={"tool_call_id": "call_0000000000000000000000000099"}),
+        }
+    )
+    with pytest.raises(IllegalTransitionError, match="identity does not match execution"):
+        apply(state, drifted_call)
+
+
+def test_r2_fold_tool_started_input_hash_drift_is_rejected() -> None:
+    """need-tests ③-14 (R2-S2-review §6): the tool.started counterpart of the
+    input_hash probe (the requested path was already pinned at the store
+    level; the started path was missing). The tool must still be pending for
+    the hash branch to be reached -- probed right after tool.requested."""
+    state, events = _seeded_r2_state(through=6)  # through tool_requested: the tool is still pending
+    drifted = events[6].model_copy(
+        update={
+            "id": "evt_9000000000000000000000000055",
+            "seq": 10,
+            "data": events[6].data.model_copy(update={"input_hash": "0" * 64}),
+        }
+    )
+    with pytest.raises(IllegalTransitionError, match=r"tool\.started input_hash mismatch"):
+        apply(state, drifted)
+
+
+def test_r2_fold_pending_tool_may_finish_directly() -> None:
+    """need-tests ③-15 (R2-S2-review §6): the pending -> terminal rows of the
+    §2.1 L46-52 table (the pending branch of ``_apply_tool_finished``) had
+    only rejection probes. Positive case chosen: a still-pending call that
+    was never started finishing directly ``failed/not_started`` -- the one
+    terminal family the table allows from pending (side effects cannot have
+    happened, so effect_status must stay not_started)."""
+    state, events = _seeded_r2_state(through=6)  # the tool is pending
+    direct = events[7].model_copy(
+        update={
+            "id": "evt_9000000000000000000000000056",
+            "seq": 9,
+            "data": events[7].data.model_copy(update={"state": "failed", "effect_status": "not_started"}),
+        }
+    )
+    folded = apply(state, direct)
+    tool = folded.tools["exec_0000000000000000000000000001"]
+    assert tool.state is ToolState.FAILED
+    assert tool.effect_status is EffectStatus.NOT_STARTED
+    assert folded.applied_seq == 9
+
+
+def test_r2_fold_step_started_duplicate_step_and_message_ids_are_rejected() -> None:
+    """need-tests ③-18 (R2-S2-review §6): step.started uniqueness -- the same
+    step id twice, and a fresh step id under an already-used message id (the
+    tool_call_id uniqueness inside the generated plan was already pinned;
+    the step side was the symmetric gap)."""
+    state, events = _seeded_r2_state(through=2)  # run started, step ...0002 running
+    duplicate_step = events[1].model_copy(update={"id": "evt_9000000000000000000000000057", "seq": 5})
+    with pytest.raises(IllegalTransitionError, match="is already registered"):
+        apply(state, duplicate_step)
+
+    # A fresh step id under the used message id: staged after step ...0002 went
+    # terminal so the serial-step gate passes and the message-id branch fires.
+    terminal, _ = _seeded_r2_state(through=9)  # through step_finished: step ...0002 terminal, run running
+    duplicate_message = events[1].model_copy(
+        update={
+            "id": "evt_9000000000000000000000000058",
+            "seq": 12,
+            "data": events[1].data.model_copy(update={"step_id": "step_0000000000000000000000000003"}),
+        }
+    )
+    with pytest.raises(IllegalTransitionError, match="is already used"):
+        apply(terminal, duplicate_message)

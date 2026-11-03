@@ -457,12 +457,31 @@ class SessionProjector:
                 },
             )
         except IntegrityError as error:
-            # unique(session_id, request_id): the same request accepted under
-            # a different run id (§2.1 L37 identity conflict).
+            # Two constraints can collide on this INSERT: unique(session_id,
+            # request_id) -- the same request accepted under a different run id
+            # in this session (§2.1 L37 identity conflict) -- or the GLOBAL
+            # runs.run_id primary key: this run id is already accepted in
+            # ANOTHER session (T-A-007 §10-1 keeps the global key), in which
+            # case the request above may be brand new and must not be blamed.
+            # Re-query the identity pair to tell the sources apart (S2 review
+            # m-2, T-C1-020); the query is local to this handler so the fix
+            # stays inside the one authorized spot.
+            identity = (
+                await connection.execute(
+                    sa.text("SELECT run_id FROM runs WHERE session_id = :sid AND request_id = :request_id"),
+                    {"sid": event.session_id, "request_id": request_id},
+                )
+            ).first()
+            if identity is not None:
+                raise _corrupt(
+                    REASON_DUPLICATE_RUN,
+                    event,
+                    f"request {request_id} is already accepted under another run for session {event.session_id}",
+                ) from error
             raise _corrupt(
                 REASON_DUPLICATE_RUN,
                 event,
-                f"request {request_id} is already accepted under another run for session {event.session_id}",
+                f"run {run_id} is already accepted under another session (global run_id collision)",
             ) from error
 
     async def _set_active_run_id(

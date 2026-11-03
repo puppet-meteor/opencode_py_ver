@@ -433,6 +433,24 @@ class TestTokenBudget:
         with pytest.raises(ContextLimitExceeded):
             builder.build(request_id="req-1", history=history, tools=(bulky_tool,))
 
+    def test_ceil_rounding_overflows_on_a_non_multiple_of_four(self) -> None:
+        """m-1 (R2-S4-review §2): pin the ceil rounding direction on a char
+        count that is NOT a multiple of 4 -- 3001 chars = 750.25 tokens, so
+        ceil -> 751 > 750. A floor (``//``) or round implementation would
+        estimate exactly 750 and let this history through: this test must go
+        red under any non-conservative rounding change."""
+        with pytest.raises(ContextLimitExceeded) as info:
+            ContextBuilder(_settings()).build(request_id="req-1", history=[_user("a" * 3001)])
+        assert info.value.core.details["estimated_input_tokens"] == 751
+
+    def test_ceil_rounding_reaches_exactly_at_budget_on_a_non_multiple_of_four(self) -> None:
+        """m-1 (R2-S4-review §2): the conservative direction rounds UP to the
+        boundary, never under it -- 2997 chars = 749.25 tokens, ceil -> 750,
+        exactly at the available budget: the request builds with the full
+        output reserve (never shrunk)."""
+        request = ContextBuilder(_settings()).build(request_id="req-1", history=[_user("a" * 2997)])
+        assert request.max_output_tokens == 200
+
 
 class TestCatalogSnapshot:
     """§5.1 L253: the injected tool sequence is the fixed catalog for the request."""
@@ -448,6 +466,27 @@ class TestCatalogSnapshot:
         assert request.tools == [_read_tool()]
         assert request.tools[0].description == "Read a file from the workspace roots."
         assert spec.description == "mutated after build"  # the caller's own mutation survives, isolated
+
+    def test_mutating_nested_input_schema_after_build_does_not_affect_request(self) -> None:
+        """m-2 (R2-S4-review §2): the deep in ``model_copy(deep=True)`` is
+        load-bearing -- mutating the NESTED ``input_schema`` dict on the
+        caller's spec after build must not reach the built request. A shallow
+        copy (which still passes the scalar-mutation test above) shares the
+        nested dict and fails this pin."""
+        builder = ContextBuilder(_settings())
+        spec = _read_tool()
+        request = builder.build(request_id="req-1", history=[_user("hi")], tools=[spec])
+        schema = spec.input_schema
+        properties = schema["properties"]
+        assert isinstance(properties, dict)  # narrows the JsonValue union for the mutation below
+        properties["mutated"] = {"type": "string"}
+        required = schema["required"]
+        assert isinstance(required, list)
+        required.append("mutated")
+        assert request.tools[0].input_schema == _read_tool().input_schema
+        assert request.tools[0].input_schema["properties"] == {"path": {"type": "string"}}
+        # the caller's own nested mutation survives on the caller's object
+        assert "mutated" in properties and "mutated" in required
 
 
 class TestDottedNames:
@@ -520,3 +559,12 @@ class TestRuntimeSettings:
     def test_invalid_settings_values_rejected(self, field: str, value: Any) -> None:
         with pytest.raises(ValueError):
             _settings(**{field: value})
+
+    def test_timeout_s_must_be_finite(self) -> None:
+        """n-2 (R2-S4-review §2): ``> 0`` alone lets ``+inf`` through (an
+        unbounded deadline) and only rejected NaN by accident (``nan > 0`` is
+        False). The ``math.isfinite`` guard rejects both on purpose."""
+        with pytest.raises(ValueError, match="timeout_s"):
+            _settings(timeout_s=float("inf"))
+        with pytest.raises(ValueError, match="timeout_s"):
+            _settings(timeout_s=float("nan"))
