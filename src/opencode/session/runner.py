@@ -659,7 +659,7 @@ class Runner:
                     # cancelling (§2.1 L59-61): finalize interrupted instead.
                     state = await self._load_state(session_id)
                     if state.runs[run_id].status is RunStatus.CANCELLING:
-                        await self._finalize_interrupted(session_id, run_id, state, None)
+                        await self._finalize_interrupted(session_id, run_id, state, None, observed=result)
                         return RunResult(outcome="interrupted", steps=steps)
                     raise
                 return RunResult(outcome="succeeded", steps=steps)
