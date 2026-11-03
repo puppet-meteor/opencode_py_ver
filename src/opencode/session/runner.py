@@ -91,6 +91,7 @@ from opencode.contracts.events import (
 from opencode.contracts.llm import (
     ErrorChunk,
     FinishChunk,
+    FinishReason,
     GenerationRequest,
     ModelRef,
     ReasoningDeltaChunk,
@@ -98,6 +99,7 @@ from opencode.contracts.llm import (
     ToolCallArgsDeltaChunk,
     ToolCallEndChunk,
     ToolCallStartChunk,
+    Usage,
     UsageChunk,
 )
 from opencode.contracts.messages import (
@@ -106,6 +108,7 @@ from opencode.contracts.messages import (
     AssistantReasoningPart,
     AssistantTextPart,
     AssistantToolPart,
+    CostUsd,
     JsonObject,
     ToolContent,
     ToolTextContent,
@@ -250,6 +253,34 @@ class _StreamResult:
     error: CoreError | None = None
     interrupted: bool = False
     slots: list[_TextSlot | _CallSlot] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedFields:
+    """The stream-observed finish/usage an interrupted terminal may carry.
+
+    A-009③: an interrupt that lands after the provider already emitted
+    ``finish``/``usage`` must not lose those observations -- the interrupted
+    terminal message keeps them, mirroring the succeeded read on the
+    step-finished construction.
+    """
+
+    finish: FinishReason | None = None
+    raw_finish: str | None = None
+    usage: Usage | None = None
+    cost_usd: CostUsd | None = None
+
+
+def _observed_fields(observed: _StreamResult | None) -> _ObservedFields:
+    """Project one consumed stream's finish/usage into terminal fields (A-009③)."""
+    if observed is None:
+        return _ObservedFields()
+    return _ObservedFields(
+        finish=observed.finish.reason if observed.finish is not None else None,
+        raw_finish=observed.finish.raw_reason if observed.finish is not None else None,
+        usage=observed.usage.usage if observed.usage is not None else None,
+        cost_usd=observed.usage.cost_usd if observed.usage is not None else None,
+    )
 
 
 class _GenerationViolation(Exception):
@@ -558,7 +589,7 @@ class Runner:
                 if partial:
                     await self._committer.commit(session_id, partial)
                 state = await self._load_state(session_id)
-                await self._finalize_interrupted(session_id, run_id, state, result.error)
+                await self._finalize_interrupted(session_id, run_id, state, result.error, observed=result)
                 return RunResult(outcome="interrupted", steps=steps, error=result.error)
 
             # §3.1 L144: all finalized parts by ordinal + exactly one
@@ -589,7 +620,7 @@ class Runner:
             cancelled = await self._run_tools(session_id, run_id, message_id, parts, working_dir)
             if cancelled:
                 state = await self._load_state(session_id)
-                await self._finalize_interrupted(session_id, run_id, state, None)
+                await self._finalize_interrupted(session_id, run_id, state, None, observed=result)
                 return RunResult(outcome="interrupted", steps=steps)
             finished = AssistantMessage(
                 id=message_id,
@@ -959,6 +990,8 @@ class Runner:
         run_id: str,
         state: SessionState,
         error: CoreError | None,
+        *,
+        observed: _StreamResult | None = None,
     ) -> None:
         """Terminate the open step (if any) and the run as interrupted.
 
@@ -970,9 +1003,13 @@ class Runner:
         ``py.step.finished``, then ``py.run.finished``. The terminal message
         is rebuilt from the folded truth: the generated branch keeps the
         committed text and tool facts; the non-generated branch carries
-        exactly the committed finalized text (§3.3 L212); ``finish``/``usage``
-        stay conservative ``None``. The open step's ``(model, started_at)``
-        comes from the single-flight ``_active_steps`` bookkeeping.
+        exactly the committed finalized text (§3.3 L212). ``finish``/``usage``
+        keep what the caller's consumed stream observed when it is still at
+        hand (A-009③: the error-path and tool-cancel finals pass ``observed``
+        so an already-emitted finish/usage survives the interrupt); callers
+        that lost the stream object (the hard-cancel paths) stay
+        conservative ``None``. The open step's ``(model, started_at)`` comes
+        from the single-flight ``_active_steps`` bookkeeping.
         """
         drafts: list[EventDraft[Any]] = []
         #: The synthesized tool terminals of this batch, by execution id: the
@@ -1020,7 +1057,13 @@ class Runner:
             assert entry is not None  # an open step implies its step.started set the entry
             model, started_at = entry
             message = self._interrupted_message(
-                state, step, error, synthesized=synthesized, model=model, started_at=started_at
+                state,
+                step,
+                error,
+                synthesized=synthesized,
+                model=model,
+                started_at=started_at,
+                observed=observed,
             )
             drafts.append(
                 self._draft(
@@ -1039,14 +1082,18 @@ class Runner:
         model: ModelRef,
         started_at: datetime,
         synthesized: dict[str, ToolFinishedData],
+        observed: _StreamResult | None = None,
     ) -> AssistantMessage:
         """The interrupted terminal message, rebuilt from the folded truth.
 
         ``synthesized`` carries this batch's synthesized tool terminals: their
         parts must reflect those (the pre-batch fold still shows them
         pending/running); tools that already committed their own terminal keep
-        the folded facts.
+        the folded facts. ``observed`` (A-009③) carries the consumed stream
+        whose finish/usage survive onto the terminal message when the caller
+        still holds it.
         """
+        fields = _observed_fields(observed)
         if step.generated:
             existing = next(
                 (
@@ -1096,6 +1143,10 @@ class Runner:
                 model=existing.model,
                 parts=parts,
                 status="interrupted",
+                finish=fields.finish,
+                raw_finish=fields.raw_finish,
+                usage=fields.usage,
+                cost_usd=fields.cost_usd,
                 error=error,
                 completed_at=self._clock(),
             )
@@ -1119,6 +1170,10 @@ class Runner:
             model=model,
             parts=parts,
             status="interrupted",
+            finish=fields.finish,
+            raw_finish=fields.raw_finish,
+            usage=fields.usage,
+            cost_usd=fields.cost_usd,
             error=error,
             completed_at=self._clock(),
         )

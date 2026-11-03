@@ -134,6 +134,12 @@ _UPDATE_SESSION_DIAGNOSTIC = sa.text(
 _INSERT_SESSION_DIAGNOSTIC = sa.text(
     "INSERT INTO sessions (session_id, status, applied_seq, diagnostic) VALUES (:sid, 'read_only_diagnostic', 0, :diag)"
 )
+# -- T-C1-022 (R2-S7 ④-3): the S7 close-timeout management mark ---------------
+# Verbatim move of the service-owned UPDATE (session/service.py): scoped to
+# still-active rows, no seq/applied_seq advance, no business events.
+_UPDATE_SESSION_CLEANUP_FAILED = sa.text(
+    "UPDATE sessions SET status = 'cleanup_failed', diagnostic = :diag WHERE session_id = :sid AND status = 'active'"
+)
 # -- R1-S8 rebuild (§3.3): the read-model replacement runs in one transaction --
 _SELECT_SESSION_EVENTS = sa.text(
     "SELECT id, session_id, seq, type, version, created, data, metadata "
@@ -411,6 +417,32 @@ class TransactionWriter:
                             # corruption error stays caller-facing.
                             raise corruption from persist_error
                     raise
+
+    async def cleanup_failed(self, session_id: str, run_id: str, reason: str) -> None:
+        """Persist ``sessions.status = cleanup_failed`` (S7 management write).
+
+        T-C1-022 (R2-S7 ④-3): consolidation of the service-owned direct
+        UPDATE. Mirrors the S4 isolation-write discipline (§3.2.1): one short
+        independent transaction scoped to still-active rows -- no business
+        events, no seq or applied_seq advance, no bus notify (structurally:
+        this module cannot reach a bus), and deliberately no asyncio locks:
+        the pre-consolidation call sites (the close-timeout mark and the
+        cancel-cleanup mark) held none, and taking the commit locks here
+        would change close-timeout marking under a stuck writer. The
+        ``status = 'active'`` guard makes repeats and already-marked rows
+        no-ops. Service callers validate upstream, so the arg checks mirror
+        :meth:`rebuild`'s defensiveness only.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            raise StoreValidationError("session_id must be a non-empty string")
+        if not isinstance(run_id, str) or not run_id:
+            raise StoreValidationError("run_id must be a non-empty string")
+        if not isinstance(reason, str) or not reason:
+            raise StoreValidationError("reason must be a non-empty string")
+        diagnostic = json.dumps({"reason": reason, "session_id": session_id, "run_id": run_id}, sort_keys=True)
+        async with self._engine.connect() as connection:
+            await connection.execute(_UPDATE_SESSION_CLEANUP_FAILED, {"sid": session_id, "diag": diagnostic})
+            await connection.commit()
 
     async def _commit_transaction(
         self, session_id: str, batch: EventBatch, expected_seq: int
