@@ -145,7 +145,7 @@ def _prompt_accepted_draft(
     )
 
 
-async def _populate(store: SessionStore, session_id: str, *, prompts: int) -> int:
+async def _populate(store: SessionStore, session_id: str, *, prompts: int, run_id: str = "run_1") -> int:
     """Create the session, then commit ``prompts`` prompt events; return H.
 
     Events: seq 1 = py.session.created (``evt_{sid}_c``), seq 2.. = prompts
@@ -157,6 +157,7 @@ async def _populate(store: SessionStore, session_id: str, *, prompts: int) -> in
         draft = _prompt_accepted_draft(
             session_id,
             f"evt_{session_id}_p{index}",
+            run_id=run_id,
             text=f"text-{index}",
             message_id=f"msg_{index}",
         )
@@ -182,6 +183,7 @@ def _ephemeral(session_id: str, event_id: str) -> EphemeralEvent[_TextDelta]:
         session_id=session_id,
         created_at=_CREATED_AT,
         data=_TextDelta(message_id="msg_0", part_id="part_0", delta="x"),
+        metadata={"run_id": "run_1"},
     )
 
 
@@ -385,7 +387,7 @@ async def test_read_unknown_version_or_type_fails_closed_instead_of_skipping(tmp
     async with open_database(db_path, mode="create") as database:
         store = SessionStore(database.engine, projector=SessionProjector())
         assert await _populate(store, "ses_a", prompts=3) == 4
-        assert await _populate(store, "ses_b", prompts=3) == 4
+        assert await _populate(store, "ses_b", prompts=3, run_id="run_ses_b") == 4
 
     with sqlite3.connect(db_path) as connection:
         connection.execute("UPDATE events SET version = 99 WHERE session_id = 'ses_a' AND seq = 2")
@@ -795,7 +797,7 @@ async def test_repos_missing_projection_and_undecodable_rows_fail_closed(tmp_pat
     async with open_database(db_path, mode="create") as database:
         store = SessionStore(database.engine, projector=SessionProjector())
         assert await _populate(store, "ses_a", prompts=3) == 4
-        assert await _populate(store, "ses_b", prompts=3) == 4
+        assert await _populate(store, "ses_b", prompts=3, run_id="run_ses_b") == 4
 
     # ses_a loses its read model while the log survives; ses_b keeps the row
     # but one message payload stops being decodable.

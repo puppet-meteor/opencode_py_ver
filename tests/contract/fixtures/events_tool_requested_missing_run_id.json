@@ -1,0 +1,25 @@
+{
+  "id": "evt_0000000000000000000000000026",
+  "type": "py.tool.requested",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:15Z",
+  "data": {
+    "message_id": "msg_0000000000000000000000000012",
+    "tool_call_id": "call_0000000000000000000000000001",
+    "execution_id": "exec_0000000000000000000000000001",
+    "requested_name": "read",
+    "tool_ref": {
+      "namespace": "fs",
+      "name": "read",
+      "version": 1
+    },
+    "input": {
+      "path": "notes.md",
+      "limit": 50
+    },
+    "input_hash": "5b8160c3ef7a2aa5fc1207a2740b1d783068c96fd850a1bbb969107e32c2d625"
+  },
+  "metadata": {},
+  "seq": 8
+}

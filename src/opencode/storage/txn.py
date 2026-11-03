@@ -94,6 +94,13 @@ REASON_REBUILD_INVARIANT = "rebuild_applied_seq_mismatch"
 #: §3.2.1 L191, T-C1-012 scheduler ruling). first_bad_seq = H + 1 locates the
 #: first event the projection applied that the log no longer has.
 REASON_PROJECTION_AHEAD_OF_LOG = "projection_ahead_of_log"
+#: Rebuild re-projection of the R2 read models: a tool_executions/runs row hit
+#: an identity constraint the fold already forbids (unique(session_id,
+#: execution_id)/unique(session_id, step_id, tool_call_id)/run_id PK/
+#: unique(session_id, request_id)) -- reachable only through stored rows the
+#: fold never produced (hand-tampered data).
+REASON_REBUILD_DUPLICATE_TOOL_EXECUTION = "rebuild_duplicate_tool_execution"
+REASON_REBUILD_DUPLICATE_RUN = "rebuild_duplicate_run"
 
 _SELECT_SESSION_STATUS = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
 _SELECT_SESSION_APPLIED = sa.text("SELECT applied_seq FROM sessions WHERE session_id = :sid")
@@ -134,6 +141,8 @@ _SELECT_SESSION_EVENTS = sa.text(
 )
 _SELECT_REBUILD_SESSION = sa.text("SELECT status, applied_seq, diagnostic FROM sessions WHERE session_id = :sid")
 _DELETE_SESSION_MESSAGES = sa.text("DELETE FROM messages WHERE session_id = :sid")
+_DELETE_SESSION_TOOL_EXECUTIONS = sa.text("DELETE FROM tool_executions WHERE session_id = :sid")
+_DELETE_SESSION_RUNS = sa.text("DELETE FROM runs WHERE session_id = :sid")
 _DELETE_SESSION_ROW = sa.text("DELETE FROM sessions WHERE session_id = :sid")
 _INSERT_REBUILT_SESSION = sa.text(
     "INSERT INTO sessions (session_id, status, config_snapshot, snapshot_hash, "
@@ -142,6 +151,15 @@ _INSERT_REBUILT_SESSION = sa.text(
 )
 _INSERT_REBUILT_MESSAGE = sa.text(
     "INSERT INTO messages (session_id, message_id, seq, data) VALUES (:sid, :message_id, :seq, :data)"
+)
+_INSERT_REBUILT_TOOL_EXECUTION = sa.text(
+    "INSERT INTO tool_executions (session_id, execution_id, run_id, step_id, message_id, tool_call_id, "
+    "input_hash, state) VALUES (:sid, :execution_id, :run_id, :step_id, :message_id, :tool_call_id, "
+    ":input_hash, :state)"
+)
+_INSERT_REBUILT_RUN = sa.text(
+    "INSERT INTO runs (run_id, session_id, request_id, status, error) "
+    "VALUES (:run_id, :sid, :request_id, :status, :error)"
 )
 
 
@@ -780,10 +798,14 @@ class TransactionWriter:
         # Clear the read model inside the transaction: any later failure rolls
         # the clearing back with everything else (§3.3 全部回滚).
         await connection.execute(_DELETE_SESSION_MESSAGES, {"sid": session_id})
+        await connection.execute(_DELETE_SESSION_TOOL_EXECUTIONS, {"sid": session_id})
+        await connection.execute(_DELETE_SESSION_RUNS, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_ROW, {"sid": session_id})
 
         state = SessionState()
-        message_rows: list[dict[str, Any]] = []
+        # Keyed by message id: appended messages keep their first-appearance
+        # seq, a terminal replacement (step.finished) only rewrites the data.
+        message_rows: dict[str, dict[str, Any]] = {}
         expected_seq = 1
         for row in rows:
             seq = int(row.seq)
@@ -829,17 +851,26 @@ class TransactionWriter:
                     ),
                 ) from error
             try:
-                appended_from = len(state.messages)
+                previous_messages = state.messages
                 state = apply(state, event)
-                for message in state.messages[appended_from:]:
-                    message_rows.append(
-                        {
+                # Identity diff over the folded sequence: appends are new ids;
+                # step.finished replaces a message by id (a new object at the
+                # old position); unchanged messages keep the first-appearance
+                # seq and their stored data verbatim.
+                for index, message in enumerate(state.messages):
+                    if index < len(previous_messages) and message is previous_messages[index]:
+                        continue
+                    data = canonical_json(message.model_dump(mode="json"))
+                    message_row = message_rows.get(message.id)
+                    if message_row is None:
+                        message_rows[message.id] = {
                             "sid": session_id,
                             "message_id": message.id,
                             "seq": seq,
-                            "data": canonical_json(message.model_dump(mode="json")),
+                            "data": data,
                         }
-                    )
+                    else:
+                        message_row["data"] = data
             except IllegalTransitionError as error:
                 raise _corruption(
                     REASON_REPLAY_ILLEGAL_TRANSITION,
@@ -876,7 +907,7 @@ class TransactionWriter:
                 "diagnostic": diagnostic,
             },
         )
-        for message_row in message_rows:
+        for message_row in message_rows.values():
             try:
                 # One INSERT per row so a violation locates the offending row.
                 await connection.execute(_INSERT_REBUILT_MESSAGE, message_row)
@@ -886,6 +917,56 @@ class TransactionWriter:
                     Diagnostic(
                         reason=REASON_REBUILD_DUPLICATE_MESSAGE,
                         first_bad_seq=int(message_row["seq"]),
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+
+        # The R2 read models are re-projected from the final fold state: the
+        # runs rows (accepted/running/terminal per the replayed transitions)
+        # and the tool_executions rows (ownership + input_hash + the final
+        # state) -- events stay the authority (§3.2 L185, §3.3).
+        for tool in state.tools.values():
+            try:
+                await connection.execute(
+                    _INSERT_REBUILT_TOOL_EXECUTION,
+                    {
+                        "sid": session_id,
+                        "execution_id": tool.execution_id,
+                        "run_id": tool.run_id,
+                        "step_id": tool.step_id,
+                        "message_id": tool.message_id,
+                        "tool_call_id": tool.tool_call_id,
+                        "input_hash": tool.input_hash,
+                        "state": tool.state.value,
+                    },
+                )
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_TOOL_EXECUTION,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_TOOL_EXECUTION,
+                        first_bad_seq=state.applied_seq,
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+        for run in state.runs.values():
+            try:
+                await connection.execute(
+                    _INSERT_REBUILT_RUN,
+                    {
+                        "run_id": run.run_id,
+                        "sid": session_id,
+                        "request_id": run.request_id,
+                        "status": run.status.value,
+                        "error": canonical_json(run.error.model_dump(mode="json")) if run.error is not None else None,
+                    },
+                )
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_RUN,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_RUN,
+                        first_bad_seq=state.applied_seq,
                         applied_seq=applied_at_discovery,
                     ),
                 ) from error

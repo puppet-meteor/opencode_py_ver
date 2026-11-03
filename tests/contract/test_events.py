@@ -739,24 +739,34 @@ class TestR2NegativeFixtures:
 
 
 class TestR2RunScopedMetadata:
-    """run_id metadata correlation: current semantics plus the whenever-present rule.
+    """run_id metadata correlation: required on every run-scoped type.
 
-    The RUN_SCOPED expansion to the R2 types is blocked by frozen R1 tests that
-    construct py.run.started/py.text.delta envelopes without metadata.run_id
-    (test_bus.py, test_eventlog.py, test_projector.py) — see the T-C1-013
-    progress file, open question 1. Producers still write run_id into every
-    new type's metadata, and a run_id key that appears anywhere stays validated.
+    RUN_SCOPED_EVENT_TYPES covers the full R2 set (scheduler ledger #71,
+    T-C1-014): py.prompt.accepted plus the 15 R2 types; py.session.created
+    stays out. Every envelope of a set member must carry metadata.run_id at
+    construction and decode, and a run_id key that appears anywhere stays
+    validated.
     """
 
-    def test_run_scoped_set_is_pinned_to_r1_pending_arbitration(self) -> None:
-        assert RUN_SCOPED_EVENT_TYPES == frozenset({PY_PROMPT_ACCEPTED})
+    def test_run_scoped_set_covers_the_full_r2_subset(self) -> None:
+        assert RUN_SCOPED_EVENT_TYPES == frozenset({PY_PROMPT_ACCEPTED} | set(R2_ALL_FIXTURES))
+        assert PY_SESSION_CREATED not in RUN_SCOPED_EVENT_TYPES
 
     @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
-    def test_missing_run_id_metadata_currently_decodes(self, event_type: str, fixture_name: str) -> None:
-        """Pins the current (unexpanded) state loudly: any expansion must flip this test."""
+    def test_missing_run_id_metadata_rejected(self, event_type: str, fixture_name: str) -> None:
+        """Flipped with the ledger-#71 expansion: a run-scoped envelope
+        without metadata.run_id fails validation at decode."""
         raw = _load_fixture(fixture_name)
         del raw["metadata"]["run_id"]
-        _decode_r2(default_event_registry(), event_type, raw)  # no raise expected today
+        with pytest.raises(ValidationError):
+            _decode_r2(default_event_registry(), event_type, raw)
+
+    @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
+    def test_missing_run_id_fixture_rejected(self, event_type: str, fixture_name: str) -> None:
+        """The file-based negative fixtures pin the same rule (R2 naming)."""
+        stem = fixture_name.removesuffix("_valid.json")
+        with pytest.raises(ValidationError):
+            _decode_r2(default_event_registry(), event_type, _load_fixture(f"{stem}_missing_run_id.json"))
 
     @pytest.mark.parametrize(("event_type", "fixture_name"), sorted(R2_ALL_FIXTURES.items()))
     def test_bad_run_id_metadata_rejected_whenever_present(self, event_type: str, fixture_name: str) -> None:
