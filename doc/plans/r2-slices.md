@@ -58,7 +58,7 @@
 - **新增/修改文件**：
   - `src/opencode/contracts/llm.py`：`ModelRef`、`Usage`（五 token 可选非负整数、未知=null 不冒充 0、`cost_usd` 可选定点字符串 §2.1 L74）、`GenerationRequest`（§2.2 L78 字段全集）、`LLMMessage`（system/user/assistant/tool 四角色；text/reasoning/tool_call/tool_result 内容 union）、`ProviderChunk`（§2.3 L88-98 七型表逐行：公共字段+按 type 必需数据；index 从 0 递增）、finish reason 枚举。
   - `contracts/messages.py` 扩展：`AssistantPart`（text/reasoning/tool 三态 tagged union，§2.1 L33）、`AssistantMessage`（model/parts/status: running/completed/failed/interrupted + 可选 finish/raw_finish/usage/cost_usd/error/completed_at，L28）、`IdleMessage`（run_id/outcome/error，L29）、`ToolContent`（text/file 两型，L69-70；file 可编码往返但未启用媒体不得读发 URI §2.1 L72——R2 仅 text）。
-  - `contracts/events.py` 注册扩容：R2 durable 10 型（py.run.started/cancel_requested/finished、py.step.started/generated/finished、py.text.finalized、py.reasoning.finalized、py.tool.requested/started/finished——data 按 §3.1 L124-132 逐行）+ ephemeral 4 型（py.text.delta/py.reasoning.delta/py.tool.input.delta/py.tool.progress，L140）。
+  - `contracts/events.py` 注册扩容：R2 durable 11 型（py.run.started/cancel_requested/finished、py.step.started/generated/finished、py.text.finalized、py.reasoning.finalized、py.tool.requested/started/finished——data 按 §3.1 L124-132 逐行）+ ephemeral 4 型（py.text.delta/py.reasoning.delta/py.tool.input.delta/py.tool.progress，L140）。
   - `src/opencode/contracts/tools.py`：`ToolSpec`（§5.1 L250 八字段）、`ToolResult`（content/structured_output?/metadata/error?，L245）。
   - fixtures：每新事件类型至少 1 正 1 反（含 run_id metadata 强制关联——RUN_SCOPED_EVENT_TYPES 扩容）。
 - **TS 基准映射**：
