@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -1047,3 +1048,77 @@ def test_retry_after_seconds_prefers_ms_header() -> None:
     assert retry_after_seconds({"retry-after-ms": "abc", "retry-after": "3"}) == 3.0
     assert retry_after_seconds({"retry-after": "-1"}) is None
     assert retry_after_seconds({}) is None
+
+
+# ---------------------------------------------------------------------------
+# T-C1-017a micro-patch pins: connect-establishment retry exhaustion
+# (R2-S3-review §2 M-2 / §4 ③-4) and 5xx surfacing without auto-retry
+# (OP-8 final ruling, CORE-CONTRACTS §10 L383; review §4 ③-3)
+# ---------------------------------------------------------------------------
+
+
+async def test_connect_refused_exhausts_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M-2 (§4 ③-4): connection-establishment failures retry, then exhaust.
+
+    The adapter points at an ephemeral port nothing listens on (bind port 0,
+    take the number, close the probe socket), so the TCP stack refuses the
+    connect immediately — an immediate-refusal ConnectError, not a connect
+    timeout, which keeps this scenario clear of the M-1 dual-timer race. The
+    refusal carries no Retry-After, so every retry waits 0 (OP-7). Attempts
+    are counted directly at the create() boundary (A §10 L387: count them,
+    never infer the retry count from elapsed-time lower bounds). NO_PROXY is
+    set because httpx2's environment probing falls back to the Windows
+    registry proxy, and a system proxy would answer the dead-port request
+    itself (e.g. 502) instead of letting the refusal surface.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()  # reserve-then-release: an ephemeral port nothing listens on
+
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")  # before the SDK client is built
+    adapter = MaasAdapter(f"http://127.0.0.1:{port}/v1", api_key="r2s4a-test-key")
+    original_create: Any = adapter._client.chat.completions.create
+    calls = 0
+
+    async def counting_create(**kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return await original_create(**kwargs)
+
+    monkeypatch.setattr(adapter._client.chat.completions, "create", counting_create)
+    try:
+        # timeout_s=30.0: the total deadline only has to stay unreachable —
+        # refusal latency is machine-dependent and the outcome must depend on
+        # the retry cap alone.
+        chunks = [chunk async for chunk in adapter.stream(make_request(timeout_s=30.0))]
+    finally:
+        await adapter.close()
+
+    validate_sequence(chunks, "req-1")
+    assert [chunk.type for chunk in chunks] == ["error"]
+    terminal = chunks[-1]
+    assert isinstance(terminal, ErrorChunk)
+    assert terminal.error.code == CoreErrorCode.PROVIDER_UNAVAILABLE
+    assert terminal.error.retryable is True
+    assert terminal.error.details == {"attempts": 3}  # 1 initial + 2 retries
+    assert calls == 3  # direct count: 1 initial + 2 retries, no elapsed inference
+
+
+async def test_5xx_error_surfaced_without_retry() -> None:
+    """③-3 (OP-8 final ruling §10 L383): 5xx -> one terminal ProviderUnavailable.
+
+    The provider's 500 surfaces as exactly one terminal error chunk marked
+    retryable=True (the upper layer may still retry) and the adapter never
+    auto-retries it (OP-8 conservative reading, ruling upheld).
+    """
+    async with fake_server([ScriptedResponse(status=500)]) as server:
+        chunks = await consume(make_adapter(server), make_request())
+
+    validate_sequence(chunks, "req-1")
+    assert [chunk.type for chunk in chunks] == ["error"]  # one terminal error chunk, no finish
+    terminal = chunks[-1]
+    assert isinstance(terminal, ErrorChunk)
+    assert terminal.error.code == CoreErrorCode.PROVIDER_UNAVAILABLE
+    assert terminal.error.retryable is True
+    assert len(server.requests) == 1  # surfaced, never auto-retried (OP-8)
