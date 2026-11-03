@@ -127,3 +127,29 @@ uv run ruff check .                # All checks passed
 uv run ruff format --check .       # 18 files already formatted
 uv run mypy src tools/r0 tests/r0  # Success: no issues in 7 source files
 ```
+
+## 11. R2-S3 正式化差异与证据延续（OP-4 追记节，2026-11-03）
+
+R2 重建 `src/opencode/ai/`（T-C1-015：provider.py Provider 协议 + maas.py adapter）时，按 OP-4 保守读法，上方 R0 原始证据**一字不改**；本节仅追记新 golden 行为差异与证据延续结果。
+
+### 11.1 证据延续（硬条款，§7 L94）
+
+- `tests/r0/` 重跑：**32 passed**（spike 及其测试零触碰——不搬移不修改）；
+- 7 个 fixture 经冻结 `tools/r0/dump_fixtures.py` 再生成（输出到仓库外临时目录，不覆盖冻结文件），与 `doc/evidence/r0/fixtures/` 逐字节比对：**7/7 MATCH（ALL-BYTES-MATCH）**——无环境漂移，R0 证据仍可复现。
+
+### 11.2 OP-4 差异清单（spike → 正式 adapter，新 golden 钉行为）
+
+1. **错误交付（§6-3 临时形态 → 正式承接）**：spike 终端错误以 `CoreError` 异常上抛；正式 adapter 以**终止 ErrorChunk** 交付（CORE-CONTRACTS §2.3 L98/L102），一次请求最多一个终止 chunk（finish 或 error，error 恒为末位），仅 `CancelledError` 以异常传播。场景 04 → `ProviderStreamInterrupted`，场景 06/07 → `ValidationError`（details.violation=`duplicate_finish`|`content_after_finish`）；错误码与 violation 值沿用 spike，message 措辞为新定（golden 内嵌记录）；已交付的部分 chunk 不重组、不重试。
+2. **类型实现（§6-4 兑现）**：dataclass → S1 pydantic contracts（`ProviderChunk` 8 型 union）。golden 以 `model_dump(mode="json")` 钉全字段面（`provider_metadata={}`、`cost_usd=null`、`Usage.cache_write=null` 等显式呈现）。
+3. **工具名可逆反解（§6-2"留给 R2"兑现）**：spike chunk `name` 携带 wire 名（`fs__read`）；正式 adapter chunk `name` 为反解后的点分名（`fs.read`，按首个 `__` 切分），wire 名仍 `namespace__name`；请求侧（assistant 回放）反向由点分名组装 wire 名。无 `__` 的名字原样透传（S5 注册面关注）。
+4. **新增防御路径**：tool call end 缺 id/name（分片流缺 start 帧等）在 spike dataclass 形状下不可表达；正式 adapter 产生 `ValidationError`（details.violation=`tool_call_without_id`|`tool_call_without_name`）error chunk。R0 fixture 无此场景——新 golden 新增断言。
+5. **请求消息组装**：spike `LLMMessage(role, text)` 简化 → S1 `content` parts 组装：system/user 仅拼接 text parts；tool 角色每个 tool_result part 发一条 OpenAI tool 消息；assistant 回放丢弃 reasoning parts（§6-6 无 wire 槽）；文件类 tool 内容以 `"[attachment not loaded]"` 占位（CORE-CONTRACTS §2.1 L72）。
+6. **重试语义（OP-7 终稿，§8 L350）**：仅 429+连接建立失败、且未产出内容，≤2 次；确定性等待 `min(retry_after, remaining)`（retry-after-ms 优先于秒数、无头按 0、无抖动）、受总 deadline 截断；部分流后不重试（重试点唯一）。
+7. **不变项确认**：`stream_options.include_usage` 透传、`cache_write` 无对应字段=null、usage 压末/finish 逻辑压流末、text part 合成 `text-0`、HTTP-date Retry-After 仍未实现（§6-5 维持）——与 §2/§6/§8.1 一致。
+
+新 golden 位置：`tests/contract/test_ai_adapter.py`（断言内嵌，未新增 `doc/evidence/` 文件；场景 01-07 成功侧序列一致，错误侧差异如第 1 条）。R0 fixture 文件零迁移零修改。
+
+### 11.3 §7 R2 承接清单前两项
+
+- **错误分片**：本切片落地（终止 ErrorChunk 交付，见 11.2-1）；
+- **重复 tool call ID**：adapter 单响应内按 call_index 聚合、不做跨响应 ID 查重——属 adapter/runner 边界，本切片不裁决，留给 R2 runner 切片承接（方案 §2 R2-S3）。

@@ -77,7 +77,7 @@ Phase 1 内置工具只产生 text；file 可编码往返，但未启用媒体�
 
 `GenerationRequest` 包含 `request_id`、`model: ModelRef`、`messages: list[LLMMessage]`、`tools: list[ToolSpec]`、`max_output_tokens`、`temperature?` 和 `timeout_s`。
 
-`LLMMessage.role` 为 system/user/assistant/tool；内容可为 text/reasoning/tool_call/tool_result。tool_result 必须携带配对的 tool_call_id，MAAS adapter 转成 OpenAI tool role。`ContextBuilder` 从历史 + 配置快照生成请求：不直接把 SessionMessage 或 openai.types 发给另一层。
+`LLMMessage.role` 为 system/user/assistant/tool；内容可为 text/reasoning/tool_call/tool_result。tool_call part 的 `name` 必须为点分 `namespace.name`（如 `fs.read`），由 MAAS adapter 与 wire 名 `namespace__name` 双向转换。tool_result 必须携带配对的 tool_call_id，MAAS adapter 转成 OpenAI tool role。`ContextBuilder` 从历史 + 配置快照生成请求：不直接把 SessionMessage 或 openai.types 发给另一层。
 
 运行时接口：
 `Provider.stream(request: GenerationRequest) -> AsyncIterator[ProviderChunk]`。
@@ -377,3 +377,11 @@ details/异常链做脱敏，不把认证头或原始 SDK request 暴露到 wire
 `[T-A-005] 2026-11-03`：OP-2 采纳 `0002` runs 读模型。§7 的 `run_status(run_id)` 需要保留历史 run 的归属和终态，sessions.active_run_id 单值不足；每次扫描 events 又无法直接使用 §3.2.1 要求保留的诊断读模型。TS `packages/core/src/session/projector.ts:481–535` 展示事件驱动的 message/idle 投影，Python 显式 run_id 的读模型按自身接口补充，不声称 TS 表结构同构。追加 revision 符合 `doc/PHASE1-SLIM.md:69–74`；§3.2 的同事务、回填及多 accepted 兼容约束承接 `doc/plans/r2-slices.md:25–33,73–84` 和 `doc/reviews/R1-S7-review.md:94–100`。B/调度器须将裁决并入 R2-S2/S7 方案与任务书，C 后续验证真实旧库升级、历史 run 查询、回滚和 rebuild 一致性。
 
 同次 OP-7 选 B：§8 原“带抖动”修订为 Phase 1 无 jitter 的确定性等待，保留 retry owner、次数、Retry-After 和总 deadline。jitter 用于打散并发调用者的重试时刻、减轻雷鸣群；TS `packages/core/src/model-retry.ts:22–35,62–103` 的通用 jittered schedule 由 buffered/one-shot 调用复用，兼顾服务端并发场景。Python 本阶段以本地单用户 CLI 和单 active run 为目标（`doc/PHASE1-SLIM.md:78–85`），通常串行发请求，尚无同步重试拥塞的证据，故保留 `doc/evidence/r0/provider.md:53–60`、`tools/r0/provider_spike.py:340–364` 已验证的有限确定性策略；R0 证明实际行为，不证明所有并发场景都不需要 jitter。单 writer 不保证跨 session 只有一个 provider 请求；若引入并发宿主/多进程，再评估并修订本条。§10 以本条记录显式契约变更；B/调度器须同步 S3 方案/任务书并安排确定性延迟、Retry-After/总 deadline 与两次重试上限验证，冻结的 R0 证据保留原文。
+
+`[T-A-006] 2026-11-03`：OP-4 终审维持 S3 落法并关闭：冻结 spike 的七个 fixture 再生成须逐字节相同，正式 adapter 对相同七场景采用新 golden，两者不要求 JSON 逐字节相同。证据延续结果见 `doc/evidence/r0/provider.md:94,137–150`；正式差异以 §11.2 七条为准，其中终止 ErrorChunk、Pydantic 全字段面（含空 metadata 与可选 null）、可反解工具名的 `fs__read → fs.read` 分别兑现本契约 §2.3 L98/L102、§1 和 R0 §6-2。TS `packages/core/src/aisdk.ts:784–812,841–856` 保留 provider toolName、以 Effect.fail 交付流错误，Python 按自己的请求/chunk 接缝正式化，不宣称 TS wire 或 spike JSON 同构；这符合 `doc/PHASE1-SLIM.md:78–83` 的 adapter→runner 全链验收。§8 L350 与 `doc/evidence/r0/provider.md:55–60,147` 的重试边界不因 golden 差异而放宽；B/调度器须据此把 r2-slices §4 OP-4 标为已裁决，保留冻结 R0 原文和 fixture。
+
+同次 OP-8 终审维持：5xx 交付一个 `ProviderUnavailable(retryable=True)` 终止 error chunk，adapter 不自动重试；retryable 是错误属性，不授权 runner 增设自动重试。依据为 §8 L350 的 429/连接建立失败集合、`doc/evidence/r0/provider.md:55–60,80,142,147` 及 `src/opencode/ai/maas.py:450–468`。TS `packages/core/src/model-retry.ts:80–103` 的 notRun 明列 503/529 等条件，Python 本阶段缺少真实端点支持该扩展的对照证据，保守收窄可避免重复请求，与 `doc/PHASE1-SLIM.md:82–83` 的中断不拼接和生成次数验证一致。B/调度器须将 r2-slices §4 OP-8 标为已裁决，并派发 ③-3 status=500 注入测试：恰一个末位 error、code=ProviderUnavailable、retryable=True、仅一次请求且无 finish；该补测是后续义务，本次裁决不声称已覆盖。
+
+同次 ④-3 选 A：§2.2 L80 明定 `LLMToolCallPart.name` 为 `namespace.name`，避免 S4 产出裸 `read` 或误传 wire 名使 namespace 丢失。依据为 `doc/reviews/R2-S3-review.md:117–121,129,133`、`doc/evidence/r0/provider.md:73,144`、`src/opencode/ai/maas.py:99–119,325–335`；TS `packages/core/src/aisdk.ts:784–812` 原样携带工具名，Python 的双向命名映射须在本地接缝明确。B/调度器须让 S4/S6 任务书引用 §2.2，S4 核对请求 part 的点分名及 `fs.read ↔ fs__read` 往返，S6 核对 chunk→计划→请求回放的一致性并承接跨响应重复 tool_call_id 查重（`doc/evidence/r0/provider.md:154–155`），满足 PHASE1-SLIM L80–83 的调用/结果配对；adapter 对不可反解 provider 名的原样保留、未知工具 not_started 失败语义和 S5 注册面已有的 `__`-free 约束不变。
+
+排期建议（非新增实现授权）：M-1 注释、M-2 连接建立失败补测和 OP-8/③-3 的 500 补测合为独立 adapter 微补丁，在当前 S4 窗口安排、S6 接入前验收，不留到 S8。M-1 仅记录 `asyncio.timeout(header_s)` 与 connect timeout 竞争及两路径皆合法失败的理由（`doc/reviews/R2-S3-review.md:19–28,130–132`）；M-2 用立即拒绝的未监听端口避开计时竞态，核对单个终止 error、ProviderUnavailable/retryable=True、attempts=3，并直接计数初次加两次重试，不以耗时下界推断零等待重试次数。两项补测同落 `tests/contract/test_ai_adapter.py`，M-1 注释落 maas.py；此处只记交接，冻结的实现、测试、方案及任务书由下游另行获授权后处理。
