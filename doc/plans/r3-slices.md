@@ -148,6 +148,7 @@
 | 21 | pyproject [project.scripts] entry | OP-5 残留 | OP-R3-7（调度器裁量） |
 | 22 | n-3 注入基建（绕过 committer 锁与 bus——复制场景须携注） | R2-S7c n-3（记档防扩散） | R3-S2/S8 测试纪律条款（沿用注入 idiom 必携注） |
 | 23 | evidence 行号重锚（§3.1 L187→L195 类） | R2-S8-closeout m-1 | 状态核对：若未随 r2-s9 合并修正→R3-S1 首项一行带入 |
+| 24 | upcaster 机制平台级缺位（`upcast` 全库 0 命中含 R1/R2；首个 py.* 事件族升 v2 前置条件：旧版本模型保留+确定性转换+旧 fixture 可读，§8 L356 最低门槛） | T-B-027 nit-1（B 处方） | **R3-S8 exit-evidence 检查项**（首个 v2 前必建，非阻塞） |
 
 ## 4. 关键设计差异备忘（Python vs TS，实现时勿"照抄"）
 
