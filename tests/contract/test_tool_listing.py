@@ -1,16 +1,18 @@
-"""R3-S3/R3-S4 contract tests: the fs family's specs and registration face.
+"""R3-S3/R3-S4/R3-S5 contract tests: spec and registration faces.
 
 The real ``FsLsAdapter``/``FsGlobAdapter``/``FsGrepAdapter`` (plus
-``FsReadAdapter`` as the R2 precedent and the R3-S4 mutation pair
-``FsWriteAdapter``/``FsEditAdapter``) are registered through the same
-public ``ToolRegistry.register`` face the host uses, pinned by one
-snapshot, and resolved back through their reversible wire names -- no
-filesystem and no ripgrep involved here (behavior is covered by
-``tests/integration/test_tool_static_trio.py`` and
-``tests/integration/test_tool_write_edit.py``). Contract anchors: plan
-§2 R3-S3/R3-S4, CORE-CONTRACTS §5.1 L251-253/L255 (wire names), §5.2
-L266 (root-internal allow; write/edit default to ``ask``), PHASE1-SLIM
-§4 L91 (acceptance A front half).
+``FsReadAdapter`` as the R2 precedent, the R3-S4 mutation pair
+``FsWriteAdapter``/``FsEditAdapter``, and the R3-S5 ``BashAdapter``)
+are registered through the same public ``ToolRegistry.register`` face
+the host uses, pinned by one snapshot, and resolved back through their
+reversible wire names -- no filesystem, no ripgrep and no shell
+involved here (behavior is covered by
+``tests/integration/test_tool_static_trio.py``,
+``tests/integration/test_tool_write_edit.py`` and
+``tests/integration/test_tool_bash.py``). Contract anchors: plan §2
+R3-S3/R3-S4/R3-S5, CORE-CONTRACTS §5.1 L251-253/L255 (wire names),
+§5.2 L266 (root-internal allow; bash/write/edit default to ``ask``),
+PHASE1-SLIM §4 L91 (acceptance A front half).
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ from opencode.contracts.events import EventDraft
 from opencode.session.service import IdFactory
 from opencode.tools import RegistrationError, ToolRegistry
 from opencode.tools.builtin import (
+    BASH_INPUT_SCHEMA,
+    BASH_SPEC,
     EDIT_INPUT_SCHEMA,
     EDIT_SPEC,
     GLOB_DEFAULT_LIMIT,
@@ -44,6 +48,7 @@ from opencode.tools.builtin import (
     READ_SPEC,
     WRITE_INPUT_SCHEMA,
     WRITE_SPEC,
+    BashAdapter,
     FsEditAdapter,
     FsGlobAdapter,
     FsGrepAdapter,
@@ -99,7 +104,7 @@ class _RecordingSink:
 
 
 def _registry() -> ToolRegistry:
-    """A registry with the host's default six-tool fs family, one pinned snapshot."""
+    """A registry with the host's default seven-tool family, one pinned snapshot."""
     registry = ToolRegistry(sink=cast("Any", _RecordingSink()), clock=_clock, ids=cast(IdFactory, _FixedIds()))
     for adapter in (
         FsReadAdapter(),
@@ -108,6 +113,7 @@ def _registry() -> ToolRegistry:
         FsGrepAdapter(),
         FsWriteAdapter(),
         FsEditAdapter(),
+        BashAdapter(),
     ):
         registry.register(adapter)
     registry.snapshot("ses_listing")
@@ -135,22 +141,31 @@ def test_trio_wire_names_partition_reversibly() -> None:
 
 
 def test_trio_quartet_registers_through_public_face_and_snapshots() -> None:
-    """The six builtins register through ``ToolRegistry.register`` (the face
+    """The seven builtins register through ``ToolRegistry.register`` (the face
     cli.py's tools tuple assembles) and one snapshot resolves every wire name."""
     registry = _registry()
     catalog = registry.snapshot("ses_listing")
 
-    # Sorted by (namespace, name): edit, glob, grep, ls, read, write -- all fs.
-    assert [spec.name for spec in catalog.specs] == ["edit", "glob", "grep", "ls", "read", "write"]
-    assert all(spec.namespace == "fs" for spec in catalog.specs)
+    # Sorted by (namespace, name): bash__run first (b < f), then the fs
+    # family (edit, glob, grep, ls, read, write) -- namespaces {bash, fs}.
+    assert [spec.name for spec in catalog.specs] == ["run", "edit", "glob", "grep", "ls", "read", "write"]
+    assert {spec.namespace for spec in catalog.specs} == {"bash", "fs"}
     for spec in (READ_SPEC, LS_SPEC, GLOB_SPEC, GREP_SPEC, WRITE_SPEC, EDIT_SPEC):
         assert catalog.resolve(f"fs__{spec.name}") is spec
+    assert catalog.resolve("bash__run") is BASH_SPEC
     assert catalog.resolve("fs__missing") is None
 
 
 def test_trio_registration_rejects_duplicate_wire_names() -> None:
     registry = _registry()
-    for adapter in (FsLsAdapter(), FsGlobAdapter(), FsGrepAdapter(), FsWriteAdapter(), FsEditAdapter()):
+    for adapter in (
+        FsLsAdapter(),
+        FsGlobAdapter(),
+        FsGrepAdapter(),
+        FsWriteAdapter(),
+        FsEditAdapter(),
+        BashAdapter(),
+    ):
         with pytest.raises(RegistrationError, match="already registered"):
             registry.register(adapter)
 
@@ -279,3 +294,63 @@ def test_mutation_pair_asks_by_default_in_the_permission_table(tmp_path: Path) -
             side_effects=True,
         )
         assert (decision.effect, decision.source) == ("ask", "default"), action
+
+
+# ---------------------------------------------------------------------------
+# R3-S5 bash: side-effect spec, TS-anchored schema, ask-by-default
+# ---------------------------------------------------------------------------
+
+
+def test_bash_spec_declares_side_effects_without_idempotency() -> None:
+    """``bash__run`` mutates the world by design, so it declares
+    ``side_effects`` (behind the §5.2 L266 ask default) and no idempotency
+    support (a retried command re-runs its effects)."""
+    assert BASH_SPEC.namespace == "bash"
+    assert BASH_SPEC.name == "run"
+    assert BASH_SPEC.version == 1
+    assert BASH_SPEC.side_effects is True
+    assert BASH_SPEC.idempotency_support is False
+    assert BASH_SPEC.supported_content_types == ["text"]
+    assert BASH_SPEC.description  # non-empty model-facing description
+
+
+def test_bash_input_schema_stays_in_the_validator_subset() -> None:
+    schema = BASH_INPUT_SCHEMA
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    allowed = {"type", "description", "properties", "required", "additionalProperties"}
+    assert set(schema) <= allowed
+    property_allowed = {"type", "description", "minimum", "maximum"}
+    for property_schema in cast("dict[str, Any]", schema["properties"]).values():
+        assert set(property_schema) <= property_allowed
+        assert property_schema["type"] in ("string", "integer", "boolean")
+
+
+def test_bash_input_schema_fields_match_the_ts_anchors() -> None:
+    """The TS shell input face: ``command`` required, a ``timeout`` in whole
+    seconds (TS milliseconds converted one-to-one), and ``cwd`` named per the
+    S2-frozen ``extract_resources`` command/cwd convention (not TS's
+    ``workdir`` keyword)."""
+    assert BASH_INPUT_SCHEMA["required"] == ["command"]
+    bash_properties = cast("dict[str, dict[str, Any]]", BASH_INPUT_SCHEMA["properties"])
+    assert set(bash_properties) == {"command", "cwd", "timeout"}
+    assert bash_properties["command"]["type"] == "string"
+    assert bash_properties["cwd"]["type"] == "string"
+    assert bash_properties["timeout"]["type"] == "integer"
+    assert bash_properties["timeout"]["minimum"] == 0
+
+
+def test_bash_asks_by_default_in_the_permission_table(tmp_path: Path) -> None:
+    """§5.2 L266: the frozen default table maps bash__run to ``ask`` -- every
+    shell call needs an approval or a saved always-decision, never the
+    default-allow read face."""
+    policy = PermissionPolicy(boot_id="boot_listing")
+    decision = policy.evaluate(
+        session_id="ses_000001",
+        action="bash__run",
+        resources=(str(tmp_path / "note.txt"),),
+        input_hash="a" * 64,
+        working_dir=str(tmp_path),
+        side_effects=True,
+    )
+    assert (decision.effect, decision.source) == ("ask", "default")

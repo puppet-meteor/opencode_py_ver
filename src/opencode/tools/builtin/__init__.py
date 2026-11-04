@@ -1,12 +1,24 @@
-"""Builtin tool adapters: the ``fs`` family.
+"""Builtin tool adapters: the ``fs`` family and the ``bash`` shell tool.
 
 ``fs__read`` (R2-S5), the R3-S3 static read trio ``fs__ls`` /
-``fs__glob`` / ``fs__grep``, and the R3-S4 mutation pair ``fs__write`` /
-``fs__edit``. Adapters are registered by the host (R2-S6) via
+``fs__glob`` / ``fs__grep``, the R3-S4 mutation pair ``fs__write`` /
+``fs__edit``, and the R3-S5 shell tool ``bash__run``. Adapters are
+registered by the host (R2-S6) via
 :meth:`opencode.tools.registry.ToolRegistry.register`; this package only
 provides the implementations.
 """
 
+from opencode.tools.builtin.bash import (
+    BASH_DEFAULT_TIMEOUT_S,
+    BASH_DESCRIPTION,
+    BASH_INPUT_SCHEMA,
+    BASH_MAX_OUTPUT_BYTES,
+    BASH_NAME,
+    BASH_NAMESPACE,
+    BASH_SPEC,
+    BASH_VERSION,
+    BashAdapter,
+)
 from opencode.tools.builtin.edit import (
     EDIT_DESCRIPTION,
     EDIT_INPUT_SCHEMA,
@@ -74,6 +86,14 @@ from opencode.tools.builtin.write import (
 )
 
 __all__ = [
+    "BASH_DEFAULT_TIMEOUT_S",
+    "BASH_DESCRIPTION",
+    "BASH_INPUT_SCHEMA",
+    "BASH_MAX_OUTPUT_BYTES",
+    "BASH_NAME",
+    "BASH_NAMESPACE",
+    "BASH_SPEC",
+    "BASH_VERSION",
     "EDIT_DESCRIPTION",
     "EDIT_INPUT_SCHEMA",
     "EDIT_MAX_SOURCE_BYTES",
@@ -121,6 +141,7 @@ __all__ = [
     "WRITE_NAMESPACE",
     "WRITE_SPEC",
     "WRITE_VERSION",
+    "BashAdapter",
     "FsEditAdapter",
     "FsGlobAdapter",
     "FsGrepAdapter",

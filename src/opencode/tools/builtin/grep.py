@@ -50,13 +50,12 @@ import json
 import os
 import shutil
 import subprocess
-import threading
-import time
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
+from opencode.process import run_command
 from opencode.tools.builtin.read import _clamp_line, _failure, _resolve_within_root
 
 if TYPE_CHECKING:
@@ -75,8 +74,6 @@ GREP_TIMEOUT_S = 30.0
 GREP_MAX_LIMIT = 1_000
 #: binary.ts L155 verify analog: how long the ``rg --version`` probe may take.
 RG_VERSION_TIMEOUT_S = 5.0
-#: Kill/reap grace for the rg subprocess.
-_RG_WAIT_S = 5.0
 #: Single-file binary pre-check window (fs__read binary-face precedent).
 _BINARY_SNIFF_BYTES = 8_192
 
@@ -238,52 +235,29 @@ def _run_rg(
 ) -> tuple[list[tuple[str, int, str]], bool, int, str]:
     """Run rg and collect at most ``limit + 1`` matches (grep.ts L119 semantics).
 
-    stderr is drained on a helper thread so a chatty rg cannot dead-lock
-    the stdout read; the process is killed and reaped when the limit is
-    exceeded or the deadline passes.
+    R3-S5 consolidation (plan §3 item 25): the subprocess runs through the
+    unified controlled runner (:mod:`opencode.process.runner`), so the
+    deadline is a strong monotonic-clock timeout that fires even when rg
+    produces no output at all -- the previous read-loop deadline was only
+    checked when a stdout line arrived, so a silently hung rg would park
+    the serial Invoker forever. The limit+1 early stop is a per-line
+    callback, and the process (tree) is killed and reaped on every exit
+    path (Windows Job Object / Unix process group). Matches are collected
+    per line in the callback, so the runner's 64 KiB buffered-stdout cap
+    does not affect them (quantified delta, progress file); an early stop
+    kills rg, hence a nonzero exit code there is expected.
     """
-    process = subprocess.Popen(
-        args,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    stderr_lines: list[str] = []
-
-    def _drain() -> None:
-        if process.stderr is not None:
-            for err_line in process.stderr:
-                stderr_lines.append(err_line)
-
-    drain = threading.Thread(target=_drain, daemon=True)
-    drain.start()
-
     matches: list[tuple[str, int, str]] = []
-    truncated = False
-    timed_out = False
-    deadline = time.monotonic() + timeout_s
-    if process.stdout is not None:
-        for out_line in process.stdout:
-            if time.monotonic() > deadline:
-                timed_out = True
-                break
-            match = _parse_match(out_line)
-            if match is not None:
-                matches.append(match)
-                if len(matches) > limit:
-                    truncated = True
-                    break
-    if timed_out or truncated:
-        process.kill()
-    try:
-        returncode = process.wait(timeout=_RG_WAIT_S)
-    except subprocess.TimeoutExpired:
-        returncode = process.returncode if process.returncode is not None else -1
-    drain.join(timeout=_RG_WAIT_S)
-    return matches, timed_out, returncode, "".join(stderr_lines)
+
+    def _collect(line: str) -> bool:
+        match = _parse_match(line)
+        if match is not None:
+            matches.append(match)
+        return len(matches) > limit
+
+    result = run_command(args, cwd=cwd, timeout_s=timeout_s, on_stdout_line=_collect)
+    returncode = result.returncode if result.returncode is not None else -1
+    return matches, result.timed_out, returncode, result.stderr
 
 
 def _render(matches: list[tuple[str, int, str]], truncated: bool) -> str:
