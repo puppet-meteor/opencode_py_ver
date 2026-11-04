@@ -151,6 +151,8 @@
 | 24 | upcaster 机制平台级缺位（`upcast` 全库 0 命中含 R1/R2；首个 py.* 事件族升 v2 前置条件：旧版本模型保留+确定性转换+旧 fixture 可读，§8 L356 最低门槛） | T-B-027 nit-1（B 处方） | **R3-S8 exit-evidence 检查项**（首个 v2 前必建，非阻塞） |
 | 25 | rg 读循环超时收编（m-1：`_run_rg` 30s deadline 仅 stdout 行到达时检查——rg 零输出挂起→工具调用无限挂起→串行 invoker 整 run 挂起；TS 为整进程超时，同名常量弱执行面。R3-S5 受控子进程环境统一超时/收树机制落地时收编，一处 `_run_rg` 改动） | T-B-029 m-1（B 处方） | **R3-S5 任务书条款**（明列"rg 读循环超时收编"） |
 | 26 | nit-2 `test_grep_real_path_absence` 直接 `_RG_CACHE.clear()` 无恢复（全局态测试卫生）；nit-1 截断分支"确定性"措辞仅覆盖已收集子集内次序（成员身份依赖枚举序） | T-B-029 nit-2/nit-1 | nit-2=后续触达该测试文件切片顺手改 monkeypatch.setattr 整体替换（非必须）；nit-1=S8 evidence 书写注意项（零代码） |
+| 27 | m-1 close-timeout 硬取消掉队者可孤儿化 PENDING 权限（§2.1 L53 角落——close 硬取消绕过审批协调器正常 closed 配对面，且无恢复扫描兜底）；closed_outcome "restart" 词表零生产者=崩溃恢复面前瞻（非死词表） | T-B-028 m-1（B 处方） | **恢复切片任务书两条款**：①孤儿 pending 清理；②closed 门对账或受认定角落声明（裁定：非 R3-S2 缺陷，S2 零代码） |
+| 28 | nit-1 默认表未知动作回落 declared side_effects 无契约锚+bash/MCP 动作无默认表键（开放点）；nit-2 reason 常量双份（tools/policy.py 与 session/service.py 本地复制）无 drift pin；nit-3 revoke check-then-act assert 窗口（当前不可达——唯一 saved 生产者写 expires_at=None） | T-B-028 nit-1/2/3 | nit-1=S6 补表键或受认定契约注记（开放点闭合载体）；nit-2=S4/S5 触达该面时顺手加 drift pin（非必须）；nit-3=到期决定落地（expires_at 非 None 生产者出现）时回收 assert |
 
 ## 4. 关键设计差异备忘（Python vs TS，实现时勿"照抄"）
 
