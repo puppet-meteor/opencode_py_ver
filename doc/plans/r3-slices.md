@@ -3,7 +3,7 @@
 > 修订：[T-B-026] 2026-11-04 首版产出（R2 收官 main **#99 `c87f317`** 后）；硬性输入①-⑧（T-B-026 任务书）逐条对照见 §7 自检清单。
 > 席位B（T-B-026）产出，供 C 席按序实现。状态：**S1 起待派**（R2 全交付态+checkpoint 链见 doc/plans/r2-slices.md 头部）。
 > 依据：doc/PHASE1-SLIM.md §4（L87-96 R3 全量）、doc/CORE-CONTRACTS.md（§2.1 L35、§3.1 L140/L183、§3.2 L160/L185、§3.2.1 L195-204、§5.1 L257-261、§5.2 L266/L268、§5.3 L272-276、§7 L173/L316/L335/L337、§8 L348/L358、§9 L368、§10 L404/L414/L424）、doc/plans/r2-slices.md（头部+§0.1 衔接+L113 read 先例+L181 OP-9）、doc/reference/r2-exit-evidence.md（R2 收官基线）、doc/reviews/ R2 全部评审（R2-S2/S4/S5/S6/S7/S7-closeout/S7c/S8/S8-closeout 增项源）、doc/reestimate-r0.md L49/L62、doc/orchestration/progress/*（③未决源）。
-> TS 基准：`D:/26_code/opencode_py_ver/opencode-2.2.2/`（指纹 doc/source-baseline.json 现锁 20 文件，含 tool-runtime/read/cli/schema 链）。**R3 新引用 11 文件须先补指纹**（调度器派发 C 席前执行——r2-slices 前置项模式）：`packages/core/src/tool/plugin/{write,edit,glob,grep,shell}.ts`、`packages/core/src/permission/{saved,sql}.ts`、`packages/core/src/shell/{select,scan,result}.ts`、`packages/core/src/ripgrep/binary.ts`、`packages/core/src/config/discovery.ts`。
+> TS 基准：`D:/26_code/opencode_py_ver/opencode-2.2.2/`（指纹 doc/source-baseline.json 现锁 **51 文件**=20 R1+19 R2+12 R3 前置补录，含 tool-runtime/read/cli/schema 链）。**R3 新引用 12 文件指纹已随检查点#102 补录完成**（调度器亲算 SHA256 逐文件录入，r2-slices 前置项模式；对 B 原 11 文件清单的核对修正：+`tool/plugin/file-diff.ts`（§2.4 已引用而清单漏列）、−`config/discovery.ts`（R1 既有指纹））：`packages/core/src/tool/plugin/{write,edit,glob,grep,shell,file-diff}.ts`、`packages/core/src/permission/{saved,sql}.ts`、`packages/core/src/shell/{select,scan,result}.ts`、`packages/core/src/ripgrep/binary.ts`。
 > 拆分基准：按现行文档拆；A 席若修订 R3 定义，由调度器对齐后本文件再改版。
 
 ## 0. R3 范围锚定（摘自 PHASE1-SLIM §4 L87-96）
@@ -38,7 +38,7 @@
 | R3-S7 | CLI 审批面+R3 增项收口（P-1 真 SIGINT 双子场景必做等） | cli | S2+S6 | 60-75min |
 | R3-S8 | 全链 e2e+R3 退出证据收口（r3-exit-evidence.md） | tests+doc | S1-S7 | 60-75min |
 
-**依赖序**：S1→S2→{S3→S4、S5}→S6→S7→S8。S3 仅依赖 S1（事件/投影+registry 面；ls/glob/grep 走根内 allow 不依赖审批协议），**可与 S2 并行派发**；S4/S5 依赖 S2（审批挂点）；S6 可在 S5 后提前启动；S7 依赖 S2（审批 CLI 面）与 S6（参数面替换）；S8 收口全量。TS 指纹补录（11 文件）在 S1 派发前一次性完成。
+**依赖序**：S1→S2→{S3→S4、S5}→S6→S7→S8。S3 仅依赖 S1（事件/投影+registry 面；ls/glob/grep 走根内 allow 不依赖审批协议），**可与 S2 并行派发**；S4/S5 依赖 S2（审批挂点）；S6 可在 S5 后提前启动；S7 依赖 S2（审批 CLI 面）与 S6（参数面替换）；S8 收口全量。TS 指纹补录（12 文件）已随检查点#102 一次性完成（调度器核对 B 清单：+file-diff.ts、−discovery.ts 系 R1 既有）。
 
 ## 2. 每切片详情
 
@@ -47,7 +47,7 @@
 - **目标**：`contracts/events.py` 注册 py.permission.* 家族（durable、封闭 wire：versioned_type+canonical_json+显式 upcaster，§8 L358；旧读者遇新版明确失败）；`session/state.py` fold 扩展权限态（§2.1 L35 工具状态机补面：pending→denied（审批拒）/cancelled（审批过期/重启），pending 直接终态必 `effect_status=not_started`，终态只有一次）；`session/projector.py` 写 permissions 表（激活 0001 L32-38；投影字段=§3.1 L183 input_hash/作用域/有效期/终态）；**注册表单源化（R2-S2 n-1 必做）**：`projector._REPLAY_REGISTRY = default_event_registry()` import 期冻结改为注入/惰性取（与 store 同源），防应用侧注册的 durable 型"txn 插入侧通过、projector 重放侧报 stored_event_decode_failed"双注册表漂移——R3 正是触发点。
 - **涉及接缝**：contracts/events.py、session/state.py、session/projector.py、storage/txn.py（L160 commit 序不动，仅注册表同源）、storage/migrations（仅当 0001 permissions 列集不足时新增 0003 追加 revision——§3.2 L185"只追加"纪律，不改写 0001/0002）。
 - **新增文件**：`tests/contract/test_permission_events.py`（+JSON fixtures 正反例）、`tests/integration/test_permission_projector.py`。
-- **TS 基准映射**：`packages/schema/src/session-event.ts`（Permission* 事件型，L39-57 Created 邻域参照；已锁指纹）、`packages/core/src/permission/sql.ts`+`saved.ts`（140L：Info/AddInput/UpdateInput/ConflictError/isUniqueViolation——保存决定字段面参照；**须补指纹**）。
+- **TS 基准映射**：`packages/schema/src/session-event.ts`（Permission* 事件型，L39-57 Created 邻域参照；已锁指纹）、`packages/core/src/permission/sql.ts`+`saved.ts`（140L：Info/AddInput/UpdateInput/ConflictError/isUniqueViolation——保存决定字段面参照；**已录指纹（#102）**）。
 - **验收标准**：py.permission.* 注册+versioned_type 齐；投影四字段（input_hash/作用域/有效期/终态）落列；坏形 fail-closed（沿 §3.2.1 StorageCorrupt 分类，不塞半行）；重放=日志确定性函数（连续 rebuild 全等）；诊断 session 拒绝权限写入（§3.2.1 L195-204 只读纪律）。
 - **测试计划**：契约 fixture 往返+未知版本/坏形拒绝；投影/重放等价（含冷暖重放）；denied/cancelled 终态一次性；0003 迁移旧库升级+新库建库双路（若触发 OP-R3-8）。
 - **开放点（保守读法）**：OP-R3-8（permissions 表列集对齐——保守=优先复用 0001，不足才 0003 追加）；事件家族型名全集以 §3.1 L140 表为准不预写。
@@ -57,7 +57,7 @@
 - **目标**：`tools/policy.py`（或 policy 包）——allow/deny/ask 评估（§5.2 L266：根内 read/glob/grep/ls allow 先例延续；write/edit/bash 档位见 OP-R3-5）；saved 决定：once=单 permission_id+input_hash、always=当前进程本 session 的可展示具体 action/resource 规则、**禁止无范围通配**，shell 规则绑定完整 command/cwd（§5.2 L268）；**saved 经同一事件路径写入 permissions 投影，不新增独立 JSON 权限文件（L96 硬约束）**；审批协议：requested→（replied|closed|expired），默认 300 秒（L268）；策略直接 deny 不伪造宿主回复、实际 reject 才写 py.permission.replied（L268）；未连接审批→py.permission.closed（cancelled+ApprovalUnavailable）（L268）；**独立控制通道** `reply_permission(permission_id, reply) -> DecisionReceipt`（§7 L316：与运行锁分离，避免等待审批时死锁）；**条件更新竞争**（§7 L173：回复/过期/关闭只允许首个提交的合法迁移，迟到回复 ApprovalExpired/Conflict；不在等待审批时持提交锁）；**OP-9 激活**：close()/cancel 的 pending approval 分支（§7 L337 py.permission.closed；r2-slices L181 保守读法"分支代码面留位 R3 接入"兑现）；invoke 挂点接线（§5.1 L259：校验成功→policy/审批→started 提交确认；L261：输入在校验/审批后不可变）。
 - **涉及接缝**：tools/policy.py（新）、tools/invoker.py（policy 挂点，串行不变量不动）、session/service.py（reply_permission+到期任务+close 分支激活）。
 - **新增文件**：`tests/contract/test_policy.py`（表驱动）、`tests/integration/test_approval.py`。
-- **TS 基准映射**：`packages/core/src/permission/saved.ts`（once/always/ConflictError 语义；**须补指纹**）；审批 UI 面 TS modal/session-ui **不沿用**（差异表 4）。
+- **TS 基准映射**：`packages/core/src/permission/saved.ts`（once/always/ConflictError 语义；**已录指纹（#102）**）；审批 UI 面 TS modal/session-ui **不沿用**（差异表 4）。
 - **验收标准**：验收 B（L92）逐句——allow/deny/ask；once/always/reject+到期；独立通道不被 active run 锁死；无人审批拒绝执行；审批与 cancel/expiry 条件更新竞争、首个合法提交者胜出；迟到回复 ApprovalExpired/Conflict。
 - **测试计划**：表驱动 policy（决策矩阵）；审批/取消/到期竞态两分支（注入提交顺序，沿 S7 `_CancelAfterStepFinishedCommitter` 同款 store 正常提交注入——**n-3 记档约束：注入基建绕过 committer 锁与 bus，复制场景须携注**）；迟到回复双错误码；审批中 run 并发可响应（锁分离阳控）；pending→denied/cancelled/not_started 状态面。
 - **开放点**：OP-R3-3（CLI 审批 UX 形态）、OP-R3-5（write/edit 默认档位）。
@@ -67,7 +67,7 @@
 - **目标**：`tools/builtin/ls.py`/`glob.py`/`grep.py`（fs 命名空间沿 read 先例）；数量限制+truncated 显式标记（验收 A；TS glob/grep EncodedOutput+toModelContent(…, truncated) 先例）；**rg 外部依赖+启动可用性检查**（验收 A：明确 rg 为外部依赖并检查可用性——启动检查+明确诊断，不静默降级；TS `ripgrep/binary.ts` verify(bytes, filename, expected) 发现+校验先例）；路径越界/超大/二进制诊断（验收 A；read 先例复用：traversal/symlink·junction realpath 检查、大小上限、二进制/invalid UTF-8 诊断——量化偏差 float-reported 声明同 §5.3 模式）；根内 allow 无审批（§5.2 L266）。
 - **涉及接缝**：tools/builtin/（新三件）、tools/registry.py（注册，串行不变量）。
 - **新增文件**：`tools/builtin/ls.py`、`glob.py`、`grep.py`、`tests/contract/test_tool_listing.py`（或并入 test_tools.py 扩容）、`tests/integration/test_tool_static_trio.py`（真实临时 workspace）。
-- **TS 基准映射**：`tool/plugin/glob.ts`（139L：EncodedOutput/truncated）、`tool/plugin/grep.ts`（170L：同款）、`ripgrep/binary.ts`（166L：rg 发现校验）——**均须补指纹**；**ls 无 TS 对应物**（TS glob 覆盖列目录语义；Python 按验收 A 明列 ls——差异表 2）。
+- **TS 基准映射**：`tool/plugin/glob.ts`（139L：EncodedOutput/truncated）、`tool/plugin/grep.ts`（170L：同款）、`ripgrep/binary.ts`（166L：rg 发现校验）——**均已录指纹（#102）**；**ls 无 TS 对应物**（TS glob 覆盖列目录语义；Python 按验收 A 明列 ls——差异表 2）。
 - **验收标准**：验收 A 前半逐句（数量限制/越界/超大/二进制诊断/rg 依赖检查）。
 - **测试计划**：每工具真实临时 workspace（L94）；截断+标记断言；rg 缺失/不可用诊断面；越界 symlink/junction 逃逸面（read 同款）；Windows/Linux 路径面（L94）。
 - **开放点**：OP-R3-1（rg 引入方式：PATH 发现 vs vendored vs pyproject 依赖——pyproject/uv.lock 写权归调度器；保守=PATH 发现+明确诊断）。
@@ -77,7 +77,7 @@
 - **目标**：`tools/builtin/write.py`/`edit.py`；**精确冲突检测**（验收 A：edit 多处匹配/零匹配/边缘锚定诊断——TS edit.ts findOccurrences/findLineOccurrences/matchView 332L 先例）；**原子替换**（验收 A：同目录临时文件+原子 rename，失败不半写、不留中间态）；根边界（声明 roots 内，含 symlink/junction realpath 防逃逸——read 先例）；policy 挂点（审批档位 OP-R3-5）；量化偏差 float-reported（文件大小上限/输出限额，§5.3 同模式声明）。
 - **涉及接缝**：tools/builtin/（新两件）、policy（S2 挂点）。
 - **新增文件**：`tools/builtin/write.py`、`edit.py`、`tests/integration/test_tool_write_edit.py`。
-- **TS 基准映射**：`tool/plugin/write.ts`（101L）、`tool/plugin/edit.ts`（332L：normalizeForMatch/findOccurrences/matchView/countBefore 冲突检测核心）、`tool/plugin/file-diff.ts`（邻接参照）——**均须补指纹**。
+- **TS 基准映射**：`tool/plugin/write.ts`（101L）、`tool/plugin/edit.ts`（332L：normalizeForMatch/findOccurrences/matchView/countBefore 冲突检测核心）、`tool/plugin/file-diff.ts`（邻接参照）——**均已录指纹（#102）**。
 - **验收标准**：验收 A 首句（write/edit 精确冲突检测、原子替换）。
 - **测试计划**：冲突检测全分支（unique/non-unique/missing/行尾与编码边角）；原子性（写入中断注入→无半写）；真实 workspace 往返（write→read 校验逐字）；越界写拒绝。
 - **开放点**：OP-R3-5（默认审批档位——保守=ask）。
@@ -87,7 +87,7 @@
 - **目标**：`tools/builtin/bash.py`+受控子进程环境；**shell 显式选择解释器**（§5.3 L276：Unix bash/Windows PowerShell，启动时检查可用性，不依赖 create_subprocess_shell 平台默认——TS shell/select.ts resolve/list/gitbash 先例）；**超时/取消收回进程树**（验收 C：进程组/Job Object 机制见 OP-R3-9；取消传播沿 §7 L335 语义，已开始命令如实保存已确定结果）；**输出限额不导致管道死锁**（验收 C：持续排空+限额截断+显式标记，读端不可阻塞卡死）；**deny 清单=辅助提示非沙箱**（L96 硬约束：TS shell/scan.ts 2409L 完整词法扫描器**不移植**——Python 保守=最小 deny 正则集+文档化"仅辅助提示"，危险命令正则不能证明安全 §5.3 L276 末句）；完整 command/cwd 审批绑定（§5.2 L268）；超时默认值参照 TS shell.ts DEFAULT_TIMEOUT_MS。
 - **涉及接缝**：tools/builtin/、子进程环境（新模块）、policy（ask 默认）。
 - **新增文件**：`tools/builtin/bash.py`（或 shell.py，命名沿 wire 名纪律——fs 命名空间外新命名空间由 C 席对契约落定）、`src/opencode/process/`（受控子进程环境）、`tests/integration/test_tool_bash.py`。
-- **TS 基准映射**：`tool/plugin/shell.ts`（293L：DEFAULT_TIMEOUT_MS/resultMessages/toolResult）、`shell/select.ts`（227L：解释器显式选择）、`shell/scan.ts`（2409L：仅参照**不移植**）、`shell/result.ts`——**均须补指纹**；TS persistent-pty/pty 常驻面**不沿用**（差异表 6）。
+- **TS 基准映射**：`tool/plugin/shell.ts`（293L：DEFAULT_TIMEOUT_MS/resultMessages/toolResult）、`shell/select.ts`（227L：解释器显式选择）、`shell/scan.ts`（2409L：仅参照**不移植**）、`shell/result.ts`——**均已录指纹（#102）**；TS persistent-pty/pty 常驻面**不沿用**（差异表 6）。
 - **验收标准**：验收 C 首句逐句（超时/取消收树、输出限额无死锁）+L96 deny 约束。
 - **测试计划**：超时→树回收断言；取消→树回收+not_started/unknown 效果语义（§2.1 L35）；输出洪水→限额+无死锁（**带超时的测试级断言**）；deny 提示触发+不阻断语义；Windows/Linux 双平台子进程（L94+A-PLATFORM）。
 - **开放点**：OP-R3-9（Windows 进程树回收选型：Job Object vs taskkill /T——A-PLATFORM 要求双平台证据）、OP-R3-2（deny 清单内容——保守=最小集+文档化）。
@@ -97,7 +97,7 @@
 - **目标**：config 模块；**config 声明 roots**（read.py 模块 docstring 硬输入："R2 唯一允许 root=working_dir；R3 增加 config 声明 roots"——多根归置进 §5.2 根解析，read/ls/glob/grep/write/edit 全工具共用根边界面）；**项目配置不能扩宿主 roots/凭据/MCP 信任**（验收 C：拒绝面显式+测试钉死）；**重启后按原快照恢复**（验收 C：ConfigSnapshot canonical hash 漂移检测复用 R1 机制——CORE-CONTRACTS L300 Python 侧论证：摘要仅覆盖非秘密配置、固定序列化字节可重启重算检测漂移）；ConfigSnapshot v1 语义**不可静默改**（§9 L368；新增配置字段→版本升级+upcaster §8 L358）；CLI 参数面→ConfigLoader 注入（cli.py docstring 声明的 R3 注入点，替换 `--model`/`--context-limit` 直构路径）；**surrogate 前置扫描一行**（T-C1-002-review ② B 意见已采纳带入：ConfigLoader 引入字符串快照字段时的 surrogate 前置扫描）；system_prompt 单点替换（R2-S4 ④-1 注记：RuntimeSettings 构造器一字段+一分派行）；session 复用/配置层议题落位（T-C1-023 R-3 归 R3 议题——本切片承接）。
 - **涉及接缝**：`src/opencode/config/`（新）、cli.py（注入面替换，stdlib-only 纪律延续）、session/context.py（RuntimeSettings system_prompt 单点）。
 - **新增文件**：`src/opencode/config/loader.py`（形态见 OP-R3-10）、`tests/contract/test_config.py`、`tests/integration/test_config_loader.py`。
-- **TS 基准映射**：`packages/core/src/config/discovery.ts`（145L：Sources/discover L15-25/59-145 多来源发现——**Python 不做多来源信任合并**，差异表 7；**须补指纹**）、config/normalize.ts/variable.ts（参照）。
+- **TS 基准映射**：`packages/core/src/config/discovery.ts`（145L：Sources/discover L15-25/59-145 多来源发现——**Python 不做多来源信任合并**，差异表 7；**已录指纹（R1 既有）**）、config/normalize.ts/variable.ts（参照）。
 - **验收标准**：验收 C 后半逐句（不扩信任；重启按快照恢复）。
 - **测试计划**：快照往返+重启恢复一致性；项目配置扩信任面拒绝（roots/凭据/MCP 三面）；config roots 边界（根内 allow/越界诊断）；快照漂移检测；CLI 注入面替换后 R2 既有 CLI 测试零回归。
 - **开放点**：OP-R3-10（config 文件形态与位置——保守=最小单文件，不做 TS discovery 多来源）。
@@ -198,7 +198,7 @@
 | ④ 六工具面+受控子进程 | S3（ls/glob/grep+rg 依赖+数量/诊断）/S4（write/edit 冲突+原子）/S5（bash 树回收+管道死锁+deny）；read 先例内联 | ✓ |
 | ⑤ Policy/审批/保存决定 | S2 全量（allow/deny/ask、once/always/reject、到期、独立通道、竞态、ApprovalExpired/Conflict、py.permission.* 注册+投影） | ✓ |
 | ⑥ ConfigLoader/快照 | S6 全量（声明 roots、不扩信任、快照恢复、v1 语义、CLI 注入点、surrogate 行、read docstring 硬输入） | ✓ |
-| ⑦ TS 基准清单+行号锚 | 各切片 TS 映射（discovery L15-25/59-145、runtime L287-292 已锁）+头部**指纹待补 11 文件清单** | ✓ |
+| ⑦ TS 基准清单+行号锚 | 各切片 TS 映射（discovery L15-25/59-145、runtime L287-292 已锁）+头部指纹清单（**12 文件已随 #102 补录**，discovery 系 R1 既有） | ✓ |
 | ⑧ 门禁基线与配方 | 头部基线（#99：651/66/双 ruff）+§8 模板（python -m 形式+per-tree PYTEST_DEBUG_TEMPROOT） | ✓ |
 
 ## 8. 每切片任务书模板（供调度器直接取用派发 C 席；对齐 T-C1-024 风格）
@@ -211,7 +211,7 @@
 - 写权限（本任务显式授权，仅此）：<文件清单——逐文件列出，含"新增"/"修改"与红线声明（src 冻结面/契约文档/pyproject/uv.lock/CI/source-baseline.json/ORCHESTRATION 零触碰）>。**其余一切冻结**；e2e/测试若暴露 src 缺陷→停下浮报不修，修复归调度器另行授权；fixture 只读复用（跨模块导入或同形态新建，不改既有文件）。
 - 门禁（worktree 内自跑，python -m 形式）：先导出专属 temproot（已预建）：`$env:PYTEST_DEBUG_TEMPROOT=$env:TEMP+'/opencode/pytest-tmp/r3-sX'`；四件：`uv run python -m pytest -q`（基线 651+N 零回归+新增如实计数——逐测落点入进度文件）；`uv run ruff check .`；`uv run ruff format --check .`（计数非验收标准，退出码 0 即过）；`uv run python -m mypy src tools/r0 tests/r0 tests/contract tests/integration`（基线 66 files+N 零问题）。
 - 止损：NNmin，到线即停——已完成部分+剩余清单写进度文件，回报"部分完成"；超时如实记录不粉饰。防截断：进度文件增量写入；最终回报 1-2 段。
-- TS 锚纪律：本切片引用 TS 文件须已在 source-baseline.json 指纹内（R3-S1 派发前 11 文件补录完成）；不宣称与 TS 同构；差异按 r3-slices §4 备忘保守读法。
+- TS 锚纪律：本切片引用 TS 文件须已在 source-baseline.json 指纹内（**12 文件已随检查点#102 补录完成**——discovery.ts 系 R1 既有）；不宣称与 TS 同构；差异按 r3-slices §4 备忘保守读法。
 - 开放点纪律：r3-slices §6 所列 OP-* **不预写裁决**——实现触及时按保守读法落地+进度④浮报，越出即停下待裁。
 
 【任务】<逐项：spec 引用（r3-slices §2.X 目标/验收句原文）+最低落测结构+每测落点要求（测名↔验收句映射入进度文件）>

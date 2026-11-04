@@ -37,5 +37,17 @@
   {"path":"packages/cli/src/index.ts","sha256":"ece29308f549e5ae3413fa9efa9588957d1ffa3ca4229126de0d8ae342bf20fe"},
   {"path":"packages/cli/src/run/run.ts","sha256":"f260ba54dc9f82d6add02544125159c1a7fef72ebb110614b191fc1b202d0b6e"},
   {"path":"packages/cli/src/run/noninteractive.ts","sha256":"ef7e3d65250a4246eb60ae065b677e284ef1f39ec41f84182a01eb9294c407c7"},
-  {"path":"packages/cli/src/ui/prompt.ts","sha256":"1726556f7f6f2577e7fd2c61786e2f37f1da641e73548b5474269606c92d1694"}
+  {"path":"packages/cli/src/ui/prompt.ts","sha256":"1726556f7f6f2577e7fd2c61786e2f37f1da641e73548b5474269606c92d1694"},
+  {"path":"packages/core/src/tool/plugin/write.ts","sha256":"c554c1863a90a97cc63954f5c45320ab54b4a0db588df22946a361b26b7ff0d9"},
+  {"path":"packages/core/src/tool/plugin/edit.ts","sha256":"a88385f5018613eff64de6824a41bad46bc41e641d8ce835efc8fdc59306ed58"},
+  {"path":"packages/core/src/tool/plugin/glob.ts","sha256":"1282e72cdcb5e8e1b528292a5d80643796c94ff90b3dc92bd938d657395b4ef7"},
+  {"path":"packages/core/src/tool/plugin/grep.ts","sha256":"2a8971ff65f03d46a252645e1fbc439dd91267afa2b517fff9f1a83976eec860"},
+  {"path":"packages/core/src/tool/plugin/shell.ts","sha256":"28ad33be27be2a64f649058bb30b8cb49deff309e49c1f320d3e8763d241e718"},
+  {"path":"packages/core/src/tool/plugin/file-diff.ts","sha256":"da711b1bae9ec75f251d4d9531e51ce6a4d61066bc9dc75782d1d23da3c980fd"},
+  {"path":"packages/core/src/permission/saved.ts","sha256":"848367e039e6eec2eab1d12019d28b7978554862ff981ac4d2eb82e096680958"},
+  {"path":"packages/core/src/permission/sql.ts","sha256":"3199a8f2cec3cab82d37b480783cb27eb03cb0ab715b9ebd4975c85a6bcf11d9"},
+  {"path":"packages/core/src/shell/select.ts","sha256":"03427b391487a26cba5ca115bd294ebcbfecfdc98d03f5b9ea66ede151bda822"},
+  {"path":"packages/core/src/shell/scan.ts","sha256":"625317f6388019dbfd27a44db14033d69e09516323d9f9cc0aaf125b82efdcd1"},
+  {"path":"packages/core/src/shell/result.ts","sha256":"3020a8a9bb7a3c8a3b05cfcc8a8c9f0d6de6ce67a6cc5919e231c0859f4cf16c"},
+  {"path":"packages/core/src/ripgrep/binary.ts","sha256":"cb0866ec835b78eb18eb783198b1959a82469fbd7bfd1f21793d743310831755"}
 ]
