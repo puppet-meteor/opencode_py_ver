@@ -56,6 +56,7 @@ from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import RunStatus, RunStatusValue, SessionService
 from opencode.storage import LifecycleCleanupFailedError
 from opencode.tools.builtin import (
+    BashAdapter,
     FsEditAdapter,
     FsGlobAdapter,
     FsGrepAdapter,
@@ -283,7 +284,15 @@ async def _drive(
     app = App(
         db_path,
         provider=provider,
-        tools=(FsReadAdapter(), FsLsAdapter(), FsGlobAdapter(), FsGrepAdapter(), FsWriteAdapter(), FsEditAdapter()),
+        tools=(
+            FsReadAdapter(),
+            FsLsAdapter(),
+            FsGlobAdapter(),
+            FsGrepAdapter(),
+            FsWriteAdapter(),
+            FsEditAdapter(),
+            BashAdapter(),
+        ),
         settings=settings,
         max_steps=max_steps,
     )
