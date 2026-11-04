@@ -814,8 +814,11 @@ class TestR2Registration:
             default_event_registry().resolve_durable(PY_RUN_STARTED, 2)
 
     def test_unknown_type_still_rejected(self) -> None:
+        # T-C1-025: the probe flipped from py.permission.requested (now a
+        # registered R3 type) to a permanently-unknown py.* type -- same
+        # assertion semantics, same T-C1-014 probe-flip precedent.
         with pytest.raises(UnknownEventTypeError):
-            default_event_registry().resolve_durable("py.permission.requested", 1)
+            default_event_registry().resolve_durable("py.permission.granted", 1)
 
 
 class TestR2DataShapes:

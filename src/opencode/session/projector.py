@@ -1,8 +1,8 @@
-"""Read-model projector for the R1+R2 event subsets (R2-S2; CORE-CONTRACTS §3.2/§3.3).
+"""Read-model projector for the R1+R2+R3-permission event subsets (R3-S1; CORE-CONTRACTS §3.2/§3.3).
 
 :class:`SessionProjector` implements the §3.2 ``Projector`` Protocol injected
 into :class:`opencode.storage.SessionStore`: it writes the
-sessions/messages/tool_executions/runs read model inside the commit transaction
+sessions/messages/tool_executions/runs/permissions read model inside the commit transaction
 and advances ``sessions.applied_seq`` (the projector advances, the store
 re-verifies A=H+n before committing -- the T-B-008-confirmed split). All
 transition rules live in :mod:`opencode.session.state` (the pure fold): this
@@ -27,6 +27,27 @@ consults the projector and is untouched. Reads stay O(prefix length) per
 commit (airtight tamper detection requires re-reading every prefix row);
 the pydantic decode + fold work drops to O(new events) (run_status queries
 read the runs table only and never replay, §3.2 L187).
+
+Registry single-sourcing (R3-S1, plan §2 group A): the registry that decodes
+stored rows for the pre-state replay is no longer a module-import-frozen
+``default_event_registry()``. The store binds its own ``EventRegistry`` onto
+the projector (:meth:`SessionProjector.bind_registry`; the writer duck-types
+the hook, so recording fakes without the method stay unaffected), so an
+application-registered durable type commits and replays through ONE registry
+-- the R2-S2-review n-1 double-registry drift (txn insert side passes,
+projector replay side raises ``stored_event_decode_failed``) is pinned shut.
+A projector that was never bound (standalone rebuilds, direct test
+construction) lazily falls back to the default registry.
+
+R3 permission projection (§3.2 L160/L183): ``py.permission.requested`` and
+``py.permission.saved`` INSERT approval/decision rows into the 0001
+``permissions`` table (input_hash/action/resources/expires_at for approvals,
+scope for decisions, the lifecycle state in ``state``); replied/closed and
+revoked/expired UPDATE the state column on the legal transitions. The table
+carries no unique index on permission_id/decision_id, so inserts pre-check
+for an existing row (the accepted-run pattern) instead of catching
+IntegrityError. Permission events never touch messages/tools/runs or the
+active-run slot; the permissions diff is their only read-model write.
 
 TS mapping (``packages/core/src/session/projector.ts``):
 - ``SessionEvent.Created`` handler (L541-568): insert the SessionTable row,
@@ -64,11 +85,18 @@ from opencode.contracts import (
     PY_SESSION_CREATED,
     DurableEvent,
     EventDecodeError,
+    EventRegistry,
     JsonObject,
     canonical_json,
     default_event_registry,
 )
 from opencode.contracts.events import (
+    PY_PERMISSION_CLOSED,
+    PY_PERMISSION_EXPIRED,
+    PY_PERMISSION_REPLIED,
+    PY_PERMISSION_REQUESTED,
+    PY_PERMISSION_REVOKED,
+    PY_PERMISSION_SAVED,
     PY_REASONING_FINALIZED,
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
@@ -89,7 +117,7 @@ from opencode.session.state import (
     apply,
 )
 from opencode.storage import StorageCorruptError
-from opencode.storage.txn import from_epoch_ms
+from opencode.storage.txn import epoch_ms, from_epoch_ms
 
 #: Reasons recorded in StorageCorruptError details (sanitized; no raw row content).
 REASON_DUPLICATE_SESSION_PROJECTION = "duplicate_session_projection"
@@ -99,6 +127,7 @@ REASON_UNKNOWN_SESSION_STATUS = "unknown_session_status"
 REASON_DUPLICATE_MESSAGE_ID = "duplicate_message_id"
 REASON_DUPLICATE_RUN = "duplicate_run_projection"
 REASON_DUPLICATE_TOOL_EXECUTION = "duplicate_tool_execution_projection"
+REASON_DUPLICATE_PERMISSION = "duplicate_permission_projection"
 REASON_READ_MODEL_ROW_MISSING = "read_model_row_missing"
 REASON_STORED_DECODE_FAILED = "stored_event_decode_failed"
 
@@ -119,8 +148,17 @@ _R2_DURABLE_TYPES = frozenset(
     }
 )
 
-#: Registry used to decode stored rows for the stateless pre-state replay.
-_REPLAY_REGISTRY = default_event_registry()
+#: The R3 permission family this projector translates (§3.1 L135-139).
+_PERMISSION_TYPES = frozenset(
+    {
+        PY_PERMISSION_REQUESTED,
+        PY_PERMISSION_REPLIED,
+        PY_PERMISSION_CLOSED,
+        PY_PERMISSION_SAVED,
+        PY_PERMISSION_REVOKED,
+        PY_PERMISSION_EXPIRED,
+    }
+)
 
 _SELECT_SESSION = sa.text("SELECT status, applied_seq, active_run_id FROM sessions WHERE session_id = :sid")
 _INSERT_SESSION = sa.text(
@@ -146,6 +184,23 @@ _INSERT_TOOL_EXECUTION = sa.text(
 )
 _UPDATE_TOOL_EXECUTION = sa.text(
     "UPDATE tool_executions SET state = :state WHERE session_id = :sid AND execution_id = :execution_id"
+)
+_SELECT_PERMISSION = sa.text("SELECT state FROM permissions WHERE session_id = :sid AND permission_id = :permission_id")
+_SELECT_DECISION = sa.text("SELECT state FROM permissions WHERE session_id = :sid AND decision_id = :decision_id")
+_INSERT_PERMISSION = sa.text(
+    "INSERT INTO permissions (session_id, permission_id, execution_id, action, resources, input_hash, "
+    "expires_at, state) VALUES (:sid, :permission_id, :execution_id, :action, :resources, :input_hash, "
+    ":expires_at, :state)"
+)
+_INSERT_DECISION = sa.text(
+    "INSERT INTO permissions (session_id, decision_id, scope, expires_at, state) "
+    "VALUES (:sid, :decision_id, :scope, :expires_at, :state)"
+)
+_UPDATE_PERMISSION = sa.text(
+    "UPDATE permissions SET state = :state WHERE session_id = :sid AND permission_id = :permission_id"
+)
+_UPDATE_DECISION = sa.text(
+    "UPDATE permissions SET state = :state WHERE session_id = :sid AND decision_id = :decision_id"
 )
 _SELECT_EVENTS_BEFORE = sa.text(
     "SELECT id, session_id, seq, type, version, created, data, metadata "
@@ -258,12 +313,44 @@ class SessionProjector:
     #: itself must stay constructor-free.
     _fold_cache: dict[str, _FoldCacheEntry] | None = None
 
+    #: The registry the pre-state replay decodes stored rows with
+    #: (single-sourced with the writer, module docstring). Same lazily
+    #: bound pattern as ``_fold_cache`` for the same constructor-free
+    #: reason: ``None`` means "never bound, lazily default".
+    _registry: EventRegistry | None = None
+
     def _cache(self) -> dict[str, _FoldCacheEntry]:
         cache = self._fold_cache
         if cache is None:
             cache = {}
             self._fold_cache = cache
         return cache
+
+    def bind_registry(self, registry: EventRegistry) -> None:
+        """Bind the writer's registry (R3-S1 group A: single-sourced replay decode).
+
+        The store calls this from its writer so both sides decode through one
+        registry; the frozen module-level ``_REPLAY_REGISTRY`` is gone. A
+        second, different registry is a wiring defect (two stores sharing one
+        projector with diverging registries) and is rejected loudly instead
+        of silently switching the replay wire.
+        """
+        if self._registry is not None and self._registry is not registry:
+            raise RuntimeError("SessionProjector registry is already bound; rebinding is a wiring defect")
+        self._registry = registry
+
+    def _replay_registry(self) -> EventRegistry:
+        """The registry the pre-state replay decodes stored rows with.
+
+        Lazily defaults for a projector that was never bound (standalone
+        rebuilds, direct test construction) so the replay still decodes the
+        shipped wire.
+        """
+        registry = self._registry
+        if registry is None:
+            registry = default_event_registry()
+            self._registry = registry
+        return registry
 
     async def apply(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
         """Project one durable event inside the event-insert transaction."""
@@ -273,6 +360,8 @@ class SessionProjector:
             await self._project_prompt(connection, event)
         elif event.type in _R2_DURABLE_TYPES:
             await self._project_r2(connection, event)
+        elif event.type in _PERMISSION_TYPES:
+            await self._project_permission(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -383,6 +472,21 @@ class SessionProjector:
         await self._advance_applied_seq(connection, event)
         await self._remember_fold_state(connection, event, post, digest)
 
+    async def _project_permission(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.permission.*`` event and write the permissions diff.
+
+        The same incremental-cache shape as the R2 face: pre-state via the
+        cache (or the full replay), one fold, the permissions diff, the
+        applied_seq advance, then the cache update. Permission events never
+        touch messages/tools/runs or the active-run slot, so the permissions
+        diff is their only read-model write (§3.2 L160/L183).
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        await self._write_permission_diff(connection, event, pre, post)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
     async def _pre_state(self, connection: AsyncConnection, event: DurableEvent[Any]) -> tuple[SessionState, bytes]:
         """The fold pre-state plus the digest of the prefix it was derived from."""
         entry = self._cache().get(event.session_id)
@@ -485,7 +589,7 @@ class SessionProjector:
                     "metadata": _json_column(row.metadata),
                     "seq": seq,
                 }
-                stored = _REPLAY_REGISTRY.decode_durable(envelope)
+                stored = self._replay_registry().decode_durable(envelope)
             except (EventDecodeError, ValueError) as error:
                 raise _corrupt_row(
                     REASON_STORED_DECODE_FAILED,
@@ -604,6 +708,96 @@ class SessionProjector:
                     event,
                     f"runs row {run_id} vanished before its status update",
                 )
+
+    async def _write_permission_diff(
+        self, connection: AsyncConnection, event: DurableEvent[Any], pre: SessionState, post: SessionState
+    ) -> None:
+        """Insert new approval/decision rows; update the state column on transitions.
+
+        The 0001 ``permissions`` table has no unique index on
+        permission_id/decision_id, so duplicates are caught by a pre-INSERT
+        SELECT (the accepted-run pattern) instead of an IntegrityError; the
+        fold's fresh-id gates make that branch reachable only over rows the
+        fold never produced. Only ``state`` is updated on transitions -- the
+        §3.2 L183 projection fields (input_hash/action/resources/scope/
+        expires_at) are pinned at registration, the events stay the authority
+        for reply/outcome/reason detail.
+        """
+        for permission_id, permission in post.permissions.items():
+            old = pre.permissions.get(permission_id)
+            if old is permission:
+                continue
+            if old is None:
+                row = (
+                    await connection.execute(
+                        _SELECT_PERMISSION, {"sid": event.session_id, "permission_id": permission_id}
+                    )
+                ).first()
+                if row is not None:
+                    raise _corrupt(
+                        REASON_DUPLICATE_PERMISSION,
+                        event,
+                        f"permission {permission_id} is already projected for session {event.session_id}",
+                    )
+                await connection.execute(
+                    _INSERT_PERMISSION,
+                    {
+                        "sid": event.session_id,
+                        "permission_id": permission.permission_id,
+                        "execution_id": permission.execution_id,
+                        "action": permission.action,
+                        "resources": canonical_json(list(permission.resources)),
+                        "input_hash": permission.input_hash,
+                        "expires_at": epoch_ms(permission.expires_at),
+                        "state": permission.state.value,
+                    },
+                )
+            else:
+                result = await connection.execute(
+                    _UPDATE_PERMISSION,
+                    {"sid": event.session_id, "permission_id": permission_id, "state": permission.state.value},
+                )
+                if not result.rowcount:
+                    raise _corrupt(
+                        REASON_READ_MODEL_ROW_MISSING,
+                        event,
+                        f"permissions row {permission_id} vanished before its state update",
+                    )
+        for decision_id, decision in post.decisions.items():
+            previous = pre.decisions.get(decision_id)
+            if previous is decision:
+                continue
+            if previous is None:
+                row = (
+                    await connection.execute(_SELECT_DECISION, {"sid": event.session_id, "decision_id": decision_id})
+                ).first()
+                if row is not None:
+                    raise _corrupt(
+                        REASON_DUPLICATE_PERMISSION,
+                        event,
+                        f"decision {decision_id} is already projected for session {event.session_id}",
+                    )
+                await connection.execute(
+                    _INSERT_DECISION,
+                    {
+                        "sid": event.session_id,
+                        "decision_id": decision.decision_id,
+                        "scope": canonical_json(decision.scope),
+                        "expires_at": epoch_ms(decision.expires_at) if decision.expires_at is not None else None,
+                        "state": decision.state.value,
+                    },
+                )
+            else:
+                result = await connection.execute(
+                    _UPDATE_DECISION,
+                    {"sid": event.session_id, "decision_id": decision_id, "state": decision.state.value},
+                )
+                if not result.rowcount:
+                    raise _corrupt(
+                        REASON_READ_MODEL_ROW_MISSING,
+                        event,
+                        f"permissions row {decision_id} vanished before its state update",
+                    )
 
     async def _write_accepted_run(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
         """Insert the accepted run row (idempotent for legacy re-accepts)."""

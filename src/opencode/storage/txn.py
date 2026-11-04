@@ -101,6 +101,11 @@ REASON_PROJECTION_AHEAD_OF_LOG = "projection_ahead_of_log"
 #: fold never produced (hand-tampered data).
 REASON_REBUILD_DUPLICATE_TOOL_EXECUTION = "rebuild_duplicate_tool_execution"
 REASON_REBUILD_DUPLICATE_RUN = "rebuild_duplicate_run"
+#: Rebuild re-projection of the permissions read model (R3-S1). The 0001
+#: table has no unique index on permission_id/decision_id, so this guard is
+#: defensive only (NOT NULL/FK violations); a duplicate is structurally
+#: impossible over the just-cleared table given the fold's fresh-id gates.
+REASON_REBUILD_DUPLICATE_PERMISSION = "rebuild_duplicate_permission"
 
 _SELECT_SESSION_STATUS = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
 _SELECT_SESSION_APPLIED = sa.text("SELECT applied_seq FROM sessions WHERE session_id = :sid")
@@ -149,6 +154,7 @@ _SELECT_REBUILD_SESSION = sa.text("SELECT status, applied_seq, diagnostic FROM s
 _DELETE_SESSION_MESSAGES = sa.text("DELETE FROM messages WHERE session_id = :sid")
 _DELETE_SESSION_TOOL_EXECUTIONS = sa.text("DELETE FROM tool_executions WHERE session_id = :sid")
 _DELETE_SESSION_RUNS = sa.text("DELETE FROM runs WHERE session_id = :sid")
+_DELETE_SESSION_PERMISSIONS = sa.text("DELETE FROM permissions WHERE session_id = :sid")
 _DELETE_SESSION_ROW = sa.text("DELETE FROM sessions WHERE session_id = :sid")
 _INSERT_REBUILT_SESSION = sa.text(
     "INSERT INTO sessions (session_id, status, config_snapshot, snapshot_hash, "
@@ -166,6 +172,15 @@ _INSERT_REBUILT_TOOL_EXECUTION = sa.text(
 _INSERT_REBUILT_RUN = sa.text(
     "INSERT INTO runs (run_id, session_id, request_id, status, error) "
     "VALUES (:run_id, :sid, :request_id, :status, :error)"
+)
+_INSERT_REBUILT_PERMISSION = sa.text(
+    "INSERT INTO permissions (session_id, permission_id, execution_id, action, resources, input_hash, "
+    "expires_at, state) VALUES (:sid, :permission_id, :execution_id, :action, :resources, :input_hash, "
+    ":expires_at, :state)"
+)
+_INSERT_REBUILT_DECISION = sa.text(
+    "INSERT INTO permissions (session_id, decision_id, scope, expires_at, state) "
+    "VALUES (:sid, :decision_id, :scope, :expires_at, :state)"
 )
 
 
@@ -343,6 +358,17 @@ class TransactionWriter:
         self._write_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._isolated: set[str] = set()
+        # Registry single-sourcing (R3-S1, plan §2 group A): the writer and
+        # the projector's pre-state replay must decode stored rows through
+        # ONE registry, or an application-registered durable type commits
+        # fine and then fails the projector replay as
+        # stored_event_decode_failed (the R2-S2-review n-1 double-registry
+        # drift). Duck-typed on purpose: session.projector imports this
+        # package, so an isinstance-based import would cycle; getattr keeps
+        # registry-less recording fakes unaffected.
+        bind_registry = getattr(projector, "bind_registry", None)
+        if callable(bind_registry):
+            bind_registry(registry)
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         """Get-or-create the per-session lock (sync, no await -> no race in asyncio)."""
@@ -382,8 +408,8 @@ class TransactionWriter:
         read-model rows, read the full log in seq order, decode + fold every
         event (fail closed on unknown type/version, undecodable JSON, seq
         gaps/duplicates/illegal values, snapshot-hash mismatch, illegal fold
-        transitions), re-project the sessions/messages rows from the fold's
-        final state, verify applied_seq = H, and only then commit. Any
+        transitions), re-project the sessions/messages/tool_executions/runs/permissions rows from
+        the fold's final state, verify applied_seq = H, and only then commit. Any
         failure rolls the whole transaction back -- the clearing included, so
         the original projection survives untouched (§3.3: no half read model
         before a bad point, no bad-point skipping) -- then isolates the
@@ -832,6 +858,7 @@ class TransactionWriter:
         await connection.execute(_DELETE_SESSION_MESSAGES, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_TOOL_EXECUTIONS, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_RUNS, {"sid": session_id})
+        await connection.execute(_DELETE_SESSION_PERMISSIONS, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_ROW, {"sid": session_id})
 
         state = SessionState()
@@ -956,7 +983,10 @@ class TransactionWriter:
         # The R2 read models are re-projected from the final fold state: the
         # runs rows (accepted/running/terminal per the replayed transitions)
         # and the tool_executions rows (ownership + input_hash + the final
-        # state) -- events stay the authority (§3.2 L185, §3.3).
+        # state) -- events stay the authority (§3.2 L185, §3.3). The R3
+        # permission rows follow the same pattern (below): without the
+        # explicit delete+re-insert the sessions-row CASCADE would drop them
+        # and a rebuild would silently lose the permissions read model.
         for tool in state.tools.values():
             try:
                 await connection.execute(
@@ -998,6 +1028,56 @@ class TransactionWriter:
                     REASON_REBUILD_DUPLICATE_RUN,
                     Diagnostic(
                         reason=REASON_REBUILD_DUPLICATE_RUN,
+                        first_bad_seq=state.applied_seq,
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+
+        # The R3 permission read model: approval rows from
+        # ``state.permissions`` (input_hash/action/resources/expires_at plus
+        # the lifecycle state), decision rows from ``state.decisions``
+        # (scope/expires_at/state), mirroring the commit-path projection.
+        for permission in state.permissions.values():
+            try:
+                await connection.execute(
+                    _INSERT_REBUILT_PERMISSION,
+                    {
+                        "sid": session_id,
+                        "permission_id": permission.permission_id,
+                        "execution_id": permission.execution_id,
+                        "action": permission.action,
+                        "resources": canonical_json(list(permission.resources)),
+                        "input_hash": permission.input_hash,
+                        "expires_at": epoch_ms(permission.expires_at),
+                        "state": permission.state.value,
+                    },
+                )
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_PERMISSION,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_PERMISSION,
+                        first_bad_seq=state.applied_seq,
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+        for decision in state.decisions.values():
+            try:
+                await connection.execute(
+                    _INSERT_REBUILT_DECISION,
+                    {
+                        "sid": session_id,
+                        "decision_id": decision.decision_id,
+                        "scope": canonical_json(decision.scope),
+                        "expires_at": epoch_ms(decision.expires_at) if decision.expires_at is not None else None,
+                        "state": decision.state.value,
+                    },
+                )
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_PERMISSION,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_PERMISSION,
                         first_bad_seq=state.applied_seq,
                         applied_seq=applied_at_discovery,
                     ),

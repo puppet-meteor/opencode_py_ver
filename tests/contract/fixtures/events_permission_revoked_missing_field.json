@@ -1,0 +1,12 @@
+{
+  "id": "evt_00000000000000000000000044",
+  "type": "py.permission.revoked",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:24Z",
+  "data": {
+    "decision_id": "psv_0000000000000000000000000001"
+  },
+  "metadata": {},
+  "seq": 15
+}

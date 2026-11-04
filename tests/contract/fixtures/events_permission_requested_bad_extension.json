@@ -1,0 +1,22 @@
+{
+  "id": "evt_00000000000000000000000040",
+  "type": "py.permission.requested",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:20Z",
+  "data": {
+    "permission_id": "per_0000000000000000000000000001",
+    "execution_id": "exec_0000000000000000000000000001",
+    "action": "write",
+    "resources": [
+      "file://D:/work/demo/notes.md"
+    ],
+    "input_hash": "5b8160c3ef7a2aa5fc1207a2740b1d783068c96fd850a1bbb969107e32c2d625",
+    "expires_at": "2026-11-03T08:05:20Z",
+    "unexpected_extension_key": true
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 11
+}

@@ -1,4 +1,4 @@
-"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2 event subsets.
+"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3-permission subsets.
 
 Decode is fail closed: unknown type/version, wrong durability, malformed JSON, or any
 schema violation raises and nothing is silently skipped or coerced. Field-level failures
@@ -7,7 +7,10 @@ subclasses so S4/S6 can map them to ``StorageCorrupt`` and read-only diagnostics
 
 TS mapping (doc/parity.md §3, ``packages/schema/src/event.ts``): the envelope mirrors
 ``Event.durable()/ephemeral()`` with Python differences seq >= 1 (initial 1, not 0/-1)
-and a ``py.*`` event domain that never claims TS wire compatibility.
+and a ``py.*`` event domain that never claims TS wire compatibility. The R3 permission
+family (``py.permission.*``, six durable types) registers per §3.1 L140; TS keeps its
+permission events ephemeral (``packages/schema/src/permission.ts`` Asked/Replied), a
+Python-contract difference, not a port.
 """
 
 from __future__ import annotations
@@ -54,6 +57,17 @@ PY_TEXT_DELTA = "py.text.delta"
 PY_REASONING_DELTA = "py.reasoning.delta"
 PY_TOOL_INPUT_DELTA = "py.tool.input.delta"
 PY_TOOL_PROGRESS = "py.tool.progress"
+
+# R3 permission family (§3.1 L140 rows): the approval lifecycle
+# (requested/replied/closed) plus the saved-decision lifecycle
+# (saved/revoked/expired). All six are durable; S1 registers the wire +
+# fold + projection, producers (Policy/approval protocol) land in R3-S2.
+PY_PERMISSION_REQUESTED = "py.permission.requested"
+PY_PERMISSION_REPLIED = "py.permission.replied"
+PY_PERMISSION_CLOSED = "py.permission.closed"
+PY_PERMISSION_SAVED = "py.permission.saved"
+PY_PERMISSION_REVOKED = "py.permission.revoked"
+PY_PERMISSION_EXPIRED = "py.permission.expired"
 
 EVENT_VERSION = 1
 
@@ -396,6 +410,104 @@ class ToolProgressData(BaseModel):
     metadata: JsonObject = Field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# R3 permission event data models (§3.1 L140 rows; plan §2 R3-S1). ID rules:
+# permission_id/decision_id/boot_id follow the request_id convention (plain
+# non-empty strings) — the four patterned ID types (evt_/msg_/ses_/run_) do
+# not cover them. ``resources`` mirrors the TS ``Permission.Request`` anchor
+# (``packages/schema/src/permission.ts``: action string + resources string
+# array); ``reply`` mirrors ``Permission.Reply`` (once/always/reject).
+# ---------------------------------------------------------------------------
+
+
+class PermissionRequestedData(BaseModel):
+    """``py.permission.requested`` v1 data (§3.1 L140): approval for one pending call.
+
+    ``expires_at`` is the approval deadline (§5.2's 300 s default is producer
+    policy, not wire shape). Ownership of ``execution_id``/``input_hash``
+    against the folded tool plan is commit-time fold validation (R3-S1), not
+    wire shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    permission_id: str = Field(min_length=1)
+    execution_id: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    resources: list[str]
+    input_hash: str = Field(pattern=_SHA256_HEX)
+    expires_at: UtcDateTime
+
+
+class PermissionRepliedData(BaseModel):
+    """``py.permission.replied`` v1 data (§3.1 L140): the host reply.
+
+    §5.2 L268: only an actual reject/once/always reply writes this event (a
+    policy deny never fakes a host reply); §7 L173: the first legal
+    transition wins and a late reply cannot override a closed permission.
+    ``source`` is pinned to ``host`` for v1 (the only approval channel).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    permission_id: str = Field(min_length=1)
+    reply: Literal["once", "always", "reject"]
+    source: Literal["host"]
+
+
+class PermissionClosedData(BaseModel):
+    """``py.permission.closed`` v1 data (§3.1 L140): system close, never a fake host reject.
+
+    ``outcome`` covers expiry, cancellation (including the unconnected-approval
+    case, §5.2 L268) and restart recovery closure (§3.3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    permission_id: str = Field(min_length=1)
+    outcome: Literal["expired", "cancelled", "restart"]
+    reason: str = Field(min_length=1)
+
+
+class PermissionSavedData(BaseModel):
+    """``py.permission.saved`` v1 data (§3.1 L140/§5.2): one saved always-decision.
+
+    ``scope``/``rule`` carry the concrete, displayable action/resource binding
+    (§5.2: no unbounded wildcards; shell rules bind the full command/cwd).
+    Their inner shape is policy-owned — R3-S1 has no producer, so the wire
+    pins them as JSON objects, the ``ToolRequestedData.input`` precedent for
+    tool-owned shapes. ``expires_at`` is optional (None = no explicit expiry;
+    activation is still bounded by ``boot_id``). Only decisions of the current
+    boot activate (§5.2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(min_length=1)
+    scope: JsonObject
+    rule: JsonObject
+    expires_at: UtcDateTime | None = None
+    boot_id: str = Field(min_length=1)
+
+
+class PermissionRevokedData(BaseModel):
+    """``py.permission.revoked`` v1 data (§3.1 L140): host revocation of a saved decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class PermissionExpiredData(BaseModel):
+    """``py.permission.expired`` v1 data (§3.1 L140): expiry-check terminal of a saved decision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -609,8 +721,8 @@ R1_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 #: R2 additions (§3.1 R2 subset): 11 durable rows + 4 ephemeral live types.
-#: py.permission.* stays out (R3, PHASE1-SLIM §4); registration is additive so
-#: R1 logs and fixtures decode identically (plan §0.2).
+#: The R3 permission family is its own tuple below; registration stays
+#: additive so R1/R2 logs and fixtures decode identically (plan §0.2).
 R2_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
     EventDefinition(event_type=PY_RUN_STARTED, durability="durable", data_model=RunStartedData),
     EventDefinition(event_type=PY_RUN_CANCEL_REQUESTED, durability="durable", data_model=RunCancelRequestedData),
@@ -630,6 +742,21 @@ R2_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: R3 permission family (§3.1 L140 rows): the approval lifecycle plus the
+#: saved-decision lifecycle, six durable types. Kept in a separate tuple so
+#: the frozen R2 boundary pins hold (len(R2_EVENT_DEFINITIONS) == 15; no
+#: py.permission.* rows in R2) while ``default_event_registry`` resolves the
+#: full §3.1 table through R3-S1 (plan §2 group B).
+R3_PERMISSION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_PERMISSION_REQUESTED, durability="durable", data_model=PermissionRequestedData),
+    EventDefinition(event_type=PY_PERMISSION_REPLIED, durability="durable", data_model=PermissionRepliedData),
+    EventDefinition(event_type=PY_PERMISSION_CLOSED, durability="durable", data_model=PermissionClosedData),
+    EventDefinition(event_type=PY_PERMISSION_SAVED, durability="durable", data_model=PermissionSavedData),
+    EventDefinition(event_type=PY_PERMISSION_REVOKED, durability="durable", data_model=PermissionRevokedData),
+    EventDefinition(event_type=PY_PERMISSION_EXPIRED, durability="durable", data_model=PermissionExpiredData),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2 event subsets (all §3.1 rows through R2-S1)."""
-    return EventRegistry((*R1_EVENT_DEFINITIONS, *R2_EVENT_DEFINITIONS))
+    """Fresh registry over the R1+R2+R3-permission event subsets (§3.1 rows through R3-S1)."""
+    return EventRegistry((*R1_EVENT_DEFINITIONS, *R2_EVENT_DEFINITIONS, *R3_PERMISSION_EVENT_DEFINITIONS))
