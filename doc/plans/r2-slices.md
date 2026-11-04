@@ -1,7 +1,7 @@
 # R2 实现切片拆分
 
-> 修订：[T-B-014] 2026-11-03 首版产出（R1 收官 #64 `38f0b96` 后）；硬性输入①-⑧（T-B-014 任务书）逐条对照见 §7 自检清单。
-> 席位B（T-B-014）产出，供 C 席按序实现。状态：**S1 起待派**（R1 全交付态+checkpoint 链见 doc/plans/r1-slices.md 头部）。
+> 修订：[T-B-026] 2026-11-04 头部收口（S1-S8 全交付态+checkpoint 链；正文切片语义/表格/差异表零改动）；[T-B-014] 2026-11-03 首版产出（R1 收官 #64 `38f0b96` 后）；硬性输入①-⑧（T-B-014 任务书）逐条对照见 §7 自检清单。
+> 席位B（T-B-014）产出，供 C 席按序实现。状态：**S1-S8 全交付（R2 收官）**。checkpoint 链：#97 T-B-024 评审 PASS 0/0/0/1（r2-s8 `8cf82e8`）→ #98 T-C1-024 验收（r2-s9 `971fa37`）→ merge `0d4cbb5` → **#99 `c87f317`**（651 passed / mypy 66 files / 双 ruff 绿）；R2 退出证据 doc/reference/r2-exit-evidence.md。R3 计划见 doc/plans/r3-slices.md。
 > 依据：doc/PHASE1-SLIM.md §4（L76-85）、doc/CORE-CONTRACTS.md（§2.1 L21-72、§2.2 L76-84、§2.3 L86-102、§3.1 L106-144、§4 L223-244、§5.1-§5.3 L246-277、§6.1-§6.2 L287-300、§7 L304-341、§8 L343-356）、doc/evidence/r0/provider.md（L94 证据延续硬条款、§7 L84-92 R2 承接清单、§8.1 L103-110 实测注记）、doc/ROADMAP.md（§3 L52、§4.5 L68、§6 L88-102、§7 L113-116）、doc/reestimate-r0.md L59-65、doc/plans/r1-slices.md（R1 交付面）、doc/reviews/R1-S7-review.md §6-4、doc/reviews/R1-S8-review.md §8-3。
 > TS 基准：`D:/26_code/opencode_py_ver/opencode-2.2.2/`（指纹 doc/source-baseline.json，现锁 20 文件（调度器亲点 committed 基线 20 条，前记 21 系计数笔误）；**R2 新引用的 runner/execution/context/model-request/message-updater/run-coordinator/tool-runtime/read/cli 链须先补指纹**——ROADMAP §4.5，见 §4 前置项）。
 > 拆分基准：按现行文档拆；A 席若修订 R2 定义，由调度器对齐后本文件再改版。
