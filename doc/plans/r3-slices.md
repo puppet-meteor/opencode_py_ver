@@ -149,6 +149,8 @@
 | 22 | n-3 注入基建（绕过 committer 锁与 bus——复制场景须携注） | R2-S7c n-3（记档防扩散） | R3-S2/S8 测试纪律条款（沿用注入 idiom 必携注） |
 | 23 | evidence 行号重锚（§3.1 L187→L195 类） | R2-S8-closeout m-1 | 状态核对：若未随 r2-s9 合并修正→R3-S1 首项一行带入 |
 | 24 | upcaster 机制平台级缺位（`upcast` 全库 0 命中含 R1/R2；首个 py.* 事件族升 v2 前置条件：旧版本模型保留+确定性转换+旧 fixture 可读，§8 L356 最低门槛） | T-B-027 nit-1（B 处方） | **R3-S8 exit-evidence 检查项**（首个 v2 前必建，非阻塞） |
+| 25 | rg 读循环超时收编（m-1：`_run_rg` 30s deadline 仅 stdout 行到达时检查——rg 零输出挂起→工具调用无限挂起→串行 invoker 整 run 挂起；TS 为整进程超时，同名常量弱执行面。R3-S5 受控子进程环境统一超时/收树机制落地时收编，一处 `_run_rg` 改动） | T-B-029 m-1（B 处方） | **R3-S5 任务书条款**（明列"rg 读循环超时收编"） |
+| 26 | nit-2 `test_grep_real_path_absence` 直接 `_RG_CACHE.clear()` 无恢复（全局态测试卫生）；nit-1 截断分支"确定性"措辞仅覆盖已收集子集内次序（成员身份依赖枚举序） | T-B-029 nit-2/nit-1 | nit-2=后续触达该测试文件切片顺手改 monkeypatch.setattr 整体替换（非必须）；nit-1=S8 evidence 书写注意项（零代码） |
 
 ## 4. 关键设计差异备忘（Python vs TS，实现时勿"照抄"）
 
