@@ -14,13 +14,20 @@ This module owns the runtime side of the tool chain: :class:`ToolLimits`
    never implicitly converted or modified;
 3. the cancellation checkpoint before ``py.tool.started`` (§2.1 L45:
    started requires not-cancelled);
-4. ``py.tool.started`` commit confirmation -- R2 has no PermissionPolicy,
-   so the §5.2 L264 default allow goes into the event's
-   ``permission_decision`` (py.permission.* events are R3; float report);
-5. adapter execution with a bounded progress callback, then result
+4. the §5.1 L259 policy/approval gate -- with an injected
+   :class:`~opencode.tools.policy.PermissionPolicy` (R3-S2) the §5.2
+   evaluation runs here: deny folds straight to the §2.1 L47
+   denied/not_started terminal (no faked host reply), ask runs the §5.2
+   L268 approval protocol (requested -> replied|closed, 300 s default,
+   closed-first paired terminals), allow proceeds; without a policy the
+   R2 default-allow face is unchanged (§5.2 L264);
+5. ``py.tool.started`` commit confirmation carrying the effective
+   ``permission_decision`` (an ask-approved start carries the host
+   reply's "allow");
+6. adapter execution with a bounded progress callback, then result
    normalization (§2.1 L72 model-readable text, §5.3 L276
    structured_output/progress-metadata caps);
-6. ``py.tool.finished`` commit; every terminal carries at least one
+7. ``py.tool.finished`` commit; every terminal carries at least one
    model-readable text (§2.1 L72).
 
 Adapter exceptions become model-readable failed results (§7 L341); only
@@ -46,7 +53,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -55,10 +62,20 @@ from pydantic import BaseModel
 from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.events import (
     EVENT_VERSION,
+    PY_PERMISSION_CLOSED,
+    PY_PERMISSION_EXPIRED,
+    PY_PERMISSION_REPLIED,
+    PY_PERMISSION_REQUESTED,
+    PY_PERMISSION_SAVED,
     PY_TOOL_FINISHED,
     PY_TOOL_REQUESTED,
     PY_TOOL_STARTED,
     EventDraft,
+    PermissionClosedData,
+    PermissionExpiredData,
+    PermissionRepliedData,
+    PermissionRequestedData,
+    PermissionSavedData,
     ToolFinishedData,
     ToolRequestedData,
     ToolStartedData,
@@ -67,6 +84,17 @@ from opencode.contracts.events import (
 from opencode.contracts.messages import JsonObject, JsonValue, ToolContent, ToolTextContent
 from opencode.contracts.tools import ToolRef, ToolResult, ToolSpec
 from opencode.session.service import Clock, IdFactory
+from opencode.tools.policy import (
+    DEFAULT_APPROVAL_TIMEOUT_S,
+    REASON_APPROVAL_RUN_CANCELLED,
+    REASON_APPROVAL_UNCONNECTED,
+    REASON_DECISION_EXPIRED,
+    ApprovalCoordinator,
+    PermissionPolicy,
+    PermissionRequest,
+    SavedDecision,
+    extract_resources,
+)
 
 if TYPE_CHECKING:
     # ResolvedTool carries the adapter (registry-owned protocol); string
@@ -75,10 +103,6 @@ if TYPE_CHECKING:
 
 _KIB = 1024
 _MIB = 1024 * 1024
-
-#: §5.2 L264: R2 has no PermissionPolicy (R3 injects it into the Invoker);
-#: every R2 py.tool.started carries the default allow decision.
-R2_PERMISSION_DECISION: Literal["allow"] = "allow"
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +458,33 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _draft[DataT: BaseModel](
+    ids: IdFactory,
+    clock: Clock,
+    context: ToolContext,
+    event_type: str,
+    data: DataT,
+    *,
+    metadata: JsonObject | None = None,
+) -> EventDraft[DataT]:
+    """Build one tool-domain event draft (run metadata by default, §3.1 L110).
+
+    ``metadata=None`` pins ``{"run_id": context.run_id}`` (required by the
+    fold for run-scoped events); the session-scoped permission trio members
+    (saved/revoked/expired) pass ``metadata={}`` instead -- they are
+    deliberately outside RUN_SCOPED_EVENT_TYPES.
+    """
+    return EventDraft[DataT](
+        id=ids.event_id(),
+        type=event_type,
+        version=EVENT_VERSION,
+        session_id=context.session_id,
+        created_at=clock(),
+        data=data,
+        metadata={"run_id": context.run_id} if metadata is None else metadata,
+    )
+
+
 async def _emit[DataT: BaseModel](
     sink: EventSink,
     ids: IdFactory,
@@ -450,16 +501,7 @@ async def _emit[DataT: BaseModel](
     Sink errors propagate (§7 L341: storage infrastructure errors fail
     closed; no synthetic finished event).
     """
-    draft = EventDraft[DataT](
-        id=ids.event_id(),
-        type=event_type,
-        version=EVENT_VERSION,
-        session_id=context.session_id,
-        created_at=clock(),
-        data=data,
-        metadata={"run_id": context.run_id},
-    )
-    await sink((draft,))
+    await sink((_draft(ids, clock, context, event_type, data),))
 
 
 async def _finish(
@@ -477,9 +519,16 @@ async def _finish(
     content: Sequence[ToolContent],
     structured_output: JsonValue,
     error: CoreError | None,
+    pre: Sequence[EventDraft[Any]] = (),
 ) -> ToolOutcome:
-    await _emit(
-        sink,
+    """Commit the terminal ``py.tool.finished`` (plus optional same-batch predecessors).
+
+    ``pre`` carries the T-B-027 ④-2 pairing: an approval protocol event
+    (replied / closed) that must land in the *same* batch as the not-started
+    terminal it causes, permission event first (§3.3 L212 closed-first), so
+    no path leaves a permanently pending permission.
+    """
+    finished = _draft(
         ids,
         clock,
         context,
@@ -493,6 +542,7 @@ async def _finish(
             error=error,
         ),
     )
+    await sink((*pre, finished))
     return ToolOutcome(
         execution_id=execution_id,
         requested_name=requested_name,
@@ -506,6 +556,376 @@ async def _finish(
     )
 
 
+# ---------------------------------------------------------------------------
+# The §5.1 L259 policy/approval gate (R3-S2)
+# ---------------------------------------------------------------------------
+
+
+async def _apply_policy(
+    *,
+    policy: PermissionPolicy,
+    sink: EventSink,
+    ids: IdFactory,
+    clock: Clock,
+    context: ToolContext,
+    tool: ResolvedTool,
+    tool_ref: ToolRef,
+    requested_name: str,
+    raw_input: JsonObject,
+    input_hash: str,
+    execution_id: str,
+) -> ToolOutcome | Literal["started", "proceed"]:
+    """The §5.1 L259 policy gate between validation and ``py.tool.started``.
+
+    Returns a terminal :class:`ToolOutcome` when the call must not start
+    (policy deny / host reject / expiry / cancellation / unconnected
+    approval channel); ``"started"`` when the approved-ask flow already
+    committed the ``[replied (, saved), started]`` batch (the caller
+    proceeds straight to adapter execution); ``"proceed"`` when a plain
+    allow leaves the started confirmation to the caller. The input is
+    already strictly validated and is never modified here (§5.1 L261).
+    """
+    action = _wire_name(tool.spec)
+    resources = extract_resources(action, raw_input)
+    due = policy.due_expired(context.session_id)
+    if due:
+        # §5.2 L270: expire due saved decisions durably first (through the
+        # same commit-lock sink, session-scoped metadata), then re-evaluate
+        # -- the expired decision no longer matches.
+        await sink(
+            tuple(
+                _draft(
+                    ids,
+                    clock,
+                    context,
+                    PY_PERMISSION_EXPIRED,
+                    PermissionExpiredData(decision_id=decision.decision_id, reason=REASON_DECISION_EXPIRED),
+                    metadata={},
+                )
+                for decision in due
+            )
+        )
+        policy.mark_expired([decision.decision_id for decision in due])
+    decision = policy.evaluate(
+        session_id=context.session_id,
+        action=action,
+        resources=resources,
+        input_hash=input_hash,
+        working_dir=context.working_dir,
+        side_effects=tool.spec.side_effects,
+    )
+    if decision.effect == "deny":
+        # §5.2 L268: a policy deny never fakes a host reply -- no
+        # py.permission.* event, straight to the §2.1 L47 denied terminal.
+        message = f'Tool "{requested_name}" was denied by the permission policy: {decision.reason}'
+        return await _finish(
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            execution_id=execution_id,
+            requested_name=requested_name,
+            tool_ref=tool_ref,
+            input_hash=input_hash,
+            state="denied",
+            effect_status="not_started",
+            content=[ToolTextContent(type="text", text=message)],
+            structured_output=None,
+            error=CoreError(code=CoreErrorCode.PERMISSION_DENIED, message=message, retryable=False),
+        )
+    if decision.effect == "allow":
+        return "proceed"
+    return await _request_approval(
+        policy=policy,
+        sink=sink,
+        ids=ids,
+        clock=clock,
+        context=context,
+        tool=tool,
+        tool_ref=tool_ref,
+        requested_name=requested_name,
+        action=action,
+        resources=resources,
+        input_hash=input_hash,
+        execution_id=execution_id,
+    )
+
+
+async def _request_approval(
+    *,
+    policy: PermissionPolicy,
+    sink: EventSink,
+    ids: IdFactory,
+    clock: Clock,
+    context: ToolContext,
+    tool: ResolvedTool,
+    tool_ref: ToolRef,
+    requested_name: str,
+    action: str,
+    resources: tuple[str, ...],
+    input_hash: str,
+    execution_id: str,
+) -> ToolOutcome | Literal["started"]:
+    """The §5.2 L268 approval protocol for one ask decision (300 s default).
+
+    ``py.permission.requested`` commits alone first (the durable record
+    precedes the in-memory wait; T-B-027 ④-1: the Invoker is the sole
+    py.permission.requested/replied/closed producer). Without a connected
+    approval channel the call folds to closed(cancelled) + the cancelled/
+    not_started terminal carrying ApprovalUnavailable -- never a silent
+    allow. With one, the registered future resolves exactly once (§7 L173
+    CAS) and the outcome pairs with the tool terminal in one batch (④-2):
+    allow -> ``[replied (, saved), started]``; reject -> ``[replied,
+    finished(denied)]``; expired/cancelled -> ``[closed, finished]``
+    closed-first (§3.3 L212).
+    """
+    approvals: ApprovalCoordinator | None = policy.approvals
+    now = clock()
+    expires_at = (
+        approvals.expires_at(now) if approvals is not None else now + timedelta(seconds=DEFAULT_APPROVAL_TIMEOUT_S)
+    )
+    permission_id = policy.mint_permission_id()
+    await _emit(
+        sink,
+        ids,
+        clock,
+        context,
+        PY_PERMISSION_REQUESTED,
+        PermissionRequestedData(
+            permission_id=permission_id,
+            execution_id=execution_id,
+            action=action,
+            resources=list(resources),
+            input_hash=input_hash,
+            expires_at=expires_at,
+        ),
+    )
+    if approvals is None:
+        # §5.2 L268: approval channel not connected -> closed(cancelled) +
+        # ApprovalUnavailable, the pending tool ends cancelled/not_started.
+        message = f'Tool "{requested_name}" was cancelled: no approval channel is connected.'
+        return await _finish(
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            execution_id=execution_id,
+            requested_name=requested_name,
+            tool_ref=tool_ref,
+            input_hash=input_hash,
+            state="cancelled",
+            effect_status="not_started",
+            content=[ToolTextContent(type="text", text=message)],
+            structured_output=None,
+            error=CoreError(code=CoreErrorCode.APPROVAL_UNAVAILABLE, message=message, retryable=False),
+            pre=(
+                _draft(
+                    ids,
+                    clock,
+                    context,
+                    PY_PERMISSION_CLOSED,
+                    PermissionClosedData(
+                        permission_id=permission_id, outcome="cancelled", reason=REASON_APPROVAL_UNCONNECTED
+                    ),
+                ),
+            ),
+        )
+    future = await approvals.register(
+        PermissionRequest(
+            permission_id=permission_id,
+            session_id=context.session_id,
+            run_id=context.run_id,
+            execution_id=execution_id,
+            action=action,
+            resources=resources,
+            input_hash=input_hash,
+            expires_at=expires_at,
+        )
+    )
+    outcome = await future
+    if outcome.outcome == "allow":
+        # §7 L173: re-check the cooperative cancel after the wait -- a
+        # started commit is fold-illegal once the run is cancelling, so an
+        # allow racing a cancel folds to the cancelled pair instead (the
+        # reply stays in-memory; the permission is still fold-pending).
+        if context.cancel.is_set():
+            message = f'Tool "{requested_name}" was cancelled before it started.'
+            return await _finish(
+                sink=sink,
+                ids=ids,
+                clock=clock,
+                context=context,
+                execution_id=execution_id,
+                requested_name=requested_name,
+                tool_ref=tool_ref,
+                input_hash=input_hash,
+                state="cancelled",
+                effect_status="not_started",
+                content=[ToolTextContent(type="text", text=message)],
+                structured_output=None,
+                error=None,
+                pre=(
+                    _draft(
+                        ids,
+                        clock,
+                        context,
+                        PY_PERMISSION_CLOSED,
+                        PermissionClosedData(
+                            permission_id=permission_id, outcome="cancelled", reason=REASON_APPROVAL_RUN_CANCELLED
+                        ),
+                    ),
+                ),
+            )
+        # an allow resolves only from a host reply, so the vocabulary is pinned
+        assert outcome.reply is not None
+        await _start_approved(
+            policy=policy,
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            action=action,
+            resources=resources,
+            input_hash=input_hash,
+            execution_id=execution_id,
+            permission_id=permission_id,
+            reply=outcome.reply,
+        )
+        return "started"
+    if outcome.outcome == "deny":
+        # §5.2 L268: an actual reject writes py.permission.replied, paired
+        # same-batch with the denied/not_started terminal (④-2).
+        message = f'Tool "{requested_name}" was rejected by the host approval.'
+        return await _finish(
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            execution_id=execution_id,
+            requested_name=requested_name,
+            tool_ref=tool_ref,
+            input_hash=input_hash,
+            state="denied",
+            effect_status="not_started",
+            content=[ToolTextContent(type="text", text=message)],
+            structured_output=None,
+            error=CoreError(code=CoreErrorCode.PERMISSION_DENIED, message=message, retryable=False),
+            pre=(
+                _draft(
+                    ids,
+                    clock,
+                    context,
+                    PY_PERMISSION_REPLIED,
+                    PermissionRepliedData(permission_id=permission_id, reply="reject", source="host"),
+                ),
+            ),
+        )
+    # expired / cancelled: the system close, paired closed-first with the
+    # cancelled/not_started terminal (§3.3 L212; expiry surfaces
+    # ApprovalUnavailable, a plain cancellation carries no error).
+    closed_outcome: Literal["expired", "cancelled", "restart"] = (
+        "expired" if outcome.outcome == "expired" else "cancelled"
+    )
+    if outcome.outcome == "expired":
+        message = f'Tool "{requested_name}" was cancelled: the approval timed out.'
+        error: CoreError | None = CoreError(code=CoreErrorCode.APPROVAL_UNAVAILABLE, message=message, retryable=False)
+    else:
+        message = f'Tool "{requested_name}" was cancelled before it started.'
+        error = None
+    return await _finish(
+        sink=sink,
+        ids=ids,
+        clock=clock,
+        context=context,
+        execution_id=execution_id,
+        requested_name=requested_name,
+        tool_ref=tool_ref,
+        input_hash=input_hash,
+        state="cancelled",
+        effect_status="not_started",
+        content=[ToolTextContent(type="text", text=message)],
+        structured_output=None,
+        error=error,
+        pre=(
+            _draft(
+                ids,
+                clock,
+                context,
+                PY_PERMISSION_CLOSED,
+                PermissionClosedData(permission_id=permission_id, outcome=closed_outcome, reason=outcome.reason),
+            ),
+        ),
+    )
+
+
+async def _start_approved(
+    *,
+    policy: PermissionPolicy,
+    sink: EventSink,
+    ids: IdFactory,
+    clock: Clock,
+    context: ToolContext,
+    action: str,
+    resources: tuple[str, ...],
+    input_hash: str,
+    execution_id: str,
+    permission_id: str,
+    reply: Literal["once", "always", "reject"],
+) -> None:
+    """Commit the ``[replied (, saved), started]`` batch for an approved ask (④-2).
+
+    The host reply carries "allow" onto ``py.tool.started`` (the §5.2
+    effect vocabulary records the decision that took effect, not the ask
+    that preceded it). An "always" reply adds ``py.permission.saved`` (the
+    concrete action/resource rule, session+boot scoped, no wildcards) and
+    registers the in-memory decision only after the durable commit.
+    """
+    replied = _draft(
+        ids,
+        clock,
+        context,
+        PY_PERMISSION_REPLIED,
+        PermissionRepliedData(permission_id=permission_id, reply=reply, source="host"),
+    )
+    started = _draft(
+        ids,
+        clock,
+        context,
+        PY_TOOL_STARTED,
+        ToolStartedData(execution_id=execution_id, permission_decision="allow", input_hash=input_hash),
+    )
+    if reply == "always":
+        decision_id = policy.mint_decision_id()
+        saved = _draft(
+            ids,
+            clock,
+            context,
+            PY_PERMISSION_SAVED,
+            PermissionSavedData(
+                decision_id=decision_id,
+                scope={"session_id": context.session_id, "boot_id": policy.boot_id},
+                rule={"action": action, "resources": list(resources)},
+                expires_at=None,
+                boot_id=policy.boot_id,
+            ),
+            metadata={},
+        )
+        await sink((replied, saved, started))
+        policy.register_saved(
+            SavedDecision(
+                decision_id=decision_id,
+                session_id=context.session_id,
+                action=action,
+                resources=resources,
+                input_hash=input_hash,
+                boot_id=policy.boot_id,
+                expires_at=None,
+            )
+        )
+        return
+    await sink((replied, started))
+
+
 async def invoke_tool(
     *,
     tool: ResolvedTool | None,
@@ -516,6 +936,7 @@ async def invoke_tool(
     sink: EventSink,
     clock: Clock,
     ids: IdFactory,
+    policy: PermissionPolicy | None = None,
 ) -> ToolOutcome:
     """Drive the §5.1 L257 sequence for one tool call (registry-internal).
 
@@ -524,7 +945,11 @@ async def invoke_tool(
     model-readable failed results; ``asyncio.CancelledError`` is *not*
     caught (hard cancellation propagates; R2 cancellation flows through
     the cooperative signal and the pre-start checkpoint, and an unfinished
-    started call is closed by the R2-S7 close/cancel paths).
+    started call is closed by the R2-S7 close/cancel paths). With an
+    injected policy the §5.1 L259 policy/approval gate runs between the
+    cancellation checkpoint and ``py.tool.started`` (§5.2: PermissionPolicy
+    is injected into the Invoker; a tool never approves itself); without
+    one the R2 default-allow face is unchanged (§5.2 L264).
     """
     if not isinstance(raw_input, dict):
         raise ToolInvokeError("input must be a JSON object")
@@ -619,20 +1044,49 @@ async def invoke_tool(
             error=None,
         )
 
-    # R2: no PermissionPolicy (§5.2 L264 default allow goes on the wire;
-    # R3 replaces this with the policy decision at this exact point).
-    await _emit(
-        sink,
-        ids,
-        clock,
-        context,
-        PY_TOOL_STARTED,
-        ToolStartedData(
-            execution_id=execution_id,
-            permission_decision=R2_PERMISSION_DECISION,
+    # §5.1 L259: the policy/approval gate sits between validation and the
+    # started confirmation. Without an injected policy (the R2 face) the
+    # §5.2 L264 default allow goes on the wire unchanged.
+    # the catalog-miss terminal returned above: the resolved tool and its
+    # tool_ref are pinned from here on (the type system carries no such join)
+    assert tool_ref is not None
+    gate: ToolOutcome | Literal["started", "proceed"]
+    if policy is not None:
+        gate = await _apply_policy(
+            policy=policy,
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            tool=tool,
+            tool_ref=tool_ref,
+            requested_name=requested_name,
+            raw_input=raw_input,
             input_hash=input_hash,
-        ),
-    )
+            execution_id=execution_id,
+        )
+        if isinstance(gate, ToolOutcome):
+            return gate
+    else:
+        gate = "proceed"
+    if gate == "proceed":
+        # R3-S2: every started commit carries the effective decision on the
+        # wire (the R2_PERMISSION_DECISION placeholder is gone); both the
+        # policy-allow and default-allow paths record "allow".
+        await _emit(
+            sink,
+            ids,
+            clock,
+            context,
+            PY_TOOL_STARTED,
+            ToolStartedData(
+                execution_id=execution_id,
+                permission_decision="allow",
+                input_hash=input_hash,
+            ),
+        )
+    # gate == "started": the approved-ask batch [replied (, saved), started]
+    # is already committed -- proceed straight to adapter execution.
 
     exec_context = replace(context, progress=_bounded_progress(context.progress, context.limits))
     try:
@@ -641,6 +1095,10 @@ async def invoke_tool(
         effect: Literal["not_started", "completed", "unknown"] = (
             "not_started" if not tool.spec.side_effects else "unknown"
         )
+        if effect == "unknown" and policy is not None:
+            # §5.2 L270: an identical retry after an unknown-effect terminal
+            # must re-ask, never reuse an old once/always decision.
+            policy.record_unknown(context.session_id, _wire_name(tool.spec), input_hash)
         message = f'Tool "{requested_name}" failed: {type(error).__name__}: {error}'
         return await _finish(
             sink=sink,
@@ -660,11 +1118,14 @@ async def invoke_tool(
 
     content, structured_output = _normalize_result(tool.spec, result, context.limits)
     if result.error is not None:
-        # A graceful adapter failure: no policy layer in R2 maps an adapter
-        # PermissionDenied to the §2.1 L47 "denied" terminal (that
-        # transition is pending→denied, i.e. pre-start policy; R3). The
-        # call already started, so it ends failed (§2.1 L50).
+        # A graceful adapter failure: the pre-start policy deny maps to the
+        # §2.1 L47 "denied" terminal (R3-S2 gate above); an adapter-reported
+        # permission failure arrives after the call started, so it ends
+        # failed (§2.1 L50 -- pending->denied is pre-start only).
         effect = "not_started" if not tool.spec.side_effects else "unknown"
+        if effect == "unknown" and policy is not None:
+            # §5.2 L270: same unknown-effect retry rule as the exception path.
+            policy.record_unknown(context.session_id, _wire_name(tool.spec), input_hash)
         return await _finish(
             sink=sink,
             ids=ids,

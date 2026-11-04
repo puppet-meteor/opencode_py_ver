@@ -30,6 +30,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol
+from uuid import uuid4
 
 from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
@@ -47,6 +48,7 @@ from opencode.storage import (
     open_database,
 )
 from opencode.tools import ToolLimits, ToolRegistry
+from opencode.tools.policy import DEFAULT_APPROVAL_TIMEOUT_S, ApprovalCoordinator, PermissionPolicy
 from opencode.tools.registry import ToolAdapter
 
 
@@ -93,6 +95,7 @@ class App:
         limits: ToolLimits | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
+        approval_timeout_s: float = DEFAULT_APPROVAL_TIMEOUT_S,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -103,10 +106,18 @@ class App:
         repos = ReadRepositories(engine)
         shared_ids = ids if ids is not None else AscendingIds(clock)
         runner: Runner | None = None
+        approvals: ApprovalCoordinator | None = None
+        policy: PermissionPolicy | None = None
         if provider is not None:
             assert settings is not None  # validated above
+            approvals = ApprovalCoordinator(clock=clock, timeout_s=approval_timeout_s)
+            policy = PermissionPolicy(
+                boot_id=f"boot_{uuid4().hex}",
+                approvals=approvals,
+                clock=clock,
+            )
             committer = EventCommitter(repos, store, self._bus, ids=shared_ids, clock=clock)
-            registry = ToolRegistry(sink=committer.sink, clock=clock, ids=shared_ids)
+            registry = ToolRegistry(sink=committer.sink, clock=clock, ids=shared_ids, policy=policy)
             for adapter in tools:
                 registry.register(adapter)
             runner = Runner(
@@ -131,6 +142,8 @@ class App:
             engine=engine,
             runner=runner,
             provider_close=provider.close if provider is not None else None,
+            approvals=approvals,
+            policy=policy,
             close_timeout_s=close_timeout_s,
         )
 

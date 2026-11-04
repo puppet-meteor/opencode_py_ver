@@ -61,7 +61,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -80,7 +80,12 @@ from opencode.contracts import (
     UserMessage,
     compute_snapshot_hash,
 )
-from opencode.contracts.events import PY_RUN_CANCEL_REQUESTED, RunCancelRequestedData
+from opencode.contracts.events import (
+    PY_PERMISSION_REVOKED,
+    PY_RUN_CANCEL_REQUESTED,
+    PermissionRevokedData,
+    RunCancelRequestedData,
+)
 from opencode.session.state import SessionStatus
 from opencode.storage import (
     EventBatch,
@@ -98,6 +103,13 @@ from opencode.storage import (
     StoreValidationError,
 )
 from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError
+
+if TYPE_CHECKING:
+    # Runtime cycle guard (①): the tools package imports this module at
+    # runtime (AscendingIds/Clock/IdFactory), so the policy types are
+    # annotation-only here; the wired instances flow in through the
+    # constructor and are used structurally.
+    from opencode.tools.policy import ApprovalCoordinator, PermissionPolicy
 
 #: §3.1 ID patterns enforced on the command surface (session/run identity).
 _SES_PREFIX = "ses_"
@@ -128,6 +140,14 @@ REASON_CLOSE_TIMEOUT = "close_timeout"
 #: stream/adapter) before the timeout branch. The contract fixes the order,
 #: not the number (④ open question: the CLI face owns the tunable in R2-S8).
 DEFAULT_CLOSE_TIMEOUT_S = 30.0
+
+#: §5.2 L268/L270 sanitized reasons for the service approval faces. These
+#: duplicate the canonical constants in ``tools/policy.py`` (same strings):
+#: importing that module at runtime here would close the import cycle
+#: (tools.invoker imports this module), so the three literals stay local.
+REASON_APPROVAL_RUN_CANCELLED = "run cancelled while awaiting approval"
+REASON_APPROVAL_SHUTDOWN = "service close while awaiting approval"
+REASON_DECISION_REVOKED = "revoked by host"
 
 #: Grace period after a hard task cancel at close-timeout: the runner's
 #: CancelledError handler still commits the honest unknown/interrupted
@@ -164,6 +184,35 @@ class SessionBusyError(StoreError):
     """
 
     code = CoreErrorCode.SESSION_BUSY
+
+
+class ApprovalExpiredError(StoreError):
+    """A reply arrived after the approval expired (§5.2 L268/§7 L173, code ApprovalExpired).
+
+    Defined beside :class:`SessionBusyError` for the same reason: the §7
+    approval-protocol race is a service rule no storage module owns. The
+    companion late-reply case (over a replied/closed permission) reuses the
+    storage-exported :class:`ConflictError` and its registered Conflict code
+    (§8 L348); both codes are pre-registered, none is added here.
+    """
+
+    code = CoreErrorCode.APPROVAL_EXPIRED
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionReceipt:
+    """§7 L322: ``{permission_id, decision, execution_id}`` -- an ack, not a token.
+
+    Returned by :meth:`SessionService.reply_permission` before the Invoker
+    makes the reply durable (it commits immediately after): the receipt
+    confirms the host's input was accepted by the §7 L173 CAS and carries no
+    reusable execution permission -- the durable reply belongs to exactly
+    one pinned execution_id (① disclosed).
+    """
+
+    permission_id: str
+    decision: Literal["allow", "deny"]
+    execution_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +449,8 @@ class SessionService:
         engine: AsyncEngine | None = None,
         runner: RunScheduler | None = None,
         provider_close: Callable[[], Awaitable[None]] | None = None,
+        approvals: ApprovalCoordinator | None = None,
+        policy: PermissionPolicy | None = None,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
     ) -> None:
         if not isinstance(working_dir, str) or not working_dir:
@@ -428,6 +479,13 @@ class SessionService:
         self._engine = engine
         self._runner = runner
         self._provider_close = provider_close
+        # R3-S2 wiring: the approval channel (§7 L316) and the policy engine
+        # holding the current-boot saved decisions (revoke face, §5.2 L270).
+        # Both stay optional so the R1/R2 direct-construction faces are
+        # unchanged; the App composition passes the same pair it injected
+        # into the ToolRegistry.
+        self._approvals = approvals
+        self._policy = policy
         self._close_timeout_s = float(close_timeout_s)
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
@@ -751,6 +809,20 @@ class SessionService:
         if current.status.is_terminal:
             return current
         session_id = current.session_id
+        # R3-S2 §7 L173/L337: set the cooperative signal FIRST -- any Invoker
+        # that wakes from here on (via the coordinator close below or a
+        # racing host reply) observes it and folds an in-flight allow into
+        # the cancelled/not_started pair instead of committing a started
+        # the fold rejects on a cancelling run. The durable intent commits
+        # while the parked Invoker is still quiet (resolving the approval
+        # first would wake its commit burst against this intent's retries);
+        # only then does close_run resolve the pending approval -- the
+        # Invoker, not this method, commits the paired py.permission.closed
+        # + terminal through its own callback (T-B-027 ④-1). close_run is a
+        # no-op when nothing is pending, and a pending approval pins the run
+        # non-terminal, so the pair is always fold-legal.
+        if self._runner is not None:
+            self._runner.cancel_event(run_id).set()
         async with self._session_lock(session_id):
             # Re-read under the lock: the scheduled task may have committed
             # its terminal while we waited for the lock (late cancel).
@@ -758,6 +830,8 @@ class SessionService:
             if current.status.is_terminal:
                 return current
             await self._commit_cancel_intent(session_id, run_id, "user")
+        if self._approvals is not None:
+            await self._approvals.close_run(run_id, REASON_APPROVAL_RUN_CANCELLED)
         # §7 L313: the lock is released before waiting for the cleanup.
         if self._runner is not None:
             self._runner.cancel_event(run_id).set()
@@ -793,6 +867,144 @@ class SessionService:
         # resources to reclaim, and R4 owns the terminal.
         return await self._run_status_by_runs_table(run_id)
 
+    # -- §7 reply_permission / revoke_permission (R3-S2) ----------------------
+
+    async def reply_permission(self, permission_id: str, reply: str) -> DecisionReceipt:
+        """The host approval input channel (§7 L316): CAS-resolve one pending reply.
+
+        Independent of the run/session commit locks by design -- the Invoker
+        parks on the approval future without holding them, so a host reply
+        can never deadlock against a waiting run (§7 L316 "与运行锁分离").
+        The reply vocabulary is once/always/reject (§3.1 L136). The §7 L173
+        conditional update runs in the coordinator: the first legal
+        transition wins, a late reply maps to
+        :class:`ApprovalExpiredError` (the earlier terminal was expiry) or
+        :class:`ConflictError` (replied/closed), an unknown permission_id is
+        NotFound. A ``read_only_diagnostic`` session's approvals are refused
+        here (§3.2.1 L203: the Invoker's paired commit could never land on a
+        quarantined session). The returned receipt is an ack of the accepted
+        CAS, not a reusable permission: the Invoker commits the durable
+        ``py.permission.replied`` (plus ``saved`` for an always) immediately
+        after (①).
+        """
+        if not isinstance(permission_id, str) or not permission_id:
+            raise StoreValidationError("permission_id must be a non-empty string")
+        if reply not in ("once", "always", "reject"):
+            raise StoreValidationError("reply must be one of 'once', 'always', 'reject' (§3.1 L136)")
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        if self._approvals is None:
+            raise StoreValidationError("reply_permission requires an approval channel (approvals=)")
+        # the membership validation above pins the vocabulary; the str type
+        # carries no narrowing, so the literal is restored explicitly
+        reply_value = cast(Literal["once", "always", "reject"], reply)
+        request = await self._approvals.pending_request(permission_id)
+        if request is not None:
+            record = await self._read_record(request.session_id)
+            if record.status == SessionStatus.READ_ONLY_DIAGNOSTIC:
+                raise SessionReadOnlyError(
+                    f"session {request.session_id} is read_only_diagnostic",
+                    details={"session_id": request.session_id, "permission_id": permission_id},
+                )
+        resolution = await self._approvals.resolve_reply(permission_id, reply_value)
+        if resolution.status == "unknown":
+            raise NotFoundError(
+                f"permission {permission_id!r} does not exist", details={"permission_id": permission_id}
+            )
+        if resolution.status == "late":
+            assert resolution.outcome is not None
+            if resolution.outcome.outcome == "expired":
+                raise ApprovalExpiredError(
+                    f"permission {permission_id!r} already expired",
+                    details={"permission_id": permission_id},
+                )
+            raise ConflictError(
+                f"permission {permission_id!r} is already {resolution.outcome.outcome}",
+                details={"permission_id": permission_id, "state": resolution.outcome.outcome},
+            )
+        # An accepted CAS implies the permission was pending above (register
+        # happens exactly once, before the Invoker awaits).
+        assert request is not None and resolution.outcome is not None
+        decision: Literal["allow", "deny"] = "allow" if reply_value != "reject" else "deny"
+        return DecisionReceipt(
+            permission_id=permission_id,
+            decision=decision,
+            execution_id=request.execution_id,
+        )
+
+    async def revoke_permission(self, decision_id: str) -> None:
+        """Revoke one saved always-decision (§7 L317): deactivate, then append the event.
+
+        Only decisions the current boot registered are revocable through
+        this face (the in-memory policy registry is the activation set, §5.2
+        L270); a previous boot's audit rows answer NotFound (① disclosed).
+        The in-memory deactivation precedes the durable commit (fail-closed
+        direction: a failed commit leaves the rule deactivated, never a
+        revoked row that still activates). Revocation never changes already
+        executed results (§5.2 L270) -- the Invoker's pre-start gate simply
+        stops matching the rule. The ``py.permission.revoked`` event commits
+        under the session lock with bounded ConflictError retries, like
+        every service write.
+        """
+        if not isinstance(decision_id, str) or not decision_id:
+            raise StoreValidationError("decision_id must be a non-empty string")
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        if self._policy is None:
+            raise StoreValidationError("revoke_permission requires the permission policy (policy=)")
+        decision = self._policy.decision(decision_id)
+        if decision is None:
+            raise NotFoundError(f"decision {decision_id!r} does not exist", details={"decision_id": decision_id})
+        if decision.state != "saved":
+            raise ConflictError(
+                f"decision {decision_id!r} is already {decision.state}",
+                details={"decision_id": decision_id, "state": decision.state},
+            )
+        record = await self._read_record(decision.session_id)
+        if record.status == SessionStatus.READ_ONLY_DIAGNOSTIC:
+            raise SessionReadOnlyError(
+                f"session {decision.session_id} is read_only_diagnostic",
+                details={"session_id": decision.session_id, "decision_id": decision_id},
+            )
+        deactivated = self._policy.deactivate(decision_id)
+        assert deactivated  # the state check above pins saved; deactivate only fails otherwise
+        async with self._session_lock(decision.session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._commit_revoked(decision.session_id, decision_id)
+
+    async def _commit_revoked(self, session_id: str, decision_id: str) -> None:
+        """Commit one ``py.permission.revoked`` under the session lock (§5.2 L270).
+
+        Bounded ConflictError retries with the same batch (the scheduled
+        runner commits concurrently, so a stale expected_seq is retried);
+        there is no dedupe key -- repeated revocations are fenced by the
+        state gate in :meth:`revoke_permission` and the fold's
+        terminal-once rule.
+        """
+        draft = EventDraft[PermissionRevokedData](
+            id=self._ids.event_id(),
+            type=PY_PERMISSION_REVOKED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=self._clock(),
+            data=PermissionRevokedData(decision_id=decision_id, reason=REASON_DECISION_REVOKED),
+            metadata={},
+        )
+        batch = EventBatch(self._ids.batch_id(), (draft,))
+        conflict: ConflictError | None = None
+        for _ in range(_COMMIT_ATTEMPTS):
+            expected_seq = await self._repos.log_high(session_id)
+            try:
+                committed = await self._store.commit(session_id, batch, expected_seq)
+            except ConflictError as error:
+                conflict = error
+                continue
+            self._bus.notify(session_id, committed)
+            return
+        assert conflict is not None
+        raise conflict
+
     # -- §7 close -------------------------------------------------------------
 
     async def close(self) -> None:
@@ -804,11 +1016,14 @@ class SessionService:
         repeated calls await that same task -- the same result or error, never
         a duplicate shutdown event. The lifecycle: commit
         ``py.run.cancel_requested(reason=shutdown)`` for every live scheduled
-        run (R2 has no pending approvals: the ``permission.closed`` branch is
-        protocol-unreachable, ③ disclosure) -- a quarantined session is
+        run and set its cooperative signal -- a quarantined session is
         skipped, not fatal (A-010: its intent commit raises
         SessionReadOnlyError and close must still drain the other sessions) --
-        release the commit locks, wait
+        then resolve every pending approval "closed" (OP-9, T-C1-026: each
+        waiting Invoker, its run already cancelling and its signal already
+        set, commits the closed-first ``py.permission.closed`` +
+        ``tool.finished`` pair, T-B-027 ④-1, and folds the run to
+        interrupted), then release the commit locks, wait
         for the scheduled tasks while their terminals still flow through the
         same :meth:`SessionStore.commit`; on timeout hard-cancel the
         stragglers, let their CancelledError handlers commit the honest
@@ -835,7 +1050,10 @@ class SessionService:
         # needs no release because none was taken). The task registry
         # snapshot is safe: prompt's scheduling decision is a synchronous
         # block that re-checks _closing, so every task here was registered
-        # before the gate and no later one can appear.
+        # before the gate and no later one can appear. The intents also land
+        # while every approval-waiting Invoker is still parked: resolving
+        # those approvals first would wake their [closed, finished] commit
+        # bursts against these very retries.
         scheduled = list(self._tasks.items())
         for _run_id, (session_id, _task) in scheduled:
             try:
@@ -848,6 +1066,16 @@ class SessionService:
                 pass
             if self._runner is not None:
                 self._runner.cancel_event(_run_id).set()
+        # Phase 1.5 (OP-9, T-C1-026): NOW resolve every pending approval
+        # "closed" -- after every intent, with every cooperative signal
+        # already set. Each registered Invoker observes the closed status
+        # and commits the closed-first ``py.permission.closed`` +
+        # ``tool.finished`` pair (T-B-027 ④-1), so the run folds to
+        # interrupted/cancelled through the normal phase-2 wait; the
+        # post-allow re-check can never commit a started over the already
+        # cancelling run.
+        if self._approvals is not None:
+            await self._approvals.close_all(REASON_APPROVAL_SHUTDOWN)
         # Phase 2: wait for the tasks (their determined tool/step/run
         # terminals still commit through the same store); on timeout
         # hard-cancel the stragglers and let the grace period carry their
