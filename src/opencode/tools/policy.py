@@ -44,7 +44,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from opencode.contracts.messages import JsonObject
 
@@ -235,6 +235,57 @@ class PermissionRule:
     source: Literal["host", "project"] = "host"
     resources: tuple[str, ...] | None = None
     reason: str = ""
+
+
+#: Known fields of one snapshot ``permission_rules`` entry (R3-S7). ``source``
+#: is deliberately absent: the tier of a config-file rule is host authority
+#: (§5.2 L266), so an entry trying to declare its own source fails closed.
+_SNAPSHOT_RULE_KEYS: frozenset[str] = frozenset({"action", "effect", "resources", "reason"})
+
+
+def permission_rules_from_snapshot(rules: Sequence[JsonObject]) -> tuple[PermissionRule, ...]:
+    """Convert snapshot v2 ``permission_rules`` entries into engine rules (R3-S7).
+
+    The wiring seam of the CLI assembly: the loader validated each entry's
+    shape at load time (the exit-2 face), so the host normally reaches this
+    helper with legal entries. It stays fail-closed anyway -- a snapshot
+    recovered from the store (or any non-loader source) was never
+    load-validated, and a malformed entry raises ValueError (the host's
+    exit-70 face) instead of silently dropping a rule. Every rule assembles
+    with ``source="project"``: config-file rules extend the project tier and
+    can never outrank the host tier (§5.2 L266 source priority).
+    """
+    converted: list[PermissionRule] = []
+    for index, entry in enumerate(rules):
+        if not isinstance(entry, dict):
+            raise ValueError(f"permission rule #{index} must be a JSON object")
+        for key in entry:
+            if key not in _SNAPSHOT_RULE_KEYS:
+                raise ValueError(f"permission rule #{index} has unknown field {key!r}")
+        action = entry["action"]
+        if not isinstance(action, str) or not action:
+            raise ValueError(f"permission rule #{index} needs a non-empty string 'action'")
+        effect = entry["effect"]
+        if effect not in ("allow", "ask", "deny"):
+            raise ValueError(f"permission rule #{index} effect must be allow/ask/deny, got {effect!r}")
+        resources = entry.get("resources")
+        if resources is not None and (
+            not isinstance(resources, list) or not all(isinstance(item, str) and item for item in resources)
+        ):
+            raise ValueError(f"permission rule #{index} 'resources' must be a list of non-empty strings")
+        reason = entry.get("reason", "")
+        if not isinstance(reason, str):
+            raise ValueError(f"permission rule #{index} 'reason' must be a string")
+        converted.append(
+            PermissionRule(
+                action=action,
+                effect=cast('Literal["allow", "ask", "deny"]', effect),
+                source="project",
+                resources=tuple(cast("list[str]", resources)) if resources is not None else None,
+                reason=reason,
+            )
+        )
+    return tuple(converted)
 
 
 def extract_resources(action: str, raw_input: JsonObject) -> tuple[str, ...]:

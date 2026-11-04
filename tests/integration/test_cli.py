@@ -6,6 +6,13 @@ KeyboardInterrupt from it is the mid-run Ctrl-C injection). The fake server
 rides a dedicated thread-owned event loop so its URL is known before main()
 starts and it outlives main()'s asyncio.run. Every test here is a sync
 function on purpose: main() owns the event loop.
+
+R3-S7 boundary note: the KeyboardInterrupt injections here (line-seam,
+wait_hook) are *in-process* seams — they pin the routing logic race-free but
+never exercise the OS signal machinery. The real-signal faces (a genuine
+CTRL_C_EVENT/SIGINT delivered to a ``python -m opencode`` subprocess, both
+mid-run and at the prompt) live in test_cli_r3.py; the two files split the
+axis (in-process determinism vs subprocess realism) on purpose.
 """
 
 from __future__ import annotations

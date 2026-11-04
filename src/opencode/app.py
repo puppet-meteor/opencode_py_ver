@@ -48,7 +48,7 @@ from opencode.storage import (
     open_database,
 )
 from opencode.tools import ToolLimits, ToolRegistry
-from opencode.tools.policy import DEFAULT_APPROVAL_TIMEOUT_S, ApprovalCoordinator, PermissionPolicy
+from opencode.tools.policy import DEFAULT_APPROVAL_TIMEOUT_S, ApprovalCoordinator, PermissionPolicy, PermissionRule
 from opencode.tools.registry import ToolAdapter
 
 
@@ -96,6 +96,7 @@ class App:
         max_steps: int = DEFAULT_MAX_STEPS,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
         approval_timeout_s: float = DEFAULT_APPROVAL_TIMEOUT_S,
+        rules: Sequence[PermissionRule] = (),
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -114,6 +115,10 @@ class App:
             policy = PermissionPolicy(
                 boot_id=f"boot_{uuid4().hex}",
                 approvals=approvals,
+                # R3-S7 wiring seam (B report §6 open point 1): snapshot
+                # permission rules enter as the project tier -- they tighten
+                # the defaults but never outrank the host tier (§5.2 L266).
+                rules=rules,
                 clock=clock,
             )
             committer = EventCommitter(repos, store, self._bus, ids=shared_ids, clock=clock)

@@ -15,22 +15,25 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from opencode.cli import main
 from opencode.config import CliOverrides, ConfigError, ConfigLoader, InstructionLimitError, RecoveryStoppedError
-from opencode.config.loader import HOST_ONLY_KEYS, _merge_json
+from opencode.config.loader import HOST_ONLY_KEYS, _merge_json, _sanitize_endpoint
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.events import (
     ConfigSnapshot,
+    ConfigSnapshotV2,
     SessionCreatedData,
     SessionCreatedDataV2,
     compute_snapshot_hash,
     upcast_session_created,
 )
 from opencode.contracts.messages import JsonObject, ToolTextContent
+from opencode.session.service import _coerce_config_snapshot
+from opencode.storage import StoreValidationError
 from opencode.tools.builtin import FsReadAdapter, FsWriteAdapter
 from opencode.tools.invoker import ToolContext
 from tests.r0.fake_openai_server import (
@@ -514,3 +517,64 @@ def test_cli_broken_config_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     with pytest.raises(SystemExit) as exc_info:
         main(argv)
     assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# R3-S7 nit-2 batch: snapshot coercion routing, merge type mismatch, endpoint
+# sanitization rejections (scheduler row #32).
+# ---------------------------------------------------------------------------
+
+
+def _v2_snapshot_dict() -> dict[str, Any]:
+    """A minimal legal v2 snapshot as raw JSON (the store/service wire face)."""
+    return {
+        "schema_version": 2,
+        "model": {"provider": "maas", "model": "fake-model"},
+        "endpoint_ref": "https://api.example.test/v1",
+        "roots": [],
+        "permission_rules": [{"action": "fs__write", "effect": "deny"}],
+        "instructions": [],
+        "limits": {
+            "context_limit": 100000,
+            "output_reserve": 4096,
+            "timeout_s": 30.0,
+            "safety_margin": 0,
+            "temperature": None,
+            "max_steps": 20,
+        },
+    }
+
+
+def test_coerce_config_snapshot_routes_by_schema_version() -> None:
+    """nit-2(c): a JSON object routes by ``schema_version`` — 2 decodes through
+    the v2 model (permission_rules carried), anything else through the frozen
+    v1 model; a non-dict is rejected before either."""
+    v1 = _coerce_config_snapshot({"schema_version": 1, "permission_rules": []})
+    assert isinstance(v1, ConfigSnapshot)
+    v2 = _coerce_config_snapshot(_v2_snapshot_dict())
+    assert isinstance(v2, ConfigSnapshotV2)
+    assert v2.permission_rules == [{"action": "fs__write", "effect": "deny"}]
+    with pytest.raises(StoreValidationError, match="must be a ConfigSnapshot"):
+        _coerce_config_snapshot(cast("Any", ["not", "a", "dict"]))
+    with pytest.raises(StoreValidationError, match="invalid config_snapshot"):
+        _coerce_config_snapshot({"schema_version": 3})
+
+
+def test_merge_json_type_mismatch_replaces_whole() -> None:
+    """nit-2(d): a scalar/map/list type mismatch resolves as "override wins" —
+    the later layer replaces the earlier value whole (§6 L285)."""
+    assert _merge_json({"a": 1}, {"a": {"b": 2}}) == {"a": {"b": 2}}  # scalar <- map
+    assert _merge_json({"a": {"b": 1}}, {"a": 5}) == {"a": 5}  # map <- scalar
+    assert _merge_json({"a": [1, 2]}, {"a": 9}) == {"a": 9}  # list (non-append path) <- scalar
+    assert _merge_json({"a": 1}, {"a": [1, 2]}) == {"a": [1, 2]}  # scalar <- list
+    assert _merge_json({"a": {"b": 1}}, {"a": [1]}) == {"a": [1]}  # map <- list
+
+
+def test_sanitize_endpoint_rejects_non_absolute_and_non_http() -> None:
+    """nit-2(e): only an absolute http(s) URL is a legal endpoint reference;
+    userinfo/query/fragment strip, and http stays http (no silent upgrade)."""
+    for bad in ("ftp://example.com/v1", "example.com/v1", "//example.com", "http://", "/relative/path"):
+        with pytest.raises(ConfigError, match="absolute http"):
+            _sanitize_endpoint(bad)
+    assert _sanitize_endpoint("http://example.com/v1") == "http://example.com/v1"
+    assert _sanitize_endpoint("https://user:secret@example.com/v1?q=1#f") == "https://example.com/v1"
