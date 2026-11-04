@@ -1,10 +1,44 @@
-"""Builtin tool adapters (R2-S5): the ``fs__read`` text file reader.
+"""Builtin tool adapters: the static read quartet.
 
-Adapters are registered by the runner (R2-S6) via
-:meth:`opencode.tools.registry.ToolRegistry.register`; this package only
-provides the implementations.
+``fs__read`` (R2-S5) plus the R3-S3 static read trio ``fs__ls`` /
+``fs__glob`` / ``fs__grep``. Adapters are registered by the host (R2-S6)
+via :meth:`opencode.tools.registry.ToolRegistry.register`; this package
+only provides the implementations.
 """
 
+from opencode.tools.builtin.glob import (
+    GLOB_DEFAULT_LIMIT,
+    GLOB_DESCRIPTION,
+    GLOB_INPUT_SCHEMA,
+    GLOB_MAX_LIMIT,
+    GLOB_NAME,
+    GLOB_NAMESPACE,
+    GLOB_SPEC,
+    GLOB_VERSION,
+    FsGlobAdapter,
+)
+from opencode.tools.builtin.grep import (
+    GREP_DEFAULT_LIMIT,
+    GREP_DESCRIPTION,
+    GREP_INPUT_SCHEMA,
+    GREP_MAX_LIMIT,
+    GREP_NAME,
+    GREP_NAMESPACE,
+    GREP_SPEC,
+    GREP_VERSION,
+    FsGrepAdapter,
+)
+from opencode.tools.builtin.ls import (
+    LS_DEFAULT_LIMIT,
+    LS_DESCRIPTION,
+    LS_INPUT_SCHEMA,
+    LS_MAX_LIMIT,
+    LS_NAME,
+    LS_NAMESPACE,
+    LS_SPEC,
+    LS_VERSION,
+    FsLsAdapter,
+)
 from opencode.tools.builtin.read import (
     MAX_LINE_LENGTH,
     MAX_LINE_SUFFIX,
@@ -19,6 +53,30 @@ from opencode.tools.builtin.read import (
 )
 
 __all__ = [
+    "GLOB_DEFAULT_LIMIT",
+    "GLOB_DESCRIPTION",
+    "GLOB_INPUT_SCHEMA",
+    "GLOB_MAX_LIMIT",
+    "GLOB_NAME",
+    "GLOB_NAMESPACE",
+    "GLOB_SPEC",
+    "GLOB_VERSION",
+    "GREP_DEFAULT_LIMIT",
+    "GREP_DESCRIPTION",
+    "GREP_INPUT_SCHEMA",
+    "GREP_MAX_LIMIT",
+    "GREP_NAME",
+    "GREP_NAMESPACE",
+    "GREP_SPEC",
+    "GREP_VERSION",
+    "LS_DEFAULT_LIMIT",
+    "LS_DESCRIPTION",
+    "LS_INPUT_SCHEMA",
+    "LS_MAX_LIMIT",
+    "LS_NAME",
+    "LS_NAMESPACE",
+    "LS_SPEC",
+    "LS_VERSION",
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
@@ -28,5 +86,8 @@ __all__ = [
     "READ_NAMESPACE",
     "READ_SPEC",
     "READ_VERSION",
+    "FsGlobAdapter",
+    "FsGrepAdapter",
+    "FsLsAdapter",
     "FsReadAdapter",
 ]

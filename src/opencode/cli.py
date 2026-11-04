@@ -2,7 +2,7 @@
 
 The CLI is an ordinary host over the App public face (the composition root
 stays untouched): it runs the alembic migration step as a subprocess, then
-composes ``App`` with the MAAS adapter and the fs.read builtin and drives the
+composes ``App`` with the MAAS adapter and the fs builtins and drives the
 §7 command surface (create / prompt / cancel / run_status / messages). Its
 only responsibilities are input and display (ROADMAP L102; R2 has no
 approval face); the argument face is the R3 ConfigLoader injection point,
@@ -55,7 +55,7 @@ from opencode.session.context import RuntimeSettings
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import RunStatus, RunStatusValue, SessionService
 from opencode.storage import LifecycleCleanupFailedError
-from opencode.tools.builtin.read import FsReadAdapter
+from opencode.tools.builtin import FsGlobAdapter, FsGrepAdapter, FsLsAdapter, FsReadAdapter
 
 #: Terminal poll cadence for ``service.run_status`` (the durable authority).
 _POLL_INTERVAL_S = 0.05
@@ -273,7 +273,13 @@ async def _drive(
     wait_hook: Callable[[], None] | None,
 ) -> int:
     """One process = one migrated database + one App + one fresh session."""
-    app = App(db_path, provider=provider, tools=(FsReadAdapter(),), settings=settings, max_steps=max_steps)
+    app = App(
+        db_path,
+        provider=provider,
+        tools=(FsReadAdapter(), FsLsAdapter(), FsGlobAdapter(), FsGrepAdapter()),
+        settings=settings,
+        max_steps=max_steps,
+    )
     try:
         session = await app.service.create(ConfigSnapshot.create())
         session_id = session.session_id
