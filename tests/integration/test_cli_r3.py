@@ -691,7 +691,14 @@ def test_history_non_numeric_argument_warns_and_keeps_default(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """P-2 (row #2): /history with a non-numeric limit warns once and keeps the
-    default instead of erroring."""
+    default instead of erroring.
+
+    Open point 6 (T-B-033 §6-6), made explicit: this injection is also the
+    pump dead-lock regression pin — "/history abc" arrives *mid-run* through
+    ``_pump_input``, whose ``include_pushback=False`` read + ``push_back``
+    deferral is exactly the fixed face; a regression there parks the line in
+    the wrong queue and this test dead-locks at the next prompt read.
+    """
     host = _ServerHost([_ok_response("hello")])
     base_url = host.start()
     try:
@@ -776,3 +783,31 @@ def test_migration_failure_maps_to_exit_70(tmp_path: Path, capsys: pytest.Captur
     code = main(_argv(db_path, "http://127.0.0.1:9/v1", "hello"))
     assert code == 70
     assert "database migration failed" in capsys.readouterr().err
+
+
+def test_resolve_phase_config_error_maps_to_exit_70(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Row #28 (nit-2): a shape-valid config whose *resolved* values are illegal
+    (context_limit <= output_reserve, the RuntimeSettings invariant) fails in
+    main's resolve phase — traceback + exit 70, the resolve-stage complement to
+    the migration-stage injection above (never the failed-run exit 1)."""
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "cli-resolve-70.db"
+    config = _write_json(
+        tmp_path / "resolve.json", {"model": "fake-model", "context_limit": 100, "output_reserve": 200}
+    )
+    code = main(
+        [
+            "--db",
+            str(db_path),
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--api-key",
+            "r0-test-key",
+            "--config",
+            str(config),
+        ]
+    )
+    assert code == 70
+    assert "the resolved config is not a legal runtime face" in capsys.readouterr().err

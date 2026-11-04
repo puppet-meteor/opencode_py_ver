@@ -153,7 +153,7 @@ _PREVIEW_TYPES = frozenset(
     }
 )
 
-# §5.3 L277: every C0 control except \t and \n, DEL, and C1 become U+FFFD; the
+# §5.3: every C0 control except \t and \n, DEL, and C1 become U+FFFD; the
 # ESC replacement also dissolves CSI sequences. Deterministic, side-effect free.
 _REPLACEMENT = "\ufffd"
 _CONTROL_TABLE = str.maketrans(
@@ -169,7 +169,7 @@ _ACTIVE_INPUT: _ReplInput | None = None
 
 
 def escape_for_display(text: str) -> str:
-    """Replace every display-dangerous control character with U+FFFD (§5.3 L277)."""
+    """Replace every display-dangerous control character with U+FFFD (§5.3)."""
     return text.translate(_CONTROL_TABLE)
 
 
@@ -732,6 +732,9 @@ async def _pump_input(app: App, repl_input: _ReplInput) -> None:
         except _EndOfInput:
             return
         except KeyboardInterrupt:
+            # a mid-run SIGINT stops only this round's dispatch (T-B-033 open
+            # point 1): nothing is lost — unread/deferred lines stay buffered
+            # and replay at the next prompt.
             repl_input.route_sigint()
             return
         command = line.strip()
@@ -820,7 +823,7 @@ async def _print_events(events: AsyncIterator[Event]) -> None:
 
 
 async def _print_history(app: App, session_id: str, command: str) -> None:
-    """[history] [limit]: forward pagination through the union face, <= 100 per page."""
+    """/history [limit]: forward pagination through the union face, <= 100 per page."""
     limit = _HISTORY_DEFAULT_LIMIT
     parts = command.split()
     if len(parts) > 1:

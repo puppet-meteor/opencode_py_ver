@@ -334,6 +334,15 @@ async def test_interrupted_partial_stream_next_request_starts_fresh(tmp_path: Pa
             fresh_request = _wire_messages(server.requests[1].body)
             assert fresh_request[-1].get("role") == "user"
             assert _content_str(fresh_request[-1].get("content")) == "start over"
+            # r-1 (R2-S8-closeout-review L87), the two-sided zero-rejoin proof.
+            # This side: the second request's history DOES carry the interrupted
+            # assistant message with its partial fragment (the ContextBuilder's
+            # normal history selection); together with the fresh generation's
+            # exact-own-script finalization above, zero-rejoin is proven
+            # independently of which history rows were selected.
+            interrupted_wire = [message for message in fresh_request if message.get("role") == "assistant"]
+            assert len(interrupted_wire) == 1
+            assert _content_str(interrupted_wire[0].get("content")) == "partial tex"
     finally:
         await server.aclose()
 
