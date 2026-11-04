@@ -51,6 +51,7 @@ from opencode.tools.invoker import (
     invoke_tool,
     validate_schema_supported,
 )
+from opencode.tools.policy import PermissionPolicy
 
 #: §5.1 L250 / TS normalizedName: each half of the wire name
 #: ``namespace__name`` is restricted to URL-safe characters. Reversibility
@@ -138,6 +139,7 @@ class ToolRegistry:
         sink: EventSink | None = None,
         clock: Clock | None = None,
         ids: IdFactory | None = None,
+        policy: PermissionPolicy | None = None,
     ) -> None:
         self._sink = sink
         self._clock: Clock = clock if clock is not None else _utc_now
@@ -145,6 +147,9 @@ class ToolRegistry:
         self._lock = asyncio.Lock()
         self._adapters: dict[tuple[str, str], ToolAdapter] = {}
         self._pinned: dict[str, ToolCatalog] = {}
+        # R3-S2: the PermissionPolicy injected into the Invoker (§5.1 L257).
+        # None keeps the R2 default-allow face (no policy gate at all).
+        self._policy = policy
 
     # -- §5.1 L251 registration --------------------------------------------
 
@@ -248,4 +253,5 @@ class ToolRegistry:
                 sink=self._sink,
                 clock=self._clock,
                 ids=self._ids,
+                policy=self._policy,
             )
