@@ -125,9 +125,9 @@
 
 | # | 项 | 来源 | 处置（并入/缓） |
 |---|---|---|---|
-| 1 | P-1 真 SIGINT subprocess 双子场景（prompt 面 exit-130 挂起风险；os._exit(130)/daemon 化备选） | R2-S8-review n-1（T-B-024 处方） | **R3-S7 必做** |
-| 2 | P-2 /history 非数值参数告警 | R2-S8 r-1 | R3-S7（可选） |
-| 3 | P-3 `_print_terminal` 渲染 str(CoreError) repr | R2-S8 r-3 | R3-S7（可选） |
+| 1 | P-1 真 SIGINT subprocess 双子场景（prompt 面 exit-130 挂起风险；os._exit(130)/daemon 化备选） | R2-S8-review n-1（T-B-024 处方） | **已闭合（R3-S7 落地，T-C1-031 PASS+T-B-033 维5/点名①复核）**：双子落 test_cli_r3.py subprocess 真信号（CREATE_NEW_PROCESS_GROUP+SetConsoleCtrlHandler(None,False)+父侧 SIG_IGN+1314 族 skip-not-fail）；(a) mid-run→cancel→exit 2[omit_done 流结束=proactor 在途 read 不可中止约束如实记，④档]；(b) prompt 面→exit 130+**进程真实退出断言**[15s wait 护栏]——挂起复现[Temp 取证呈 poll-parked]→修复=**input 工作线程 daemon 化+显式放弃 join**（非 os._exit(130) 快路径，保 DB flush/finally）+`_sigint_router` 带内路由；连带发现=泵自吞 pushback 死锁[见行#33 注记项] |
+| 2 | P-2 /history 非数值参数告警 | R2-S8 r-1 | **已闭合（R3-S7 落地，T-B-033 维7 复核）**：cli.py `/history` 非数值回显警告行后取默认；编辑波及=nit-3 docstring 前导 "/" 丢失→行#33 回补 |
+| 3 | P-3 `_print_terminal` 渲染 str(CoreError) repr | R2-S8 r-3 | **已闭合（R3-S7 测试钉+零代码，前提过时记档；T-B-033 点名⑥独立复核 concur）**：考古链=failed 行自 CLI 诞生即消息形（runs.error=canonical_json(CoreError dump)→`_decode_run_error`[R2-S7 aa67bd3 诞生]提取 .message→`RunStatus.error: str`→escape_for_display；cli.py 从未引用 CoreError、全 src 无 str(CoreError) 路径）——r-3 观察=**评审侧静态误判经 r-3→行#3→任务书三层传递未复核**，调度器侦察责任记档；席位双断言钉住（error: 在场+CoreError( 缺席）处置正确 |
 | 4 | 函数级测试名枚举（pytest --collect-only 一次性补齐） | R2-S8-closeout ④(a) | R3-S8 |
 | 5 | r-1 e2e requests[1] 历史含 interrupted 断言 | R2-S8-closeout r-1 | R3-S8（可选） |
 | 6 | projector 双注册表漂移（`_REPLAY_REGISTRY` import 期冻结→注入/惰性） | R2-S2-review n-1 | **R3-S1 必做**（应用侧注册触发点） |
@@ -135,13 +135,13 @@
 | 8 | m-2 撞键文案小修 | R2-S2-review m-2 | 同上（状态核对） |
 | 9 | CJK 乘数/真 tokenizer 缓存 | R2-S4 ④-6/m-3+§10-2 L404 | **缓 R4+**（§10-2 已定 R2 零行为变更；fail-visible 保持、需求未证实；决策归调度器） |
 | 10 | ephemeral delta 合批（100ms 先例） | R2-S6 n-2 | **缓**（条件触发：R3 总线压力实测成立再议） |
-| 11 | runner 单文件→包拆分 | R2-S6 ④ | R3-S7 评估（触发=host 装配面需求） |
+| 11 | runner 单文件→包拆分 | R2-S6 ④ | **已闭合（R3-S7 评估=零代码，T-C1-031 必答⑤+T-B-033 维7 concur）**：App 构造点已纳全部 host 装配面（rules 参数恰接线自证），拆分触发条件不成立——维持单文件 |
 | 12 | OP-9 permission.closed 分支激活 | r2-slices L181/R2-S7 §6-4 | **R3-S2 必做**（审批接入后协议可达） |
 | 13 | m-1 残窗 cancelling() | R2-S7c/#92 | **显式缓不设票**（#92 裁定维持，R3 不重开） |
 | 14 | R-3 类型收窄遗留（session 复用/配置层） | T-C1-023 ④ | R3-S6 承接（ConfigLoader 面） |
-| 15 | 迁移失败注入（alembic 子进程→70） | R2-S8 §5 | R3-S7（与 16/17 合并条目） |
-| 16 | exit 3（cancel 清理失败）真实触发 | R2-S8 §5 | R3-S7（同上合并） |
-| 17 | 非 UTF-8 控制台 | R2-S8 §5 | R3-S7 批处理 |
+| 15 | 迁移失败注入（alembic 子进程→70） | R2-S8 §5 | **已闭合（R3-S7 落地，T-B-033 维7 复核）**：migration 注入 pin exit 70 落 test_cli_r3.py（与 nit-2 exit-70 专测合并落点）；行#33 追加 resolve 阶段 ConfigError→exit 70 注入测（B nit-2 处方） |
+| 16 | exit 3（cancel 清理失败）真实触发 | R2-S8 §5 | **已闭合（R3-S7 落地，T-B-033 维7 复核）**：`LifecycleCleanupFailedError` 注入 pin（`_CLEANUP_EXIT_CODE`）落 test_cli_r3.py |
+| 17 | 非 UTF-8 控制台 | R2-S8 §5 | **已闭合（R3-S7 落地，T-B-033 维7 复核）**：`_harden_console_streams` errors="replace" 损失性降级+测试钉（GB2312 旁路解析面） |
 | 18 | SlowConsumerError 显示 | R2-S8 §5 | **缓/低价值**（stderr 单行已满足契约） |
 | 19 | surrogate 前置扫描一行 | T-C1-002-review ②（B 意见已采纳带入） | **已闭合（R3-S6 落地，T-B-032 维4 复核）**：loader.py 指令装配前 encode 预扫描，surrogate 触发=具名 ConfigError（非裸 UnicodeEncodeError）；64KiB/源+256KiB 总量恰界四面+具名触发专测承重 |
 | 20 | session 复用/配置层=CLI 参数面→ConfigLoader | R2-S8 §5/T-C1-023 R-3 | R3-S6 |
@@ -156,7 +156,8 @@
 | 29 | T-C1-028 ④-2/④-3 移植重启条件（前瞻记档，非缺陷）：④-2 formatter 钩子——TS write.ts 落盘后 format+sync BOM，Python 侧无 formatter 服务承载面（已量化偏差）；④-3 file-diff.ts——TS 侧 fileDiff 产物仅流向 permission.assert 的 metadata.files 审批预览与 Output.files 结构化输出，Python 侧 S2 审批通道无此二消费者（任务书④"仅参照"裁决成立） | T-C1-028 ④-2/④-3（席位浮报，裁定 concur） | 重启条件载明：formatter=Python 侧格式化集成承载面落地时连带处理；file-diff=approval metadata.files 预览或 structured-output 消费方出现时连带移植；④-4 cli.py 行号漂移（冻结 test_tool_static_trio.py docstring 引"cli.py L276"→实际 L283，import 括号化 +7）=leave-as-is float 仅台账记档不开行（装配面语义仍真，S2 events.py L333 同类先例；席位已把可编辑面内同款引述改为无行号措辞） |
 | 30 | T-B-030 nit 三项（均登记级，零返工）：nit-1 write/edit TOOL_FAILED 包装措辞 "Cannot {path}: {error}" vs TS "Unable to"——语义等价纯措辞面，进度④披露档未列（集成测试已 pin "Cannot"）；nit-2 进度⑤"既有 8 测原名原断言"不精确——六件套扩展使 2 测断言必然扩展（目录清单断言纳入 write/edit+重复拒绝循环 3→5），测名未改属实；nit-3 ③四档缺 endingsOnly-unchanged 一行（该分支双实现结构不可达，edit.py 代码注释已披露"④ disclosure"而进度③未列）；**T-B-031 追加三项**（均登记级，零返工）：nit-1 rg stderr 流现亦受 64 KiB 上限（旧 `_run_rg` 无界）而进度⑤ delta 仅明列 stdout 面=披露精度（B 独立 concur 调度器观察①）；nit-2 timeout=0 禁用测试无法区分"禁用生效"与 falsy 回退 bug 类（monkeypatch 设 timeout 源可强化区分度）；nit-3 进度② test#1 "Proves"列高估 env 四标记（代码设置而测试未钉定） | T-B-030 nit-1/2/3 + T-B-031 nit-1/2/3 | nit-1=后续触达 write.py/edit.py 的切片顺手对齐措辞（连动测试断言）或维持 Python 措辞并在④补记（非返工）；nit-2/nit-3=恢复切片或下次触达进度文件/③四档时补记（本链保持评审对象与并回对象 1:1，不做事后文件修正）；开放点（悬空 symlink NOT_FOUND vs file-access.ts 未对拍）仅存评审报告不进台账；T-B-031 三项=下次触达 grep.py/进度文件/test_tool_bash.py 的切片顺手补记或强化（登记级非返工） |
 | 31 | frozen-invoker 诊断后置（移植重启条件，非缺陷）：解释器不可用/缺 cwd/空命令等 pre-execute 诊断现经冻结 invoker 映射落 started 后 failed/unknown 而非 not_started（§2.1 L35 更精确终态不可表达——冻结面结构性属性，席位④已如实披露） | T-B-031 必答1b（B 独立 concur 调度器观察②；行#29 先例=重启条件前瞻记档模式） | invoker 获 pre-execute 诊断钩子承载面时连带升级（not_started 精确终态+诊断直报）；S7 CLI+SIGINT 或恢复切片触达 invoker 时评估——非交付切片缺陷零代码 |
-| 32 | **S6 回归批（T-B-032 处方，测试缺口非返工）**：minor-1=glob/grep/ls 三适配器多根面零直测——补 roots 构造+次根路径允许+次根条目**绝对形渲染断言**，`_display_path` 跨盘 ValueError 分支标注 skip-if-single-drive（Windows CI 双盘符构造受限）；nit-2=四分支候选并入——(a) 跨盘 ValueError 绝对形回退/(c) `_coerce_config_snapshot` dict-v2 路由/(d) `_merge_json` 类型失配整体替换/(e) `_sanitize_endpoint` 非 http(s) 拒绝，另席位已披露六候选中 exit-70 专测优先；**任务书作者纪律（零代码）**：涟漪授权条款字面增列渲染面（多根条目绝对形，沿 S2 裁定 a+T-B-032 必答1b 追认先例）；Windows 符号链机制统一表述 symlink 实跑（1314 跳过分支在册）不称 junction | T-B-032 §5.1/5.2/5.3/5.4 处方（minor-1/nit-2/nit-1/任务书改进） | **R3-S7 回归批**（T-C1-031 任务书条款；permission.rules 执法接线与 CLI 单次装载形态候选=§2.7 切片面本体+报告开放点，非本行） |
+| 32 | **S6 回归批（T-B-032 处方，测试缺口非返工）**：minor-1=glob/grep/ls 三适配器多根面零直测——补 roots 构造+次根路径允许+次根条目**绝对形渲染断言**，`_display_path` 跨盘 ValueError 分支标注 skip-if-single-drive（Windows CI 双盘符构造受限）；nit-2=四分支候选并入——(a) 跨盘 ValueError 绝对形回退/(c) `_coerce_config_snapshot` dict-v2 路由/(d) `_merge_json` 类型失配整体替换/(e) `_sanitize_endpoint` 非 http(s) 拒绝，另席位已披露六候选中 exit-70 专测优先；**任务书作者纪律（零代码）**：涟漪授权条款字面增列渲染面（多根条目绝对形，沿 S2 裁定 a+T-B-032 必答1b 追认先例）；Windows 符号链机制统一表述 symlink 实跑（1314 跳过分支在册）不称 junction | T-B-032 §5.1/5.2/5.3/5.4 处方（minor-1/nit-2/nit-1/任务书改进） | **已闭合（R3-S7 落地，T-C1-031 行#32 条款+T-B-033 维8 复核）**：minor-1 三适配器次根允许+**绝对形渲染断言**（多根条目唯一可回环形态）+缺省适配器外面拒绝[roots=() R2 语义钉]全落 test_fs_multiroot.py；跨盘 ValueError 分支**词法构造零 skip 化解**（drive 字母判定不依赖盘符存在，POSIX 同输入走 ".." 词法守卫同绝对形结果——skip-if-single-drive 条款化解，1314 同族如实记）；nit-2 四分支 (a)(c)(d)(e)+exit-70 专测落 test_config_loader.py +3；grep 次根 `./` wart 披露钉现状（判定非缺陷零工具改动） |
+| 33 | **S7 回归批（T-B-033 处方，登记级）**：nit-1=进度② 措辞浮报（"断言含文件路径"为实现事实、测试仅断言 exit code 2）——报告承载不回改进度，零动作记档；nit-2=resolve 阶段 exit-70 注入测（--config 携 context_limit=100+output_reserve=200→resolve_runtime ConfigError→exit 70，~10 行——与行#15 已落的 migration 注入面互补，补 resolve 阶段缺口）；nit-3=`_print_history` docstring 前导 "/" 回补（P-2 编辑波及，下次 cli.py 触碰时一字符）；开放点6=泵回归钉显性化（P-2 测试 `/history abc` 中途注入恰为泵死锁回归钉载体——加注释或拆测试名使其可见）；可选=泵 KI 后行为注记（中途 SIGINT 停同轮分发、缓冲至下 prompt，无害未注）+契约锚漂移批（docstring §5.3 L277→L279、§8 L350→L330 去行号化——建议随 S8 evidence 行号重锚纪律并批）；其余开放点（proactor cancel 终态延迟≤请求超时/未测轻面池[usage 分支、非主线程 sigint install、`_wake` 闭环抑制]/IPv6 分支）=R4+ 登记级不设行 | T-B-033 §5 nit-1/2/3+§6 开放点1/2/6 | **R3-S8 回归批**（T-C1-032 任务书条款；cli.py/test 触碰授权随批给出；契约锚去行号化并入 S8 evidence 行号重锚纪律——裁量归调度器） |
 
 ## 4. 关键设计差异备忘（Python vs TS，实现时勿"照抄"）
 
