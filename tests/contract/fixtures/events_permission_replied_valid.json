@@ -1,0 +1,16 @@
+{
+  "id": "evt_00000000000000000000000041",
+  "type": "py.permission.replied",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:21Z",
+  "data": {
+    "permission_id": "per_0000000000000000000000000001",
+    "reply": "once",
+    "source": "host"
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 12
+}

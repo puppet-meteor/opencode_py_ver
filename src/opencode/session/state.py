@@ -11,6 +11,15 @@ machine (L44-52, effect_status recorded independently per L35), ``py.step.finish
 replaces the assistant message with the self-contained terminal message
 (consistency with the folded parts, §3.1 L144), and ``py.run.finished`` appends
 the idle message and releases ``active_run_id`` (L65 "idle 只由 run.finished 投影").
+R3-S1 adds the ``py.permission.*`` fold (§3.1 L135-139): the approval trio is
+run-scoped through the execution it pins (requested requires the folded PENDING
+tool and a matching input_hash; replied/closed terminate a PENDING permission
+exactly once -- §7 L173 first-legal-transition-wins, a late reply never
+overrides a closed permission), while the saved-decision trio is session-scoped
+with no run linkage (saved registers a fresh decision; revoked/expired
+terminate a SAVED decision once). No cross-entity invariant pairs a permission
+terminal with the tool terminal: §2.1 L53's same-batch pairing is producer
+discipline (S2), not a fold gate.
 The fold is a pure function (§3.3): no clock, no randomness, no external calls;
 read-model writes live in :mod:`opencode.session.projector` and the rebuild
 replays the log through this same fold. Event types outside the folded subset
@@ -37,6 +46,7 @@ the step.finished consistency check accepts as ordered containment.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any
@@ -56,6 +66,12 @@ from opencode.contracts import (
     canonical_json,
 )
 from opencode.contracts.events import (
+    PY_PERMISSION_CLOSED,
+    PY_PERMISSION_EXPIRED,
+    PY_PERMISSION_REPLIED,
+    PY_PERMISSION_REQUESTED,
+    PY_PERMISSION_REVOKED,
+    PY_PERMISSION_SAVED,
     PY_REASONING_FINALIZED,
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
@@ -67,6 +83,12 @@ from opencode.contracts.events import (
     PY_TOOL_FINISHED,
     PY_TOOL_REQUESTED,
     PY_TOOL_STARTED,
+    PermissionClosedData,
+    PermissionExpiredData,
+    PermissionRepliedData,
+    PermissionRequestedData,
+    PermissionRevokedData,
+    PermissionSavedData,
     ReasoningFinalizedData,
     RunCancelRequestedData,
     RunFinishedData,
@@ -150,6 +172,36 @@ class EffectStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class PermissionState(StrEnum):
+    """§3.1 L135-137 approval lifecycle (§5.2 L268, §7 L173).
+
+    ``replied`` and ``closed`` are both terminal: for a pending permission
+    only the first committed reply/expiry/close transition is legal, so a
+    late reply never overrides a closed permission and a closed permission
+    is never replied afterwards.
+    """
+
+    PENDING = "pending"
+    REPLIED = "replied"
+    CLOSED = "closed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self is not PermissionState.PENDING
+
+
+class DecisionState(StrEnum):
+    """§3.1 L138-139 saved-decision lifecycle; revoked/expired are terminal."""
+
+    SAVED = "saved"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self is not DecisionState.SAVED
+
+
 _RUN_NON_TERMINAL = frozenset({RunStatus.ACCEPTED, RunStatus.RUNNING, RunStatus.CANCELLING})
 #: Legal py.run.finished outcomes per current status (§2.1 L59-61).
 _RUN_FINISH_OUTCOMES: dict[RunStatus, frozenset[str]] = {
@@ -207,6 +259,45 @@ class ToolInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionInfo:
+    """One approval lifecycle: the §3.2 L183 permissions read-model row source.
+
+    ``reply``/``outcome``/``reason`` record the terminal facts so an identical
+    terminal replay compares equal (§7 L173 dedupe); ``run_id`` is the run of
+    the pinned execution, kept for the envelope-ownership check.
+    """
+
+    permission_id: str
+    execution_id: str
+    run_id: str
+    action: str
+    resources: tuple[str, ...]
+    input_hash: str
+    expires_at: datetime
+    state: PermissionState
+    reply: str | None = None
+    outcome: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionInfo:
+    """One saved always-decision (§5.2): the §3.2 L183 permissions row source.
+
+    ``scope``/``rule`` are the displayable binding (producer-owned shape);
+    ``boot_id`` stays event-only -- activation is producer policy (§5.2 L270),
+    not folded state.
+    """
+
+    decision_id: str
+    scope: JsonObject
+    rule: JsonObject
+    expires_at: datetime | None
+    state: DecisionState
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FinalizedPart:
     """A committed ``py.text.finalized``/``py.reasoning.finalized`` value."""
 
@@ -248,6 +339,8 @@ class SessionState:
     steps: dict[str, StepInfo] = field(default_factory=dict)
     tools: dict[str, ToolInfo] = field(default_factory=dict)
     finalized: dict[tuple[str, str], FinalizedPart] = field(default_factory=dict)
+    permissions: dict[str, PermissionInfo] = field(default_factory=dict)
+    decisions: dict[str, DecisionInfo] = field(default_factory=dict)
 
     @property
     def created(self) -> bool:
@@ -262,8 +355,9 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
     second ``py.session.created``, ``py.prompt.accepted`` without an active
     session, a data model that does not match the event type, run-scoped
     ownership (envelope ``metadata.run_id`` must match the event's run), any
-    illegal transition of the §2.1 run/step/tool tables, and any event type
-    outside the folded subset.
+    illegal transition of the §2.1 run/step/tool tables or the §3.1
+    permission/decision lifecycles, and any event type outside the folded
+    subset.
     """
     if state.created and state.session_id != event.session_id:
         raise IllegalTransitionError(
@@ -295,6 +389,18 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_tool_started(state, event)
     if event.type == PY_TOOL_FINISHED:
         return _apply_tool_finished(state, event)
+    if event.type == PY_PERMISSION_REQUESTED:
+        return _apply_permission_requested(state, event)
+    if event.type == PY_PERMISSION_REPLIED:
+        return _apply_permission_replied(state, event)
+    if event.type == PY_PERMISSION_CLOSED:
+        return _apply_permission_closed(state, event)
+    if event.type == PY_PERMISSION_SAVED:
+        return _apply_permission_saved(state, event)
+    if event.type == PY_PERMISSION_REVOKED:
+        return _apply_permission_revoked(state, event)
+    if event.type == PY_PERMISSION_EXPIRED:
+        return _apply_permission_expired(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -743,6 +849,212 @@ def _apply_tool_finished(state: SessionState, event: DurableEvent[Any]) -> Sessi
     )
 
 
+# -- R3 permission handlers (§3.1 L135-139; §5.2 L268, §7 L173/§337) ----------
+
+
+def _apply_permission_requested(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.requested``: register one pending approval (§5.2 L268).
+
+    The approval pins its execution: the folded tool must be PENDING with a
+    matching ``input_hash`` (the same ownership rule as py.tool.requested,
+    §3.1 L129/L131), one approval per execution, and a fresh permission_id.
+    The run must be RUNNING (approvals are asked mid-run, after the plan is
+    generated; cancel_requested blocks new asks, §3.1 L127).
+    """
+    if not isinstance(event.data, PermissionRequestedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected PermissionRequestedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    tool = state.tools.get(data.execution_id)
+    if tool is None:
+        raise IllegalTransitionError(f"event {event.id} references unknown execution {data.execution_id!r}")
+    if tool.state is not ToolState.PENDING:
+        raise IllegalTransitionError(
+            f"execution {data.execution_id} is {tool.state.value}; only a pending call can be approved "
+            f"(event {event.id})"
+        )
+    if data.input_hash != tool.input_hash:
+        raise IllegalTransitionError(
+            f"py.permission.requested input_hash mismatch for {data.execution_id} (event {event.id})"
+        )
+    if data.permission_id in state.permissions:
+        raise IllegalTransitionError(f"permission {data.permission_id!r} is already registered (event {event.id})")
+    for permission in state.permissions.values():
+        if permission.execution_id == data.execution_id:
+            raise IllegalTransitionError(
+                f"execution {data.execution_id} already has permission {permission.permission_id!r} (event {event.id})"
+            )
+    run = _require_run(state, event, tool.run_id)
+    if run.status is not RunStatus.RUNNING:
+        raise IllegalTransitionError(
+            f"run {tool.run_id} is {run.status.value}; an approval may only be requested while running "
+            f"(event {event.id})"
+        )
+    return _with_permission(
+        state,
+        event,
+        PermissionInfo(
+            permission_id=data.permission_id,
+            execution_id=data.execution_id,
+            run_id=tool.run_id,
+            action=data.action,
+            resources=tuple(data.resources),
+            input_hash=data.input_hash,
+            expires_at=data.expires_at,
+            state=PermissionState.PENDING,
+        ),
+    )
+
+
+def _apply_permission_replied(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.replied``: pending -> replied, the first reply wins (§7 L173).
+
+    A late reply after the permission closed (or a second, different reply)
+    is rejected -- the terminal is written once and never overridden (§5.2
+    L268 迟到回复拒绝, 不能覆盖 closed); the identical committed reply
+    replays idempotently. The envelope run_id must match the approval's run,
+    and the run must still be live (the reply races only while it is).
+    """
+    if not isinstance(event.data, PermissionRepliedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected PermissionRepliedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    permission = state.permissions.get(data.permission_id)
+    if permission is None:
+        raise IllegalTransitionError(f"event {event.id} references unknown permission {data.permission_id!r}")
+    if permission.state.is_terminal:
+        if permission.state is PermissionState.REPLIED and permission.reply == data.reply:
+            return replace(state, applied_seq=event.seq)
+        raise IllegalTransitionError(
+            f"permission {data.permission_id} is already {permission.state.value}; a late reply cannot "
+            f"override it (event {event.id})"
+        )
+    run = _require_run(state, event, permission.run_id)
+    if run.status.is_terminal or run.status is RunStatus.ACCEPTED:
+        raise IllegalTransitionError(
+            f"run {permission.run_id} is {run.status.value}; the reply cannot arrive after the run ended "
+            f"(event {event.id})"
+        )
+    return _with_permission(state, event, replace(permission, state=PermissionState.REPLIED, reply=data.reply))
+
+
+def _apply_permission_closed(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.closed``: pending -> closed by the system (§3.1 L137).
+
+    Expiry, cancellation and restart recovery close a still-pending approval;
+    the producer order is closed-first (§3.3 L212: closed is appended before
+    the tool/step/run terminals), so a close arriving after its run ended is
+    out-of-protocol and fails closed. The identical committed close replays
+    idempotently; anything else is a conflict.
+    """
+    if not isinstance(event.data, PermissionClosedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected PermissionClosedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    permission = state.permissions.get(data.permission_id)
+    if permission is None:
+        raise IllegalTransitionError(f"event {event.id} references unknown permission {data.permission_id!r}")
+    if permission.state.is_terminal:
+        if (
+            permission.state is PermissionState.CLOSED
+            and permission.outcome == data.outcome
+            and permission.reason == data.reason
+        ):
+            return replace(state, applied_seq=event.seq)
+        raise IllegalTransitionError(
+            f"permission {data.permission_id} is already {permission.state.value} (event {event.id})"
+        )
+    run = _require_run(state, event, permission.run_id)
+    if run.status.is_terminal or run.status is RunStatus.ACCEPTED:
+        raise IllegalTransitionError(
+            f"run {permission.run_id} is {run.status.value}; the close cannot arrive after the run ended "
+            f"(event {event.id})"
+        )
+    return _with_permission(
+        state,
+        event,
+        replace(permission, state=PermissionState.CLOSED, outcome=data.outcome, reason=data.reason),
+    )
+
+
+def _apply_permission_saved(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.saved``: register one saved always-decision (§5.2 L270).
+
+    Session-scoped with no run linkage: the decision outlives the run that
+    produced it, so the envelope carries no run_id (the saved/revoked/expired
+    trio is deliberately outside RUN_SCOPED_EVENT_TYPES). ``boot_id`` stays
+    event-only -- only decisions of the current boot activate, which is
+    producer policy, not folded state. A fresh decision_id registers; a known
+    id is a producer defect and fails closed.
+    """
+    if not isinstance(event.data, PermissionSavedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected PermissionSavedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    if data.decision_id in state.decisions:
+        raise IllegalTransitionError(f"decision {data.decision_id!r} is already registered (event {event.id})")
+    return _with_decision(
+        state,
+        event,
+        DecisionInfo(
+            decision_id=data.decision_id,
+            scope=data.scope,
+            rule=data.rule,
+            expires_at=data.expires_at,
+            state=DecisionState.SAVED,
+        ),
+    )
+
+
+def _apply_permission_revoked(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.revoked``: saved -> revoked by the host, once (§5.2 L270)."""
+    return _terminate_decision(state, event, DecisionState.REVOKED)
+
+
+def _apply_permission_expired(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.permission.expired``: saved -> expired by the expiry check, once (§5.2 L270)."""
+    return _terminate_decision(state, event, DecisionState.EXPIRED)
+
+
+def _terminate_decision(state: SessionState, event: DurableEvent[Any], terminal: DecisionState) -> SessionState:
+    """Shared saved-decision terminal: identical replay idempotent, else illegal.
+
+    Terminal-once (the §2.1 L35 discipline, §7 L173 dedupe): a terminal
+    decision is never rewritten -- revoked-then-expired, a second revoke with
+    a different reason, all illegal; only the byte-identical terminal replay
+    advances ``applied_seq``.
+    """
+    if not isinstance(event.data, PermissionRevokedData | PermissionExpiredData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected a decision terminal data model"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    decision = state.decisions.get(data.decision_id)
+    if decision is None:
+        raise IllegalTransitionError(f"event {event.id} references unknown decision {data.decision_id!r}")
+    if decision.state.is_terminal:
+        if decision.state is terminal and decision.reason == data.reason:
+            return replace(state, applied_seq=event.seq)
+        raise IllegalTransitionError(
+            f"decision {data.decision_id} is already {decision.state.value} (event {event.id})"
+        )
+    return _with_decision(state, event, replace(decision, state=terminal, reason=data.reason))
+
+
 # -- shared helpers -----------------------------------------------------------
 
 
@@ -756,6 +1068,16 @@ def _with_step(state: SessionState, event: DurableEvent[Any], step: StepInfo) ->
 
 def _with_tool(state: SessionState, event: DurableEvent[Any], tool: ToolInfo) -> SessionState:
     return replace(state, applied_seq=event.seq, tools={**state.tools, tool.execution_id: tool})
+
+
+def _with_permission(state: SessionState, event: DurableEvent[Any], permission: PermissionInfo) -> SessionState:
+    return replace(
+        state, applied_seq=event.seq, permissions={**state.permissions, permission.permission_id: permission}
+    )
+
+
+def _with_decision(state: SessionState, event: DurableEvent[Any], decision: DecisionInfo) -> SessionState:
+    return replace(state, applied_seq=event.seq, decisions={**state.decisions, decision.decision_id: decision})
 
 
 def _step_for_message(state: SessionState, run_id: str, message_id: str) -> StepInfo:

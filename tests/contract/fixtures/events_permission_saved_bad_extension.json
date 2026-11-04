@@ -1,0 +1,25 @@
+{
+  "id": "evt_00000000000000000000000043",
+  "type": "py.permission.saved",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:23Z",
+  "data": {
+    "decision_id": "psv_0000000000000000000000000001",
+    "scope": {
+      "action": "write",
+      "resources": [
+        "file://D:/work/demo/notes.md"
+      ]
+    },
+    "rule": {
+      "kind": "file_write",
+      "path": "D:/work/demo/notes.md"
+    },
+    "expires_at": "2026-11-10T08:00:00Z",
+    "boot_id": "boot_0000000000000000000000000001",
+    "unexpected_extension_key": true
+  },
+  "metadata": {},
+  "seq": 14
+}

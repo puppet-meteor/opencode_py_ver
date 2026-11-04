@@ -1,0 +1,16 @@
+{
+  "id": "evt_00000000000000000000000042",
+  "type": "py.permission.closed",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-03T08:00:22Z",
+  "data": {
+    "permission_id": "per_0000000000000000000000000001",
+    "outcome": "expired",
+    "reason": "approval window elapsed"
+  },
+  "metadata": {
+    "run_id": "run_0000000000000000000000000002"
+  },
+  "seq": 13
+}
