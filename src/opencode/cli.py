@@ -1,24 +1,54 @@
-"""Stdlib-only CLI host (R2-S8, OP-5 #92): single-shot prompt or REPL.
+"""Stdlib-only CLI host (R2-S8, OP-5 #92; R3-S7 approval face + closures).
 
 The CLI is an ordinary host over the App public face (the composition root
 stays untouched): it runs the alembic migration step as a subprocess, then
 composes ``App`` with the MAAS adapter and the fs builtins and drives the
-§7 command surface (create / prompt / cancel / run_status / messages). Its
-only responsibilities are input and display (ROADMAP L102; R2 has no
-approval face); the argument face is the R3 ConfigLoader injection point,
-not a config layer — since R3-S6 the ConfigLoader owns layering
-(CORE-CONTRACTS §6 L283: builtin < global < project-root→cwd < CLI) and
-main() runs on the resolved :class:`~opencode.config.ResolvedRuntime`
-(RuntimeSettings incl. the assembled system_prompt, declared roots, and the
-v2 config snapshot persisted through ``service.create``). The layer load
-runs twice by design: once at parse time (model/context-limit completeness
-plus early config errors on the exit-2 face) and once at resolve time (the
-full runtime face; errors there land on exit 70).
+§7 command surface (create / prompt / cancel / run_status / messages /
+reply_permission). Its only responsibilities are input and display (ROADMAP
+L102); the argument face is the R3 ConfigLoader injection point, not a
+config layer — since R3-S6 the ConfigLoader owns layering (CORE-CONTRACTS
+§6 L283: builtin < global < project-root→cwd < CLI) and main() runs on the
+resolved :class:`~opencode.config.ResolvedRuntime` (RuntimeSettings incl.
+the assembled system_prompt, declared roots, and the v2 config snapshot
+persisted through ``service.create``). The layer load runs twice by design:
+once at parse time (model/context-limit completeness, early config errors,
+and — R3-S7 — ``permission.rules`` entry shape, all on the exit-2 face) and
+once at resolve time (the full runtime face; errors there land on exit 70).
+
+R3-S7 wiring: the snapshot's validated ``permission_rules`` assemble into
+the live engine at the App constructor seam via
+:func:`opencode.tools.policy.permission_rules_from_snapshot` with
+``source="project"`` — config-file rules tighten the defaults but never
+outrank the host tier (§5.2 L266).
+
+The approval host face (§7 L316): ``py.permission.requested`` joins the
+live-preview set and prints a pending line (permission_id / action /
+resources / reply guidance); the REPL commands ``/approve <id> [always]``
+and ``/reject <id>`` carry the §3.1 L136 once/always/reject vocabulary; and
+a parallel input pump keeps reading while a run waits, so an approval can
+complete mid-run (§7 L316 independence from the run locks). Reply failures
+surface as one user-readable line, never a traceback. The pending list face
+is not in this slice; a single-shot approval rides the §5.2 300 s timeout
+closure (both disclosed ④).
 
 Terminal authority is ``service.run_status`` polling only (§7 L314 durable
 truth); the bus subscription is a live preview, so a ``SlowConsumerError``
 disconnect or any lost preview event never changes the terminal
 determination or the exit code.
+
+SIGINT routing is deterministic (R2-S8-review n-1 / P-1): a module router
+delivers the signal in-band — into the active input object while the loop
+is driven (prompt face → 130 through the REPL; run face → one idempotent
+cancel intent, then keep waiting), or the default raise before that
+(migration phase → 130). The prompt-face reader is a daemon thread that is
+abandoned at interpreter exit and never joined, so ``asyncio.run``'s
+default-executor join cannot hang the process on a parked ``input()``.
+
+Console hardening (R3-S7 row #17): stdout/stderr are reconfigured to
+``errors="replace"`` so model text a legacy console codec cannot encode
+degrades lossily instead of crashing the run; on win32 the
+CREATE_NEW_PROCESS_GROUP Ctrl+C ignore flag is cleared so hosts that spawn
+this process in a new group keep a working Ctrl-C face.
 
 Exit codes (#94): 0 succeeded (or /exit / EOF), 1 failed, 2 interrupted
 (argparse usage errors exit 2 as well), 3 cancel cleanup failed, 70
@@ -31,18 +61,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import ctypes
+import io
 import os
+import signal
 import subprocess
 import sys
+import threading
 import traceback
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Sequence
+from collections import deque
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.bus import Event, SlowConsumerError
 from opencode.config import CliOverrides, ConfigError, ConfigLoader, ResolvedRuntime
 from opencode.contracts.events import (
+    PY_PERMISSION_REQUESTED,
     PY_REASONING_DELTA,
     PY_REASONING_FINALIZED,
     PY_TEXT_DELTA,
@@ -58,8 +96,18 @@ from opencode.contracts.messages import (
     UserMessage,
 )
 from opencode.session.runner import DEFAULT_MAX_STEPS
-from opencode.session.service import RunStatus, RunStatusValue, SessionService
-from opencode.storage import LifecycleCleanupFailedError
+from opencode.session.service import (
+    ApprovalExpiredError,
+    RunStatus,
+    RunStatusValue,
+    SessionService,
+)
+from opencode.storage import (
+    ConflictError,
+    LifecycleCleanupFailedError,
+    NotFoundError,
+    SessionReadOnlyError,
+)
 from opencode.tools.builtin import (
     BashAdapter,
     FsEditAdapter,
@@ -69,6 +117,7 @@ from opencode.tools.builtin import (
     FsReadAdapter,
     FsWriteAdapter,
 )
+from opencode.tools.policy import permission_rules_from_snapshot
 
 #: Terminal poll cadence for ``service.run_status`` (the durable authority).
 _POLL_INTERVAL_S = 0.05
@@ -90,7 +139,8 @@ _ROUND_EXIT_CODES = {
     RunStatusValue.FAILED: 1,
     RunStatusValue.INTERRUPTED: 2,
 }
-#: The six live-preview event types the printer subscribes to.
+#: The seven live-preview event types the printer subscribes to (R3-S7 adds
+#: the pending-approval notice).
 _PREVIEW_TYPES = frozenset(
     {
         PY_TEXT_DELTA,
@@ -99,6 +149,7 @@ _PREVIEW_TYPES = frozenset(
         PY_REASONING_FINALIZED,
         PY_TOOL_STARTED,
         PY_TOOL_FINISHED,
+        PY_PERMISSION_REQUESTED,
     }
 )
 
@@ -110,6 +161,11 @@ _CONTROL_TABLE = str.maketrans(
     | {chr(0x7F): _REPLACEMENT}
     | {chr(code): _REPLACEMENT for code in range(0x80, 0xA0)}
 )
+
+#: The input object the SIGINT router routes into while the loop is driven
+#: (None before/after: the router then re-raises KeyboardInterrupt, which is
+#: the pre-loop default face).
+_ACTIVE_INPUT: _ReplInput | None = None
 
 
 def escape_for_display(text: str) -> str:
@@ -136,7 +192,7 @@ def _positive_seconds(text: str) -> float:
     except ValueError:
         raise argparse.ArgumentTypeError(f"timeout-s must be a number, got {text!r}") from None
     if value <= 0:
-        raise argparse.ArgumentTypeError(f"timeout-s must be > 0, got {value}")
+        raise argparse.ArgumentTypeError(f"timeout-s must be > 0, got {value!r}")
     return value
 
 
@@ -199,7 +255,8 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     # longer argparse-required — a config layer may supply them; the CLI flag
     # wins when both are present. Discovery runs once here so a broken config
     # fails on the argparse exit-2 face; ConfigErrors after this point (the
-    # full resolve in main) land on exit 70 instead.
+    # full resolve in main) land on exit 70 instead. R3-S7: the load-time
+    # ``permission.rules`` entry-shape validation rides the same face (必答②).
     try:
         layered = ConfigLoader(global_config=args.config, project_root=args.project_root).load()
     except ConfigError as error:
@@ -240,6 +297,63 @@ def _run_migrations(db_path: Path) -> int:
     return 0
 
 
+def _harden_console_streams() -> None:
+    """Best-effort non-UTF-8 console survival (R3-S7 row #17).
+
+    Model text the console codec cannot encode would otherwise crash the
+    preview printer mid-run with UnicodeEncodeError; ``errors="replace"``
+    degrades lossily instead. Only the error policy changes — the encoding
+    itself stays the console's choice.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            with contextlib.suppress(OSError, ValueError):
+                stream.reconfigure(errors="replace")
+
+
+def _enable_windows_ctrl_c() -> None:
+    """Clear the CREATE_NEW_PROCESS_GROUP Ctrl+C ignore flag (win32).
+
+    A child spawned with CREATE_NEW_PROCESS_GROUP has Ctrl+C disabled at the
+    OS level (SetConsoleCtrlHandler semantics); restoring normal processing
+    is production-legitimate for any host that spawns this way (the R3-S7
+    subprocess twins exercise exactly that face)."""
+    if sys.platform != "win32":
+        return
+    with contextlib.suppress(Exception):
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+
+
+def _sigint_router(signum: int, frame: FrameType | None) -> None:
+    """Deterministic SIGINT routing (P-1): in-band into the active input while
+    the loop is driven, the default raise otherwise."""
+    active = _ACTIVE_INPUT
+    if active is None:
+        # Pre-loop face (e.g. during the migration subprocess): the default
+        # raise — main()'s KeyboardInterrupt handler prints ^C and exits 130.
+        raise KeyboardInterrupt
+    active.interrupt()
+
+
+def _install_sigint_router() -> Callable[[int, FrameType | None], Any] | int | None:
+    """Install the router; returns the previous handler for restoration."""
+    try:
+        previous: Callable[[int, FrameType | None], Any] | int | None = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _sigint_router)
+        return previous
+    except (OSError, ValueError):
+        # Not the main thread (an in-process embedding) or an unsupported
+        # platform: the default KeyboardInterrupt face stays in place.
+        return None
+
+
+def _restore_sigint(previous: Callable[[int, FrameType | None], Any] | int | None) -> None:
+    if previous is None:
+        previous = signal.default_int_handler
+    with contextlib.suppress(OSError, ValueError):
+        signal.signal(signal.SIGINT, previous)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -247,12 +361,15 @@ def main(
     wait_hook: Callable[[], None] | None = None,
 ) -> int:
     """CLI entry; ``lines``/``wait_hook`` are in-process test seams (production omits them)."""
-    args = _parse_arguments(argv)
-    db_path = Path(args.db).resolve()
-    migration_code = _run_migrations(db_path)
-    if migration_code != 0:
-        return migration_code
+    _harden_console_streams()
+    _enable_windows_ctrl_c()
+    previous_handler = _install_sigint_router()
     try:
+        args = _parse_arguments(argv)
+        db_path = Path(args.db).resolve()
+        migration_code = _run_migrations(db_path)
+        if migration_code != 0:
+            return migration_code
         # R3-S6 (§6 L283): the CLI is the top config layer. The loader turns
         # the merged layers + the explicit flags into the runtime face; a
         # ConfigError here (bad values, host-tier violations deep in a layer,
@@ -282,7 +399,7 @@ def main(
             )
         )
     except KeyboardInterrupt:
-        # A real SIGINT outside the injection seams: asyncio.run has already
+        # A real SIGINT outside the driven loop: asyncio.run has already
         # cancelled and drained the scheduled tasks (their handlers commit the
         # durable terminals); the graceful close is skipped on this path.
         print("^C", file=sys.stderr)
@@ -290,23 +407,139 @@ def main(
     except Exception:
         traceback.print_exc()
         return 70
+    finally:
+        _restore_sigint(previous_handler)
 
 
 class _EndOfInput(Exception):
     """The line source is exhausted (EOF or a drained scripted iterator)."""
 
 
-def _read_line(source: Iterator[str] | None) -> str:
-    """One input line, off the event loop (the REPL prompt face)."""
-    if source is None:
+class _ReplInput:
+    """The CLI's line source: one daemon reader thread + in-band SIGINT routing.
+
+    Why a daemon reader (R2-S8-review n-1 fix, R3-S7 P-1(b)): parking
+    ``input()`` in the default executor (``asyncio.to_thread``) leaves a
+    non-daemon executor thread that ``asyncio.run`` joins on shutdown, so a
+    prompt-face SIGINT hung the process forever. Here the reader is a plain
+    daemon thread that every exit path abandons at interpreter exit instead
+    — nothing ever joins it.
+
+    Cross-thread state lives behind ``_lock``; the reader completes lines
+    into ``_lines`` and wakes the loop through ``loop.call_soon_threadsafe``
+    (the self-pipe write also breaks the loop's selector wait, which is what
+    makes in-band routing work while the loop is parked). SIGINT is routed
+    in-band: the router (main thread) or a reader-side KeyboardInterrupt
+    only sets ``_sigint`` and wakes; ``read_line`` then raises
+    KeyboardInterrupt locally inside the coroutine, so the exception never
+    lands in a random main-thread frame. EOF is sticky; lines deferred by
+    the mid-run pump replay from ``_pushback`` at the next prompt.
+    """
+
+    def __init__(self, lines: Iterable[str] | None, *, run_reader: bool) -> None:
+        self._source = iter(lines) if lines is not None else None
+        self._loop = asyncio.get_running_loop()
+        self._lock = threading.Lock()
+        self._lines: deque[str] = deque()
+        self._pushback: deque[str] = deque()
+        self._ready = asyncio.Event()
+        self._eof = False
+        self._sigint = False
+        if run_reader:
+            self._thread: threading.Thread | None = threading.Thread(
+                target=self._read_lines, name="opencode-repl-reader", daemon=True
+            )
+            self._thread.start()
+        else:
+            self._thread = None
+
+    @property
+    def interactive(self) -> bool:
+        """True when the reader parks on real stdin (the echoed prompt face)."""
+        return self._source is None
+
+    def _wake(self) -> None:
+        def _set() -> None:
+            self._ready.set()
+
         try:
-            return input(_PROMPT)
-        except EOFError:
-            raise _EndOfInput from None
-    try:
-        return next(source)
-    except StopIteration:
-        raise _EndOfInput from None
+            self._loop.call_soon_threadsafe(_set)
+        except RuntimeError:
+            pass  # the loop is already closed (interpreter teardown)
+
+    def _read_lines(self) -> None:
+        """Reader thread body: one line at a time, forever (daemon; never joined)."""
+        while True:
+            try:
+                if self._source is not None:
+                    line = next(self._source)
+                else:
+                    line = input("")
+            except (StopIteration, EOFError):
+                with self._lock:
+                    self._eof = True
+                self._wake()
+                return
+            except KeyboardInterrupt:
+                # Only reachable through the scripted test seam (a real
+                # SIGINT lands on the main thread, which routes through the
+                # module router): route it in-band the same way and park.
+                with self._lock:
+                    self._sigint = True
+                self._wake()
+                return
+            with self._lock:
+                self._lines.append(line)
+            self._wake()
+
+    def interrupt(self) -> None:
+        """SIGINT router entry (main thread): set the flag and wake the loop."""
+        with self._lock:
+            self._sigint = True
+        self._wake()
+
+    def route_sigint(self) -> None:
+        """Re-arm a KeyboardInterrupt that ``read_line`` already consumed (pump)."""
+        with self._lock:
+            self._sigint = True
+        self._wake()
+
+    def consume_sigint(self) -> bool:
+        """Check-and-clear the SIGINT flag (the run-wait cancel intent)."""
+        with self._lock:
+            if self._sigint:
+                self._sigint = False
+                return True
+            return False
+
+    def push_back(self, line: str) -> None:
+        """Defer one non-approval line typed mid-run to the next prompt."""
+        with self._lock:
+            self._pushback.append(line)
+        self._wake()
+
+    async def read_line(self, *, include_pushback: bool = True) -> str:
+        """Next input line; _EndOfInput on (sticky) EOF, KeyboardInterrupt on SIGINT.
+
+        ``include_pushback=False`` is the mid-run pump face: deferred lines
+        replay at the next *prompt* (the REPL's read), never back into the
+        pump — re-reading its own pushback would spin the pump, and each
+        spin's ``_wake`` write can fill the loop's self-pipe socket (a
+        blocking ``send`` on the Windows proactor) and deadlock the process.
+        """
+        while True:
+            with self._lock:
+                if include_pushback and self._pushback:
+                    return self._pushback.popleft()
+                if self._lines:
+                    return self._lines.popleft()
+                if self._sigint:
+                    self._sigint = False
+                    raise KeyboardInterrupt
+                if self._eof:
+                    raise _EndOfInput
+            await self._ready.wait()
+            self._ready.clear()
 
 
 async def _drive(
@@ -325,7 +558,14 @@ async def _drive(
     App receives the loader-built RuntimeSettings (system_prompt included)
     and the snapshot's max_steps, and ``service.create`` persists the v2
     config snapshot as the session's behavioral baseline (§6.1 L302).
+
+    R3-S7: the snapshot's permission rules also reach the live engine
+    (``rules=`` on App, source="project"), and one ``_ReplInput`` owns all
+    line reading + in-band SIGINT routing for both the single-shot and REPL
+    faces.
     """
+    global _ACTIVE_INPUT
+    rules = permission_rules_from_snapshot(runtime.snapshot.permission_rules)
     app = App(
         db_path,
         provider=provider,
@@ -340,18 +580,26 @@ async def _drive(
         ),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
+        rules=rules,
     )
+    repl_input = _ReplInput(lines, run_reader=not prompt_text)
     try:
         session = await app.service.create(runtime.snapshot)
         session_id = session.session_id
+        _ACTIVE_INPUT = repl_input
         if prompt_text:
-            status = await _run_round(app, session_id, prompt_text, request_id="req_cli_1", wait_hook=wait_hook)
+            status = await _run_round(
+                app, session_id, prompt_text, request_id="req_cli_1", wait_hook=wait_hook, repl_input=repl_input
+            )
             if status is None:
                 return _CLEANUP_EXIT_CODE
             _print_terminal(status)
             return _ROUND_EXIT_CODES[status.status]
-        return await _repl(app, session_id, lines=lines, wait_hook=wait_hook)
+        return await _repl(app, session_id, repl_input=repl_input, wait_hook=wait_hook)
     finally:
+        # Dropped before close: a SIGINT during the graceful close falls back
+        # to the default raise (the 130 face) instead of vanishing in-band.
+        _ACTIVE_INPUT = None
         await app.close()
 
 
@@ -359,14 +607,17 @@ async def _repl(
     app: App,
     session_id: str,
     *,
-    lines: Iterable[str] | None,
+    repl_input: _ReplInput,
     wait_hook: Callable[[], None] | None,
 ) -> int:
-    source = iter(lines) if lines is not None else None
+    """The REPL face: commands first (/exit, /history, /approve, /reject),
+    any other line is one round; the prompt echoes only on real stdin."""
     counter = 0
     while True:
+        if repl_input.interactive:
+            print(_PROMPT, end="", flush=True)
         try:
-            line = await asyncio.to_thread(_read_line, source)
+            line = await repl_input.read_line()
         except _EndOfInput:
             return 0
         except KeyboardInterrupt:
@@ -375,16 +626,68 @@ async def _repl(
         command = line.strip()
         if not command:
             continue
+        head = command.split(maxsplit=1)[0]
         if command == "/exit":
             return 0
-        if command.split(maxsplit=1)[0] == "/history":
+        if head == "/history":
             await _print_history(app, session_id, command)
             continue
+        if head == "/approve":
+            await _reply_permission(app, command, default_reply="once")
+            continue
+        if head == "/reject":
+            await _reply_permission(app, command, default_reply="reject")
+            continue
         counter += 1
-        status = await _run_round(app, session_id, command, request_id=f"req_cli_{counter}", wait_hook=wait_hook)
+        status = await _run_round(
+            app, session_id, command, request_id=f"req_cli_{counter}", wait_hook=wait_hook, repl_input=repl_input
+        )
         if status is None:
             return _CLEANUP_EXIT_CODE
         _print_terminal(status)
+
+
+async def _reply_permission(app: App, command: str, *, default_reply: str) -> None:
+    """Dispatch one /approve//reject command onto the host approval channel (§7 L316).
+
+    ``/approve <id> [always]`` defaults to the once reply; ``/reject <id>``
+    carries the reject vocabulary (§3.1 L136). reply_permission failures
+    surface as one user-readable line (unknown / expired / already-resolved
+    ids, read-only sessions) — never a traceback.
+    """
+    parts = command.split()
+    reply = default_reply
+    if default_reply == "once" and len(parts) >= 3 and parts[2] == "always":
+        reply = "always"
+    if len(parts) < 2 or not parts[1]:
+        usage = "/approve <id> [always]" if default_reply == "once" else "/reject <id>"
+        print(f"[approve] usage: {usage}")
+        return
+    permission_id = parts[1]
+    try:
+        receipt = await app.service.reply_permission(permission_id, reply)
+    except (NotFoundError, ApprovalExpiredError, ConflictError, SessionReadOnlyError) as error:
+        print(_permission_error_line(error))
+        return
+    outcome = "approved" if receipt.decision == "allow" else "rejected"
+    print(f"[approve] {escape_for_display(permission_id)} {outcome}")
+
+
+#: reply_permission error -> user-readable label (the /approve mapping face).
+_PERMISSION_ERROR_LABELS: tuple[tuple[type[Exception], str], ...] = (
+    (NotFoundError, "unknown permission id"),
+    (ApprovalExpiredError, "approval expired"),
+    (ConflictError, "already resolved"),
+    (SessionReadOnlyError, "read-only session"),
+)
+
+
+def _permission_error_line(error: Exception) -> str:
+    """One sanitized line for a reply_permission failure (pure mapping face)."""
+    for kind, label in _PERMISSION_ERROR_LABELS:
+        if isinstance(error, kind):
+            return f"[approve] {label}: {escape_for_display(str(error))}"
+    return f"[approve] failed: {escape_for_display(str(error))}"
 
 
 async def _run_round(
@@ -394,20 +697,53 @@ async def _run_round(
     *,
     request_id: str,
     wait_hook: Callable[[], None] | None,
+    repl_input: _ReplInput,
 ) -> RunStatus | None:
     """One run: subscribe first (no early events lost), prompt, then poll the
-    durable terminal; the bus printer is preview-only, never authoritative."""
+    durable terminal; the bus printer is preview-only, never authoritative.
+
+    R3-S7: a parallel input pump keeps reading while the run waits, so an
+    approval can complete mid-run (§7 L316 independence from the run locks);
+    /approve//reject dispatch immediately, any other line defers to the next
+    prompt, and a SIGINT becomes the (idempotent) cancel intent."""
     async with app.bus.subscribe(session_id, _PREVIEW_TYPES) as events:
         printer = asyncio.create_task(_print_events(events))
+        pump = asyncio.create_task(_pump_input(app, repl_input))
         try:
             ref = await app.service.prompt(session_id, text, request_id)
-            status = await _wait_terminal(app.service, ref.run_id, wait_hook=wait_hook)
+            status = await _wait_terminal(app.service, ref.run_id, wait_hook=wait_hook, repl_input=repl_input)
             await asyncio.sleep(_DRAIN_S)
         finally:
-            printer.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await printer
+            for task in (printer, pump):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
     return status
+
+
+async def _pump_input(app: App, repl_input: _ReplInput) -> None:
+    """Mid-run input pump: approval commands complete immediately (§7 L316),
+    other lines defer to the next prompt, EOF parks, SIGINT re-arms for the
+    terminal wait's cancel intent. Deferred lines are *not* re-read here —
+    they replay at the next prompt (see ``_ReplInput.read_line``)."""
+    while True:
+        try:
+            line = await repl_input.read_line(include_pushback=False)
+        except _EndOfInput:
+            return
+        except KeyboardInterrupt:
+            repl_input.route_sigint()
+            return
+        command = line.strip()
+        if not command:
+            continue
+        head = command.split(maxsplit=1)[0]
+        if head == "/approve":
+            await _reply_permission(app, command, default_reply="once")
+        elif head == "/reject":
+            await _reply_permission(app, command, default_reply="reject")
+        else:
+            repl_input.push_back(command)
 
 
 async def _wait_terminal(
@@ -415,10 +751,16 @@ async def _wait_terminal(
     run_id: str,
     *,
     wait_hook: Callable[[], None] | None,
+    repl_input: _ReplInput,
 ) -> RunStatus | None:
     """Poll ``run_status`` until a terminal status; Ctrl-C maps to one cancel
-    intent (idempotent on repeats) and keeps waiting (§7 L335/L337)."""
+    intent (idempotent on repeats) and keeps waiting (§7 L335/L337). The
+    SIGINT router's in-band flag is consumed here the same way."""
     while True:
+        if repl_input.consume_sigint():
+            if not await _cancel_run(service, run_id):
+                return None
+            continue
         try:
             if wait_hook is not None:
                 wait_hook()
@@ -445,8 +787,10 @@ async def _cancel_run(service: SessionService, run_id: str) -> bool:
 async def _print_events(events: AsyncIterator[Event]) -> None:
     """Live preview printer: deltas inline, the durable finalized value on its
     own ``[final]`` line (§4 L244/L246 preview -> override, distinguishable in
-    the output), tool events single-line. A SlowConsumerError disconnect is
-    display-only: the terminal stays with run_status polling."""
+    the output), tool events single-line, and one pending-approval notice per
+    ``py.permission.requested`` (R3-S7: the prompt face of the approval
+    channel). A SlowConsumerError disconnect is display-only: the terminal
+    stays with run_status polling."""
     inline_open = False
     try:
         async for event in events:
@@ -464,17 +808,27 @@ async def _print_events(events: AsyncIterator[Event]) -> None:
                 print(f"[tool] {escape_for_display(data.execution_id)} started")
             elif event.type == PY_TOOL_FINISHED:
                 print(f"[tool] {escape_for_display(data.execution_id)} {data.state}")
+            elif event.type == PY_PERMISSION_REQUESTED:
+                print(
+                    f"[permission] {escape_for_display(data.permission_id)} {escape_for_display(data.action)} "
+                    "awaiting approval: /approve <id> [always] or /reject <id>"
+                )
+                if data.resources:
+                    print(f"[permission] resources: {escape_for_display(', '.join(data.resources))}")
     except SlowConsumerError:
         print("[bus] live preview disconnected (slow consumer); waiting for the durable terminal", file=sys.stderr)
 
 
 async def _print_history(app: App, session_id: str, command: str) -> None:
-    """/history [limit]: forward pagination through the union face, <= 100 per page."""
+    """[history] [limit]: forward pagination through the union face, <= 100 per page."""
     limit = _HISTORY_DEFAULT_LIMIT
     parts = command.split()
     if len(parts) > 1:
-        with contextlib.suppress(ValueError):
+        try:
             limit = int(parts[1])
+        except ValueError:
+            # P-2 (row #2): a non-numeric argument warns and keeps the default.
+            print(f"[history] limit must be an integer; ignoring {escape_for_display(parts[1])!r}")
     limit = max(1, min(_HISTORY_MAX_LIMIT, limit))
     remaining = limit
     after: str | None = None

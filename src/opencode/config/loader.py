@@ -104,6 +104,12 @@ _APPEND_LIST_PATHS: frozenset[tuple[str, ...]] = frozenset({("instructions",), (
 #: Known sub-keys of the ``permission`` map (anything else is a config error).
 _PERMISSION_KEYS: frozenset[str] = frozenset({"rules"})
 
+#: Known fields of one ``permission.rules`` entry (R3-S7, 必答②: load-time
+#: fail-closed shape validation on the exit-2 face). ``source`` is deliberately
+#: not a config field: the tier of a config-file rule is host authority (§5.2
+#: L266), so an entry trying to declare its own source fails closed here.
+_RULE_KEYS: frozenset[str] = frozenset({"action", "effect", "resources", "reason"})
+
 #: §6 L283 builtin layer: the R2 CLI defaults move here so an absent CLI flag
 #: means "fall through to config" instead of pinning the default at the top
 #: layer. ``model``/``context_limit`` are deliberately absent — an unknown
@@ -301,6 +307,40 @@ def _parse_config_file(path: Path) -> JsonObject:
     return parsed
 
 
+def _validate_permission_rule(path: Path, index: int, rule: object) -> None:
+    """One ``permission.rules`` entry: known fields + action/effect/resources/reason shapes.
+
+    R3-S7 (必答② ruling): rule entries are config *content* discovered in a
+    layer, so a malformed one fails at load time with the file path in the
+    message -- the same exit-2 face as every other unknown config field (§6
+    L285) -- instead of surfacing later as an exit-70 assembly crash. The
+    policy-side snapshot conversion remains the fail-closed backstop for
+    snapshots that never passed through a layer load (recovery face).
+    """
+    if not isinstance(rule, dict):
+        raise ConfigError(f"'permission.rules[{index}]' in {path} must be a JSON object")
+    for key in rule:
+        if key not in _RULE_KEYS:
+            raise ConfigError(
+                f"unknown config field 'permission.rules[{index}].{key}' in {path} (CORE-CONTRACTS §6 L285)"
+            )
+    action = rule.get("action")
+    if not isinstance(action, str) or not action:
+        raise ConfigError(f"'permission.rules[{index}].action' in {path} must be a non-empty string")
+    effect = rule.get("effect")
+    if effect not in ("allow", "ask", "deny"):
+        raise ConfigError(f"'permission.rules[{index}].effect' in {path} must be one of allow/ask/deny")
+    resources = rule.get("resources")
+    if resources is not None:
+        if not isinstance(resources, list) or not all(isinstance(item, str) and item for item in resources):
+            raise ConfigError(
+                f"'permission.rules[{index}].resources' in {path} must be a list of non-empty path strings"
+            )
+    reason = rule.get("reason", "")
+    if not isinstance(reason, str):
+        raise ConfigError(f"'permission.rules[{index}].reason' in {path} must be a string")
+
+
 def _validate_layer_keys(path: Path, values: JsonObject, *, host_tier: bool) -> None:
     """Unknown keys are a config error; host-only keys are rejected in project layers (L285)."""
     for key in values:
@@ -318,6 +358,12 @@ def _validate_layer_keys(path: Path, values: JsonObject, *, host_tier: bool) -> 
         for key in permission:
             if key not in _PERMISSION_KEYS:
                 raise ConfigError(f"unknown config field 'permission.{key}' in {path} (CORE-CONTRACTS §6 L285)")
+        rules = permission.get("rules")
+        if rules is not None:
+            if not isinstance(rules, list):
+                raise ConfigError(f"'permission.rules' in {path} must be a list of rule objects")
+            for index, rule in enumerate(rules):
+                _validate_permission_rule(path, index, rule)
 
 
 # ---------------------------------------------------------------------------
