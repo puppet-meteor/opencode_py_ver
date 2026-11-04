@@ -171,6 +171,9 @@ class TestNegativeFixtures:
             default_event_registry().decode_durable(_load_fixture("events_unknown_type.json"))
 
     def test_unknown_version_rejected(self) -> None:
+        # T-C1-030: the probe flipped from py.session.created v2 (now a
+        # registered R3-S6 version) to version 3 -- a permanently-unknown
+        # version for this type (the T-C1-025 unknown-type precedent).
         with pytest.raises(UnknownEventVersionError):
             default_event_registry().decode_durable(_load_fixture("events_unknown_version.json"))
 

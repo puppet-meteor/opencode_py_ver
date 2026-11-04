@@ -6,7 +6,14 @@ composes ``App`` with the MAAS adapter and the fs builtins and drives the
 §7 command surface (create / prompt / cancel / run_status / messages). Its
 only responsibilities are input and display (ROADMAP L102; R2 has no
 approval face); the argument face is the R3 ConfigLoader injection point,
-not a config layer.
+not a config layer — since R3-S6 the ConfigLoader owns layering
+(CORE-CONTRACTS §6 L283: builtin < global < project-root→cwd < CLI) and
+main() runs on the resolved :class:`~opencode.config.ResolvedRuntime`
+(RuntimeSettings incl. the assembled system_prompt, declared roots, and the
+v2 config snapshot persisted through ``service.create``). The layer load
+runs twice by design: once at parse time (model/context-limit completeness
+plus early config errors on the exit-2 face) and once at resolve time (the
+full runtime face; errors there land on exit 70).
 
 Terminal authority is ``service.run_status`` polling only (§7 L314 durable
 truth); the bus subscription is a live preview, so a ``SlowConsumerError``
@@ -34,7 +41,7 @@ from pathlib import Path
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.bus import Event, SlowConsumerError
-from opencode.contracts import ConfigSnapshot
+from opencode.config import CliOverrides, ConfigError, ConfigLoader, ResolvedRuntime
 from opencode.contracts.events import (
     PY_REASONING_DELTA,
     PY_REASONING_FINALIZED,
@@ -43,7 +50,6 @@ from opencode.contracts.events import (
     PY_TOOL_FINISHED,
     PY_TOOL_STARTED,
 )
-from opencode.contracts.llm import ModelRef
 from opencode.contracts.messages import (
     AssistantMessage,
     AssistantReasoningPart,
@@ -51,7 +57,6 @@ from opencode.contracts.messages import (
     SessionMessage,
     UserMessage,
 )
-from opencode.session.context import RuntimeSettings
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import RunStatus, RunStatusValue, SessionService
 from opencode.storage import LifecycleCleanupFailedError
@@ -144,30 +149,44 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--db", default="opencode.db", help="database file path (default ./opencode.db)")
     parser.add_argument("--base-url", default=None, help="MAAS base URL (env OPENCODE_PY_BASE_URL fallback)")
     parser.add_argument("--api-key", default=None, help="MAAS API key (env OPENCODE_PY_API_KEY fallback)")
-    parser.add_argument("--model", required=True, help="model name (provider is fixed to maas in Phase 1)")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="explicit global config file path (default ~/.config/opencode-py/opencode.json, §6 L283)",
+    )
+    parser.add_argument(
+        "--project-root",
+        default=None,
+        help="project root override for config layer discovery (default: nearest VCS root, else the cwd, §6 L283)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="model name (required unless a config layer supplies it; CLI overrides config, §6 L283)",
+    )
     parser.add_argument(
         "--context-limit",
-        required=True,
+        default=None,
         type=_int_at_least_one("--context-limit"),
-        help="model context window limit in tokens (host-configured, no default)",
+        help="model context window in tokens (required unless a config layer supplies it; CLI overrides config)",
     )
     parser.add_argument(
         "--output-reserve",
         type=_int_at_least_one("--output-reserve"),
-        default=4096,
-        help="output reserve in tokens (default 4096)",
+        default=None,
+        help="output reserve in tokens (unset falls through to config, builtin default 4096)",
     )
     parser.add_argument(
         "--timeout-s",
         type=_positive_seconds,
-        default=30.0,
-        help="request total timeout in seconds (default 30)",
+        default=None,
+        help="request total timeout in seconds (unset falls through to config, builtin default 30)",
     )
     parser.add_argument(
         "--max-steps",
         type=_int_at_least_one("--max-steps"),
-        default=DEFAULT_MAX_STEPS,
-        help=f"runner step budget (default {DEFAULT_MAX_STEPS})",
+        default=None,
+        help=f"runner step budget (unset falls through to config, builtin default {DEFAULT_MAX_STEPS})",
     )
     args = parser.parse_args(argv)
     args.base_url = args.base_url or os.environ.get("OPENCODE_PY_BASE_URL")
@@ -176,6 +195,20 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--base-url is required (or set OPENCODE_PY_BASE_URL)")
     if not args.api_key:
         parser.error("--api-key is required (or set OPENCODE_PY_API_KEY)")
+    # §6 L283 layer-aware completeness (R3-S6): --model/--context-limit are no
+    # longer argparse-required — a config layer may supply them; the CLI flag
+    # wins when both are present. Discovery runs once here so a broken config
+    # fails on the argparse exit-2 face; ConfigErrors after this point (the
+    # full resolve in main) land on exit 70 instead.
+    try:
+        layered = ConfigLoader(global_config=args.config, project_root=args.project_root).load()
+    except ConfigError as error:
+        parser.error(f"config: {error}")
+    values = layered.values
+    if args.model is None and values.get("model") is None:
+        parser.error('--model is required (or set "model" in a config file)')
+    if args.context_limit is None and values.get("context_limit") is None:
+        parser.error('--context-limit is required (or set "context_limit" in a config file)')
     return args
 
 
@@ -220,23 +253,29 @@ def main(
     if migration_code != 0:
         return migration_code
     try:
-        # Host-config errors (e.g. context_limit <= output_reserve, the
-        # RuntimeSettings invariant) land on the 70 face too: a traceback +
-        # exit 70 per #94, never a raw escape the shell would render as the
-        # failed-run exit 1.
+        # R3-S6 (§6 L283): the CLI is the top config layer. The loader turns
+        # the merged layers + the explicit flags into the runtime face; a
+        # ConfigError here (bad values, host-tier violations deep in a layer,
+        # context_limit <= output_reserve via the RuntimeSettings invariant)
+        # lands on the 70 face — a traceback + exit 70 per #94, never a raw
+        # escape the shell would render as the failed-run exit 1.
         provider = MaasAdapter(args.base_url, args.api_key)
-        settings = RuntimeSettings(
-            model=ModelRef(provider="maas", model=args.model),
-            context_limit=args.context_limit,
-            output_reserve=args.output_reserve,
-            timeout_s=args.timeout_s,
+        loader = ConfigLoader(global_config=args.config, project_root=args.project_root)
+        runtime = loader.resolve_runtime(
+            cli=CliOverrides(
+                model=args.model,
+                context_limit=args.context_limit,
+                output_reserve=args.output_reserve,
+                timeout_s=args.timeout_s,
+                max_steps=args.max_steps,
+            ),
+            endpoint_url=args.base_url,
         )
         return asyncio.run(
             _drive(
                 db_path,
                 provider,
-                settings,
-                args.max_steps,
+                runtime,
                 prompt_text=" ".join(args.prompt),
                 lines=lines,
                 wait_hook=wait_hook,
@@ -273,31 +312,37 @@ def _read_line(source: Iterator[str] | None) -> str:
 async def _drive(
     db_path: Path,
     provider: MaasAdapter,
-    settings: RuntimeSettings,
-    max_steps: int,
+    runtime: ResolvedRuntime,
     *,
     prompt_text: str,
     lines: Iterable[str] | None,
     wait_hook: Callable[[], None] | None,
 ) -> int:
-    """One process = one migrated database + one App + one fresh session."""
+    """One process = one migrated database + one App + one fresh session.
+
+    R3-S6: the resolved runtime face drives every injection point — the fs
+    adapters receive the declared roots (working_dir always stays a root),
+    App receives the loader-built RuntimeSettings (system_prompt included)
+    and the snapshot's max_steps, and ``service.create`` persists the v2
+    config snapshot as the session's behavioral baseline (§6.1 L302).
+    """
     app = App(
         db_path,
         provider=provider,
         tools=(
-            FsReadAdapter(),
-            FsLsAdapter(),
-            FsGlobAdapter(),
-            FsGrepAdapter(),
-            FsWriteAdapter(),
-            FsEditAdapter(),
+            FsReadAdapter(roots=runtime.roots),
+            FsLsAdapter(roots=runtime.roots),
+            FsGlobAdapter(roots=runtime.roots),
+            FsGrepAdapter(roots=runtime.roots),
+            FsWriteAdapter(roots=runtime.roots),
+            FsEditAdapter(roots=runtime.roots),
             BashAdapter(),
         ),
-        settings=settings,
-        max_steps=max_steps,
+        settings=runtime.settings,
+        max_steps=runtime.snapshot.limits.max_steps,
     )
     try:
-        session = await app.service.create(ConfigSnapshot.create())
+        session = await app.service.create(runtime.snapshot)
         session_id = session.session_id
         if prompt_text:
             status = await _run_round(app, session_id, prompt_text, request_id="req_cli_1", wait_hook=wait_hook)

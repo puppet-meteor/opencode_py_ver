@@ -3,9 +3,9 @@
 Text file reads over the R0-B verified path-containment scheme
 (``tools/r0/platform_probe.py`` L513-539, itself derived from
 ``filesystem.ts:133-146``): NUL check → lexical resolve → containment →
-``realpath(strict)`` → containment of the realpathed root. R2 has exactly
-one allowed root, the session's ``working_dir`` (§5.1 L255); R3 adds the
-config-declared roots (float report).
+``realpath(strict)`` → containment of the realpathed root. R2 had exactly
+one allowed root, the session's ``working_dir`` (§5.1 L255); R3-S6 adds the
+config-declared roots through the shared multi-root face below (§6 L287).
 
 TS mapping (``packages/core/src/tool/plugin/read.ts`` / ``read-filesystem.ts``):
 ``name`` L15, the offset/limit ``PageInput`` semantics, the per-line clamp
@@ -30,6 +30,7 @@ cost. Moving reads to a thread executor is deferred (float report).
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreError, CoreErrorCode
@@ -126,6 +127,95 @@ def _resolve_within_root(root: str, user_path: str) -> tuple[str | None, str | N
     if not _contains(real_root, real):
         return None, "escapes_workspace_after_realpath"
     return real, None
+
+
+# ---------------------------------------------------------------------------
+# R3-S6 multi-root face: config-declared roots (CORE-CONTRACTS §6 L287).
+#
+# The session working_dir stays a root in every configuration (R2 semantics
+# preserved, ⑤); the global config may declare additional host-tier roots that
+# the six fs tools share through this single boundary (one loader source, no
+# drift). The §5.2 policy engine/Invoker stay single-root (working_dir) — a
+# frozen face this slice; the adapter-level allowance is disclosed in ④.
+# ---------------------------------------------------------------------------
+
+#: Rejection-reason priority for the multi-root aggregate: the strongest
+#: evidence wins (a realpath escape beats a lexical escape beats a missing
+#: path), so the model sees the most specific denial.
+_REASON_RANK = {
+    "escapes_workspace_after_realpath": 3,
+    "escapes_workspace_before_realpath": 2,
+    "realpath_failed_or_missing": 1,
+}
+
+
+def _resolve_within_roots(
+    roots: Sequence[str],
+    user_path: str,
+    resolver: Callable[[str, str], tuple[str | None, str | None]] = _resolve_within_root,
+) -> tuple[str | None, str | None]:
+    """Resolve ``user_path`` against the first root that accepts it (R3-S6).
+
+    The NUL check is intrinsic (identical for every root). Each root runs the
+    R0-B single-root scheme (read's read scheme, or write's creation-target
+    extension via ``resolver``); the first success wins, and the aggregated
+    rejection reason is the highest-priority one across roots. An empty root
+    list rejects with the lexical-escape reason (defensive: the adapter face
+    always includes the working directory; ④ disclosure).
+    """
+    if "\x00" in user_path:
+        return None, "nul_byte_in_path"
+    if not roots:
+        return None, "escapes_workspace_before_realpath"
+    best: str | None = None
+    for root in roots:
+        real, reason = resolver(root, user_path)
+        if real is not None:
+            return real, None
+        if reason is not None and (best is None or _REASON_RANK.get(reason, 0) > _REASON_RANK.get(best, 0)):
+            best = reason
+    return None, best
+
+
+def _validate_roots(roots: Sequence[str]) -> tuple[str, ...]:
+    """Adapter-side guard: roots are host-injected non-empty path strings."""
+    checked = tuple(roots)
+    for root in checked:
+        if not isinstance(root, str) or not root:
+            raise ValueError("roots must be a sequence of non-empty path strings")
+    return checked
+
+
+def _effective_roots(declared: Sequence[str], working_dir: str) -> tuple[str, ...]:
+    """The adapter root list: working_dir first, declared roots appended, dedup'd.
+
+    The working directory always stays a root (R2 semantics, ⑤); declared
+    roots extend the boundary after it, so a path resolvable in both resolves
+    to the working_dir copy (first success wins).
+    """
+    ordered = [working_dir]
+    for root in declared:
+        if root not in ordered:
+            ordered.append(root)
+    return tuple(ordered)
+
+
+def _display_path(working_dir: str, target: str) -> str:
+    """Model-facing path: working_dir-relative when possible, else absolute.
+
+    '/' separators keep the output identical on Windows and Linux. A target
+    under a secondary root has no unambiguous relative form from the working
+    directory (``relpath`` would cross a ``..`` boundary or, on Windows,
+    another drive entirely and raise ``ValueError``) — the absolute form is
+    the only shape that round-trips through the multi-root resolver.
+    """
+    try:
+        relative = os.path.relpath(target, working_dir)
+    except ValueError:
+        return target.replace(os.sep, "/")
+    if relative == ".." or relative.startswith(".." + os.sep) or relative.startswith("../"):
+        return target.replace(os.sep, "/")
+    return relative.replace(os.sep, "/")
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +336,7 @@ def _rejection(path: str, reason: str) -> ToolResult:
     return _failure(CoreErrorCode.PERMISSION_DENIED, f"Path escapes the working directory: {path}")
 
 
-def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
+def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against READ_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts below are
     # static narrows, not conversions. A caller bypassing the Invoker gets
@@ -256,7 +346,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     offset = cast(int, input.get("offset", 1))
     limit = min(cast(int, input.get("limit", MAX_READ_LINES)), MAX_READ_LINES)
 
-    real, reason = _resolve_within_root(context.working_dir, path)
+    real, reason = _resolve_within_roots(_effective_roots(roots, context.working_dir), path)
     if real is None:
         assert reason is not None  # the resolver always returns a reason on rejection
         return _rejection(path, reason)
@@ -302,12 +392,17 @@ class FsReadAdapter:
 
     ``execute`` is a thin async wrapper -- the read itself is synchronous
     by design (see module docstring: serial Phase-1 execution + bounded
-    window make blocking reads safe).
+    window make blocking reads safe). ``roots`` is the optional R3-S6
+    config-declared root extension (empty default = the R2 single-root
+    behavior, ⑤); the working_dir stays a root in every configuration.
     """
+
+    def __init__(self, *, roots: Sequence[str] = ()) -> None:
+        self._roots = _validate_roots(roots)
 
     @property
     def spec(self) -> ToolSpec:
         return READ_SPEC
 
     async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
-        return _execute(context, input)
+        return _execute(context, input, self._roots)

@@ -62,9 +62,16 @@ REASON_DECISION_REVOKED = "revoked by host"
 REASON_DECISION_EXPIRED = "saved decision expired"
 
 #: §5.2 L266 default table: in-root read/glob/grep/ls allow, write/edit ask.
+#: R3-S5 added ``bash__run`` (scheduler ledger row #28 nit-1, T-C1-030 item 11):
+#: the explicit key documents the shell tool in the table with the same
+#: "ask" the ``_ASK_NAMESPACES`` bash row already produced -- a zero-behavior
+#: closure (the existing bash approval/contract tests stay green either way).
 #: Actions outside the enumeration fall back to the tool's declared
 #: ``side_effects`` (True -> ask, False -> allow) -- the R2-era tools that
-#: declare no side effects (app.wait/app.slow class) stay allow.
+#: declare no side effects (app.wait/app.slow class) stay allow. This
+#: Python-side conservative default is the sanctioned fallback (CORE-CONTRACTS
+#: §5.2 L266: the enumeration is the authority, side_effects is the residual
+#: rule), recorded here per ledger row #28.
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -72,6 +79,7 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__ls": "allow",
     "fs__write": "ask",
     "fs__edit": "ask",
+    "bash__run": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

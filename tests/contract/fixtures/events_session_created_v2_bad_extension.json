@@ -1,0 +1,38 @@
+{
+  "id": "evt_0000000000000000000000000021",
+  "type": "py.session.created",
+  "version": 2,
+  "session_id": "ses_0000000000000000000000000021",
+  "created_at": "2026-11-04T08:00:00Z",
+  "data": {
+    "working_dir": "D:/work/demo",
+    "config_snapshot": {
+      "schema_version": 2,
+      "model": {
+        "provider": "maas",
+        "model": "fixture-model"
+      },
+      "endpoint_ref": "https://api.example.com/v1",
+      "roots": [],
+      "permission_rules": [],
+      "instructions": [
+        {
+          "path": "D:/work/demo/AGENTS.md",
+          "text": "Be careful."
+        }
+      ],
+      "limits": {
+        "context_limit": 100000,
+        "output_reserve": 4096,
+        "timeout_s": 30.0,
+        "safety_margin": 0,
+        "temperature": null,
+        "max_steps": 20
+      },
+      "mcp_servers": []
+    },
+    "snapshot_hash": "c6393ecca407d07ad2122d455d63de4ee460d65ef6f44e3777ef59fc3e0bca98"
+  },
+  "metadata": {},
+  "seq": 1
+}

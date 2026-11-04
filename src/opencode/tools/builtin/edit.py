@@ -40,14 +40,19 @@ from __future__ import annotations
 import os
 import re
 from bisect import bisect_left
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
-from opencode.tools.builtin.read import _failure, _resolve_within_root
+from opencode.tools.builtin.read import (
+    _effective_roots,
+    _failure,
+    _resolve_within_roots,
+    _validate_roots,
+)
 from opencode.tools.builtin.write import _atomic_replace, _reject
 
 if TYPE_CHECKING:
@@ -374,7 +379,7 @@ def _match_view(source: str, old_string: str, new_string: str) -> tuple[list[_Ma
 # ---------------------------------------------------------------------------
 
 
-def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
+def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against EDIT_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts below are
     # static narrows, not conversions.
@@ -394,7 +399,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
             "oldString must not be empty. Use write to create or overwrite a file.",
         )
 
-    real, reason = _resolve_within_root(context.working_dir, path)
+    real, reason = _resolve_within_roots(_effective_roots(roots, context.working_dir), path)
     if real is None:
         assert reason is not None  # the resolver always returns a reason on rejection
         return _reject(path, reason)
@@ -485,12 +490,17 @@ class FsEditAdapter:
 
     ``execute`` is a thin async wrapper -- the edit itself is synchronous
     by design (write.py module docstring: serial Phase-1 execution + the
-    source cap bound each edit's cost).
+    source cap bound each edit's cost). ``roots`` is the optional R3-S6
+    config-declared root extension (empty default = the R2 single-root
+    behavior, ⑤).
     """
+
+    def __init__(self, *, roots: Sequence[str] = ()) -> None:
+        self._roots = _validate_roots(roots)
 
     @property
     def spec(self) -> ToolSpec:
         return EDIT_SPEC
 
     async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
-        return _execute(context, input)
+        return _execute(context, input, self._roots)

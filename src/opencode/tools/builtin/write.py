@@ -47,12 +47,20 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
-from opencode.tools.builtin.read import _contains, _failure, _resolve_within_root
+from opencode.tools.builtin.read import (
+    _contains,
+    _effective_roots,
+    _failure,
+    _resolve_within_root,
+    _resolve_within_roots,
+    _validate_roots,
+)
 
 if TYPE_CHECKING:
     # Annotation-only: importing the runtime package here would create an
@@ -157,6 +165,16 @@ def _resolve_write_target(root: str, user_path: str) -> tuple[str | None, str | 
     return os.path.join(real_ancestor, *tail), None
 
 
+def _resolve_write_target_roots(roots: Sequence[str], user_path: str) -> tuple[str | None, str | None]:
+    """R3-S6 multi-root face: the first root that accepts the creation target wins.
+
+    Same aggregation as read.py ``_resolve_within_roots`` (first success,
+    highest-priority rejection reason), with this module's creation-target
+    extension as the per-root resolver.
+    """
+    return _resolve_within_roots(roots, user_path, _resolve_write_target)
+
+
 # ---------------------------------------------------------------------------
 # The §5.3 L274 atomic replace (shared with fs__edit).
 # ---------------------------------------------------------------------------
@@ -207,7 +225,7 @@ def _reject(path: str, reason: str) -> ToolResult:
 # ---------------------------------------------------------------------------
 
 
-def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
+def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against WRITE_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts below are
     # static narrows, not conversions. A caller bypassing the Invoker gets
@@ -216,7 +234,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     path = cast(str, input["path"])
     content = cast(str, input["content"])
 
-    real, reason = _resolve_write_target(context.working_dir, path)
+    real, reason = _resolve_write_target_roots(_effective_roots(roots, context.working_dir), path)
     if real is None:
         assert reason is not None  # the resolver always returns a reason on rejection
         return _reject(path, reason)
@@ -252,12 +270,16 @@ class FsWriteAdapter:
 
     ``execute`` is a thin async wrapper -- the write itself is synchronous
     by design (module docstring: serial Phase-1 execution + the byte cap
-    bound each write's cost).
+    bound each write's cost). ``roots`` is the optional R3-S6 config-declared
+    root extension (empty default = the R2 single-root behavior, ⑤).
     """
+
+    def __init__(self, *, roots: Sequence[str] = ()) -> None:
+        self._roots = _validate_roots(roots)
 
     @property
     def spec(self) -> ToolSpec:
         return WRITE_SPEC
 
     async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
-        return _execute(context, input)
+        return _execute(context, input, self._roots)

@@ -5,7 +5,10 @@
 ``fs__edit``, and the R3-S5 shell tool ``bash__run``. Adapters are
 registered by the host (R2-S6) via
 :meth:`opencode.tools.registry.ToolRegistry.register`; this package only
-provides the implementations.
+provides the implementations. R3-S6 (CORE-CONTRACTS §6 L287): the six fs
+adapters accept an optional keyword-only ``roots`` constructor argument
+(host config-declared extra roots, empty by default = the R2 single-root
+semantics; the session working_dir always stays a root).
 """
 
 from opencode.tools.builtin.bash import (
