@@ -21,7 +21,7 @@ from hashlib import sha256
 from json import dumps, loads
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, field_validator, model_validator
 
 from opencode.contracts.errors import CoreError
 from opencode.contracts.llm import ModelRef
@@ -131,11 +131,14 @@ def canonical_json(value: JsonValue) -> str:
     return dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def compute_snapshot_hash(snapshot: ConfigSnapshot) -> str:
+def compute_snapshot_hash(snapshot: ConfigSnapshot | ConfigSnapshotV2) -> str:
     """sha256 hex of the snapshot's canonical JSON (CORE-CONTRACTS §6.2).
 
-    The R1 value domain makes the canonical text a constant:
-    ``{"permission_rules":[],"schema_version":1}`` — UTF-8, no BOM, 64 lowercase hex.
+    R3-S6 generalization: the same canonical serializer + sha256 over either
+    snapshot schema version. The R1 value domain stays the constant
+    ``{"permission_rules":[],"schema_version":1}`` — UTF-8, no BOM, 64
+    lowercase hex, fingerprint frozen (§9 L368); a v2 domain hashes its own
+    canonical text through the identical pipeline.
     """
     return sha256(canonical_json(snapshot.model_dump(mode="json")).encode("utf-8")).hexdigest()
 
@@ -165,6 +168,80 @@ class ConfigSnapshot(BaseModel):
         return cls(schema_version=1, permission_rules=[])
 
 
+class InstructionSource(BaseModel):
+    """One instruction contribution with provenance (§6.1 L287): file path + text.
+
+    ``path`` is the resolved file that contributed ``text`` — an AGENTS.md
+    path, or the declaring config file for config-declared instruction
+    strings. Instructions only shape the system prompt; they never raise
+    permissions (§6.1 L287).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    text: str
+
+
+class SnapshotLimits(BaseModel):
+    """The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).
+
+    Wire shape of the runtime knobs the §7 L339 face consumes; every field is
+    explicit (no fabricated defaults, §6.1 L291) and the integer-semantic
+    fields reject bools (§1 rule) with the field's own name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    context_limit: int = Field(ge=1)
+    output_reserve: int = Field(ge=1)
+    timeout_s: float = Field(gt=0)
+    safety_margin: int = Field(ge=0)
+    temperature: float | None = None
+    max_steps: int = Field(ge=1)
+
+    @field_validator("context_limit", "output_reserve", "safety_margin", "max_steps", mode="before")
+    @classmethod
+    def _integer_field_not_bool(cls, value: Any, info: ValidationInfo) -> Any:
+        return _reject_bool(info.field_name or "", value)
+
+
+class ConfigSnapshotV2(BaseModel):
+    """R3-S6 executable config snapshot (CORE-CONTRACTS §6.1 L287, schema_version 2).
+
+    Deliberately a standalone model, NOT a ``ConfigSnapshot`` subclass: v1 is
+    the fixed minimal domain whose canonical text and fingerprint are frozen
+    (§6.2/§9 L368); v2 is the executable face (§6.1 L289) where every runtime
+    field is explicit and none carries a fabricated default. MCP refs and
+    boot fingerprints are omitted outright (R4 face, disclosed) rather than
+    defaulted, per the §6.1 L291 no-silent-backfill spirit; ``endpoint_ref``
+    is the sanitized provider base URL (userinfo/query stripped, loader-side
+    normalization); the provider stays ``maas`` (Phase 1, OP-R3-10).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2]
+    model: ModelRef
+    endpoint_ref: str = Field(min_length=1)
+    roots: list[str]
+    permission_rules: list[JsonObject]
+    instructions: list[InstructionSource]
+    limits: SnapshotLimits
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _schema_version_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("schema_version", value)
+
+    @field_validator("roots")
+    @classmethod
+    def _roots_entries_non_empty(cls, value: list[str]) -> list[str]:
+        if any(not item for item in value):
+            raise ValueError("roots entries must be non-empty path strings")
+        return value
+
+
 class SessionCreatedData(BaseModel):
     """``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash."""
 
@@ -180,6 +257,46 @@ class SessionCreatedData(BaseModel):
         if compute_snapshot_hash(self.config_snapshot) != self.snapshot_hash:
             raise ValueError("snapshot_hash does not match the canonical sha256 of config_snapshot")
         return self
+
+
+class SessionCreatedDataV2(SessionCreatedData):
+    """``py.session.created`` v2 data (§6.1 L287): the executable v2 snapshot.
+
+    Subclasses v1 so every frozen consumer that types the field as
+    ``SessionCreatedData`` (the state fold's isinstance gate, the projector's
+    canonical_json store) accepts v2 rows unchanged; overrides only
+    ``config_snapshot``. The inherited model validator recomputes the digest
+    on every decode (§6.2 L297 drift re-check) through the generalized
+    ``compute_snapshot_hash``.
+    """
+
+    config_snapshot: ConfigSnapshotV2  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class SessionCreatedRuntime:
+    """The §6.1 recovery face of one ``py.session.created`` row (L302).
+
+    ``snapshot`` is None exactly for v1 rows: the minimal snapshot has no
+    runtime face, and recovery must stop and ask the host instead of silently
+    backfilling from the current config (§6.1 L291, L302).
+    """
+
+    working_dir: str
+    snapshot: ConfigSnapshotV2 | None
+
+
+def upcast_session_created(data: SessionCreatedData) -> SessionCreatedRuntime:
+    """Deterministic v1->v2 upcast (§8 L356/L358; scheduler ledger row #24).
+
+    A v2 row passes through with its snapshot; a v1 row becomes
+    ``snapshot=None`` — the upcast never fabricates runtime fields. Rows older
+    than v1 cannot reach here (the registry rejects unknown versions at
+    decode), so there is no other historical branch (④ disclosure).
+    """
+    if isinstance(data, SessionCreatedDataV2):
+        return SessionCreatedRuntime(working_dir=data.working_dir, snapshot=data.config_snapshot)
+    return SessionCreatedRuntime(working_dir=data.working_dir, snapshot=None)
 
 
 class PromptAcceptedData(BaseModel):
@@ -757,6 +874,24 @@ R3_PERMISSION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: R3 config family (§6.1 L287): ``py.session.created`` v2 — the first py.*
+#: event family to raise a version, so the §8 L358 minimum bar applies: the
+#: v1 definition stays registered side by side (old logs/fixtures decode
+#: unchanged, §8 L356), the upcast
+#: (:func:`upcast_session_created`) is explicit and deterministic, and
+#: ``UnknownEventVersionError`` still rejects every version > 2.
+R3_CONFIG_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_SESSION_CREATED, durability="durable", data_model=SessionCreatedDataV2, version=2),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3-permission event subsets (§3.1 rows through R3-S1)."""
-    return EventRegistry((*R1_EVENT_DEFINITIONS, *R2_EVENT_DEFINITIONS, *R3_PERMISSION_EVENT_DEFINITIONS))
+    """Fresh registry over the R1+R2+R3 event subsets (§3.1 rows through R3-S6)."""
+    return EventRegistry(
+        (
+            *R1_EVENT_DEFINITIONS,
+            *R2_EVENT_DEFINITIONS,
+            *R3_PERMISSION_EVENT_DEFINITIONS,
+            *R3_CONFIG_EVENT_DEFINITIONS,
+        )
+    )

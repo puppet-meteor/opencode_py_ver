@@ -38,12 +38,19 @@ is bounded by the directory itself.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
-from opencode.tools.builtin.read import _failure, _resolve_within_root
+from opencode.tools.builtin.read import (
+    _display_path,
+    _effective_roots,
+    _failure,
+    _resolve_within_roots,
+    _validate_roots,
+)
 
 if TYPE_CHECKING:
     # Annotation-only: importing the runtime package here would create an
@@ -111,26 +118,26 @@ def _reject(path: str, reason: str) -> ToolResult:
     return _failure(CoreErrorCode.PERMISSION_DENIED, f"Path escapes the working directory: {path}")
 
 
-def _display_path(working_dir: str, real_dir: str, name: str, is_dir: bool) -> str:
+def _display_entry(working_dir: str, real_dir: str, name: str, is_dir: bool) -> str:
     """Entry path relative to the working directory, '/' separators, '/' suffix for dirs.
 
     filesystem.ts L191 renders directories with a trailing path separator;
     model-facing paths are normalized to '/' so the output is identical on
-    Windows and Linux (float-reported).
+    Windows and Linux (float-reported). R3-S6: entries under a secondary
+    root render as absolute paths (read.py ``_display_path``).
     """
-    relative = os.path.relpath(os.path.join(real_dir, name), working_dir)
     suffix = "/" if is_dir else ""
-    return relative.replace(os.sep, "/") + suffix
+    return _display_path(working_dir, os.path.join(real_dir, name)) + suffix
 
 
-def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
+def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against LS_INPUT_SCHEMA before
     # execute (adapter contract, §5.1 L257); the casts below are static narrows.
     path = cast(str, input.get("path", "."))
     hidden = cast(bool, input.get("hidden", False))
     limit = min(cast(int, input.get("limit", LS_DEFAULT_LIMIT)), LS_MAX_LIMIT)
 
-    real, reason = _resolve_within_root(context.working_dir, path)
+    real, reason = _resolve_within_roots(_effective_roots(roots, context.working_dir), path)
     if real is None:
         assert reason is not None  # the resolver always returns a reason on rejection
         return _reject(path, reason)
@@ -163,7 +170,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     if not shown:
         text = "No entries found"
     else:
-        lines = [_display_path(context.working_dir, real, name, is_dir) for _, name, is_dir in shown]
+        lines = [_display_entry(context.working_dir, real, name, is_dir) for _, name, is_dir in shown]
         if truncated:
             # glob.ts L39 marker wording, "or pattern" dropped.
             lines.append("")
@@ -177,11 +184,16 @@ class FsLsAdapter:
 
     ``execute`` is a thin async wrapper -- the listing is synchronous by
     design (module docstring: serial Phase-1 execution bounds the cost).
+    ``roots`` is the optional R3-S6 config-declared root extension (empty
+    default = the R2 single-root behavior, ⑤).
     """
+
+    def __init__(self, *, roots: Sequence[str] = ()) -> None:
+        self._roots = _validate_roots(roots)
 
     @property
     def spec(self) -> ToolSpec:
         return LS_SPEC
 
     async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
-        return _execute(context, input)
+        return _execute(context, input, self._roots)

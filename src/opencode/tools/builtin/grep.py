@@ -50,13 +50,21 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.process import run_command
-from opencode.tools.builtin.read import _clamp_line, _failure, _resolve_within_root
+from opencode.tools.builtin.read import (
+    _clamp_line,
+    _display_path,
+    _effective_roots,
+    _failure,
+    _resolve_within_roots,
+    _validate_roots,
+)
 
 if TYPE_CHECKING:
     # Annotation-only: importing the runtime package here would create an
@@ -292,7 +300,7 @@ def _reject(path: str, reason: str) -> ToolResult:
     return _failure(CoreErrorCode.PERMISSION_DENIED, f"Path escapes the working directory: {path}")
 
 
-def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
+def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against GREP_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts are narrows.
     pattern = cast(str, input["pattern"])
@@ -306,7 +314,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     case_sensitive = cast(bool, input.get("caseSensitive", True))
     limit = min(cast(int, input.get("limit", GREP_DEFAULT_LIMIT)), GREP_MAX_LIMIT)
 
-    real, reason = _resolve_within_root(context.working_dir, path)
+    real, reason = _resolve_within_roots(_effective_roots(roots, context.working_dir), path)
     if real is None:
         assert reason is not None  # the resolver always returns a reason on rejection
         return _reject(path, reason)
@@ -368,7 +376,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     # Deterministic output: sort by (path, line), then the grep.ts grouping.
     display = [
         (
-            os.path.relpath(os.path.join(cwd, raw_path), context.working_dir).replace(os.sep, "/"),
+            _display_path(context.working_dir, os.path.join(cwd, raw_path)),
             raw_line,
             raw_text,
         )
@@ -385,12 +393,17 @@ class FsGrepAdapter:
 
     ``execute`` is a thin async wrapper -- the rg subprocess runs
     synchronously by design (serial Phase-1 execution, PHASE1-SLIM L85,
-    and the match cap bounds the collected set).
+    and the match cap bounds the collected set). ``roots`` is the optional
+    R3-S6 config-declared root extension (empty default = the R2
+    single-root behavior, ⑤).
     """
+
+    def __init__(self, *, roots: Sequence[str] = ()) -> None:
+        self._roots = _validate_roots(roots)
 
     @property
     def spec(self) -> ToolSpec:
         return GREP_SPEC
 
     async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
-        return _execute(context, input)
+        return _execute(context, input, self._roots)
