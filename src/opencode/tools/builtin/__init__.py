@@ -1,11 +1,22 @@
-"""Builtin tool adapters: the static read quartet.
+"""Builtin tool adapters: the ``fs`` family.
 
-``fs__read`` (R2-S5) plus the R3-S3 static read trio ``fs__ls`` /
-``fs__glob`` / ``fs__grep``. Adapters are registered by the host (R2-S6)
-via :meth:`opencode.tools.registry.ToolRegistry.register`; this package
-only provides the implementations.
+``fs__read`` (R2-S5), the R3-S3 static read trio ``fs__ls`` /
+``fs__glob`` / ``fs__grep``, and the R3-S4 mutation pair ``fs__write`` /
+``fs__edit``. Adapters are registered by the host (R2-S6) via
+:meth:`opencode.tools.registry.ToolRegistry.register`; this package only
+provides the implementations.
 """
 
+from opencode.tools.builtin.edit import (
+    EDIT_DESCRIPTION,
+    EDIT_INPUT_SCHEMA,
+    EDIT_MAX_SOURCE_BYTES,
+    EDIT_NAME,
+    EDIT_NAMESPACE,
+    EDIT_SPEC,
+    EDIT_VERSION,
+    FsEditAdapter,
+)
 from opencode.tools.builtin.glob import (
     GLOB_DEFAULT_LIMIT,
     GLOB_DESCRIPTION,
@@ -51,8 +62,25 @@ from opencode.tools.builtin.read import (
     READ_VERSION,
     FsReadAdapter,
 )
+from opencode.tools.builtin.write import (
+    WRITE_DESCRIPTION,
+    WRITE_INPUT_SCHEMA,
+    WRITE_MAX_BYTES,
+    WRITE_NAME,
+    WRITE_NAMESPACE,
+    WRITE_SPEC,
+    WRITE_VERSION,
+    FsWriteAdapter,
+)
 
 __all__ = [
+    "EDIT_DESCRIPTION",
+    "EDIT_INPUT_SCHEMA",
+    "EDIT_MAX_SOURCE_BYTES",
+    "EDIT_NAME",
+    "EDIT_NAMESPACE",
+    "EDIT_SPEC",
+    "EDIT_VERSION",
     "GLOB_DEFAULT_LIMIT",
     "GLOB_DESCRIPTION",
     "GLOB_INPUT_SCHEMA",
@@ -86,8 +114,17 @@ __all__ = [
     "READ_NAMESPACE",
     "READ_SPEC",
     "READ_VERSION",
+    "WRITE_DESCRIPTION",
+    "WRITE_INPUT_SCHEMA",
+    "WRITE_MAX_BYTES",
+    "WRITE_NAME",
+    "WRITE_NAMESPACE",
+    "WRITE_SPEC",
+    "WRITE_VERSION",
+    "FsEditAdapter",
     "FsGlobAdapter",
     "FsGrepAdapter",
     "FsLsAdapter",
     "FsReadAdapter",
+    "FsWriteAdapter",
 ]

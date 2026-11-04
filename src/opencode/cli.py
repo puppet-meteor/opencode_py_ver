@@ -55,7 +55,14 @@ from opencode.session.context import RuntimeSettings
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import RunStatus, RunStatusValue, SessionService
 from opencode.storage import LifecycleCleanupFailedError
-from opencode.tools.builtin import FsGlobAdapter, FsGrepAdapter, FsLsAdapter, FsReadAdapter
+from opencode.tools.builtin import (
+    FsEditAdapter,
+    FsGlobAdapter,
+    FsGrepAdapter,
+    FsLsAdapter,
+    FsReadAdapter,
+    FsWriteAdapter,
+)
 
 #: Terminal poll cadence for ``service.run_status`` (the durable authority).
 _POLL_INTERVAL_S = 0.05
@@ -276,7 +283,7 @@ async def _drive(
     app = App(
         db_path,
         provider=provider,
-        tools=(FsReadAdapter(), FsLsAdapter(), FsGlobAdapter(), FsGrepAdapter()),
+        tools=(FsReadAdapter(), FsLsAdapter(), FsGlobAdapter(), FsGrepAdapter(), FsWriteAdapter(), FsEditAdapter()),
         settings=settings,
         max_steps=max_steps,
     )
