@@ -18,8 +18,8 @@
 
 ### 0.1 R3→R4 交付面衔接（现状基线 #136 `e12e4bb`：pytest 924（→926 随行#35）/mypy 92 files 零问题/双 ruff 绿；CI 双 OS 绿先例 41952806310（#132），本轮 41963085214 在跑）
 
-- **checkpoint 链**：#131 R3 收官（T-B-034 PASS 0/0/1/2+merge `9546a8c`）→ #132 CI round 3 双 OS 绿（41952806310）→ #133/#134 行#34 票链（T-C1-033 `eb01698`+T-B-035 评审 PASS 0/0/0/2）→ merge `7002ca8` → #135 R4-S1 关闭 → **#136 `e12e4bb`**（双派发：T-C1-034 行#35 在飞+T-B-036 本票）。
-- **R4-S1/R4-S1b 编号已占用**：S1=行#34 修复票（已闭合；e2e 回归钉四面断言在册——S4/S7 复用其先例：_await_terminal/store (failed,unknown)/wire 失败回灌/EventLog 三账）；S1b=行#35 伴生收尾批（grep TS 对齐+冻结面 7 处 L277 去行号化批二+doc 修正批，**已派发收口中，不重复设行**；预期落地 pytest **926**/mypy 92，落地后调度器更新 r3-slices §3 行#35 状态）。
+- **checkpoint 链**：#131 R3 收官（T-B-034 PASS 0/0/1/2+merge `9546a8c`）→ #132 CI round 3 双 OS 绿（41952806310）→ #133/#134 行#34 票链（T-C1-033 `eb01698`+T-B-035 评审 PASS 0/0/0/2）→ merge `7002ca8` → #135 R4-S1 关闭 → **#136 `e12e4bb`**（双派发：T-C1-034 行#35 在飞+T-B-036 本票）→ **#137 `c848f3b`**（T-C1-034 验收 PASS+r4-slices 入库+TS 指纹 51→57+OP-R4-1 用户裁决=自研）→ merge **`c4e70ec`**（行#35 B-baseline `96d60f0` 并回零冲突；T-B-037 PASS 0/0/0/1）→ **#138**（行#35 收口：r3-slices 状态翻牌+本节链更新；主树门禁 926/clean/format 0/mypy 92）。
+- **R4-S1/R4-S1b 编号已占用**：S1=行#34 修复票（已闭合；e2e 回归钉四面断言在册——S4/S7 复用其先例：_await_terminal/store (failed,unknown)/wire 失败回灌/EventLog 三账）；S1b=行#35 伴生收尾批（grep TS 对齐+冻结面 7 处 L277 去行号化批二+doc 修正批，**已闭合随 #138，不重复设行**：T-C1-034 23min 落地 pytest **926**/mypy 92=席位与调度器双跑同值+T-B-037 PASS 0/0/0/1+merge `c4e70ec`+主树四门禁复跑同值；r3-slices §3 行#35 状态已翻牌——**S2 起基线=926/92**）。
 - **follow/慢消费者底座已在**：EventLog.follow/EventCursor 已实现（bus/eventlog.py；runner.py L58/L406 已消费）；SlowConsumerError 已实现（bus/bus.py 队列上限断开+cli.py L821 显示面零回归在册）——S5=覆盖/硬化非新建。
 - **boot_id 底座已在**：app.py L116 `boot_{uuid4().hex}` 每次启动生成；policy/invoker 已按 boot_id 作用域（policy.py L159-172、invoker.py L906-921）——验收 C 首句机制面已在，S6/S7 落验证。
 - **MCP 配置边界已在、可执行面不在**：loader.py HOST_ONLY_KEYS 含 "mcp"（L81——项目配置无权隐式扩大，§6 L285 语义已钉）；`_ASK_NAMESPACES={"bash","mcp"}`（policy.py L86——ask 默认档位已在）；**无 src/opencode/mcp 面**（S2 新建）；**ConfigSnapshotV2 省略 MCP ref/启动指纹**（loader.py docstring L28 明示——S3 按 §6 L287 补齐）。
