@@ -49,5 +49,11 @@
   {"path":"packages/core/src/shell/select.ts","sha256":"03427b391487a26cba5ca115bd294ebcbfecfdc98d03f5b9ea66ede151bda822"},
   {"path":"packages/core/src/shell/scan.ts","sha256":"625317f6388019dbfd27a44db14033d69e09516323d9f9cc0aaf125b82efdcd1"},
   {"path":"packages/core/src/shell/result.ts","sha256":"3020a8a9bb7a3c8a3b05cfcc8a8c9f0d6de6ce67a6cc5919e231c0859f4cf16c"},
-  {"path":"packages/core/src/ripgrep/binary.ts","sha256":"cb0866ec835b78eb18eb783198b1959a82469fbd7bfd1f21793d743310831755"}
+  {"path":"packages/core/src/ripgrep/binary.ts","sha256":"cb0866ec835b78eb18eb783198b1959a82469fbd7bfd1f21793d743310831755"},
+  {"path":"packages/schema/src/config/mcp.ts","sha256":"72c8335c68fa0d72ad41bf784dea478325a769e7a39743dc242d760fdb9d951e"},
+  {"path":"packages/core/src/mcp/stdio.ts","sha256":"c7287b50b47527952d3a0928f04552f3ae9dd5ea17d8f83614c44bcd05dd7a9a"},
+  {"path":"packages/core/src/mcp/client.ts","sha256":"3ef446d2dab82116de76c78ffa7cc5fad453ac9b90639d67c2bcb234195b9ace"},
+  {"path":"packages/core/src/mcp/index.ts","sha256":"125898bbf22decb02187bf294de3b3a46aeb50c0132976e9f1dc7fd89634abd6"},
+  {"path":"packages/cli/src/mini.ts","sha256":"ab34cdcb8d7208e81d9e17fb429016308a194f39a3a39733e3f148b8b9988556"},
+  {"path":"packages/core/src/file-mutation.ts","sha256":"3e2a738819d035613c7d2a82f117e36b735ccd2998ccdc21f3bec3a0a13d79b6"}
 ]
