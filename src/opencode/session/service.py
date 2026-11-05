@@ -85,8 +85,10 @@ from opencode.contracts import (
 from opencode.contracts.events import (
     PY_PERMISSION_REVOKED,
     PY_RUN_CANCEL_REQUESTED,
+    ConfigSnapshotV3,
     PermissionRevokedData,
     RunCancelRequestedData,
+    SessionCreatedDataV3,
 )
 from opencode.session.state import SessionStatus
 from opencode.storage import (
@@ -390,19 +392,26 @@ def cancel_dedupe_key(run_id: str) -> str:
 
 
 def _coerce_config_snapshot(
-    config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | JsonObject,
-) -> ConfigSnapshot | ConfigSnapshotV2:
-    """Validate the §6.1 snapshot (v1 or v2); an illegal one is ValidationError (§7 create).
+    config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3 | JsonObject,
+) -> ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3:
+    """Validate the §6.1 snapshot (v1/v2/v3); an illegal one is ValidationError (§7 create).
 
-    A JSON object is routed by its ``schema_version``: 2 decodes through the
-    v2 model, anything else through the frozen v1 model (whose error messages
-    are unchanged); a non-dict is rejected before either.
+    A JSON object is routed by its ``schema_version``: 3 decodes through the
+    v3 model (R4-S3), 2 through the v2 model, anything else through the
+    frozen v1 model (whose error messages are unchanged); a non-dict is
+    rejected before all three.
     """
-    if isinstance(config_snapshot, ConfigSnapshot | ConfigSnapshotV2):
+    if isinstance(config_snapshot, ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3):
         return config_snapshot
     if not isinstance(config_snapshot, dict):
         raise StoreValidationError("config_snapshot must be a ConfigSnapshot or a JSON object")
-    model = ConfigSnapshotV2 if config_snapshot.get("schema_version") == 2 else ConfigSnapshot
+    model: type[ConfigSnapshot] | type[ConfigSnapshotV2] | type[ConfigSnapshotV3]
+    if config_snapshot.get("schema_version") == 3:
+        model = ConfigSnapshotV3
+    elif config_snapshot.get("schema_version") == 2:
+        model = ConfigSnapshotV2
+    else:
+        model = ConfigSnapshot
     try:
         return model.model_validate(config_snapshot)
     except PydanticValidationError as error:
@@ -522,13 +531,17 @@ class SessionService:
 
     # -- §7 create ---------------------------------------------------------
 
-    async def create(self, config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | JsonObject) -> SessionRef:
+    async def create(
+        self, config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3 | JsonObject
+    ) -> SessionRef:
         """Create and persist a session (§7 L304); every call is a new ses_ id.
 
         The §6.1 snapshot is validated through the contracts model (an illegal
         one is ValidationError); a v1 snapshot commits ``py.session.created``
-        version 1, a v2 snapshot version 2 (R3-S6; the wire version follows
-        the data shape, §8 L358). ``working_dir`` is the constructor-injected
+        version 1, a v2 snapshot version 2 (R3-S6), a v3 snapshot version 3
+        (R4-S3; the wire version follows the data shape, §8 L358 — the v3
+        branch checks first because a v3 snapshot is a standalone model,
+        never a v2 subclass). ``working_dir`` is the constructor-injected
         value. The single ``py.session.created`` batch commits with
         ``expected_seq=0`` (§3.2: a not-yet-created session's logical H=A=0);
         the projector inserts the sessions row in the same transaction. The
@@ -540,8 +553,21 @@ class SessionService:
         snapshot = _coerce_config_snapshot(config_snapshot)
         session_id = self._ids.session_id()
         created_at = self._clock()
-        draft: EventDraft[SessionCreatedData] | EventDraft[SessionCreatedDataV2]
-        if isinstance(snapshot, ConfigSnapshotV2):
+        draft: EventDraft[SessionCreatedData] | EventDraft[SessionCreatedDataV2] | EventDraft[SessionCreatedDataV3]
+        if isinstance(snapshot, ConfigSnapshotV3):
+            draft = EventDraft[SessionCreatedDataV3](
+                id=self._ids.event_id(),
+                type=PY_SESSION_CREATED,
+                version=3,
+                session_id=session_id,
+                created_at=created_at,
+                data=SessionCreatedDataV3(
+                    working_dir=self._working_dir,
+                    config_snapshot=snapshot,
+                    snapshot_hash=compute_snapshot_hash(snapshot),
+                ),
+            )
+        elif isinstance(snapshot, ConfigSnapshotV2):
             draft = EventDraft[SessionCreatedDataV2](
                 id=self._ids.event_id(),
                 type=PY_SESSION_CREATED,

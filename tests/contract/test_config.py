@@ -125,9 +125,12 @@ class TestSessionCreatedV2Wire:
         assert type(event.data) is SessionCreatedData
         assert event.data.snapshot_hash == R1_SNAPSHOT_DIGEST
 
-    def test_version_three_is_still_unknown(self) -> None:
+    def test_unregistered_version_is_still_unknown(self) -> None:
+        # The probe pins the next UNREGISTERED version and flips with every
+        # registration (T-C1-030: v2 -> v3; T-C1-036: v3 -> v4 -- py.session.created
+        # v3 is now a registered R4-S3 version, CORE-CONTRACTS §8 L358).
         raw = _load_fixture(V2_FIXTURES["valid"])
-        raw["version"] = 3
+        raw["version"] = 4
         with pytest.raises(UnknownEventVersionError):
             default_event_registry().decode_durable(raw)
 
