@@ -134,7 +134,15 @@ def test_root_restriction_denies_fs_escape(tmp_path: Path) -> None:
     policy = PermissionPolicy(boot_id="boot_contract", clock=_clock)
     inside = _evaluate(policy, action="fs__read", resources=(str(tmp_path / "a.txt"),), working_dir=str(tmp_path))
     assert (inside.effect, inside.source) == ("allow", "default")
-    escape = _evaluate(policy, action="fs__read", resources=("C:/Windows/win.ini",), working_dir=str(tmp_path))
+    # Platform-neutral absolute escape: a literal C:/... fixture is a legal
+    # relative resource on POSIX (the policy anchors it inside the root), so
+    # it cannot pin the escape face there.
+    escape = _evaluate(
+        policy,
+        action="fs__read",
+        resources=(str(tmp_path.parent / "escape" / "x.txt"),),
+        working_dir=str(tmp_path),
+    )
     assert escape.effect == "deny"
     assert escape.source == "root_restriction"
     traversal = _evaluate(
@@ -199,7 +207,14 @@ def test_rules_cannot_relax_root_restriction(tmp_path: Path) -> None:
         clock=_clock,
         rules=(PermissionRule(action="fs__write", effect="allow", source="host"),),
     )
-    decision = _evaluate(policy, action="fs__write", resources=("C:/elsewhere/x.txt",), working_dir=str(tmp_path))
+    # Same platform-neutral outside-root resource; the host allow rule must
+    # not relax the root restriction (a C:/... fixture is relative on POSIX).
+    decision = _evaluate(
+        policy,
+        action="fs__write",
+        resources=(str(tmp_path.parent / "elsewhere" / "x.txt"),),
+        working_dir=str(tmp_path),
+    )
     assert (decision.effect, decision.source) == ("deny", "root_restriction")
 
 

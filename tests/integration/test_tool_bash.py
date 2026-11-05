@@ -138,7 +138,11 @@ def _flood_command(character: str, amount: int, *, hang_s: int = 0) -> str:
         if hang_s:
             command += f"; Start-Sleep -Seconds {hang_s}"
         return command
-    code = f"print('{character}' * {amount})"
+    # flush=True: the full payload (including print's trailing newline) must
+    # reach the pipe before the hang -- a buffered trailing byte is lost when
+    # the timeout kill interrupts the sleep (the first Linux CI run drained
+    # 150000 of 150001 bytes).
+    code = f"print('{character}' * {amount}, flush=True)"
     if hang_s:
         code += f"; import time; time.sleep({hang_s})"
     return f"'{sys.executable}' -c \"{code}\""
