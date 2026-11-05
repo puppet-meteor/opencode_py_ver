@@ -161,7 +161,8 @@ def _interpreter_or_skip() -> None:
 
 def _pid_alive(pid: int) -> bool:
     """A process-level probe: True when ``pid`` names a still-running process."""
-    if _PLATFORM == "win32":
+    # Direct sys.platform: mypy narrows the win32-typed ctypes face on Linux.
+    if sys.platform == "win32":
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:

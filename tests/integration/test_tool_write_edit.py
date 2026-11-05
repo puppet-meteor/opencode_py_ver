@@ -469,6 +469,10 @@ async def test_write_symlink_escape_is_denied_after_realpath(tmp_path: Path, tmp
 
 @pytest.mark.skipif(_PLATFORM != "win32", reason="junctions are Windows-only")
 async def test_write_junction_escape_is_denied_after_realpath(tmp_path: Path, tmp_path_factory: Any) -> None:
+    # mypy narrowing: typeshed types _winapi as win32-only; the skipif above
+    # already keeps the runtime off this body on non-Windows hosts.
+    if sys.platform != "win32":
+        pytest.skip("junctions are Windows-only")
     import _winapi
 
     outside = tmp_path_factory.mktemp("outside")

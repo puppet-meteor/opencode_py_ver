@@ -40,9 +40,13 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
-if sys.platform == "win32":
+if TYPE_CHECKING:
+    # mypy resolves the JobObject class on every platform (the annotations
+    # below name it unconditionally); the runtime import stays win32-only.
+    from opencode.process.winjob import JobObject
+elif sys.platform == "win32":
     from opencode.process.winjob import JobObject
 
 #: §5.3 L274 last-sentence default: tool output is capped at 64 KiB with an

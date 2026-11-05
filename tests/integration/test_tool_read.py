@@ -10,6 +10,7 @@ CORE-CONTRACTS §5.1 L253/L255/L257, §5.3 L272-276, §2.1 L46.
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -300,6 +301,10 @@ async def test_read_symlink_escape_is_denied_after_realpath(tmp_path: Path, tmp_
 
 @pytest.mark.skipif(_PLATFORM != "win32", reason="junctions are Windows-only")
 async def test_read_junction_escape_is_denied_after_realpath(tmp_path: Path, tmp_path_factory: Any) -> None:
+    # mypy narrowing: typeshed types _winapi as win32-only; the skipif above
+    # already keeps the runtime off this body on non-Windows hosts.
+    if sys.platform != "win32":
+        pytest.skip("junctions are Windows-only")
     import _winapi
 
     outside = tmp_path_factory.mktemp("outside")
