@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 #: TS ``tool/plugin/shell.ts`` L24 ``DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000`` --
-#: exactly 120 seconds (CORE-CONTRACTS §5.3 L277 default; zero deviation).
+#: exactly 120 seconds (CORE-CONTRACTS §5.3 default; zero deviation).
 DEFAULT_TIMEOUT_S = 120.0
 #: How long the availability probe may take (rg probe precedent: 5 s).
 PROBE_TIMEOUT_S = 5.0

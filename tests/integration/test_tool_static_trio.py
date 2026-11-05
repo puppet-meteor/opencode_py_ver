@@ -16,6 +16,7 @@ from __future__ import annotations
 import glob
 import os
 import shutil
+import subprocess
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -155,6 +156,14 @@ def _patch_rg_path(monkeypatch: pytest.MonkeyPatch, executable: str | None) -> N
     """Point grep's rg discovery at ``executable`` (None = absent) for one test."""
     monkeypatch.setattr(grep_module, "_RG_CACHE", {})
     monkeypatch.setattr(grep_module, "_which_rg", lambda: executable)
+
+
+def _set_hidden_attribute(path: Path, *, hidden: bool) -> None:
+    """``attrib +h/-h`` -- the second Windows rg-hidden mechanism (measured:
+    ripgrep 15.2.0 honors the attribute; dotfiles are the portable one). A
+    sync helper so the async tests stay ASYNC221-clean (the ``_upgrade_head``
+    precedent); win32-only at the call sites."""
+    subprocess.run(["attrib", "+h" if hidden else "-h", str(path)], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +501,59 @@ async def test_grep_include_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle", "include": "*.py"})
 
     assert _text(outcome) == "Found 1 matches\nkeep.py:\n  Line 1: needle"
+
+
+async def test_grep_hidden_files_are_searched_after_ts_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row #35 (T-C1-034): ripgrep.ts L226 passes ``--hidden`` unconditionally,
+    so hidden files are part of the searchable set (the alignment's new
+    visibility). Both hidden mechanisms were measured with the real rg
+    (ripgrep 15.2.0, Windows leg): dot-prefixed names -- rg treats those as
+    hidden on every platform, so this leg is the cross-platform pin -- and
+    the ``attrib +h`` hidden attribute (Windows-only leg; A-PLATFORM: no
+    attrib on Unix, that leg is simply not exercised there)."""
+    rg = _real_rg_or_skip()
+    _patch_rg_path(monkeypatch, rg)
+    (tmp_path / ".hidden.txt").write_bytes(b"needle inside\n")
+    (tmp_path / "plain.txt").write_bytes(b"nothing to see\n")
+
+    outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle"})
+
+    assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
+    assert _text(outcome) == "Found 1 matches\n.hidden.txt:\n  Line 1: needle inside"
+
+    if sys.platform == "win32":
+        attributed = tmp_path / "attributed.txt"
+        attributed.write_bytes(b"needle attributed\n")
+        _set_hidden_attribute(attributed, hidden=True)
+        second = await _run(tmp_path, "fs__grep", {"pattern": "attributed"})
+        assert _text(second) == "Found 1 matches\nattributed.txt:\n  Line 1: needle attributed"
+
+
+async def test_grep_git_directory_is_excluded_by_glob(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Row #35 (T-C1-034): ripgrep.ts L231 appends ``--glob=!**/.git/**`` after
+    the user include glob. Under ``--hidden`` the .git tree would otherwise be
+    searched (measured: --hidden without the glob returns .git hits), so the
+    glob is what keeps it out; rg's later-glob precedence was measured both
+    ways -- the TS order keeps .git out even when its files match the user's
+    include, the reversed order admits them."""
+    rg = _real_rg_or_skip()
+    _patch_rg_path(monkeypatch, rg)
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config.txt").write_bytes(b"needle inside git\n")
+    (tmp_path / "normal.txt").write_bytes(b"needle normal\n")
+
+    outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle"})
+
+    assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
+    assert _text(outcome) == "Found 1 matches\nnormal.txt:\n  Line 1: needle normal"
+
+    # The include interplay (measured): config.txt matches the user include,
+    # but the later .git exclusion glob wins (the TS L230-L231 order is
+    # load-bearing).
+    included = await _run(tmp_path, "fs__grep", {"pattern": "needle", "include": "*.txt"})
+    assert _text(included) == "Found 1 matches\nnormal.txt:\n  Line 1: needle normal"
 
 
 async def test_grep_single_file_path_targets_that_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

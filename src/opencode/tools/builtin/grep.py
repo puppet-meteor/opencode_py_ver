@@ -39,13 +39,16 @@ TS has none) and a larger requested ``limit`` is clamped to it; a
 single-file target is pre-checked for binary content (NUL in the first
 8 KiB → explicit ``Cannot grep binary file`` diagnostic, the ``fs__read``
 binary-face precedent) while directory searches rely on rg's own built-in
-binary detection; rg's default ignore/hidden behavior is kept (hidden
-files are not searched; ignore files are respected; ``--no-config`` and
-``--no-messages`` are aligned with TS ripgrep.ts L224/L227 -- config
-isolation and stderr noise suppression with no visible result-set
-change -- while ``--hidden`` and ``--glob=!**/.git/**`` (ripgrep.ts
-L226/L231) are NOT ported: both change the result set and the T-C1-033
-task-B ruling parks them for the scheduler); rg exit codes follow the TS
+binary detection; the rg invocation is aligned with TS ripgrep.ts
+L223-235 (scheduler ruling adopted 2026-11-05): ``--no-config`` /
+``--no-messages`` (L224/L227 -- config isolation and stderr noise
+suppression) as before, plus ``--hidden`` (L226 -- hidden files ARE
+searched) and ``--glob=!**/.git/**`` (L231, after the user include glob:
+rg's later-glob precedence is why the .git exclusion comes last), closing
+the T-C1-033 parked gap; the remaining asymmetry -- grep hard-enables
+``--hidden`` while glob/ls gate it behind an input flag -- is TS-same,
+not a new deviation (T-B-035 §2); ignore files are still respected by
+rg's own handling; rg exit codes follow the TS
 three-diagnosis (ripgrep.ts L144-152): code 2 without a regex parse
 error -- a sibling file locked or unreadable, the writer.lock defect
 shape -- is tolerated and answers with the already-collected rows, code
@@ -358,18 +361,18 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
             "and retry; no silent fallback search is performed.",
         )
 
-    # ripgrep.ts L231 note: ``--glob=!**/.git/**`` (L231) and ``--hidden``
-    # (L226) are deliberately NOT passed here -- both change the visible
-    # result set (hidden files become searchable / .git gets excluded) and
-    # the T-C1-033 B2 ruling parks them for the scheduler.
-    args: list[str] = [executable, "--no-config", "--json", "--no-messages"]
+    # TS alignment (ripgrep.ts L223-235; scheduler ruling adopted 2026-11-05,
+    # r3-slices row#35): ``--hidden`` (L226) and ``--glob=!**/.git/**`` (L231)
+    # are now passed; the .git exclusion comes after the user include glob
+    # because rg gives the later glob precedence (the TS L230-L231 order).
+    args: list[str] = [executable, "--no-config", "--json", "--hidden", "--no-messages"]
     if include is not None:
         args += ["-g", include]
     if literal:
         args += ["-F"]
     if not case_sensitive:
         args += ["-i"]
-    args += ["-e", pattern, "--", file_arg]
+    args += ["--glob=!**/.git/**", "-e", pattern, "--", file_arg]
 
     try:
         matches, timed_out, returncode, stderr = _run_rg(executable, args, cwd, limit=limit, timeout_s=GREP_TIMEOUT_S)
