@@ -35,6 +35,7 @@ from uuid import uuid4
 from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
+from opencode.mcp import McpManager
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
 from opencode.session.runner import DEFAULT_MAX_STEPS, EventCommitter, Runner
@@ -69,9 +70,9 @@ class _ProviderHandle(Protocol):
 class App:
     """The explicit R2 composition: owns the Database, the bus, the runner and the service.
 
-    ``close()`` releases in fixed order (§7 L337): the service lifecycle first
+    ``close()`` releases in fixed order (§7 L337/L339): the service lifecycle first
     (closing gate -> shutdown intents for its scheduled runs -> wait/timeout
-    -> provider close -> service closed), then the
+    -> MCP close -> provider close -> service closed), then the
     :class:`~opencode.storage.Database` handle (engine dispose + writer-lock
     release; both idempotent). The async context manager does the same on
     exit. Repeated ``close()`` is safe. One shared ID factory and clock feed
@@ -97,6 +98,7 @@ class App:
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
         approval_timeout_s: float = DEFAULT_APPROVAL_TIMEOUT_S,
         rules: Sequence[PermissionRule] = (),
+        mcp_manager: McpManager | None = None,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -147,10 +149,16 @@ class App:
             engine=engine,
             runner=runner,
             provider_close=provider.close if provider is not None else None,
+            mcp_close=mcp_manager.close if mcp_manager is not None else None,
             approvals=approvals,
             policy=policy,
             close_timeout_s=close_timeout_s,
         )
+        # R4-S2 wiring: the MCP manager is App-owned but lifecycle-closed by
+        # the service (§7 L339: MCP -> provider -> DB); the caller injects it
+        # explicitly -- config loading is the S3 face, so App registers no
+        # MCP tools itself and only owns the close.
+        self._mcp_manager = mcp_manager
 
     @property
     def database(self) -> Database:
@@ -166,6 +174,11 @@ class App:
     def service(self) -> SessionService:
         """The §7 command surface."""
         return self._service
+
+    @property
+    def mcp_manager(self) -> McpManager | None:
+        """The owned MCP server manager (None = no MCP servers in this composition)."""
+        return self._mcp_manager
 
     async def close(self) -> None:
         """Release in order: the service lifecycle first, then the engine/lock."""
