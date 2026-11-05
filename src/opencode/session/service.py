@@ -459,6 +459,7 @@ class SessionService:
         engine: AsyncEngine | None = None,
         runner: RunScheduler | None = None,
         provider_close: Callable[[], Awaitable[None]] | None = None,
+        mcp_close: Callable[[], Awaitable[None]] | None = None,
         approvals: ApprovalCoordinator | None = None,
         policy: PermissionPolicy | None = None,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
@@ -489,6 +490,10 @@ class SessionService:
         self._engine = engine
         self._runner = runner
         self._provider_close = provider_close
+        # R4-S2 wiring: the §7 L339 MCP shutdown seam. Closed in Phase 3
+        # BEFORE the provider ("依次关闭 MCP、provider、DB"); None keeps the
+        # pre-R4 face (no MCP manager in the composition).
+        self._mcp_close = mcp_close
         # R3-S2 wiring: the approval channel (§7 L316) and the policy engine
         # holding the current-boot saved decisions (revoke face, §5.2 L270).
         # Both stay optional so the R1/R2 direct-construction faces are
@@ -1056,9 +1061,10 @@ class SessionService:
         ``tool.finished(effect_status=unknown)`` + interrupted terminals, and
         mark only the sessions still stuck after the grace period
         ``cleanup_failed`` (a grace exit with committed terminals is a
-        confirmed cleanup, #90); finally close the provider and set the
-        service closed. Storage-only accepted runs (no
-        live task) keep their records for R4 and are never claimed cleaned.
+        confirmed cleanup, #90); finally close MCP and the provider (§7
+        L339 order) and set the service closed. Storage-only accepted
+        runs (no live task) keep their records for R4 and are never
+        claimed cleaned.
         The engine and writer lock stay owned by the composition root.
         """
         if self._close_task is not None:
@@ -1124,8 +1130,11 @@ class SessionService:
                 for task in pending2:
                     run_id, session_id = by_task[task]
                     await self._mark_cleanup_failed(session_id, run_id, REASON_CLOSE_TIMEOUT)
-        # Phase 3: every own task has exited or is durably marked -- close the
-        # provider, then the service gate. The DB/engine stays with the App.
+        # Phase 3: every own task has exited or is durably marked -- close in
+        # the §7 L339 order: MCP first, then the provider, then the service
+        # gate. The DB/engine stays with the App.
+        if self._mcp_close is not None:
+            await self._mcp_close()
         if self._provider_close is not None:
             await self._provider_close()
         self._closed = True
