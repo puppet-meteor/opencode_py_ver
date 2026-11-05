@@ -1,4 +1,4 @@
-"""Windows Job Object wrapper (R3-S5; CORE-CONTRACTS §5.3 L277, plan §2.5).
+"""Windows Job Object wrapper (R3-S5; CORE-CONTRACTS §5.3, plan §2.5).
 
 The contract's first-named Windows process-tree reaping mechanism: every
 command's process is assigned to a job object at spawn, the job is created
@@ -12,7 +12,7 @@ creation instead of enumerated).
 
 Selected over ``taskkill /T /F`` (OP-R3-9): atomic termination, no
 external process dependency, covers descendants spawned after the kill
-starts, and it is the mechanism CORE-CONTRACTS §5.3 L277 names first
+starts, and it is the mechanism CORE-CONTRACTS §5.3 names first
 ("Windows Job Object、Unix process group 或已验证等价方案" -- the tree-reap
 test in ``tests/integration/test_tool_bash.py`` is the verification).
 

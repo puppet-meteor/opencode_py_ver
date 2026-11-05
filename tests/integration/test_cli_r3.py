@@ -788,7 +788,7 @@ def test_migration_failure_maps_to_exit_70(tmp_path: Path, capsys: pytest.Captur
 def test_resolve_phase_config_error_maps_to_exit_70(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Row #28 (nit-2): a shape-valid config whose *resolved* values are illegal
+    """Row #33 (nit-2): a shape-valid config whose *resolved* values are illegal
     (context_limit <= output_reserve, the RuntimeSettings invariant) fails in
     main's resolve phase — traceback + exit 70, the resolve-stage complement to
     the migration-stage injection above (never the failed-run exit 1)."""

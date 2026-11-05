@@ -5,7 +5,7 @@ Runs one shell command through the controlled subprocess environment
 bash / Windows PowerShell, availability checked and cached per process --
 never ``create_subprocess_shell``'s platform default; §5.3 L276), the
 command string is passed as a single argv element with no JSON repair
-(§5.3 L276), and the run carries the §5.3 L277 discipline: 120 s default
+(§5.3 L276), and the run carries the §5.3 discipline: 120 s default
 timeout (TS ``shell.ts`` L24 ``DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000`` --
 exactly 120 seconds), output capped at 64 KiB with an explicit truncation
 marker and original size (§5.3 L274 last-sentence precedent) while both
@@ -71,7 +71,7 @@ BASH_NAMESPACE = "bash"
 BASH_NAME = "run"
 BASH_VERSION = 1
 
-#: §5.3 L277 default, TS shell.ts L24 (2 * 60 * 1_000 ms == 120 s, zero deviation).
+#: §5.3 default, TS shell.ts L24 (2 * 60 * 1_000 ms == 120 s, zero deviation).
 BASH_DEFAULT_TIMEOUT_S = DEFAULT_TIMEOUT_S
 #: §5.3 L274 last sentence: output default 64 KiB, marked truncation + original size.
 BASH_MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
@@ -230,7 +230,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
             "interpreter is used (CORE-CONTRACTS §5.3 L276).",
         )
 
-    # §5.3 L277 "子进程用受控环境": the inherited environment plus the TS
+    # §5.3 "子进程用受控环境": the inherited environment plus the TS
     # shell.ts prepare anchors (AGENT/OPENCODE/AI_AGENT/OPENCODE_SESSION_ID).
     env = dict(os.environ)
     env["AGENT"] = "1"
@@ -284,7 +284,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
             ),
         )
     if not result.reaped:
-        # §5.3 L277: cleanup could not be confirmed -> unknown effect.
+        # §5.3: cleanup could not be confirmed -> unknown effect.
         return ToolResult(
             content=content,
             structured_output=_structured(result),

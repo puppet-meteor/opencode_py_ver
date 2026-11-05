@@ -385,10 +385,11 @@ async def test_r3_six_tool_chain_with_live_approvals(tmp_path: Path, monkeypatch
     """①: one run, three generations, the seven real tools on a real tree --
     the three ask tools each park on a real approval and proceed on a mid-run
     ``once`` reply; the rendered results feed back verbatim on the wire."""
-    # The DB (and its live writer.lock) must live OUTSIDE working_dir: fs__grep
-    # scans "." with rg, and a Windows sharing violation on the locked file makes
-    # rg exit 2 (a graceful TOOL_FAILED that would wedge the run -- see the
-    # float-report in doc/orchestration/progress/T-C1-032.md).
+    # The DB (and its live writer.lock) live OUTSIDE working_dir as a
+    # deterministic-environment choice: fs__grep scans "." with rg and a live
+    # writer.lock in the tree makes rg exit 2 -- a shape tolerated since R4-S1
+    # (answered with the already-collected rows), so this is not a workaround
+    # for a wedged run (that defect is fixed; T-C1-032 float-report).
     db_dir = tmp_path.parent / f"{tmp_path.name}-db"
     db_dir.mkdir()
     db_path = db_dir / "e2e.db"
@@ -505,10 +506,11 @@ async def test_event_log_ledger_per_tool_cross_validation(tmp_path: Path, monkey
     execution joins its ``py.tool.finished`` terminal by execution_id, the
     per-tool counts say exactly one execution per builtin, and the permission
     ledger reconciles with the default tier table."""
-    # The DB (and its live writer.lock) must live OUTSIDE working_dir: fs__grep
-    # scans "." with rg, and a Windows sharing violation on the locked file makes
-    # rg exit 2 (a graceful TOOL_FAILED that would wedge the run -- see the
-    # float-report in doc/orchestration/progress/T-C1-032.md).
+    # The DB (and its live writer.lock) live OUTSIDE working_dir as a
+    # deterministic-environment choice: fs__grep scans "." with rg and a live
+    # writer.lock in the tree makes rg exit 2 -- a shape tolerated since R4-S1
+    # (answered with the already-collected rows), so this is not a workaround
+    # for a wedged run (that defect is fixed; T-C1-032 float-report).
     db_dir = tmp_path.parent / f"{tmp_path.name}-db"
     db_dir.mkdir()
     db_path = db_dir / "e2e.db"
@@ -590,10 +592,11 @@ async def test_unanswered_approval_expires_tool_not_started_run_succeeds(tmp_pat
     resolves the permission expired, the pending tool folds cancelled /
     not_started (never a silent allow; the file is never written), the run
     still succeeds, and the closed pair reconciles on the durable ledger."""
-    # The DB (and its live writer.lock) must live OUTSIDE working_dir: fs__grep
-    # scans "." with rg, and a Windows sharing violation on the locked file makes
-    # rg exit 2 (a graceful TOOL_FAILED that would wedge the run -- see the
-    # float-report in doc/orchestration/progress/T-C1-032.md).
+    # The DB (and its live writer.lock) live OUTSIDE working_dir as a
+    # deterministic-environment choice: fs__grep scans "." with rg and a live
+    # writer.lock in the tree makes rg exit 2 -- a shape tolerated since R4-S1
+    # (answered with the already-collected rows), so this is not a workaround
+    # for a wedged run (that defect is fixed; T-C1-032 float-report).
     db_dir = tmp_path.parent / f"{tmp_path.name}-db"
     db_dir.mkdir()
     db_path = db_dir / "e2e.db"
@@ -680,8 +683,10 @@ async def test_post_start_graceful_failure_reaches_run_terminal(tmp_path: Path) 
     feedback, not a failed run; the test ③ cancelled/not_started run-still-
     succeeds precedent, runner.py L620-667 fold)."""
     # Same shape as ①②③: the DB and its live writer.lock live OUTSIDE
-    # working_dir; this nail's tool is fs__read (no directory scan), so the
-    # placement is uniformity, not necessity.
+    # working_dir (deterministic-environment uniformity, not a workaround --
+    # a locked sibling's rg exit 2 is tolerated since R4-S1); this nail's
+    # tool is fs__read (no directory scan), so the placement is uniformity,
+    # not necessity.
     db_dir = tmp_path.parent / f"{tmp_path.name}-db"
     db_dir.mkdir()
     db_path = db_dir / "e2e.db"
