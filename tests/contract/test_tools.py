@@ -557,7 +557,7 @@ async def test_adapter_exception_becomes_failed_result() -> None:
     outcome = await registry.invoke(_context(), "fs__read", {"text": "hi"}, "exec_001")
 
     assert outcome.state == "failed"
-    assert outcome.effect_status == "not_started"  # side_effects=False
+    assert outcome.effect_status == "unknown"  # §2.1 L50: started call, effect unprovable (T-C1-033)
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     assert "RuntimeError" in outcome.error.message

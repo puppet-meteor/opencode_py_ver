@@ -556,6 +556,42 @@ async def test_grep_invalid_regex_is_tool_failed(tmp_path: Path, monkeypatch: py
     assert "Invalid regex pattern" in _text(outcome)
 
 
+@pytest.mark.skipif(_PLATFORM != "win32", reason="the byte-range lock face is Windows-only (msvcrt)")
+async def test_grep_locked_sibling_file_is_tolerated_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-C1-033 task-B empirical pin (Windows leg, measured not assumed): a
+    sibling file locked by another handle -- the exact writer.lock shape
+    (db.py: ``msvcrt.locking`` over 1 byte at offset 0) -- makes rg exit 2
+    mid-scan. The TS three-diagnosis (ripgrep.ts L144-152) tolerates a
+    code-2 non-pattern error: the already-collected rows are the answer,
+    never a TOOL_FAILED wedge. A-PLATFORM: the POSIX leg (e.g. an
+    unreadable chmod-000 file) is not woven here -- no Linux evidence is
+    fabricated; it is disclosed in the progress file for CI to measure."""
+    # mypy narrowing: typeshed types msvcrt as win32-only; the skipif above
+    # keeps the runtime off this body on non-Windows hosts.
+    if sys.platform != "win32":
+        pytest.skip("the byte-range lock face is Windows-only")
+    import msvcrt
+
+    rg = _real_rg_or_skip()
+    _patch_rg_path(monkeypatch, rg)
+    (tmp_path / "readable.txt").write_bytes(b"needle here\n")
+    locked_path = tmp_path / "locked.txt"
+    locked_path.write_bytes(b"needle there\n")
+
+    fd = os.open(locked_path, os.O_RDWR)
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    try:
+        outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle"})
+    finally:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        os.close(fd)
+
+    assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
+    assert _text(outcome) == "Found 1 matches\nreadable.txt:\n  Line 1: needle here"
+
+
 async def test_grep_missing_search_path_is_not_found(tmp_path: Path) -> None:
     outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle", "path": "nope"})
 
@@ -583,7 +619,7 @@ async def test_grep_binary_file_is_tool_failed(tmp_path: Path) -> None:
 
     outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle", "path": "blob.bin"})
 
-    assert (outcome.state, outcome.effect_status) == ("failed", "not_started")
+    assert (outcome.state, outcome.effect_status) == ("failed", "unknown")  # §2.1 L50 (T-C1-033)
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     assert "Cannot grep binary file: blob.bin" in _text(outcome)
@@ -596,7 +632,7 @@ async def test_grep_rg_unavailable_is_explicit_diagnostic(tmp_path: Path, monkey
 
     outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle"})
 
-    assert (outcome.state, outcome.effect_status) == ("failed", "not_started")
+    assert (outcome.state, outcome.effect_status) == ("failed", "unknown")  # §2.1 L50 (T-C1-033)
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     text = _text(outcome)

@@ -331,7 +331,7 @@ async def test_read_binary_file_is_tool_failed(tmp_path: Path) -> None:
 
     outcome = await _run(tmp_path, {"path": "blob.bin"})
 
-    assert (outcome.state, outcome.effect_status) == ("failed", "not_started")
+    assert (outcome.state, outcome.effect_status) == ("failed", "unknown")  # §2.1 L50 (T-C1-033)
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     assert "Cannot read binary file: blob.bin" in _text(outcome)
@@ -342,7 +342,7 @@ async def test_read_invalid_utf8_is_tool_failed(tmp_path: Path) -> None:
 
     outcome = await _run(tmp_path, {"path": "latin1.txt"})
 
-    assert outcome.state == "failed"
+    assert (outcome.state, outcome.effect_status) == ("failed", "unknown")  # §2.1 L50 (T-C1-033)
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     assert "not valid UTF-8 text" in _text(outcome)

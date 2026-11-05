@@ -8,7 +8,7 @@ pydantic ``ProviderChunk``. Behaviour anchors (doc/evidence/r0/provider.md):
 - ``packages/ai/src/route/transport/http.ts:94-140`` header/chunk/total timeouts
 - ``packages/ai/src/route/executor.ts:22-35``  Retry-After parsing (ms first)
 - ``packages/core/src/model-retry.ts:62-103``  retry only before first content
-  (Python narrows this to 429 + connection-establishment failures, §8 L350)
+  (Python narrows this to 429 + connection-establishment failures, §8)
 
 Spike differences formally adopted here (provider.md §6 #2/#3/#4, OP-4):
 
@@ -32,7 +32,7 @@ Timeout model (provider.md §3 mapping table, unchanged from the spike):
   checked before every read and wrapped around each single read; it also bounds
   retry waits (``min(retry_after, remaining)``).
 
-Retry rules (§8 L350, OP-7/OP-8 rulings of 2026-11-03):
+Retry rules (§8, OP-7/OP-8 rulings of 2026-11-03):
 
 - SDK ``max_retries=0`` — this adapter is the single retry owner;
 - retry only when no content was produced yet AND the failure is clearly
@@ -166,7 +166,7 @@ class MaasTimeouts:
 class _RetrySignal(Exception):
     """Raised only by the create() phase — i.e. strictly before any content.
 
-    Structural invariant (§8 L350): a failed attempt that already yielded
+    Structural invariant (§8): a failed attempt that already yielded
     chunks can never raise this, so partial streams are never restarted or
     spliced; ``MaasAdapter.stream`` converts exhaustion into the terminal
     error chunk.
@@ -286,7 +286,7 @@ class MaasAdapter:
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
-            max_retries=0,  # retry policy belongs to this adapter, not the SDK (§8 L350)
+            max_retries=0,  # retry policy belongs to this adapter, not the SDK (§8)
             timeout=httpx2.Timeout(
                 connect=effective.header_s,
                 read=effective.chunk_s,

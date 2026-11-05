@@ -27,7 +27,7 @@ One runner coroutine drives one accepted run from ``py.run.started`` to
 
 Interrupt faces (验收 C): an error chunk or EOF without a terminal chunk ends
 the step/run interrupted with the fully-received committed text (不拼接不重发,
-§8 L350); cancellation is cooperative -- ``py.run.cancel_requested`` lands
+§8); cancellation is cooperative -- ``py.run.cancel_requested`` lands
 first, the signal in :meth:`Runner.cancel_event` follows; pending tools get a
 synthesized ``cancelled/not_started`` terminal, started tools keep their
 committed terminals, and no new step/tool starts (§7 L335). A hard
@@ -39,7 +39,7 @@ graph collapses into one asyncio coroutine state machine here;
 ``runner/step.ts`` Outcome -> step terminal + needs-continuation (any finish
 reason completes the step; tool calls present mean another step);
 ``max-steps.ts`` MAX_STEPS_PROMPT is reference semantics only (the run
-fails, §7 L341); ``retry.ts`` is deliberately not ported (§8 L350).
+fails, §7 L341); ``retry.ts`` is deliberately not ported (§8).
 """
 
 from __future__ import annotations
@@ -333,7 +333,7 @@ class Runner:
     graph collapses into this single coroutine state machine. Per step: pin
     the catalog snapshot (§5.1 L253), build the request through the frozen
     ``ContextBuilder``, commit ``py.step.started`` (``attempt`` is always 1:
-    OP-6 -- the retry owner is the adapter only, §8 L350), consume
+    OP-6 -- the retry owner is the adapter only, §8), consume
     ``provider.stream`` (aggregate + publish ephemerals + enforce the three
     §5.3 L276 caps inline), commit the generation batch atomically, execute
     the durable tool plan serially through ``ToolRegistry.invoke``, then
@@ -584,7 +584,7 @@ class Runner:
                 )
                 return RunResult(outcome="failed", steps=steps, error=violation.error)
             if result.interrupted:
-                # §8 L350: the received text is committed once, never resent.
+                # §8: the received text is committed once, never resent.
                 partial = self._finalized_drafts(session_id, run_id, message_id, result.slots)
                 if partial:
                     await self._committer.commit(session_id, partial)
@@ -678,7 +678,7 @@ class Runner:
         calls per generation -- over-limit stops the generation via
         :class:`_GenerationViolation` so no over-limit plan executes. An error
         chunk or an EOF without a terminal chunk marks the result interrupted
-        (§8 L350: no concatenation, no resend -- exactly one generation).
+        (§8: no concatenation, no resend -- exactly one generation).
         """
         result = _StreamResult()
         limits = self._limits
@@ -771,7 +771,7 @@ class Runner:
                 else:
                     assert isinstance(chunk, ErrorChunk)
                     # §2.3 L98: terminal chunk; the error rides verbatim and
-                    # the generation ends interrupted (no resend, §8 L350).
+                    # the generation ends interrupted (no resend, §8).
                     result.error = chunk.error
                     result.interrupted = True
                     break
@@ -797,7 +797,7 @@ class Runner:
                 code=CoreErrorCode.PROVIDER_STREAM_INTERRUPTED,
                 message=(
                     f"provider stream for request {request.request_id} ended without a "
-                    "finish or error chunk (§8 L350: no concatenation, no resend)"
+                    "finish or error chunk (§8: no concatenation, no resend)"
                 ),
                 retryable=True,
             )
@@ -996,7 +996,7 @@ class Runner:
         """Terminate the open step (if any) and the run as interrupted.
 
         The single state-driven implementation for every interrupt path (§7
-        L335, §8 L350): one atomic batch in fold order (§2.1 L65) --
+        L335, §8): one atomic batch in fold order (§2.1 L65) --
         synthesized terminals for the still-open tools first (pending ->
         ``cancelled/not_started``; started without a terminal ->
         ``unknown/unknown``, §3.3 L210), then the interrupted
