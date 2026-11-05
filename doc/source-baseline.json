@@ -55,5 +55,6 @@
   {"path":"packages/core/src/mcp/client.ts","sha256":"3ef446d2dab82116de76c78ffa7cc5fad453ac9b90639d67c2bcb234195b9ace"},
   {"path":"packages/core/src/mcp/index.ts","sha256":"125898bbf22decb02187bf294de3b3a46aeb50c0132976e9f1dc7fd89634abd6"},
   {"path":"packages/cli/src/mini.ts","sha256":"ab34cdcb8d7208e81d9e17fb429016308a194f39a3a39733e3f148b8b9988556"},
-  {"path":"packages/core/src/file-mutation.ts","sha256":"3e2a738819d035613c7d2a82f117e36b735ccd2998ccdc21f3bec3a0a13d79b6"}
+  {"path":"packages/core/src/file-mutation.ts","sha256":"3e2a738819d035613c7d2a82f117e36b735ccd2998ccdc21f3bec3a0a13d79b6"},
+  {"path":"packages/schema/src/mcp.ts","sha256":"4fc2c6cd480552130a016ccb11160043e4c58e4833480ec9e208fcf4c4f3c8d7"}
 ]
