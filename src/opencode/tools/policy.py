@@ -14,12 +14,13 @@ this module under TYPE_CHECKING only).
 - :func:`PermissionPolicy.evaluate` implements the §5.2 L266 order: host hard
   deny -> root containment (both host tier; project rules can never relax
   them) -> saved decisions (current boot, this session, not expired/revoked,
-  unknown-retry not blocked) -> explicit rules (source priority + order) ->
-  the default table (in-root read/glob/grep/ls allow; write/edit/bash/MCP
-  ask) -> the tool's declared ``side_effects`` for actions outside the
-  enumeration (True -> ask, False -> allow). An unhandled ask is never
-  turned into an allow (§5.2 L266): the caller maps it to
-  ApprovalUnavailable/cancelled.
+  unknown-retry not blocked, and — for an action with a current MCP binding —
+  the recorded server fingerprint + catalog version still match, §5.2 L268
+  R4-S3) -> explicit rules (source priority + order) -> the default table
+  (in-root read/glob/grep/ls allow; write/edit/bash/MCP ask) -> the tool's
+  declared ``side_effects`` for actions outside the enumeration (True ->
+  ask, False -> allow). An unhandled ask is never turned into an allow (§5.2
+  L266): the caller maps it to ApprovalUnavailable/cancelled.
 - :class:`ApprovalCoordinator` is the in-process approval channel (§7 L316:
   independent of the run locks). One short asyncio.Lock is the sole §7 L173
   race arbiter: reply / expiry / run-cancel / close-all resolve a pending
@@ -152,6 +153,24 @@ class PermissionDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class McpToolBinding:
+    """The MCP identity a saved decision is pinned to (§5.2 L268, R4-S3).
+
+    ``server`` is the owning MCP server id; ``fingerprint`` is that server's
+    startup fingerprint (the ``McpServerRef.fingerprint`` of the v3 config
+    snapshot); ``catalog_version`` is the tool registry's MCP catalog digest
+    at decision time. All three must still match for the decision to
+    activate: a server relaunch with a different launch identity or any
+    ``tools/list`` change forces a fresh ask (§5.2 L268/L270) — an old
+    approval can never call a renamed/reshaped tool.
+    """
+
+    server: str
+    fingerprint: str
+    catalog_version: str
+
+
+@dataclass(frozen=True, slots=True)
 class SavedDecision:
     """One registered always-decision (§5.2 L268/L270): current boot + one session.
 
@@ -160,8 +179,12 @@ class SavedDecision:
     expansion possible (lookup is exact-match only). ``input_hash`` is audit
     provenance of the approving call, not part of the always binding; an
     identical retry after an unknown-effect terminal is re-asked instead
-    (§5.2 L270). ``state`` is the in-memory lifecycle; the durable terminal
-    is the py.permission.revoked/expired event.
+    (§5.2 L270). ``mcp_binding`` (R4-S3, §5.2 L268) pins an MCP-action
+    decision to the server startup fingerprint + catalog version captured
+    at registration; None for every non-MCP action and for MCP actions of
+    hosts that never called :meth:`PermissionPolicy.bind_mcp_tools`.
+    ``state`` is the in-memory lifecycle; the durable terminal is the
+    py.permission.revoked/expired event.
     """
 
     decision_id: str
@@ -172,6 +195,7 @@ class SavedDecision:
     boot_id: str
     expires_at: datetime | None
     state: Literal["saved", "expired", "revoked"] = "saved"
+    mcp_binding: McpToolBinding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,6 +538,11 @@ class PermissionPolicy:
         self._minter = _IdMinter(self._clock)
         self._decisions: dict[str, SavedDecision] = {}
         self._unknown_retries: set[tuple[str, str, str]] = set()
+        # R4-S3 (§5.2 L268): the current MCP binding per action (wire name).
+        # Empty until the wiring calls bind_mcp_tools — with no binding an
+        # action keeps its pre-R4-S3 saved-decision semantics (zero
+        # regression for unwired hosts).
+        self._mcp_bindings: dict[str, McpToolBinding] = {}
 
     @property
     def boot_id(self) -> str:
@@ -626,6 +655,27 @@ class PermissionPolicy:
 
     # -- saved-decision registry faces (§5.2 L268/L270) -----------------------
 
+    def bind_mcp_tools(self, action: str, binding: McpToolBinding) -> None:
+        """Pin the current MCP server identity for one ``mcp__`` action (§5.2 L268, R4-S3).
+
+        The wiring face the host calls after booting a server (and after any
+        ``tools/list`` change): every saved decision on this action whose
+        recorded binding differs stops activating and the next call re-asks.
+        Fail-closed shape checks — the action must be an MCP wire name and
+        the binding fields non-empty strings.
+        """
+        if not isinstance(action, str) or not action.startswith("mcp__"):
+            raise ValueError(f"action {action!r} is not an MCP tool wire name (expected 'mcp__<name>')")
+        if not isinstance(binding, McpToolBinding):
+            raise ValueError("binding must be an McpToolBinding")
+        if not isinstance(binding.server, str) or not binding.server:
+            raise ValueError("binding.server must be a non-empty string")
+        if not isinstance(binding.fingerprint, str) or not binding.fingerprint:
+            raise ValueError("binding.fingerprint must be a non-empty string")
+        if not isinstance(binding.catalog_version, str) or not binding.catalog_version:
+            raise ValueError("binding.catalog_version must be a non-empty string")
+        self._mcp_bindings[action] = binding
+
     def register_saved(self, decision: SavedDecision) -> None:
         """Register one saved always-decision of the current boot (§5.2 L270).
 
@@ -637,6 +687,15 @@ class PermissionPolicy:
             raise ValueError(f"decision {decision.decision_id!r} belongs to boot {decision.boot_id!r}")
         if decision.decision_id in self._decisions:
             raise ValueError(f"decision {decision.decision_id!r} is already registered")
+        # R4-S3 (§5.2 L268): enrich an MCP action's decision with the
+        # binding current at registration time — here, not in the Invoker,
+        # so the durable producer stays untouched. A decision that already
+        # carries a binding keeps it (registration time is the pin; later
+        # binding changes must not rewrite stored decisions).
+        if decision.mcp_binding is None:
+            current = self._mcp_bindings.get(decision.action)
+            if current is not None:
+                decision = replace(decision, mcp_binding=current)
         self._decisions[decision.decision_id] = decision
 
     def due_expired(self, session_id: str, now: datetime | None = None) -> tuple[SavedDecision, ...]:
@@ -696,7 +755,16 @@ class PermissionPolicy:
         input_hash: str,
         now: datetime,
     ) -> SavedDecision | None:
-        """The activating saved decision for this call, if any (exact binding)."""
+        """The activating saved decision for this call, if any (exact binding).
+
+        R4-S3 (§5.2 L268): for an action with a CURRENT binding (set through
+        :meth:`bind_mcp_tools`), a decision activates only while its
+        recorded ``mcp_binding`` is equal — a server fingerprint or catalog
+        change forces a re-ask (L270). Actions without a current binding
+        keep the pre-R4-S3 semantics (an unwired host's MCP saved decisions
+        keep activating; disclosed ④).
+        """
+        current_binding = self._mcp_bindings.get(action)
         for decision in self._decisions.values():
             if (
                 decision.state == "saved"
@@ -705,6 +773,7 @@ class PermissionPolicy:
                 and decision.resources == resources
                 and (decision.expires_at is None or decision.expires_at > now)
                 and (session_id, action, input_hash) not in self._unknown_retries
+                and (current_binding is None or decision.mcp_binding == current_binding)
             ):
                 return decision
         return None

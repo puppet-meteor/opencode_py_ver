@@ -1,4 +1,4 @@
-"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3-permission subsets.
+"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3(+R4-config) subsets.
 
 Decode is fail closed: unknown type/version, wrong durability, malformed JSON, or any
 schema violation raises and nothing is silently skipped or coerced. Field-level failures
@@ -131,14 +131,15 @@ def canonical_json(value: JsonValue) -> str:
     return dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def compute_snapshot_hash(snapshot: ConfigSnapshot | ConfigSnapshotV2) -> str:
+def compute_snapshot_hash(snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3) -> str:
     """sha256 hex of the snapshot's canonical JSON (CORE-CONTRACTS §6.2).
 
-    R3-S6 generalization: the same canonical serializer + sha256 over either
-    snapshot schema version. The R1 value domain stays the constant
+    R3-S6 generalization, R4-S3 widened to three schema versions: the same
+    canonical serializer + sha256 over any registered snapshot schema
+    version. The R1 value domain stays the constant
     ``{"permission_rules":[],"schema_version":1}`` — UTF-8, no BOM, 64
-    lowercase hex, fingerprint frozen (§9 L368); a v2 domain hashes its own
-    canonical text through the identical pipeline.
+    lowercase hex, fingerprint frozen (§9 L368); a v2/v3 domain hashes its
+    own canonical text through the identical pipeline.
     """
     return sha256(canonical_json(snapshot.model_dump(mode="json")).encode("utf-8")).hexdigest()
 
@@ -242,6 +243,87 @@ class ConfigSnapshotV2(BaseModel):
         return value
 
 
+class McpServerRef(BaseModel):
+    """One host-tier local MCP server reference + its boot fingerprint (§6.1 L287, R4-S3).
+
+    The v3 snapshot's MCP face: ``server`` is the host-tier server name;
+    ``command`` is the argv list (exec'd directly, never through a shell);
+    ``env_refs`` are the environment KEY NAMES the server needs — values
+    never ride the snapshot (§6.2.1/L302: secrets and credentials stay
+    references); ``fingerprint`` is the deterministic startup digest over
+    server+command+env_refs (OP-R4-2 conservative default: ``cwd`` is
+    carried but excluded from the digest — the launch identity the policy
+    binds to is argv + referenced environment shape, §5.2 L268).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    server: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    cwd: str | None = Field(default=None, min_length=1)
+    env_refs: list[str] = Field(default_factory=list)
+    fingerprint: str = Field(pattern=_SHA256_HEX)
+
+    @field_validator("command")
+    @classmethod
+    def _command_entries_non_empty(cls, value: list[str]) -> list[str]:
+        if any(not item for item in value):
+            raise ValueError("command entries must be non-empty argument strings")
+        return value
+
+    @field_validator("env_refs")
+    @classmethod
+    def _env_refs_sorted_unique(cls, value: list[str]) -> list[str]:
+        """Canonical form: sorted, de-duplicated, non-empty key names.
+
+        Sorted-and-unique is a wire invariant (not a convenience): the
+        fingerprint and the canonical snapshot hash are computed over this
+        list, so any order wobble would silently fork identities.
+        """
+        if any(not item for item in value):
+            raise ValueError("env_refs entries must be non-empty environment key names")
+        if value != sorted(set(value)):
+            raise ValueError("env_refs must be sorted and free of duplicates (canonical wire form)")
+        return value
+
+
+class ConfigSnapshotV3(BaseModel):
+    """R4-S3 executable config snapshot (§6.1 L287, schema_version 3).
+
+    Standalone like v2 (NOT a ``ConfigSnapshotV2`` subclass): each schema
+    version pins its own domain, and a subclass would make every v2-typed
+    ``isinstance`` gate (the service create/coerce routing, the CLI
+    face) silently accept v3 rows. Adds exactly one face over v2:
+    ``mcp_servers``, the host-tier local MCP server references with their
+    startup fingerprints (§6 L287). Required with no default — a snapshot
+    without the face must say so explicitly with ``[]`` (§6.1 L291
+    no-fabrication spirit).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[3]
+    model: ModelRef
+    endpoint_ref: str = Field(min_length=1)
+    roots: list[str]
+    permission_rules: list[JsonObject]
+    instructions: list[InstructionSource]
+    limits: SnapshotLimits
+    mcp_servers: list[McpServerRef]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def _schema_version_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("schema_version", value)
+
+    @field_validator("roots")
+    @classmethod
+    def _roots_entries_non_empty(cls, value: list[str]) -> list[str]:
+        if any(not item for item in value):
+            raise ValueError("roots entries must be non-empty path strings")
+        return value
+
+
 class SessionCreatedData(BaseModel):
     """``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash."""
 
@@ -273,27 +355,49 @@ class SessionCreatedDataV2(SessionCreatedData):
     config_snapshot: ConfigSnapshotV2  # type: ignore[assignment]
 
 
+class SessionCreatedDataV3(SessionCreatedDataV2):
+    """``py.session.created`` v3 data (§6.1 L287, R4-S3): the executable v3 snapshot.
+
+    Subclasses v2 so every frozen consumer typing the field as
+    ``SessionCreatedData``/``SessionCreatedDataV2`` (the state fold's
+    isinstance gate, the projector's canonical_json store) accepts v3 rows
+    unchanged; overrides only ``config_snapshot``. The inherited model
+    validator recomputes the digest on every decode (§6.2 L297 drift
+    re-check) through the three-version ``compute_snapshot_hash``.
+    """
+
+    config_snapshot: ConfigSnapshotV3  # type: ignore[assignment]
+
+
 @dataclass(frozen=True)
 class SessionCreatedRuntime:
     """The §6.1 recovery face of one ``py.session.created`` row (L302).
 
     ``snapshot`` is None exactly for v1 rows: the minimal snapshot has no
     runtime face, and recovery must stop and ask the host instead of silently
-    backfilling from the current config (§6.1 L291, L302).
+    backfilling from the current config (§6.1 L291, L302). A v2 row carries
+    its v2 snapshot; a v3 row its v3 snapshot (R4-S3) — v2 is never
+    silently upgraded to v3 (the ``mcp_servers`` face is never backfilled).
     """
 
     working_dir: str
-    snapshot: ConfigSnapshotV2 | None
+    snapshot: ConfigSnapshotV2 | ConfigSnapshotV3 | None
 
 
 def upcast_session_created(data: SessionCreatedData) -> SessionCreatedRuntime:
-    """Deterministic v1->v2 upcast (§8 L356/L358; scheduler ledger row #24).
+    """Deterministic v1->v2->v3 upcast (§8 L356/L358; scheduler ledger row #24).
 
-    A v2 row passes through with its snapshot; a v1 row becomes
-    ``snapshot=None`` — the upcast never fabricates runtime fields. Rows older
-    than v1 cannot reach here (the registry rejects unknown versions at
-    decode), so there is no other historical branch (④ disclosure).
+    A v3 row passes through with its v3 snapshot — checked FIRST: v3 data
+    IS-A v2 data, so the v2 branch would otherwise swallow it (the
+    isinstance order is load-bearing). A v2 row passes through with its v2
+    snapshot and is never upgraded to v3 — the upcast never fabricates the
+    ``mcp_servers`` face (§6.1 L291). A v1 row becomes ``snapshot=None``:
+    the upcast never fabricates runtime fields. Rows older than v1 cannot
+    reach here (the registry rejects unknown versions at decode), so there
+    is no other historical branch (④ disclosure).
     """
+    if isinstance(data, SessionCreatedDataV3):
+        return SessionCreatedRuntime(working_dir=data.working_dir, snapshot=data.config_snapshot)
     if isinstance(data, SessionCreatedDataV2):
         return SessionCreatedRuntime(working_dir=data.working_dir, snapshot=data.config_snapshot)
     return SessionCreatedRuntime(working_dir=data.working_dir, snapshot=None)
@@ -879,19 +983,33 @@ R3_PERMISSION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 #: v1 definition stays registered side by side (old logs/fixtures decode
 #: unchanged, §8 L356), the upcast
 #: (:func:`upcast_session_created`) is explicit and deterministic, and
-#: ``UnknownEventVersionError`` still rejects every version > 2.
+#: ``UnknownEventVersionError`` still rejects every version above the
+#: registered set.
 R3_CONFIG_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
     EventDefinition(event_type=PY_SESSION_CREATED, durability="durable", data_model=SessionCreatedDataV2, version=2),
 )
 
 
+#: R4 config family (§6.1 L287, R4-S3): ``py.session.created`` v3 — the
+#: executable v3 snapshot carrying the host-tier MCP server references
+#: with their startup fingerprints. Same §8 L358 bar as the v2 raise: the
+#: v1/v2 definitions stay registered side by side (old logs and fixtures
+#: decode unchanged), the upcast above is explicit and deterministic
+#: (v2 rows are never silently upgraded to v3), and
+#: ``UnknownEventVersionError`` rejects every version > 3.
+R4_CONFIG_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_SESSION_CREATED, durability="durable", data_model=SessionCreatedDataV3, version=3),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3 event subsets (§3.1 rows through R3-S6)."""
+    """Fresh registry over the R1+R2+R3+R4 event subsets (§3.1 rows through R4-S3)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
             *R2_EVENT_DEFINITIONS,
             *R3_PERMISSION_EVENT_DEFINITIONS,
             *R3_CONFIG_EVENT_DEFINITIONS,
+            *R4_CONFIG_EVENT_DEFINITIONS,
         )
     )

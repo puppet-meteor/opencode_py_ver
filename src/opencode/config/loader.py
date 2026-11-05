@@ -25,8 +25,12 @@ layers + CLI overrides into a :class:`ResolvedRuntime` — the frozen
 ``system_prompt`` assembled from instructions; context.py is untouched), the
 declared roots tuple (the same source the adapters consume — no drift), and
 the executable :class:`~opencode.contracts.events.ConfigSnapshotV2` the CLI
-persists through ``service.create``. MCP refs/boot fingerprints are omitted,
-not defaulted (R4 face, ④ disclosure; §6.1 L291 no-fabrication spirit).
+persists through ``service.create``. R4-S3: ``resolve_runtime`` still yields
+the v2 snapshot (the frozen CLI face is unchanged); the additive
+:meth:`ConfigLoader.resolve_runtime_v3` assembles the same runtime face plus
+the host-tier MCP server refs with their startup fingerprints into the v3
+snapshot (§6 L287) — the MCP refs are carried, never defaulted, and
+environment VALUES never ride the snapshot (§6.2.1/L302: key names only).
 
 Recovery (L302, PHASE1-SLIM L93): :meth:`ConfigLoader.recover` rebuilds the
 runtime face from the recorded ``py.session.created`` data — the v2 snapshot
@@ -34,8 +38,10 @@ is the behavioral baseline and instructions replay from their recorded text,
 never from a re-read of the current config. A v1 row stops with
 :class:`RecoveryStoppedError` (the minimal snapshot has no runtime face,
 §6.1 L291 — no silent backfill); a vanished working directory stops the same
-way (L302). Credentials-reference and MCP-fingerprint stop conditions have no
-producer this slice (protocol-unreachable, ④ disclosure). Phase 1 has no hot
+way (L302). The credentials-reference stop has no producer this slice
+(protocol-unreachable, ④ disclosure); the MCP-fingerprint stop face is S4 —
+v3 snapshots record the fingerprints, recovery does not compare them yet
+(R4-S3 ④ disclosure). Phase 1 has no hot
 reload (L302): every process creates a fresh session; recovery is a library
 capability exercised by tests.
 
@@ -51,15 +57,21 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from pydantic import ValidationError
+
 from opencode.contracts.events import (
     ConfigSnapshotV2,
+    ConfigSnapshotV3,
     InstructionSource,
+    McpServerRef,
     SessionCreatedData,
     SnapshotLimits,
     canonical_json,
@@ -103,6 +115,20 @@ _APPEND_LIST_PATHS: frozenset[tuple[str, ...]] = frozenset({("instructions",), (
 
 #: Known sub-keys of the ``permission`` map (anything else is a config error).
 _PERMISSION_KEYS: frozenset[str] = frozenset({"rules"})
+
+#: Known sub-keys of the host-tier ``mcp`` block (R4-S3). ``timeout`` (TS
+#: ``TimeoutConfig`` L7-17: startup/catalog/execution) is deliberately NOT
+#: known: this build's manager timeouts are fixed constants (OP-R4-5, TS
+#: ``client.ts`` L35-40 anchor), so a configured timeout would be a
+#: silently-ignored field — it fails closed with its own named error.
+_MCP_KEYS: frozenset[str] = frozenset({"servers"})
+
+#: Known fields of one ``mcp.servers.<name>`` entry (TS ``LocalConfig``
+#: L26-39 reference: type/command/cwd/environment/disabled — a reference,
+#: not a port). Anything else — ``protocol``, ``codemode``, ``url``, ... —
+#: is an unknown config field and fails closed (§6 L285); a ``remote``
+#: type gets its own named out-of-scope error before the generic check.
+_MCP_SERVER_KEYS: frozenset[str] = frozenset({"type", "command", "cwd", "environment", "disabled"})
 
 #: Known fields of one ``permission.rules`` entry (R3-S7, 必答②: load-time
 #: fail-closed shape validation on the exit-2 face). ``source`` is deliberately
@@ -216,13 +242,16 @@ class ResolvedRuntime:
     ``settings`` is the frozen RuntimeSettings injection face (system_prompt
     assembled from instructions); ``roots`` is the declared-roots tuple the
     fs adapters receive (the same source as ``snapshot.roots`` — one loader,
-    no drift); ``snapshot`` is the executable v2 snapshot for
-    ``service.create``. ``max_steps`` rides ``snapshot.limits``.
+    no drift); ``snapshot`` is the executable snapshot for
+    ``service.create`` — v2 from :meth:`ConfigLoader.resolve_runtime`, v3
+    (the v2 domain plus the MCP refs face) from
+    :meth:`ConfigLoader.resolve_runtime_v3` (R4-S3). ``max_steps`` rides
+    ``snapshot.limits``.
     """
 
     settings: RuntimeSettings
     roots: tuple[str, ...]
-    snapshot: ConfigSnapshotV2
+    snapshot: ConfigSnapshotV2 | ConfigSnapshotV3
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +288,22 @@ def _sanitize_endpoint(endpoint_url: str) -> str:
     if parts.port is not None:
         netloc = f"{netloc}:{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path or "", "", ""))
+
+
+def mcp_startup_fingerprint(server: str, command: Sequence[str], env_refs: Sequence[str]) -> str:
+    """§6.1 L287 (R4-S3) boot fingerprint: sha256 over the canonical launch identity.
+
+    OP-R4-2 conservative default (scheduler-recorded): server name + the
+    full argv list + the sorted environment key names. ``cwd`` is excluded
+    (a working directory is not part of the identity the policy binds a
+    saved approval to) and environment VALUES never enter any digest
+    (§6.2.1/L302: secrets stay references — a value would both leak into
+    the event log and fork the fingerprint on every secret rotation).
+    """
+    command_values: list[Any] = list(command)
+    env_names: list[Any] = sorted(env_refs)
+    payload = canonical_json({"server": server, "command": command_values, "env_refs": env_names})
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _int_setting(values: JsonObject, key: str, *, minimum: int, default: int | None = None) -> int:
@@ -658,18 +703,187 @@ class ConfigLoader:
             raise ConfigError(f"the resolved config is not a legal runtime face: {error}") from error
         return ResolvedRuntime(settings=settings, roots=roots, snapshot=snapshot)
 
+    # -- §6 L285/L287: host-tier MCP loading (R4-S3) --------------------------
+
+    def _mcp_server_refs(self) -> list[McpServerRef]:
+        """Validate the host-tier ``mcp`` block into snapshot refs (§6 L285/L287, R4-S3).
+
+        Fail-closed matrix (TS ``LocalConfig`` L26-39 is the reference
+        shape, not a port):
+
+        - block keys: only ``servers`` is known; ``timeout`` gets its own
+          named out-of-scope error (the manager's startup/catalog/execution
+          timeouts are fixed constants, OP-R4-5); anything else is an
+          unknown-field error (L285).
+        - server entries: only ``type: "local"`` is accepted — ``remote``
+          fails with a named out-of-scope error (Phase 1 is local-only),
+          a missing/other type with the generic check; ``protocol``,
+          ``codemode`` and every other extra field fail as unknown fields
+          (the fixed protocol revision is manager-owned, not configurable).
+        - ``command``: a non-empty argv list of non-empty strings.
+        - ``environment``: a string→string map — ONLY the sorted key names
+          enter the snapshot as ``env_refs`` (values never ride, §6.2.1/L302).
+        - ``cwd``: optional non-empty string, recorded as declared (the S4
+          activation seam resolves it; this loader does not resolve paths).
+        - ``disabled``: optional bool — a disabled server is excluded from
+          the snapshot outright.
+
+        Determinism: servers are emitted sorted by name, so the canonical
+        snapshot hash is process- and file-order independent. Resolving
+        ``env_refs`` against the boot environment — and with it the
+        Windows-required-variables minimal-set ruling (T-B-038 ⑥②:
+        SystemRoot/PATH etc. in ``definition.env``) — belongs to the S4/S5
+        activation wiring: this slice constructs no
+        :class:`~opencode.mcp.manager.StdioServerDefinition` (the manager
+        demand for a complete minimal environment stays the caller's).
+        """
+        raw = self.load().values.get("mcp")
+        if raw is None:
+            return []
+        if not isinstance(raw, dict):
+            raise ConfigError("'mcp' must be a JSON object")
+        for key in raw:
+            if key == "timeout":
+                raise ConfigError(
+                    "'mcp.timeout' is not supported in this build: startup/catalog/execution timeouts are "
+                    "fixed constants (OP-R4-5; TS client.ts L35-40 anchor), not configuration"
+                )
+            if key not in _MCP_KEYS:
+                raise ConfigError(f"unknown config field 'mcp.{key}' (CORE-CONTRACTS §6 L285)")
+        servers = raw.get("servers")
+        if servers is None:
+            return []
+        if not isinstance(servers, dict):
+            raise ConfigError("'mcp.servers' must be a JSON object keyed by server name")
+        refs: list[McpServerRef] = []
+        for name in sorted(servers):
+            if not name:
+                raise ConfigError("'mcp.servers' keys must be non-empty server names")
+            entry = servers[name]
+            if not isinstance(entry, dict):
+                raise ConfigError(f"'mcp.servers.{name}' must be a JSON object")
+            for key in entry:
+                if key not in _MCP_SERVER_KEYS:
+                    raise ConfigError(
+                        f"'mcp.servers.{name}.{key}' is not a supported local server field "
+                        "(CORE-CONTRACTS §6 L285; TS LocalConfig L26-39 reference)"
+                    )
+            disabled = entry.get("disabled", False)
+            if not isinstance(disabled, bool):
+                raise ConfigError(f"'mcp.servers.{name}.disabled' must be a boolean")
+            if disabled:
+                continue
+            kind = entry.get("type")
+            if kind == "remote":
+                raise ConfigError(
+                    f"MCP server {name!r}: remote servers are not supported in this build "
+                    "(Phase 1 is local-only; RemoteConfig is out of scope)"
+                )
+            if kind != "local":
+                raise ConfigError(f"MCP server {name!r}: 'type' must be \"local\"")
+            command = entry.get("command")
+            if (
+                not isinstance(command, list)
+                or not command
+                or not all(isinstance(item, str) and item for item in command)
+            ):
+                raise ConfigError(f"'mcp.servers.{name}.command' must be a non-empty list of argument strings (argv)")
+            environment = entry.get("environment", {})
+            if not isinstance(environment, dict) or not all(
+                isinstance(key, str) and key and isinstance(value, str) for key, value in environment.items()
+            ):
+                raise ConfigError(f"'mcp.servers.{name}.environment' must be an object mapping names to strings")
+            cwd = entry.get("cwd")
+            if cwd is not None and (not isinstance(cwd, str) or not cwd):
+                raise ConfigError(f"'mcp.servers.{name}.cwd' must be a non-empty string or null")
+            env_refs = sorted(environment)
+            # Type-level narrowing: the shape check above proved every argv
+            # entry is a non-empty string; the comprehension only restates
+            # that for the checker (JsonValue list -> list[str]).
+            argv = [item for item in command if isinstance(item, str)]
+            # Final fail-closed gate: the model's own validators (and the
+            # fingerprint digest's UTF-8 encode — it runs during argument
+            # evaluation, BEFORE pydantic sees the strings) catch what the
+            # shape checks above cannot express — e.g. an unpaired surrogate
+            # in any string — and surface as one named ConfigError, never a
+            # raw library error (the loader's exit-2 face).
+            try:
+                refs.append(
+                    McpServerRef(
+                        server=name,
+                        command=list(argv),
+                        cwd=cwd,
+                        env_refs=env_refs,
+                        fingerprint=mcp_startup_fingerprint(name, argv, env_refs),
+                    )
+                )
+            except (ValidationError, UnicodeEncodeError) as error:
+                raise ConfigError(
+                    f"the 'mcp.servers.{name}' entry is not a legal local server reference: {error}"
+                ) from error
+        return refs
+
+    def resolve_runtime_v3(
+        self,
+        *,
+        cli: CliOverrides | None = None,
+        endpoint_url: str | None = None,
+    ) -> ResolvedRuntime:
+        """§6 L287 v3 face (R4-S3): the v2 runtime face plus the MCP refs.
+
+        The v2 assembly (:meth:`resolve_runtime`) runs unchanged first —
+        same validation, same runtime settings, zero drift — then the v3
+        snapshot adds exactly the ``mcp_servers`` face (required, may be
+        ``[]``: the explicit empty face beats a fabricated default,
+        §6.1 L291). The layer chain is loaded twice (once for the v2 face,
+        once for the MCP block): assembly is a single-threaded boot act in
+        the host process, so no interleaving is possible; the production
+        wiring of this face (the CLI composition root) is outside this
+        slice.
+        """
+        runtime = self.resolve_runtime(cli=cli, endpoint_url=endpoint_url)
+        mcp_servers = self._mcp_server_refs()
+        base = runtime.snapshot
+        snapshot = ConfigSnapshotV3(
+            schema_version=3,
+            model=base.model,
+            endpoint_ref=base.endpoint_ref,
+            roots=base.roots,
+            permission_rules=base.permission_rules,
+            instructions=base.instructions,
+            limits=base.limits,
+            mcp_servers=mcp_servers,
+        )
+        # Surrogate pre-scan over the v3 domain (row #19): the MCP block
+        # contributes new strings beyond the v2 scan inside
+        # resolve_runtime; the canonical hash text must stay UTF-8
+        # encodable with a named ConfigError, never a raw
+        # UnicodeEncodeError.
+        try:
+            canonical_json(snapshot.model_dump(mode="json")).encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ConfigError(
+                "the resolved v3 config snapshot contains unpaired surrogate code points and cannot be "
+                "canonically serialized (scheduler ledger row #19 pre-scan)"
+            ) from error
+        return ResolvedRuntime(settings=runtime.settings, roots=runtime.roots, snapshot=snapshot)
+
     # -- §6.1 L302: recovery ---------------------------------------------------
 
     def recover(self, data: SessionCreatedData) -> ResolvedRuntime:
         """Rebuild the runtime face from one recorded ``py.session.created`` row.
 
-        The v2 snapshot is the behavioral baseline (L302): settings, roots,
-        and instructions replay from the recorded snapshot, never from a
-        re-read of the current config (§6.1 L291 — no silent backfill). A v1
-        row stops (:class:`RecoveryStoppedError` — the minimal snapshot has
-        no runtime face); a vanished working directory stops the same way.
-        Credentials-reference and MCP-fingerprint stop conditions (L302) have
-        no snapshot fields this slice and are protocol-unreachable (④).
+        The recorded snapshot (v2 or v3) is the behavioral baseline (L302):
+        settings, roots, and instructions replay from the recorded snapshot,
+        never from a re-read of the current config (§6.1 L291 — no silent
+        backfill; a v3 row keeps its ``mcp_servers`` refs — v2 rows are
+        never upgraded, R4-S3). A v1 row stops
+        (:class:`RecoveryStoppedError` — the minimal snapshot has no runtime
+        face); a vanished working directory stops the same way. The
+        credentials-reference stop and the MCP-fingerprint stop (L302) are
+        S4 faces: this slice only records the fingerprints in the v3
+        snapshot, the recovery-time comparison is not implemented (④
+        disclosure).
         """
         runtime = upcast_session_created(data)
         if runtime.snapshot is None:
