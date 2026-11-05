@@ -34,6 +34,12 @@ session working directory, with the R3 approval face driven live:
    ApprovalUnavailable (never a silent allow), the run still succeeds, and
    the closed pair reconciles (requested=1, replied=0, closed(expired)=1)
    -- the acceptance-B "no approval means no execution" face end to end.
+④ ``test_post_start_graceful_failure_reaches_run_terminal`` -- the
+   T-C1-033 row#34 regression nail: a scripted ``fs__read`` on a missing
+   path fails gracefully after ``py.tool.started`` and folds
+   ``failed/unknown`` (§2.1 L50), the diagnostic text feeds back on the
+   wire, and the run closes succeeded (never the pre-fix
+   failed/not_started fold-rejection wedge).
 
 Always/reject approval branches, the policy-deny face, and the multiroot fs
 faces are deliberately NOT re-woven here: they are already carried by
@@ -460,9 +466,10 @@ async def test_r3_six_tool_chain_with_live_approvals(tmp_path: Path, monkeypatch
             ]
             assert _content_str(allow_results[0].get("content")) == _GREP_RESULT
             assert _content_str(allow_results[1].get("content")) == _GLOB_RESULT
-            # ls renders the whole working dir (the db side files are
-            # environment-dependent): containment, not equality
-            assert "note.txt" in _content_str(allow_results[2].get("content"))
+            # ls renders the working dir; the db (and its writer.lock) lives
+            # outside it in the db_dir sibling, so tmp holds exactly note.txt:
+            # equality (T-C1-033 nit-1)
+            assert _content_str(allow_results[2].get("content")) == "note.txt"
             assert _content_str(allow_results[3].get("content")) == _READ_RESULT
     finally:
         await server.aclose()
@@ -653,3 +660,84 @@ async def test_unanswered_approval_expires_tool_not_started_run_succeeds(tmp_pat
     assert closed["outcome"] == "expired"
     finished = _event_data(db_path, session_id, "py.tool.finished")
     assert [(str(row["state"]), str(row["effect_status"])) for row in finished] == [("cancelled", "not_started")]
+
+
+# ---------------------------------------------------------------------------
+# ④ the post-start graceful failure: the run must reach a terminal.
+# ---------------------------------------------------------------------------
+
+
+async def test_post_start_graceful_failure_reaches_run_terminal(tmp_path: Path) -> None:
+    """④ (T-C1-033 regression nail, the row#34 defect end to end): a scripted
+    tool call that fails gracefully *after* ``py.tool.started`` (``fs__read``
+    on a missing path -- the adapter's own NOT_FOUND face) folds
+    ``failed/unknown`` (§2.1 L50: a started call cannot claim not_started;
+    pre-fix the invoker's failed/not_started pair was rejected by the fold
+    and the run wedged permanently running with no user-visible error), the
+    failure text feeds back to the closing generation on the wire, and the
+    run closes ``py.run.finished`` succeeded -- the
+    succeeded-with-failed-tool form (§2.1: a failed tool is model-visible
+    feedback, not a failed run; the test ③ cancelled/not_started run-still-
+    succeeds precedent, runner.py L620-667 fold)."""
+    # Same shape as ①②③: the DB and its live writer.lock live OUTSIDE
+    # working_dir; this nail's tool is fs__read (no directory scan), so the
+    # placement is uniformity, not necessity.
+    db_dir = tmp_path.parent / f"{tmp_path.name}-db"
+    db_dir.mkdir()
+    db_path = db_dir / "e2e.db"
+    _require_success(_upgrade_head(db_path))
+
+    server = FakeOpenAIServer(
+        [
+            _tool_calls_response("let me read", ("call_read", "fs__read", {"path": "missing.txt"})),
+            _text_response("the read failed, closing out"),
+        ]
+    )
+    base_url = await server.start()
+    provider = MaasAdapter(f"{base_url}/v1", "test-key")
+    try:
+        async with App(
+            db_path,
+            working_dir=str(tmp_path),
+            provider=provider,
+            tools=(FsReadAdapter(),),
+            settings=_settings(),
+        ) as app:
+            session = await app.service.create(ConfigSnapshot.create())
+            session_id = session.session_id
+            run = await app.service.prompt(session_id, "read the missing note", "req_1")
+            # the wedge face: pre-fix this poll never reaches a terminal
+            terminal = await _await_terminal(app.service, run.run_id, timeout_s=10.0)
+            assert terminal.status.value == "succeeded"
+
+            # store: the tool part folded failed/unknown; the closing text
+            # and idle(succeeded) landed
+            page = await app.service.messages(session_id, limit=10)
+            assert [message.type for message in page.items] == ["user", "assistant", "assistant", "idle"]
+            assistants = [message for message in page.items if isinstance(message, AssistantMessage)]
+            idles = [message for message in page.items if isinstance(message, IdleMessage)]
+            failed_parts = _tool_parts(assistants[0])
+            assert [part.name for part in failed_parts] == ["fs.read"]
+            assert [part.state for part in failed_parts] == ["failed"]
+            assert [part.effect_status for part in failed_parts] == ["unknown"]
+            assert _assistant_text(assistants[1]) == "the read failed, closing out"
+            assert [message.outcome for message in idles] == ["succeeded"]
+
+            # wire: the failure is user-visible -- the tool result fed back
+            # to the closing generation carries the diagnostic text
+            assert len(server.requests) == 2
+            second_request = _wire_messages(server.requests[1].body)
+            results = _wire_tool_messages(second_request)
+            assert [message.get("tool_call_id") for message in results] == ["call_read"]
+            assert "File not found: missing.txt" in _content_str(results[0].get("content"))
+    finally:
+        await server.aclose()
+
+    # durable: the (failed, unknown) terminal is on the EventLog, the call
+    # really started (the fold accepted a post-start terminal), and the run
+    # closed -- never the pre-fix permanently-running wedge
+    finished = _event_data(db_path, session_id, "py.tool.finished")
+    assert [(str(row["state"]), str(row["effect_status"])) for row in finished] == [("failed", "unknown")]
+    event_types = _event_types(db_path, session_id)
+    assert event_types.count("py.tool.started") == 1
+    assert event_types.count("py.run.finished") == 1

@@ -1,6 +1,6 @@
-"""The controlled subprocess runner (R3-S5; CORE-CONTRACTS §5.3 L277, plan §2.5).
+"""The controlled subprocess runner (R3-S5; CORE-CONTRACTS §5.3, plan §2.5).
 
-One place owns the §5.3 L277 execution discipline for every spawned
+One place owns the §5.3 execution discipline for every spawned
 subprocess (the bash tool's commands **and** fs__grep's rg, whose old
 weak read-loop deadline is folded into this runner -- plan §3 item 25):
 
@@ -17,7 +17,7 @@ weak read-loop deadline is folded into this runner -- plan §3 item 25):
   process in a new session (``start_new_session``) and kills the
   process group with SIGKILL. The main process is then reaped with a
   bounded grace; an unreapable process is reported (``reaped=False``)
-  so the caller can surface ``effect_status=unknown`` (§5.3 L277: no
+  so the caller can surface ``effect_status=unknown`` (§5.3: no
   pretending cleanup finished). Descendants are swept even after a
   normal main exit -- Phase 1 has no background-command face, so the
   tree must not outlive the call (TS persistent-pty not ported, plan
@@ -25,7 +25,7 @@ weak read-loop deadline is folded into this runner -- plan §3 item 25):
 - **No pipe deadlock under output floods**: stdout and stderr are each
   drained by a dedicated reader thread that keeps reading to EOF even
   after the output cap is reached -- the cap only stops *appending*
-  (§5.3 L277 "输出截断后仍排空管道"), the byte count keeps tracking the
+  (§5.3 "输出截断后仍排空管道"), the byte count keeps tracking the
   original size, and the main loop never depends on reading a pipe.
 
 The spawn itself is ``create_subprocess_exec``-shaped (a plain argv, no
@@ -100,7 +100,7 @@ class _CappedBuffer:
 
 
 class RunResult:
-    """Everything a caller needs from one controlled run (§5.3 L277 faces)."""
+    """Everything a caller needs from one controlled run (§5.3 faces)."""
 
     __slots__ = (
         "cancelled",
@@ -164,7 +164,7 @@ def _start_reader(
 
 
 def _kill_tree(process: subprocess.Popen[str], job: JobObject | None) -> None:
-    """Terminate the whole process tree (§5.3 L277: Windows Job Object / Unix process group)."""
+    """Terminate the whole process tree (§5.3: Windows Job Object / Unix process group)."""
     if sys.platform == "win32":
         if job is not None:
             try:
@@ -195,7 +195,7 @@ def run_command(
     should_cancel: Callable[[], bool] | None = None,
     on_stdout_line: Callable[[str], bool] | None = None,
 ) -> RunResult:
-    """Run one subprocess to its §5.3 L277-controlled terminal.
+    """Run one subprocess to its §5.3-controlled terminal.
 
     Spawns ``args`` (an explicit argv -- never ``shell=True``), drains
     both pipes continuously, enforces the strong deadline

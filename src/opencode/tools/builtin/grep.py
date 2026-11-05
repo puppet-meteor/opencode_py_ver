@@ -40,7 +40,16 @@ single-file target is pre-checked for binary content (NUL in the first
 8 KiB → explicit ``Cannot grep binary file`` diagnostic, the ``fs__read``
 binary-face precedent) while directory searches rely on rg's own built-in
 binary detection; rg's default ignore/hidden behavior is kept (hidden
-files are not searched; ignore files are respected).
+files are not searched; ignore files are respected; ``--no-config`` and
+``--no-messages`` are aligned with TS ripgrep.ts L224/L227 -- config
+isolation and stderr noise suppression with no visible result-set
+change -- while ``--hidden`` and ``--glob=!**/.git/**`` (ripgrep.ts
+L226/L231) are NOT ported: both change the result set and the T-C1-033
+task-B ruling parks them for the scheduler); rg exit codes follow the TS
+three-diagnosis (ripgrep.ts L144-152): code 2 without a regex parse
+error -- a sibling file locked or unreadable, the writer.lock defect
+shape -- is tolerated and answers with the already-collected rows, code
+1 means no matches, and any code outside {0, 1, 2} is a hard failure.
 """
 
 from __future__ import annotations
@@ -300,6 +309,14 @@ def _reject(path: str, reason: str) -> ToolResult:
     return _failure(CoreErrorCode.PERMISSION_DENIED, f"Path escapes the working directory: {path}")
 
 
+def _is_invalid_pattern(stderr: str) -> bool:
+    """ripgrep.ts L100-101: the two regex-error banners rg prints for a bad
+    pattern. Case-insensitive here (TS matches the literal lowercase banners;
+    the ``.lower()`` face is a Python-side superset, float-reported)."""
+    lowered = stderr.lower()
+    return "regex parse error" in lowered or "error parsing regex" in lowered
+
+
 def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against GREP_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts are narrows.
@@ -341,7 +358,11 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
             "and retry; no silent fallback search is performed.",
         )
 
-    args: list[str] = [executable, "--json"]
+    # ripgrep.ts L231 note: ``--glob=!**/.git/**`` (L231) and ``--hidden``
+    # (L226) are deliberately NOT passed here -- both change the visible
+    # result set (hidden files become searchable / .git gets excluded) and
+    # the T-C1-033 B2 ruling parks them for the scheduler.
+    args: list[str] = [executable, "--no-config", "--json", "--no-messages"]
     if include is not None:
         args += ["-g", include]
     if literal:
@@ -362,16 +383,23 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
             CoreErrorCode.TOOL_FAILED,
             f"Search timed out after {GREP_TIMEOUT_S:.0f} seconds. Consider using a more specific path or pattern.",
         )
-    # An early stop at limit + 1 kills rg, so a nonzero exit there is
-    # expected; otherwise rg exits 0 (matches) or 1 (no matches), and any
-    # other code is an error to diagnose.
+    # The rg exit-code three-diagnosis, aligned with TS ripgrep.ts L144-152:
+    # an early stop at limit + 1 kills rg, so a nonzero exit there is
+    # expected and not diagnosed at all; code 1 is "no matches" (the empty
+    # rows render below); code 2 with a regex parse error is the
+    # pattern-error face; code 2 without one (a sibling file locked or
+    # unreadable -- the writer.lock defect shape) is TOLERATED and the
+    # already-collected rows are the answer; any other code is a failure
+    # to diagnose.
     early_stop = len(matches) > limit
-    if not early_stop and returncode not in (0, 1):
-        detail = " ".join(stderr.split())[:400] or f"rg exited with code {returncode}"
-        if "regex parse error" in stderr.lower():
+    if not early_stop:
+        if returncode == 2 and _is_invalid_pattern(stderr):
+            detail = " ".join(stderr.split())[:400]
             # grep.ts L162 wording.
             return _failure(CoreErrorCode.TOOL_FAILED, f"Invalid regex pattern: {detail}")
-        return _failure(CoreErrorCode.TOOL_FAILED, f"Unable to grep for {pattern}: {detail}")
+        if returncode not in (0, 1, 2):
+            detail = " ".join(stderr.split())[:400] or f"rg exited with code {returncode}"
+            return _failure(CoreErrorCode.TOOL_FAILED, f"Unable to grep for {pattern}: {detail}")
 
     # Deterministic output: sort by (path, line), then the grep.ts grouping.
     display = [

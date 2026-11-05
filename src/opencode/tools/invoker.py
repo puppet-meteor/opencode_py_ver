@@ -1092,10 +1092,13 @@ async def invoke_tool(
     try:
         result = await tool.adapter.execute(exec_context, raw_input)
     except Exception as error:
-        effect: Literal["not_started", "completed", "unknown"] = (
-            "not_started" if not tool.spec.side_effects else "unknown"
-        )
-        if effect == "unknown" and policy is not None:
+        # §2.1 L50: the started commit already proved the call began, so a
+        # crash after it cannot claim the effect is not_started -- every
+        # post-start failure is effect=unknown, even for a side-effect-free
+        # tool (T-C1-033: the old side_effects ternary produced the illegal
+        # failed/not_started pair, which the fold rejects from running and
+        # which wedged the run).
+        if policy is not None:
             # §5.2 L270: an identical retry after an unknown-effect terminal
             # must re-ask, never reuse an old once/always decision.
             policy.record_unknown(context.session_id, _wire_name(tool.spec), input_hash)
@@ -1110,7 +1113,7 @@ async def invoke_tool(
             tool_ref=tool_ref,
             input_hash=input_hash,
             state="failed",
-            effect_status=effect,
+            effect_status="unknown",
             content=[ToolTextContent(type="text", text=message)],
             structured_output=None,
             error=CoreError(code=CoreErrorCode.TOOL_FAILED, message=message, retryable=False),
@@ -1119,11 +1122,11 @@ async def invoke_tool(
     content, structured_output = _normalize_result(tool.spec, result, context.limits)
     if result.error is not None:
         # A graceful adapter failure: the pre-start policy deny maps to the
-        # §2.1 L47 "denied" terminal (R3-S2 gate above); an adapter-reported
-        # permission failure arrives after the call started, so it ends
-        # failed (§2.1 L50 -- pending->denied is pre-start only).
-        effect = "not_started" if not tool.spec.side_effects else "unknown"
-        if effect == "unknown" and policy is not None:
+        # §2.1 L47 "denied" terminal (R3-S2 gate above); a failure reported
+        # by the adapter itself arrives after the started commit, so it ends
+        # failed/unknown (§2.1 L50 -- a started call cannot claim
+        # not_started, even without side effects; T-C1-033 re-mapping).
+        if policy is not None:
             # §5.2 L270: same unknown-effect retry rule as the exception path.
             policy.record_unknown(context.session_id, _wire_name(tool.spec), input_hash)
         return await _finish(
@@ -1136,7 +1139,7 @@ async def invoke_tool(
             tool_ref=tool_ref,
             input_hash=input_hash,
             state="failed",
-            effect_status=effect,
+            effect_status="unknown",
             content=content,
             structured_output=structured_output,
             error=result.error,
