@@ -476,3 +476,243 @@ async def test_0002_backfill_via_rebuild_keeps_every_accepted_run(tmp_path: Path
         ("msg_2", 3),
         ("msg_3", 4),
     ]
+
+
+# -- R5-S2 (T-C1-044): closed-state backup/restore drill + open-state boundary -----
+
+
+_BACKUP_TABLES = (
+    "events",
+    "sessions",
+    "messages",
+    "tool_executions",
+    "permissions",
+    "runs",
+)
+
+
+def _wal_companions(db_path: Path) -> tuple[Path, Path]:
+    """The SQLite WAL sidecar paths (``<db>-wal`` / ``<db>-shm``)."""
+    return (db_path.parent / f"{db_path.name}-wal", db_path.parent / f"{db_path.name}-shm")
+
+
+def _fetch_closed(db_path: Path, statement: str) -> list[tuple[Any, ...]]:
+    """``_fetch_all`` with the connection deterministically closed.
+
+    sqlite3 connections participate in reference cycles, so their OS file
+    handle is only released at cyclic-GC time; the in-place restore below
+    unlinks the database file and needs every handle gone immediately
+    (Windows WinError 32 otherwise).
+    """
+    connection = sqlite3.connect(db_path)
+    try:
+        return connection.execute(statement).fetchall()
+    finally:
+        connection.close()
+
+
+def _table_snapshot(db_path: Path) -> dict[str, list[tuple[Any, ...]]]:
+    """Every row of the durable log and all five read models, ordered by rowid."""
+    return {table: _fetch_closed(db_path, f"SELECT * FROM {table} ORDER BY rowid") for table in _BACKUP_TABLES}
+
+
+def _copy_main_file(source: Path, destination: Path) -> None:
+    """Whole-database main-file copy (the backup primitive under drill)."""
+    import shutil
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+
+
+async def _seed_tool_and_permission_session(store: SessionStore) -> str:
+    """The T-C1-044 drill subject: one session carrying tool AND permission events.
+
+    Reuses the frozen R2 fixture saga and the R3 permission pair verbatim (helpers
+    imported from the sibling projector test modules -- the established
+    cross-module pattern). ``py.permission.requested`` requires the folded PENDING
+    tool (state.py fold), so the permission pair lands in the window between
+    step.generated and the tool trio; no cross-entity invariant pairs the
+    permission terminal with the tool terminal.
+    """
+    from opencode.storage import EventBatch
+    from tests.integration.test_permission_projector import _permission_draft
+    from tests.integration.test_projector import _R2_SESSION, _r2_draft, _seed_created_and_prompt
+
+    high = await _seed_created_and_prompt(store)
+    for key, batch_id in (
+        ("run_started", "r5s2_run_started"),
+        ("step_started", "r5s2_step_started"),
+        ("text_finalized", "r5s2_text_finalized"),
+        ("reasoning_finalized", "r5s2_reasoning_finalized"),
+        ("step_generated", "r5s2_step_generated"),
+    ):
+        high = (await store.commit(_R2_SESSION, EventBatch(batch_id, (_r2_draft(key),)), high))[-1].seq
+    for kind, batch_id in (("requested", "r5s2_perm_requested"), ("replied", "r5s2_perm_replied")):
+        high = (await store.commit(_R2_SESSION, EventBatch(batch_id, (_permission_draft(kind),)), high))[-1].seq
+    for key, batch_id in (
+        ("tool_requested", "r5s2_tool_requested"),
+        ("tool_started", "r5s2_tool_started"),
+        ("tool_finished", "r5s2_tool_finished"),
+        ("step_finished", "r5s2_step_finished"),
+    ):
+        high = (await store.commit(_R2_SESSION, EventBatch(batch_id, (_r2_draft(key),)), high))[-1].seq
+    return _R2_SESSION
+
+
+async def _column_values(engine: Any, statement: str) -> list[str]:
+    """Read one column through the live async engine (no external connection).
+
+    External sqlite3 readers touching the live WAL change the close-time
+    checkpoint behaviour (pinned by the boundary test below), so every
+    read issued while the database is open goes through the engine itself.
+    """
+    async with engine.connect() as connection:
+        rows = (await connection.execute(sa.text(statement))).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+async def test_closed_state_backup_restore_reconciles_row_by_row(tmp_path: Path) -> None:
+    """PHASE1-SLIM §3 acceptance B backup drill over CORE-CONTRACTS §3.3 L223.
+
+    The store close converges the WAL (sidecars gone, main file self-sufficient);
+    the whole-main-file copy backs up the closed database; restoring the copy over
+    a lost database reconciles the log and every projection row by row and serves
+    the EventLog read face and the async runtime; re-running ``upgrade head`` over
+    the data-carrying restored database is a no-op (head idempotence with data).
+    """
+    from opencode.bus.eventlog import EventLog
+
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        session_id = await _seed_tool_and_permission_session(store)
+        # Drill precondition (engine reads -- see _column_values): the subject
+        # session covers the tool and the permission projection columns.
+        assert await _column_values(database.engine, "SELECT state FROM tool_executions") == ["succeeded"]
+        assert await _column_values(database.engine, "SELECT state FROM permissions") == ["replied"]
+        assert await _column_values(database.engine, f"SELECT status FROM runs WHERE session_id = '{session_id}'") == [
+            "running"
+        ]
+
+    # Closed state: the close finalizer converged the WAL into the main file
+    # (asserted before any external connection re-opens the database).
+    wal, shm = _wal_companions(db_path)
+    assert not wal.exists()
+    assert not shm.exists()
+    snapshot = _table_snapshot(db_path)
+    event_triples = _fetch_closed(db_path, "SELECT id, seq, type FROM events ORDER BY seq")
+    assert _fetch_closed(db_path, "SELECT version_num FROM alembic_version") == [("0002",)]
+    assert len(event_triples) == 13  # created..step_finished incl. the permission pair
+
+    backup_path = tmp_path / "backup" / "app.db.bak"
+    _copy_main_file(db_path, backup_path)
+
+    # Data loss: the live database is gone (sidecars belt-and-braces).
+    db_path.unlink()
+    wal.unlink(missing_ok=True)
+    shm.unlink(missing_ok=True)
+
+    # Restore: the verified copy takes the lost file's place.
+    _copy_main_file(backup_path, db_path)
+    assert _table_snapshot(db_path) == snapshot
+    assert _alembic_version(db_path) == "0002"
+
+    # The restored file serves the durable read face and the async runtime.
+    async with open_database(db_path, mode="readonly") as database:
+        page = await EventLog(database.engine).read(session_id)
+        assert [(event.id, event.seq, event.type) for event in page.items] == event_triples
+        assert page.has_more is False
+        assert await _column_values(database.engine, "SELECT state FROM tool_executions") == ["succeeded"]
+        assert await _column_values(database.engine, "SELECT state FROM permissions") == ["replied"]
+
+    # Head idempotence over data (task 1c): the re-run is a no-op.
+    _require_success(_upgrade_head(db_path))
+    assert _table_snapshot(db_path) == snapshot
+    assert _alembic_version(db_path) == "0002"
+
+
+async def test_open_state_main_file_copy_misses_wal_commits(tmp_path: Path) -> None:
+    """Open-state backup boundary drill (task 2b) -- NOT a support face.
+
+    Phase 1 has no checkpoint API: while the writer is open the committed events
+    live in the ``-wal`` sidecar, so a main-file-only copy is a valid but stale
+    database that silently misses every runtime commit (the WAL half-write risk,
+    CORE-CONTRACTS §3.2 L193). Only the close converges the sidecar into the main
+    file. Boundary material for the S3 backup documentation; the supported path
+    is close-then-copy (the drill above).
+    """
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        await _seed_tool_and_permission_session(store)
+        async with database.engine.connect() as connection:
+            committed = (await connection.execute(sa.text("SELECT COUNT(*) FROM events"))).scalar()
+        assert committed == 13
+
+        wal, shm = _wal_companions(db_path)
+        assert wal.exists()  # the commits live in the sidecar while the writer is open
+        assert shm.exists()
+
+        open_copy = tmp_path / "open-copy.db"
+        _copy_main_file(db_path, open_copy)
+        # The open-state copy is a fully migrated, valid database -- and missing
+        # every runtime commit (schema yes, rows no).
+        assert _table_names(open_copy) == {
+            "alembic_version",
+            "events",
+            "sessions",
+            "messages",
+            "tool_executions",
+            "permissions",
+            "runs",
+        }
+        assert _fetch_all(open_copy, "SELECT COUNT(*) FROM events") == [(0,)]
+        assert _fetch_all(open_copy, "SELECT COUNT(*) FROM tool_executions") == [(0,)]
+        assert _fetch_all(open_copy, "SELECT COUNT(*) FROM permissions") == [(0,)]
+
+    # After the close the same procedure is complete: sidecars converged away
+    # and the main file carries every commit.
+    wal, shm = _wal_companions(db_path)
+    assert not wal.exists()
+    assert not shm.exists()
+    assert _fetch_all(db_path, "SELECT COUNT(*) FROM events") == [(13,)]
+
+
+async def test_close_convergence_boundary_with_external_live_reader(tmp_path: Path) -> None:
+    """External-live-reader boundary drill -- S3 backup material, not a support face.
+
+    An external connection that reads the live WAL while the writer is open (the
+    monitoring/inspection pattern) can leave the close-time checkpoint unconverged
+    on this stack: the sidecar survives the close still holding every runtime
+    commit, and a main-file-only backup taken in that state is silently stale.
+    The relation pinned here is platform-stable either way: the main-file copy is
+    complete exactly when the sidecar did not survive; when it did, the data
+    remains fully readable only through the sidecar. Operational rule for the S3
+    documentation: after close, verify the sidecar is gone (or include it in the
+    backup) and reconcile the backup copy before relying on it.
+    """
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+
+    async with open_database(db_path, mode="create") as database:
+        store = SessionStore(database.engine, projector=SessionProjector())
+        await _seed_tool_and_permission_session(store)
+        # The external live reader: a plain sqlite3 connection reading the
+        # committed events while the async writer engine is still open.
+        assert _fetch_all(db_path, "SELECT COUNT(*) FROM events") == [(13,)]
+
+    wal, _shm = _wal_companions(db_path)
+    sidecar_survived = wal.exists() and wal.stat().st_size > 0
+    closed_copy = tmp_path / "closed-copy.db"
+    _copy_main_file(db_path, closed_copy)
+    if sidecar_survived:
+        # The data never reached the main file: a main-only backup is stale.
+        assert _fetch_all(closed_copy, "SELECT COUNT(*) FROM events") == [(0,)]
+    else:
+        assert _fetch_all(closed_copy, "SELECT COUNT(*) FROM events") == [(13,)]
+    # Either way the database with its sidecar in place reads every commit.
+    assert _fetch_all(db_path, "SELECT COUNT(*) FROM events") == [(13,)]
