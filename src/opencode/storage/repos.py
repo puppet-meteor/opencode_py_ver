@@ -15,6 +15,14 @@ pattern): queries are deterministic functions of stored rows.
   never in ID lexicographic order), cursor-paginated by ``after_message_id``
   (exclusive) with a clamped limit.
 
+T-C1-037 (R4-S4) appended the startup-recovery scan faces -- still read-only,
+bus-free, no external calls: :meth:`ReadRepositories.all_session_owners` /
+:meth:`ReadRepositories.non_terminal_runs` /
+:meth:`ReadRepositories.pending_permissions` enumerate the sessions rows, the
+non-terminal runs rows and the still-pending permissions rows for the recovery
+coordinator's shortlist (§3.2.1: these queries never trigger recovery -- the
+coordinator is the only consumer and runs once at startup).
+
 T-C1-010 (R1-S7) appended the command-layer query faces -- still read-only,
 bus-free, no external calls: :meth:`ReadRepositories.log_high` (the §3.2
 expected_seq source), :meth:`ReadRepositories.prompt_by_dedupe_key` /
@@ -118,6 +126,21 @@ _SELECT_MESSAGE_SESSION_ID = sa.text("SELECT session_id FROM messages WHERE mess
 _SELECT_EVENT_ENVELOPE_BY_DEDUPE = sa.text(
     "SELECT id, type, version FROM events WHERE session_id = :sid AND dedupe_key = :dk"
 )
+# -- T-C1-037 (R4-S4): the startup-recovery scan statements. The non-terminal
+# run vocabulary restates §2.1 L59-61 -- pinned to ``_RUN_STATUS_NON_TERMINAL``
+# in session/service.py (L258) and mirrored by ``_RUN_NON_TERMINAL`` in
+# session/state.py; repos must not import the session layer (import cycle), so
+# the literal set is the scan's own pinned copy. ``'pending'`` likewise restates
+# ``PermissionState.PENDING`` (session/state.py).
+_SELECT_ALL_SESSION_OWNERS = sa.text("SELECT session_id, status FROM sessions ORDER BY session_id")
+_SELECT_NON_TERMINAL_RUNS = sa.text(
+    "SELECT run_id, session_id, request_id, status, error FROM runs "
+    "WHERE status IN ('accepted', 'running', 'cancelling') ORDER BY session_id, run_id"
+)
+_SELECT_PENDING_PERMISSIONS = sa.text(
+    "SELECT session_id, permission_id, execution_id FROM permissions "
+    "WHERE state = 'pending' ORDER BY session_id, permission_id"
+)
 
 
 class NotFoundError(StoreError):
@@ -198,6 +221,35 @@ class DedupeEventRow:
     id: str
     type: str
     version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ScanRunRow:
+    """One non-terminal runs row for the recovery scan (T-C1-037).
+
+    ``RunRow``'s raw-columns split plus the run id the cross-session
+    enumeration needs (the by-PK probe never carried it); ``error`` is
+    passed through exactly as stored, no decode, no coercion.
+    """
+
+    session_id: str
+    run_id: str
+    request_id: str
+    status: str
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPermissionRow:
+    """One still-pending permissions row for the recovery scan (T-C1-037).
+
+    The row#27① orphan face: the coordinator cross-checks these against the
+    folded truth and closes the orphans with ``permission.closed(cancelled)``.
+    """
+
+    session_id: str
+    permission_id: str
+    execution_id: str
 
 
 def _corrupt(reason: str, message: str, details: JsonObject) -> StorageCorruptError:
@@ -520,6 +572,60 @@ class ReadRepositories:
         if row is None:
             return None
         return DedupeEventRow(id=str(row.id), type=str(row.type), version=int(row.version))
+
+    # -- T-C1-037 (R4-S4): the startup-recovery scan faces -----------------------
+
+    async def all_session_owners(self) -> list[SessionOwnerRow]:
+        """Every sessions row's ``(session_id, status)`` pair, ordered by id.
+
+        The recovery coordinator's session enumeration: raw columns only (no
+        JSON decode -- the scan classifies statuses itself), deterministic
+        order by session_id.
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_ALL_SESSION_OWNERS)).fetchall()
+        return [SessionOwnerRow(session_id=str(row.session_id), status=str(row.status)) for row in rows]
+
+    async def non_terminal_runs(self) -> list[ScanRunRow]:
+        """Every ``runs`` row still in a non-terminal status (§2.1 L59-61).
+
+        The recovery scan's cross-session run enumeration over the pinned
+        accepted/running/cancelling vocabulary (see the statement block). Raw
+        columns, ordered by (session_id, run_id); the coordinator re-derives
+        the truth from the folded log and reports any table/fold drift
+        instead of trusting the projection.
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_NON_TERMINAL_RUNS)).fetchall()
+        return [
+            ScanRunRow(
+                session_id=str(row.session_id),
+                run_id=str(row.run_id),
+                request_id=str(row.request_id),
+                status=str(row.status),
+                error=row.error if row.error is None else str(row.error),
+            )
+            for row in rows
+        ]
+
+    async def pending_permissions(self) -> list[PendingPermissionRow]:
+        """Every ``permissions`` row still in the ``pending`` state.
+
+        The row#27① orphan face for the recovery scan: ``'pending'`` restates
+        ``PermissionState.PENDING`` (session/state.py -- repos stays
+        session-layer-free, the same pinned-vocabulary tradeoff as the runs
+        statement above). Ordered by (session_id, permission_id).
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_PENDING_PERMISSIONS)).fetchall()
+        return [
+            PendingPermissionRow(
+                session_id=str(row.session_id),
+                permission_id=str(row.permission_id),
+                execution_id=str(row.execution_id),
+            )
+            for row in rows
+        ]
 
     def _decode_prompt_row(self, session_id: str, row: Any) -> AcceptedPrompt:
         """Decode one events row into AcceptedPrompt, fail closed (§3.2.1 read boundary).

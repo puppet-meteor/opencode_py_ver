@@ -38,12 +38,15 @@ is the behavioral baseline and instructions replay from their recorded text,
 never from a re-read of the current config. A v1 row stops with
 :class:`RecoveryStoppedError` (the minimal snapshot has no runtime face,
 §6.1 L291 — no silent backfill); a vanished working directory stops the same
-way (L302). The credentials-reference stop has no producer this slice
-(protocol-unreachable, ④ disclosure); the MCP-fingerprint stop face is S4 —
-v3 snapshots record the fingerprints, recovery does not compare them yet
-(R4-S3 ④ disclosure). Phase 1 has no hot
-reload (L302): every process creates a fresh session; recovery is a library
-capability exercised by tests.
+way (L302). T-B-039 prescription ② (T-C1-037) completed the third stop: the
+MCP-fingerprint face — ``recover`` compares the recorded v3
+``mcp_servers`` fingerprints against the caller-supplied current refs via
+:func:`mcp_fingerprint_drift` and stops on drift; passing no refs means the
+host declares no MCP face, so the comparison is skipped (the CLI composition
+currently declares none, ④ disclosure). The credentials-reference stop still
+has no producer this slice (protocol-unreachable, ④ disclosure). Phase 1 has
+no hot reload (L302): every process creates a fresh session; recovery is a
+library capability exercised by tests.
 
 Surrogate pre-scan (scheduler ledger row #19, T-C1-002-review ②): every
 string that enters the snapshot is scanned before snapshot construction — a
@@ -304,6 +307,29 @@ def mcp_startup_fingerprint(server: str, command: Sequence[str], env_refs: Seque
     env_names: list[Any] = sorted(env_refs)
     payload = canonical_json({"server": server, "command": command_values, "env_refs": env_names})
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def mcp_fingerprint_drift(recorded: Sequence[McpServerRef], current: Sequence[McpServerRef]) -> list[str]:
+    """§6.1 L302 (T-B-039 ②, T-C1-037) fingerprint comparison: the drift list.
+
+    Compares the recorded v3 ``mcp_servers`` against the current host
+    references by server name: a recorded server missing from ``current`` and
+    any fingerprint mismatch are drift; an empty list means no drift. Extra
+    current servers with no recorded counterpart are NOT drift -- the
+    recorded snapshot is the behavioral baseline (§6.1 L291), and a newly
+    added host server never changes what a past session pinned. v1/v2
+    snapshots carry no ``mcp_servers`` face, so a caller with no recorded
+    refs passes ``[]`` and the comparison is vacuous (never a stop).
+    """
+    current_by_name = {ref.server: ref for ref in current}
+    drift: list[str] = []
+    for ref in recorded:
+        match = current_by_name.get(ref.server)
+        if match is None:
+            drift.append(f"MCP server {ref.server!r} is no longer configured in the current host refs")
+        elif match.fingerprint != ref.fingerprint:
+            drift.append(f"MCP server {ref.server!r} startup fingerprint no longer matches the current host refs")
+    return drift
 
 
 def _int_setting(values: JsonObject, key: str, *, minimum: int, default: int | None = None) -> int:
@@ -870,7 +896,12 @@ class ConfigLoader:
 
     # -- §6.1 L302: recovery ---------------------------------------------------
 
-    def recover(self, data: SessionCreatedData) -> ResolvedRuntime:
+    def recover(
+        self,
+        data: SessionCreatedData,
+        *,
+        current_mcp_servers: Sequence[McpServerRef] | None = None,
+    ) -> ResolvedRuntime:
         """Rebuild the runtime face from one recorded ``py.session.created`` row.
 
         The recorded snapshot (v2 or v3) is the behavioral baseline (L302):
@@ -879,11 +910,15 @@ class ConfigLoader:
         backfill; a v3 row keeps its ``mcp_servers`` refs — v2 rows are
         never upgraded, R4-S3). A v1 row stops
         (:class:`RecoveryStoppedError` — the minimal snapshot has no runtime
-        face); a vanished working directory stops the same way. The
-        credentials-reference stop and the MCP-fingerprint stop (L302) are
-        S4 faces: this slice only records the fingerprints in the v3
-        snapshot, the recovery-time comparison is not implemented (④
-        disclosure).
+        face); a vanished working directory stops the same way. T-B-039
+        prescription ② (T-C1-037) completed the third stop: when
+        ``current_mcp_servers`` is given, the recorded v3 fingerprints are
+        compared against it (:func:`mcp_fingerprint_drift`) and any drift
+        stops the same way (L302); ``None`` (the default) declares that the
+        host wires no MCP face, so no comparison happens and existing
+        callers behave exactly as before. The credentials-reference stop
+        remains without a producer (protocol-unreachable, ④ disclosure in
+        the progress file).
         """
         runtime = upcast_session_created(data)
         if runtime.snapshot is None:
@@ -897,6 +932,14 @@ class ConfigLoader:
                 "reconfigure before recovery can proceed (CORE-CONTRACTS §6.1 L302)"
             )
         snapshot = runtime.snapshot
+        if current_mcp_servers is not None and isinstance(snapshot, ConfigSnapshotV3):
+            drift = mcp_fingerprint_drift(snapshot.mcp_servers, current_mcp_servers)
+            if drift:
+                raise RecoveryStoppedError(
+                    "the recorded MCP server startup fingerprints no longer match the current host references "
+                    f"({'; '.join(drift)}); the host must reconfigure before recovery can proceed "
+                    "(CORE-CONTRACTS §6.1 L302)"
+                )
         texts = [source.text for source in snapshot.instructions]
         try:
             settings = RuntimeSettings(
