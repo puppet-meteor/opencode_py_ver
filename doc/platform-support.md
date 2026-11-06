@@ -1,9 +1,9 @@
-# 平台支持（R0-B 探针实测）
+# 平台支持（R0-B 探针实测+R4/R5 交付态刷新）
 
-> 状态：R0-B 平台与本地存储探针的实测结论。
+> 状态：R0-B 平台与本地存储探针的实测结论；R5-S5（T-C1-047）追加 CI 绿链（§1.1）与已知限制清单（§9）——PHASE1-SLIM 验收 C 后半「记录已支持平台和已知限制后才标记 core 0.1 稳定」的记录面。
 > 证据：[evidence/r0/platform.json](evidence/r0/platform.json)（本地 Windows 全量重跑生成，probe_version `r0b-2`）；
 > 测试：`tests/r0/test_platform_probe.py`（8 项）；探针：`tools/r0/platform_probe.py`。
-> CI 证据：run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)（ubuntu+windows 全绿，artifact `platform-probe-<os>`）；本地结果只记 `manual_verified`，CI 结果只在 CI 侧记 `ci_verified`，互不冒充。
+> CI 证据（R0-B 时点）：run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)（ubuntu+windows 全绿，artifact `platform-probe-<os>`）——**保留为历史实测锚不删**；本地结果只记 `manual_verified`，CI 结果只在 CI 侧记 `ci_verified`，互不冒充（本纪律对本文件全部 CI 引用生效）。现行全量套件 CI 绿链见 §1.1。
 > `r0b-2` 语义修正：`ci_verified`/`manual_verified` 只收录 status=verified 的检查项；restricted 检查项单独记入顶层 `restricted` 名单（配 `unsupported` 原因），绝不混入 verified 名单；进程树孙进程统一使用探针选中的解释器（含 pwsh 回退），不再硬编码。
 
 ## 1. 已验证平台（实测）
@@ -14,9 +14,17 @@
 | ubuntu-latest CI（Linux 7.0.0-1017-azure） | 3.12.16 | 同上，全部 verified | ci_verified |
 | windows-latest CI（Windows Server 2025） | 3.12.10 | 同上，全部 verified（含 symlink/junction 越界拒绝） | ci_verified |
 
+R4/R5 全量套件（1134 测）本机复跑口径：Windows 11 + CPython 3.12.16（worktree .venv 现读）——本地 manual 与 CI 分列不冒充，门禁数字与分解见 [T-C1-047 进度②](orchestration/progress/T-C1-047.md)。
+
+## 1.1 CI 绿链（R4→R5 全量套件双 OS；run id=调度器台账供给锚）
+
+- 绿链：`42228816565`[#154]→`42242948415`[#155]→`42244191726`[fixup]→`42260728594`[#158，R5-S1 并回]→`42269916522`[#159，R5-S2 并回]→`42283944194`[#160，R5-S3 并回——**首跑 Windows 腿计时型瞬态红→法证裁定→failed-job rerun 绿 @ 04:18:30**，形态记档：计时型瞬态非代码面，attempt 病态取证归调度日志]→`#161` run[本票派发时**在飞**——动态条款：以最新绿链为准；席位侧无 CI 网络核验面，终值归调度器并回流程记档，在飞态如实标注]。
+- R0-B 原 run `41182347042`（头部）保留为历史实测锚不删——「本地 manual_verified 与 CI ci_verified 互不冒充」纪律对 §1.1 同样适用：链上 run 为 CI 侧 ci_verified 口径，不冒充本地实测。
+- 本地对账（T-C1-047 门禁现跑，Windows 11+CPython 3.12.16）：pytest **1134 passed**（253.03s）/ruff check clean/`ruff format --check` exit 0（**341 files**=111 py+229 md[#161 树 340]+1 进度 md）/mypy **109 source files 零问题**——对账与分解见 [T-C1-047 进度②](orchestration/progress/T-C1-047.md)。
+
 ## 2. 证据级别说明
 
-- **ci_verified**：CI run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)（commit `d5cdb11`，2026-10-31）ubuntu+windows 两个 job 全绿；探针在 CI 内以 `GITHUB_ACTIONS=true` 运行，artifact（`platform-probe-ubuntu-latest` / `platform-probe-windows-latest`）中 `generated.by=ci`、`ci_verified` 含全部四项、`unsupported` 为空。
+- **ci_verified**：CI run [41182347042](https://github.com/puppet-meteor/opencode_py_ver/actions/runs/41182347042)（commit `d5cdb11`，2026-10-31）ubuntu+windows 两个 job 全绿；探针在 CI 内以 `GITHUB_ACTIONS=true` 运行，artifact（`platform-probe-ubuntu-latest` / `platform-probe-windows-latest`）中 `generated.by=ci`、`ci_verified` 含全部四项、`unsupported` 为空。R4/R5 时点全量套件绿链见 §1.1。
 - **manual_verified**：本地 Windows（仓库内 `evidence/r0/platform.json`，`generated.by=manual`）。本地与 CI 结果分开记录，未混用、未互相冒充。
 - 中间过程：首次 push（`7e9f0ac`）ubuntu 曾因 POSIX zombie 误判 alive 失败（kill(0) 对未收割子进程成功），修复（`f653877`）后全绿；`f653877` 又暴露 linux mypy 对 `_winapi` 桩的平台条件问题，已修（`d5cdb11`）。
 
@@ -64,3 +72,32 @@
 - 证据脱敏：主机路径只出现 `<WORKSPACE>`/`<TEMP>` 占位；不含用户名、PID、prompt、模型输出、凭据或 endpoint；写入前有泄漏自检（`_leak_self_check`，违规即抛错）。
 - 复现：`uv run python tools/r0/platform_probe.py --output <path>`；测试 `uv run pytest -q tests/r0/test_platform_probe.py`。
 - CI：单 job matrix（ubuntu-latest + windows-latest）内运行探针，`actions/upload-artifact@v4` 上传脱敏 JSON（`platform-probe-<os>`，`if: always()`），无 secrets、无真实 MAAS 访问。
+
+## 9. 已知限制清单（验收 C 后半承载；R5-S5 T-C1-047 清单化——引注一律现读锚，逐项可核）
+
+### A 平台/OS 面
+
+- **A1 POSIX 腿承载**：MCP stdio/进程树相关测试本机仅 win32 腿实跑；POSIX process-group/killpg 树杀腿+close 升级序 POSIX 分支归 CI 复验承载（`doc/reviews/R4-S2-review.md` L19、L36；§5 CI ubuntu 实测基线）。Windows 无 SIGTERM：close 升级序中间态不可稳定注入（`doc/reviews/R4-S2-review.md` L22，④ 在案）。
+- **A2 symlink 特权受限防御路径**：winerror 1314 → restricted+unsupported 记录、不静默跳过（§4）；现态未触发（本机与 CI Windows 特权均可用），机制保留为防御路径（§4 实测复核在册）。
+- **A3 writer.lock 第三方读**：持锁进程占用期间第三方进程读该文件被共享模式拒绝——快照记 `hash_unreadable`（仍比较 size/mtime）；SQL 层 busy 不作为 OS 锁证据（§6 在册复核）。
+
+### B 协议/能力面
+
+- **B1 MCP client 协议面子集**：未覆盖协议面=评审件实枚举 13 面值——cancellation/progress/ping/sampling/elicitation/roots/resources/prompts/tools·list 分页/completion/logging/setLevel/协议版本协商（`doc/reviews/R4-S2-review.md` L22；`doc/plans/r5-slices.md` §3 行 5 计「12 项」与实枚举计数差异以评审件为准——T-C1-047 进度④ 浮报在案）；server→client 请求应 -32601、notification 忽略（差异表承载）。
+- **B2 bind_mcp_tools 生产不 spawn**：生产 CLI 注册不 spawn MCP server=T8 既定（#152 调度器裁决在册）；run 级路由由组合根测试直组 `MCPToolAdapter` 承载（`doc/reference/r4-exit-evidence.md` L84；OP-R5-1 台账=`doc/plans/r5-slices.md` §3 行 1 待定夺）。
+- **B3 故障矩阵 L131 后两句（新 catalog/boot_id 旧批准失效）未 e2e 直载**：间接承载在册=S3 catalog/指纹 re-ask+S6 T7 boot_id 隔离+S2 断线 unknown 不自动重试（`doc/reference/r4-exit-evidence.md` L86；`doc/reviews/R4-S7-review.md` L52——R5+ catalog 轮换票顺手直载）。
+- **B4 deferred 能力面（core 0.1 不宣称）**：HTTP client（M5）/skills·subagent·HTTP MCP（M6）/compaction（M6）/媒体·多 provider·worktree（M6）/插件·codemode·PTY（M3/M4/M2）——`doc/parity.md` §2 deferred 5 行（差异列逐行复核在册）。
+- **B5 grep `_is_invalid_pattern` `.lower()` 超集**：大小写不敏感超集面（rg 15.2.0 banner 恒小写直跑实证现实等价；docstring 披露 float-reported）（`doc/reviews/R4-S1-review.md` L46、L69）。
+
+### C 存储/备份面
+
+- **C1 打开态 DB 备份不支持**：唯一支持面=「先 close 后复制」（close 后 WAL/-shm 伴文件消失断言→整库复制→逐行对账）；建议口径=close 后核验伴文件消失（或将 -wal 一并纳入备份）+逐行对账后信任（`doc/reviews/R5-S2-review.md` L21 素材包+`tests/integration/test_migrations.py` 测 5/6/7 钉住事实面）。
+- **C2 外部 live 读者效应平台依赖**：关闭前外部连接读取的侧车文件存活分支平台依赖——钉平台稳定关系式而非断言特定分支（`doc/reviews/R5-S2-review.md` L15、L16；根因=SQLite/aiosqlite 内部行为，冻结面外，机理未根因如实披露）。
+- **C3 句柄释放 gc 限界**：关闭后文件句柄释放受 gc 时点影响（`doc/reviews/R5-S2-review.md` L21 素材包）。
+
+### D 验证/记档面
+
+- **D1 MAAS 真实端点短会话未执行**：provider 行待 MAAS smoke 终翻（OP-R5-2 已裁：T-C1-048 独立票，端点供给后 S6 前执行；PHASE1-SLIM L116 验证行）——fake server 无网络面已测（`doc/parity.md` §2.1 provider 行），不虚过不冒充。
+- **D2 会话选择漂移面停止行内容未钉**：T5② 漂移停住面以单行 stderr+exit 4+零新建足证；消息内容（fingerprint/drift 词）未断言（`doc/reviews/R4-S6-review.md` L54——触达该文件时顺手补）。
+- **D3 src 存量 34 处历史 TS mapping 注释**：非义务低优先清理评估（`doc/reference/r4-exit-evidence.md` L85；`doc/plans/r5-slices.md` §3 行 2=登记不设行；`doc/reviews/R4-S7-review.md` L51 零 M 亲证非新增）。
+- **D4 代码记档级注记两件**：resolve_runtime_v3 双载链读（boot-only 单线程无正确性影响）/mcp namespace 单向固定（plain register 可占 `mcp` 名，一行保留检查可闭合——硬化候选）（`doc/reviews/R4-S3-review.md` L42、L43）。
