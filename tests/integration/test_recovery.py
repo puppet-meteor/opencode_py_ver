@@ -483,6 +483,172 @@ async def test_cancelling_window_full_terminal_batch_closed_first(tmp_path: Path
     assert after == before
 
 
+async def test_window2_started_tool_without_finished_synthesizes_unknown(tmp_path: Path) -> None:
+    """Window 2 (§3.3 L219, T-C1-039): a process exiting between py.tool.started
+    and py.tool.finished leaves a RUNNING tool with no result; the recovery scan
+    synthesizes the honest unknown terminal -- ToolFinishedData(state="unknown",
+    effect_status="unknown") -- even though the command may already have
+    succeeded, and lands it on the report, the event batch and the projected
+    interrupted message's tool part."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    fixture = _Fixture(db_path)
+    tool_id = "exec_000001"
+    tool_input: JsonObject = {"path": "c.txt"}
+    sid, rid = fixture.session_id, fixture.run_id
+    async with open_database(db_path, mode="create") as database:
+        engine = database.engine
+        store = SessionStore(engine, projector=_projector())
+        repos = ReadRepositories(engine)
+        committer = EventCommitter(repos, store, VolatileBus(), ids=fixture.ids, clock=_clock)
+        generated = AssistantMessage(
+            id=fixture.step_message_id,
+            type="assistant",
+            created_at=_clock(),
+            metadata={},
+            model=_MODEL,
+            parts=[
+                AssistantTextPart(type="text", part_id="p1", text="hello world"),
+                AssistantToolPart(
+                    type="tool",
+                    tool_call_id="call_c",
+                    execution_id=tool_id,
+                    name="fs__read",
+                    input=tool_input,
+                    state="pending",
+                    effect_status="not_started",
+                    content=[],
+                ),
+            ],
+            status="running",
+        )
+        await committer.commit(
+            sid,
+            [
+                _draft(
+                    fixture.ids,
+                    sid,
+                    None,
+                    "py.session.created",
+                    SessionCreatedData(
+                        working_dir=fixture.working_dir,
+                        config_snapshot=_SNAPSHOT,
+                        snapshot_hash=compute_snapshot_hash(_SNAPSHOT),
+                    ),
+                ),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.prompt.accepted",
+                    PromptAcceptedData(
+                        request_id="req_000001",
+                        run_id=rid,
+                        message=UserMessage(
+                            id=fixture.message_id, type="user", created_at=_clock(), metadata={}, text="hello"
+                        ),
+                    ),
+                ),
+                _draft(fixture.ids, sid, rid, "py.run.started", RunStartedData(run_id=rid)),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.step.started",
+                    StepStartedData(
+                        run_id=rid, step_id=fixture.step_id, message_id=fixture.step_message_id, model=_MODEL, attempt=1
+                    ),
+                ),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.text.finalized",
+                    TextFinalizedData(message_id=fixture.step_message_id, part_id="p1", ordinal=0, text="hello world"),
+                ),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.step.generated",
+                    StepGeneratedData(step_id=fixture.step_id, message=generated),
+                ),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.tool.requested",
+                    ToolRequestedData(
+                        message_id=fixture.step_message_id,
+                        tool_call_id="call_c",
+                        execution_id=tool_id,
+                        requested_name="fs__read",
+                        input=tool_input,
+                        input_hash=compute_input_hash(tool_input),
+                    ),
+                ),
+                _draft(
+                    fixture.ids,
+                    sid,
+                    rid,
+                    "py.tool.started",
+                    ToolStartedData(
+                        execution_id=tool_id, permission_decision="allow", input_hash=compute_input_hash(tool_input)
+                    ),
+                ),
+                # the crash point: no py.tool.finished ever commits (§3.3 L219)
+            ],
+        )
+    assert _run_status_value(db_path, rid) == "running"
+
+    report = await _scan(db_path, fixture)
+    entry = report.sessions[0]
+    assert entry.outcome == "recovered"
+    assert entry.closed_runs == ((rid, "running"),)
+    assert entry.tool_terminals == (tool_id,)
+    assert entry.step_terminals == (fixture.step_id,)
+
+    # The synthesized unknown terminal, verbatim (§3.3 L219): unknown/unknown plus
+    # the model-readable "could not be confirmed" text.
+    finished = _fetch_all(
+        db_path,
+        "SELECT data FROM events WHERE session_id = ? AND type = 'py.tool.finished'",
+        (sid,),
+    )
+    assert len(finished) == 1
+    data = json.loads(str(finished[0][0]))
+    assert data["execution_id"] == tool_id
+    assert data["state"] == "unknown"
+    assert data["effect_status"] == "unknown"
+    assert data["content"] == [
+        {
+            "type": "text",
+            "text": f"Tool execution {tool_id} was cancelled while running; its result could not be confirmed.",
+        }
+    ]
+
+    # Batch position: the tool terminal precedes the interrupted step/run
+    # terminals in the same single recovery batch (§3.3 L212 order).
+    types = _event_types(db_path, sid)
+    assert types[-3:] == ["py.tool.finished", "py.step.finished", "py.run.finished"]
+    assert _run_status_value(db_path, rid) == "interrupted"
+
+    # The landing: the projected interrupted message keeps the committed text
+    # part verbatim and carries the synthesized unknown terminal on its tool part.
+    messages = _fetch_all(
+        db_path,
+        "SELECT data FROM messages WHERE session_id = ? AND message_id = ?",
+        (sid, fixture.step_message_id),
+    )
+    assert messages, "the interrupted terminal message is projected"
+    message = json.loads(str(messages[0][0]))
+    assert message["status"] == "interrupted"
+    assert message["parts"][0] == {"type": "text", "part_id": "p1", "text": "hello world"}
+    assert message["parts"][1]["state"] == "unknown"
+    assert message["parts"][1]["effect_status"] == "unknown"
+    assert message["parts"][1]["content"] == data["content"]
+
+
 # ---------------------------------------------------------------------------
 # The §6.1 L302 stop faces
 # ---------------------------------------------------------------------------
