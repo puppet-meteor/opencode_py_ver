@@ -12,6 +12,9 @@ dependencies = [
     "aiosqlite>=0.20",
 ]
 
+[project.scripts]
+opencode = "opencode.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
