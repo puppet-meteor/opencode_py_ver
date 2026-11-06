@@ -1,0 +1,7 @@
+# Byte-locked artifacts (T-C1-045): the drift tests in
+# tests/contract/test_schema_lock.py compare read_bytes() against the LF
+# output of tools/r5/generate_schema_artifacts.py (newline pinned to LF).
+# Pin checkout materialization to LF so core.autocrlf cannot smudge CRLF
+# into the working copy (#160 main-tree forensics: merge checkout
+# materialized CRLF and redded the byte-identity drift test).
+doc/reference/schema/*.json text eol=lf

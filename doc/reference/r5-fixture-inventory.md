@@ -3,7 +3,7 @@
 - 席位：R5-S4（契约证据面）；任务书 `doc/orchestration/tasks/T-C1-045.md`。
 - 基线：`d889810270a00c7abca6e58a2aa913b7d457c9f0`（checkpoint #159）。
 - 权威源：`doc/CORE-CONTRACTS.md` §1 L17（「统一 JSON Schema 在 R5 由实际模型的 `model_json_schema()` 汇总生成并锁定差异」）、§2–§7（六接缝定义）、§8（错误与演进）；`doc/plans/r5-slices.md` §2.4；任务书 Done L16 与验收C 前半。
-- 范围声明：本清单只陈述 Python 侧可核事实（模型枚举、工件结构、fixture 分类、测试锚）。按 parity §3 L41 口径，全文不含 TS wire 同构/兼容宣称；冻结模型 docstring 经 `model_json_schema()` 的 `description` 字段原样进入工件，其中含历史性 TS 对照注记（差异对照，非等价宣称），见 §8。
+- 范围声明：本清单只陈述 Python 侧可核事实（模型枚举、工件结构、fixture 分类、测试锚）。按 parity §3 L41 口径，全文不含 TS wire 同构/兼容宣称；冻结模型类 docstring 经 `model_json_schema()` 的 `description` 字段原样进入工件——**现行模型类 docstring 实测零 TS 注记、工件零 TS 文本**（TS 历史注记均在模块 docstring/注释/函数 docstring，结构上不进入工件；若未来引入则原样透传，为差异对照非等价宣称）——实测与透传语义见进度文件 ③ 注记 b（T-B-049 一般-2 处方 3 修正，#160）。
 
 ## 1. 统一 JSON Schema 工件
 
