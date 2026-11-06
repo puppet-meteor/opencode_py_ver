@@ -24,7 +24,7 @@ R4 交付 MCP 与故障恢复，把 0001 的两条抽象承诺逼成具体决策
 
 实现锚：src/opencode/session/recovery.py（670L：RecoveryCoordinator L238、scan L268、_recover_session L314、RecoveryGate L194、RecoveryReport L148、SessionRecoveryReport L126、sweep_crash_temp_files L163）；src/opencode/app.py（282L：_startup_scan L74、_RecoveryGatedStore L87、接线 L161-190、recovery_gate property L259）；src/opencode/cli.py（1147L：选择面 L404-514）。
 
-测试锚：tests/integration/test_recovery.py（14 测：三窗 L389/L416/L444/L486、停住面 L657/L674、v1 可恢复 L742、非 active 不写 L768、完整性跳过 L788、进程内/跨进程崩溃 L846/L878、门 fail-closed L904、清扫 L952/L981）；tests/integration/test_cli_r4.py（选择面 L362-L587 十测，含 test_continue_stops_on_a_v1_snapshot L468、test_continue_stops_on_mcp_fingerprint_drift L488、test_session_stops_when_the_recorded_working_dir_is_gone L527）。
+测试锚：tests/integration/test_recovery.py（14 测：三窗 L389/L416/L444/L486、停住面 L657/L674、v1 可恢复 L742、非 active 不写 L768、完整性跳过 L788、进程内/跨进程崩溃 L846/L878、门 fail-closed L904、清扫 L952/L981）；tests/integration/test_cli_r4.py（选择面 L362-L587 九测，含 test_continue_stops_on_a_v1_snapshot L468、test_continue_stops_on_mcp_fingerprint_drift L488、test_session_stops_when_the_recorded_working_dir_is_gone L527）。
 
 ### A.3 备选方案和取舍
 

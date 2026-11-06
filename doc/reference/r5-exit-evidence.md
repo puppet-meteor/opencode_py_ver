@@ -18,7 +18,7 @@
 | S5 parity 翻新+platform-support 刷新 | parity 逐行翻新+CI 链追加+已知限制清单化 | `doc/parity.md`（87L：L14 本册现态 verified 8+待 MAAS 终翻 1+deferred 5+§2.1 六列证据）；`doc/platform-support.md`（103L：§1.1 CI 链+§9 已知限制 15 件） | T-C1-047 PASS+T-B-051 0/0/0/2 | 并回 `1be7295`→#162（**S6 起基线 1134/109**[format 341]） |
 | S6 发布检查+Done 对账+收口（本票） | 本文件+Done 九项对账+tag 前置门确认清单+r5-slices L4 翻牌 | `doc/reference/r5-exit-evidence.md`（本文件 §1-§10+附录 A） | T-C1-049 终报（本票）；**评审与并回归=调度器记档**（零哈希零 verdict 预写——#163 终态翻牌归调度器） | 门禁四件自跑（§8）；CI 链照录（§8） |
 
-**并行线现状（如实对账，④）**：R5-MAAS=OP-R5-2 已裁 T-C1-048 独立票（端点/凭据未供给=用户外部输入等待面在册；MAAS 相关行按动态条款标「待」，见 §4/§6 L10 行）；R5-A1（ADR 线）=OP-R5-5 待定夺，R5 期零新 ADR（`doc/adr/` 现读枚举仅 0001-core-architecture.md）；R5-M1（probe 加固微票，r5-slices §3 行 4 建议设行）=席位侧未见派发/收口记录，以调度器台账为准（#160 Windows 腿瞬态经法证裁定为计时型非标记读型，不构成发布检查阻塞）。
+**并行线现状（如实对账，④）**：R5-MAAS=OP-R5-2 已裁 T-C1-048 独立票（端点/凭据未供给=用户外部输入等待面在册；MAAS 相关行按动态条款标「待」，见 §4/§6 L10 行）；R5-A1（ADR 线）=OP-R5-5 已裁定执行并闭合（#163 ⑧→T-A-011 交付[0001 L3 状态行刷新+0002 新卷 81L]+调度器验收+T-B-053 PASS 0/0/0/1，merge `dd9421f` 随 #164 入库——`doc/adr/` 现读枚举 0001+0002）；R5-M1（probe 加固微票，r5-slices §3 行 4 建议设行）=席位侧未见派发/收口记录，以调度器台账为准（#160 Windows 腿瞬态经法证裁定为计时型非标记读型，不构成发布检查阻塞）。
 
 ## 1. 验收 A（L113 原文）："干净环境安装后运行 CLI 和同进程示例；缺配置、解释器或 rg 时明确提示；退出码区分成功/失败/中断。"
 
@@ -73,7 +73,7 @@
 | 1 | README | `README.md` 160L（L7 安装/L40 运行/L83 同进程示例/L119 退出码/L134 缺件提示/L152 文档互链） | S3（T-C1-046+T-B-050） | √ 在库 |
 | 2 | fixture 清单 | `doc/reference/r5-fixture-inventory.md` 189L（92 件枚举+63 模型映射+6 schema 工件对账+§8 零差异结论） | S4（T-C1-045+T-B-049） | √ 在库 |
 | 3 | parity 实测记录 | `doc/parity.md` 87L（L14 本册现态：verified 8+待 MAAS 终翻 1+deferred 5；§2.1 六列证据逐行） | S5（T-C1-047+T-B-051） | √ 在库（provider 行待 T-C1-048 终翻） |
-| 4 | ADR 更新 | `doc/adr/` 现读枚举**仅 0001-core-architecture.md**（R5 期零新 ADR，0001 状态行未刷新） | R5-A1（A 席线）=OP-R5-5 **待定夺**；`doc/adr/` 写权归 A 席（ORCHESTRATION §1 路径所有权），本票零触碰 | **待**（④ 如实记档，不虚过） |
+| 4 | ADR 更新 | `doc/adr/` 现读枚举 0001-core-architecture.md[L3 状态行刷新：2026-11-07]+0002-recovery-coordinator-and-mcp-client.md[81L 新卷：启动恢复协调器+MCP 自研 stdio client] | R5-A1（A 席线）=OP-R5-5 已裁定执行（#163 ⑧）——T-A-011 交付+调度器验收+T-B-053 PASS 0/0/0/1，merge `dd9421f` 随 #164 入库 | **√ 在库**（#164 翻牌） |
 | 5 | 发布/备份操作说明 | `doc/release-and-backup.md` 108L（§1 发布检查清单[tag 前置门]五小节+§2 备份/恢复操作+§3 回退路径分离+§4 清单「待」项全枚举） | S3（T-C1-046+T-B-050） | √ 在库 |
 
 ## 6. Done 九项对账（L9-17 逐项↔证据三方映射）
@@ -88,7 +88,7 @@
 | L14 `--continue` / `--session ID` 恢复已提交历史；未开始工具变 cancelled/not_started，已开始但未提交终态的工具变 unknown，不自动重执行 | √ 已闭合 | `src/opencode/cli.py` L281/L288（选择面现读锚）；`doc/reference/r4-exit-evidence.md` §5（R4-S6 在档） |
 | L15 EventLog 支持分页、补读、Synced、follow 和慢消费者处理；Bus 不承担持久写入 | √ 已闭合 | `doc/reference/r4-exit-evidence.md`（R4-S5 覆盖在档） |
 | L16 每个接缝都有正例/反例 fixture、行为测试和至少一个真实/fake 适配器测试 | √ 已闭合 | `doc/reference/r5-fixture-inventory.md` §2（六接缝×四列矩阵，适配器列全非空）；`tests/contract/test_schema_lock.py` L303-L369 |
-| L17 README 运行说明、parity 差异、ADR、迁移/备份说明齐全；ruff/mypy/pytest 和 Windows/Linux CI 通过 | **分拆**：README √/parity √（S5 翻新）/迁移备份 √/ruff·mypy·pytest √（§8）/双 OS CI √（§8 调度器锚）；**ADR=「待」**（R5 期零新卷+OP-R5-5 待定夺，A 席线） | `README.md`+`doc/release-and-backup.md`+`doc/parity.md`+§8 门禁与 CI；ADR 面=§5 行 4 |
+| L17 README 运行说明、parity 差异、ADR、迁移/备份说明齐全；ruff/mypy/pytest 和 Windows/Linux CI 通过 | **分拆**：README √/parity √（S5 翻新）/迁移备份 √/ruff·mypy·pytest √（§8）/双 OS CI √（§8 调度器锚）；**ADR=√**（#164 翻牌：T-A-011 交付[0001 状态行刷新+0002 新卷]+调度器验收+T-B-053 PASS 0/0/0/1——A 席线闭合，见 §5 行 4） | `README.md`+`doc/release-and-backup.md`+`doc/parity.md`+§8 门禁与 CI；ADR 面=§5 行 4 |
 
 **九项态汇总：7 项全绿（L9/L11/L12/L13/L14/L15/L16）+2 项分拆（L10 前半、L17 ADR 子件）——两处「待」均为 R5 收口外动态面：前者归 T-C1-048（MAAS 端点供给），后者归 A 席线（OP-R5-5 裁决）；非 R5-S6 可闭合缺口，如实记档不虚过。**
 
@@ -148,7 +148,7 @@
 ## 10. 已知边界与 R5+ 移交（非 R5 收口退出条件缺口）
 
 - **真实 MAAS 短会话**：T-C1-048 独立票（OP-R5-2 已裁）——端点/凭据未供给（用户外部输入等待面在册）；fake server 无网络复现已测（123 测）；parity L28 终翻归该票。
-- **ADR 更新**：OP-R5-5 待定夺（0001 状态行刷新+0002 新卷[启动恢复协调器+MCP 自研 client]归 A 席线 R5-A1；`doc/adr/` 写权归 A 席——ORCHESTRATION §1）。R5 期零新 ADR（现读枚举仅 0001）。
+- **ADR 更新**：已闭合（#163 ⑧ OP-R5-5 裁定执行→T-A-011 交付：0001 状态行刷新+0002 新卷[启动恢复协调器+MCP 自研 client]；调度器验收+T-B-053 PASS 0/0/0/1；merge `dd9421f` 随 #164 入库——`doc/adr/` 现读枚举 0001+0002）。
 - **bind_mcp_tools 生产接线 vs core preview 降级**：OP-R5-1 待定夺（r5-slices §3 台账行 1；现态=组合根测试直组承载，platform-support §9 B2 在册）。
 - **R5-M1 probe 加固微票**：r5-slices §3 行 4 建议设行；席位侧未见派发/收口记录（调度器台账为准）——#160 Windows 腿瞬态经法证裁定为计时型非标记读型，不构成发布检查阻塞。
 - **R4 float-reported 边界全集**：platform-support §9 15 件清单化承载（S5 交付；本文件 §3 引注）。
