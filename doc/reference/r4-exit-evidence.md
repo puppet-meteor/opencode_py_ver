@@ -89,7 +89,7 @@
 
 ## 附录 A 函数级测试枚举（uv run python -m pytest --collect-only -q 一次性全量）
 
-R4 期间新增测试 99（922→1021）：S1 +2 / S1b +2 / S2 +13（`test_mcp_stdio.py`）/ S3 +47（`test_mcp_naming.py` 44+`test_mcp_catalog.py` 3）/ S4 +13+S4b +1（`test_recovery.py` 14）/ S5 +4（`test_follow_recovery.py`）/ S6 +10（`test_cli_r4.py`）；存量修改：`test_config_loader.py`（v3 recover 面+期望翻转）、`test_events.py`/`test_config.py`（v3 翻牌注释+更名一枚）。测试基建只读复用：`tests/r0/fake_openai_server.py`、`tests/integration/mcp_stdio_server.py`。
+R4 期间新增测试 99（922→1021）：S1 +2 / S1b +2 / S2 +13（`test_mcp_stdio.py`）/ S3 +47（`test_mcp_naming.py` 44+`test_mcp_catalog.py` 3）/ S4 +13+S4b +1（`test_recovery.py` 14）/ S5 +4（`test_follow_recovery.py`）/ S6 +10（`test_cli_r4.py`）/ S7 +7（`test_e2e_r4.py`）；存量修改：`test_config_loader.py`（v3 recover 面+期望翻转）、`test_events.py`/`test_config.py`（v3 翻牌注释+更名一枚）。测试基建只读复用：`tests/r0/fake_openai_server.py`、`tests/integration/mcp_stdio_server.py`。
 
 全量 file 级分组枚举（总数 **1021 == §6 门禁 pytest 1021 passed，闭合**；沿 R3-S8 先例，collect 输出机械转录）：
 
