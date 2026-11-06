@@ -51,9 +51,11 @@ CREATE_NEW_PROCESS_GROUP Ctrl+C ignore flag is cleared so hosts that spawn
 this process in a new group keep a working Ctrl-C face.
 
 Exit codes (#94): 0 succeeded (or /exit / EOF), 1 failed, 2 interrupted
-(argparse usage errors exit 2 as well), 3 cancel cleanup failed, 70
-migration failure or any other uncaught exception, 130 prompt-face
-interrupt.
+(argparse usage errors exit 2 as well), 3 cancel cleanup failed, 4
+session selection stopped (R4-S6: an unknown ``--session`` id, an
+unreadable creation row, or recovery refusing to resume — v1 snapshot,
+vanished working directory, MCP fingerprint drift), 70 migration failure
+or any other uncaught exception, 130 prompt-face interrupt.
 """
 
 from __future__ import annotations
@@ -71,14 +73,18 @@ import threading
 import traceback
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import Any
+from uuid import uuid4
+
+from pydantic import ValidationError
 
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.bus import Event, SlowConsumerError
-from opencode.config import CliOverrides, ConfigError, ConfigLoader, ResolvedRuntime
+from opencode.config import CliOverrides, ConfigError, ConfigLoader, RecoveryStoppedError, ResolvedRuntime
 from opencode.contracts.events import (
     PY_PERMISSION_REQUESTED,
     PY_REASONING_DELTA,
@@ -87,6 +93,11 @@ from opencode.contracts.events import (
     PY_TEXT_FINALIZED,
     PY_TOOL_FINISHED,
     PY_TOOL_STARTED,
+    ConfigSnapshotV3,
+    McpServerRef,
+    SessionCreatedData,
+    SessionCreatedDataV2,
+    SessionCreatedDataV3,
 )
 from opencode.contracts.messages import (
     AssistantMessage,
@@ -95,6 +106,7 @@ from opencode.contracts.messages import (
     SessionMessage,
     UserMessage,
 )
+from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import (
     ApprovalExpiredError,
@@ -107,7 +119,10 @@ from opencode.storage import (
     LifecycleCleanupFailedError,
     NotFoundError,
     SessionReadOnlyError,
+    StoreError,
+    open_database,
 )
+from opencode.storage.repos import ReadRepositories, SessionCreatedRow
 from opencode.tools.builtin import (
     BashAdapter,
     FsEditAdapter,
@@ -133,6 +148,21 @@ _HISTORY_PAGE_SIZE = 100
 _MIGRATION_EXIT_CODE = 70
 #: Cancel cleanup failure exit code (§7 L335 honest cleanup).
 _CLEANUP_EXIT_CODE = 3
+#: Session-selection stop exit code (R4-S6, §6.2 L107; #94 "not 0/1/2" family).
+_SELECTION_EXIT_CODE = 4
+#: Windows-required-variables minimal set (T-B-038 ⑥②): a stdio server's
+#: argv is exec'd with NO inherited host environment, so the composition
+#: must hand it at least these two or nearly every child binary dies at
+#: startup (SystemRoot for crypto/encoding roots, PATH for finding anything).
+_WIN32_MINIMAL_ENV_KEYS = ("SystemRoot", "PATH")
+#: The ``py.session.created`` wire-model routing by stored version (R4-S6):
+#: the repos face returns raw columns; deciding which model decodes ``data``
+#: is the CLI's (the same raw-columns split as the run rows).
+_SESSION_CREATED_MODELS: dict[int, type[SessionCreatedData]] = {
+    1: SessionCreatedData,
+    2: SessionCreatedDataV2,
+    3: SessionCreatedDataV3,
+}
 #: Single-shot terminal status -> process exit code (#94).
 _ROUND_EXIT_CODES = {
     RunStatusValue.SUCCEEDED: 0,
@@ -244,6 +274,23 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help=f"runner step budget (unset falls through to config, builtin default {DEFAULT_MAX_STEPS})",
     )
+    # R4-S6 (§6.2 L107): the session-selection face. Mutually exclusive —
+    # one resume intent per process; both given is a usage error (exit 2).
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        default=False,
+        help="resume the most recent session created in this working directory (no match starts a fresh session)",
+    )
+    selection.add_argument(
+        "--session",
+        dest="session_id",
+        default=None,
+        metavar="ID",
+        help="resume one specific session by id instead of creating a new one",
+    )
     args = parser.parse_args(argv)
     args.base_url = args.base_url or os.environ.get("OPENCODE_PY_BASE_URL")
     args.api_key = args.api_key or os.environ.get("OPENCODE_PY_API_KEY")
@@ -354,6 +401,156 @@ def _restore_sigint(previous: Callable[[int, FrameType | None], Any] | int | Non
         signal.signal(signal.SIGINT, previous)
 
 
+# -- R4-S6 (§6.2 L107): session selection + recovery --------------------------
+
+
+class _SelectionError(Exception):
+    """Session selection refused to proceed (R4-S6): one stderr line, exit 4.
+
+    The diagnostic face, not a failed run: unknown ``--session`` id, an
+    unreadable creation row, a storage stop, or recovery refusing to resume
+    (v1 snapshot / vanished working directory / MCP fingerprint drift,
+    §6.1 L302). Never a traceback — the user must be able to read the one
+    line and reconfigure.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveredSession:
+    """The selection act's outcome (R4-S6): identity + the driving runtime.
+
+    ``session_id`` is the row's id (skips ``service.create``); ``working_dir``
+    is the RECORDED directory (the App sweep roots and the service working
+    directory replay it — the host does not silently re-root a session);
+    ``runtime`` is the recovered face (recorded snapshot as the behavioral
+    baseline, §6.1 L302), never a re-read of the current config.
+    """
+
+    session_id: str
+    working_dir: str
+    runtime: ResolvedRuntime
+
+
+def _model_created_data(row: SessionCreatedRow) -> SessionCreatedData:
+    """Route one raw creation row onto its wire model by version (R4-S6).
+
+    The routing the repos face deliberately does not do: version 1/2/3 map
+    to their own models (an unknown version is a selection stop, not a
+    coerce through the nearest model), and a decode failure — including the
+    §6.2 L297 snapshot-hash mismatch the model validator recomputes — is one
+    single-line diagnostic, never a raw pydantic traceback on the exit-4
+    face.
+    """
+    model = _SESSION_CREATED_MODELS.get(row.version)
+    if model is None:
+        raise _SelectionError(
+            f"session {row.session_id} has a py.session.created row of unsupported version {row.version}"
+        )
+    try:
+        return model.model_validate(row.data)
+    except ValidationError as error:
+        message = str(error).splitlines()[0] if str(error) else "validation failed"
+        raise _SelectionError(
+            f"session {row.session_id} has an unreadable py.session.created row: {message}"
+        ) from error
+
+
+async def _select_session_async(
+    db_path: Path,
+    *,
+    session_id: str | None,
+    working_dir: str,
+) -> SessionCreatedRow | None:
+    """The selection window (R4-S6): a readonly database, read repos, closed.
+
+    Its own small loop and its own database handle, both closed before any
+    App exists (the chicken-and-egg: the App needs the recovered runtime,
+    so the row that produces it must be read first). ``--session`` with no
+    row is a stop (§4 未建 session 报 NotFound); ``--continue`` with no row
+    for this working directory is ``None`` — the caller's fresh-session
+    branch (§6.2 L107 没有则新建). Storage failures stay single-line through
+    the same ``_SelectionError`` face.
+    """
+    try:
+        async with open_database(db_path, mode="readonly") as database:
+            repos = ReadRepositories(database.engine)
+            if session_id is not None:
+                row = await repos.session_created_by_id(session_id)
+                if row is None:
+                    raise _SelectionError(f"session {session_id} was not found in the database")
+            else:
+                row = await repos.latest_session_created_by_working_dir(working_dir)
+    except StoreError as error:
+        raise _SelectionError(f"session selection stopped: {error}") from error
+    return row
+
+
+def _select_session(
+    db_path: Path,
+    *,
+    session_id: str | None,
+    working_dir: str,
+    loader: ConfigLoader,
+    host_mcp_servers: Sequence[McpServerRef],
+) -> _RecoveredSession | None:
+    """The full selection act (R4-S6): window, decode, then recover-verify.
+
+    Returns ``None`` only for ``--continue`` with no session ever created in
+    this working directory (the fresh-session branch). Everything else is a
+    :class:`_SelectionError`: unknown id, unreadable row, storage stop, or
+    recovery refusing to resume. The working-directory match is the exact
+    recorded string (OP-R4-3: no normalization, no case folding), and the
+    drift comparison runs against the HOST's current refs — the recovered
+    session must be compatible with the process about to drive it.
+    """
+    row = asyncio.run(_select_session_async(db_path, session_id=session_id, working_dir=working_dir))
+    if row is None:
+        return None
+    data = _model_created_data(row)
+    try:
+        runtime = loader.recover(data, current_mcp_servers=list(host_mcp_servers))
+    except RecoveryStoppedError as error:
+        raise _SelectionError(f"cannot resume session {row.session_id}: {error}") from error
+    return _RecoveredSession(session_id=row.session_id, working_dir=data.working_dir, runtime=runtime)
+
+
+def _compose_mcp_manager(loader: ConfigLoader) -> McpManager | None:
+    """§6 L304 first sentence (R4-S6): config entries -> manager registration.
+
+    The host-tier ``mcp.servers`` block becomes one
+    :class:`~opencode.mcp.manager.StdioServerDefinition` per entry — argv
+    exec'd directly, the declared environment keys resolved AGAINST the
+    boot ``os.environ`` with the config-declared value as the fallback
+    (os.environ wins: a secret the operator exported overrides the file),
+    plus the win32 minimal set (T-B-038 ⑥②). Registration only:
+    ``add_server`` never spawns — no server process exists until a call
+    demands one (zero-side-effect composition; the App owns the close).
+    No entries -> no manager (``None`` = the App's no-MCP composition).
+    """
+    entries = loader.mcp_server_entries()
+    if not entries:
+        return None
+    manager = McpManager()
+    for entry in entries:
+        env = {key: os.environ.get(key, value) for key, value in entry.environment.items()}
+        if sys.platform == "win32":
+            for key in _WIN32_MINIMAL_ENV_KEYS:
+                if key not in env:
+                    resolved = os.environ.get(key)
+                    if resolved is not None:
+                        env[key] = resolved
+        manager.add_server(
+            StdioServerDefinition(
+                name=entry.name,
+                command=entry.command[0],
+                args=tuple(entry.command[1:]),
+                cwd=entry.cwd,
+                env=env,
+            )
+        )
+    return manager
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -378,7 +575,11 @@ def main(
         # escape the shell would render as the failed-run exit 1.
         provider = MaasAdapter(args.base_url, args.api_key)
         loader = ConfigLoader(global_config=args.config, project_root=args.project_root)
-        runtime = loader.resolve_runtime(
+        # R4-S6: the host resolves its CURRENT v3 face first — it carries the
+        # MCP refs the App scan and the recovered session's drift check both
+        # compare against, and it stays the driving runtime for the
+        # fresh-session branch. A ConfigError here still lands on the 70 face.
+        host_runtime = loader.resolve_runtime_v3(
             cli=CliOverrides(
                 model=args.model,
                 context_limit=args.context_limit,
@@ -388,6 +589,27 @@ def main(
             ),
             endpoint_url=args.base_url,
         )
+        if isinstance(host_runtime.snapshot, ConfigSnapshotV3):
+            host_mcp_refs = list(host_runtime.snapshot.mcp_servers)
+        else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
+            host_mcp_refs = []
+        # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
+        # App exists — a refusal exits without ever triggering the startup
+        # recovery scan (structural: recover must precede App, so other
+        # sessions' non-terminal run hygiene defers to the next successful
+        # boot — ④ disclosed, not a defect). --continue with no match in this
+        # working directory falls through to the fresh-session branch.
+        recovery: _RecoveredSession | None = None
+        if args.continue_session or args.session_id is not None:
+            recovery = _select_session(
+                db_path,
+                session_id=args.session_id,
+                working_dir=os.getcwd(),
+                loader=loader,
+                host_mcp_servers=host_mcp_refs,
+            )
+        runtime = recovery.runtime if recovery is not None else host_runtime
+        mcp_manager = _compose_mcp_manager(loader)
         return asyncio.run(
             _drive(
                 db_path,
@@ -396,8 +618,17 @@ def main(
                 prompt_text=" ".join(args.prompt),
                 lines=lines,
                 wait_hook=wait_hook,
+                session_id=recovery.session_id if recovery is not None else None,
+                working_dir=recovery.working_dir if recovery is not None else None,
+                mcp_manager=mcp_manager,
+                mcp_refs=host_mcp_refs,
             )
         )
+    except _SelectionError as error:
+        # R4-S6: the selection stop face — one stderr line, exit 4, no
+        # traceback (a diagnostic the user reads and reconfigures on).
+        print(f"opencode: {error}", file=sys.stderr)
+        return _SELECTION_EXIT_CODE
     except KeyboardInterrupt:
         # A real SIGINT outside the driven loop: asyncio.run has already
         # cancelled and drained the scheduled tasks (their handlers commit the
@@ -550,21 +781,40 @@ async def _drive(
     prompt_text: str,
     lines: Iterable[str] | None,
     wait_hook: Callable[[], None] | None,
+    session_id: str | None,
+    working_dir: str | None,
+    mcp_manager: McpManager | None,
+    mcp_refs: Sequence[McpServerRef],
 ) -> int:
-    """One process = one migrated database + one App + one fresh session.
+    """One process = one migrated database + one App + one driving session.
 
     R3-S6: the resolved runtime face drives every injection point — the fs
     adapters receive the declared roots (working_dir always stays a root),
     App receives the loader-built RuntimeSettings (system_prompt included)
-    and the snapshot's max_steps, and ``service.create`` persists the v2
+    and the snapshot's max_steps, and ``service.create`` persists the v3
     config snapshot as the session's behavioral baseline (§6.1 L302).
 
     R3-S7: the snapshot's permission rules also reach the live engine
     (``rules=`` on App, source="project"), and one ``_ReplInput`` owns all
     line reading + in-band SIGINT routing for both the single-shot and REPL
     faces.
+
+    R4-S6: ``session_id`` decides the driving session — ``None`` creates a
+    fresh one (``service.create``); a recovered id skips create and drives
+    that session directly (the first gated write is the first prompt's run
+    event, so the startup scan stays write-before-session semantics). The
+    recovered runtime is the recorded snapshot replayed (fs roots, rules,
+    max_steps, system_prompt all come from it, §6.1 L302); the App's
+    ``working_dir`` is the RECORDED directory (never silently re-rooted);
+    ``mcp_manager``/``mcp_refs`` are the host's current MCP composition —
+    registration only, closed by the App lifecycle (§7 L339).
     """
     global _ACTIVE_INPUT
+    # R4-S6: idempotency keys on (session_id, request_id, text), and a
+    # recovered session's log already carries ids minted by earlier boots —
+    # a new boot reusing a plain ``req_cli_1`` with a different text would
+    # falsely collide, so every driven boot gets its own uuid namespace.
+    request_base = f"req_cli_{uuid4().hex[:12]}"
     rules = permission_rules_from_snapshot(runtime.snapshot.permission_rules)
     app = App(
         db_path,
@@ -581,21 +831,37 @@ async def _drive(
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
         rules=rules,
+        working_dir=working_dir,
+        mcp_manager=mcp_manager,
+        mcp_refs=mcp_refs,
     )
+    # R4-S6: the driving act itself waits for the startup scan. The gated
+    # store already orders every WRITE behind the scan, but prompt()'s
+    # active-run busy check is a READ — a recovered session whose crashed run
+    # the scan has not folded yet would falsely report busy. Awaiting the
+    # gate first keeps the scan-before-driving order total (fail-closed: a
+    # scan failure surfaces here exactly as it would at the first write).
+    await app.recovery_gate.wait()
     repl_input = _ReplInput(lines, run_reader=not prompt_text)
     try:
-        session = await app.service.create(runtime.snapshot)
-        session_id = session.session_id
+        if session_id is None:
+            session = await app.service.create(runtime.snapshot)
+            session_id = session.session_id
         _ACTIVE_INPUT = repl_input
         if prompt_text:
             status = await _run_round(
-                app, session_id, prompt_text, request_id="req_cli_1", wait_hook=wait_hook, repl_input=repl_input
+                app,
+                session_id,
+                prompt_text,
+                request_id=f"{request_base}_1",
+                wait_hook=wait_hook,
+                repl_input=repl_input,
             )
             if status is None:
                 return _CLEANUP_EXIT_CODE
             _print_terminal(status)
             return _ROUND_EXIT_CODES[status.status]
-        return await _repl(app, session_id, repl_input=repl_input, wait_hook=wait_hook)
+        return await _repl(app, session_id, repl_input=repl_input, wait_hook=wait_hook, request_base=request_base)
     finally:
         # Dropped before close: a SIGINT during the graceful close falls back
         # to the default raise (the 130 face) instead of vanishing in-band.
@@ -609,6 +875,7 @@ async def _repl(
     *,
     repl_input: _ReplInput,
     wait_hook: Callable[[], None] | None,
+    request_base: str,
 ) -> int:
     """The REPL face: commands first (/exit, /history, /approve, /reject),
     any other line is one round; the prompt echoes only on real stdin."""
@@ -640,7 +907,12 @@ async def _repl(
             continue
         counter += 1
         status = await _run_round(
-            app, session_id, command, request_id=f"req_cli_{counter}", wait_hook=wait_hook, repl_input=repl_input
+            app,
+            session_id,
+            command,
+            request_id=f"{request_base}_{counter}",
+            wait_hook=wait_hook,
+            repl_input=repl_input,
         )
         if status is None:
             return _CLEANUP_EXIT_CODE

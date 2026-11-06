@@ -926,6 +926,11 @@ async def test_gate_blocks_writes_until_the_scan_completes_and_fails_closed(tmp_
         create_task = asyncio.create_task(app.service.create(_SNAPSHOT))
         await asyncio.sleep(0.05)
         assert not create_task.done(), "the gated write must wait for the scan"
+        # reads stay ungated: the same blocked window serves a read instantly
+        from opencode.storage.repos import NotFoundError
+
+        with pytest.raises(NotFoundError):
+            await app.service.run_status("run_r4s6_ungated_read_probe")
         release.set()
         await create_task
         await app.close()

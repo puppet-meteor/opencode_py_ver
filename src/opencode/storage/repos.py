@@ -96,6 +96,26 @@ REASON_SESSION_ROW_DECODE_FAILED = "session_row_decode_failed"
 #: (sanitized reason; T-C1-010 §7 idempotency query face).
 REASON_DEDUPE_ROW_UNEXPECTED = "dedupe_row_unexpected_type"
 
+#: A ``py.session.created`` events row whose JSON data no longer decodes or is
+#: not a JSON object (sanitized reason; T-C1-040 R4-S6 selection face).
+REASON_CREATED_ROW_DECODE_FAILED = "created_row_decode_failed"
+
+#: More than one ``py.session.created`` row for one session_id, or the same
+#: session appearing twice in the working-dir enumeration (sanitized reason;
+#: T-C1-040 — one session has exactly one creation event by construction).
+REASON_CREATED_ROW_DUPLICATED = "created_row_duplicated"
+
+#: A ``py.session.created`` row whose version is outside the registry's
+#: registered 1/2/3 set (sanitized reason; T-C1-040 — the commit path rejects
+#: unknown versions, so a stored row outside the set is corruption).
+REASON_CREATED_ROW_UNEXPECTED_VERSION = "created_row_unexpected_version"
+
+#: The registered wire versions of ``py.session.created`` (the three
+#: EventDefinition rows in the contracts registry; pinned here so repos stays
+#: contracts-registry-free — the same pinned-vocabulary tradeoff as the runs
+#: and permissions scan statements above).
+_SESSION_CREATED_VERSIONS = (1, 2, 3)
+
 _SELECT_SESSION = sa.text(
     "SELECT session_id, status, active_run_id, config_snapshot, snapshot_hash, applied_seq, diagnostic "
     "FROM sessions WHERE session_id = :sid"
@@ -140,6 +160,19 @@ _SELECT_NON_TERMINAL_RUNS = sa.text(
 _SELECT_PENDING_PERMISSIONS = sa.text(
     "SELECT session_id, permission_id, execution_id FROM permissions "
     "WHERE state = 'pending' ORDER BY session_id, permission_id"
+)
+# -- T-C1-040 (R4-S6): the CLI session-selection statements. The sessions
+# table carries no working_dir column (0001_initial), so both selection
+# queries scan the events log by type; ``created`` is the INTEGER epoch-ms
+# column (0001_initial L64), so the numeric ORDER BY is the "most recent
+# session" ordering with the session_id DESC tail as the deterministic
+# tie-break for rows minted within the same millisecond.
+_SELECT_SESSION_CREATED_BY_ID = sa.text(
+    "SELECT version, created, data FROM events WHERE session_id = :sid AND type = 'py.session.created' ORDER BY seq"
+)
+_SELECT_SESSION_CREATED_ALL = sa.text(
+    "SELECT session_id, version, created, data FROM events "
+    "WHERE type = 'py.session.created' ORDER BY created DESC, session_id DESC"
 )
 
 
@@ -250,6 +283,23 @@ class PendingPermissionRow:
     session_id: str
     permission_id: str
     execution_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCreatedRow:
+    """One ``py.session.created`` events row's raw columns (T-C1-040, R4-S6).
+
+    The CLI session-selection face: ``version``/``created``/``data`` are the
+    raw stored columns (0001_initial) — deciding which wire model decodes
+    ``data`` (SessionCreatedData v1/v2/v3 by version) stays with the caller,
+    the same raw-columns split as :class:`RunRow`. ``created`` is the INTEGER
+    epoch-ms event timestamp, the "most recent" ordering key.
+    """
+
+    session_id: str
+    version: int
+    created: int
+    data: JsonObject
 
 
 def _corrupt(reason: str, message: str, details: JsonObject) -> StorageCorruptError:
@@ -626,6 +676,94 @@ class ReadRepositories:
             )
             for row in rows
         ]
+
+    # -- T-C1-040 (R4-S6): the CLI session-selection faces -----------------------
+
+    async def session_created_by_id(self, session_id: str) -> SessionCreatedRow | None:
+        """The ``py.session.created`` row of one session; ``None`` when absent.
+
+        The ``--session`` selection lookup: raw columns only (the caller routes
+        the wire model by version). One session has exactly one creation event
+        by construction — more than one row is StorageCorrupt with the named
+        sanitized reason, never a "pick one" fiction.
+        """
+        _require_session_id(session_id)
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_SESSION_CREATED_BY_ID, {"sid": session_id})).fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise _corrupt(
+                REASON_CREATED_ROW_DUPLICATED,
+                f"session {session_id} has {len(rows)} py.session.created rows",
+                {"reason": REASON_CREATED_ROW_DUPLICATED, "session_id": session_id, "row_count": len(rows)},
+            )
+        return self._decode_created_row(session_id, rows[0])
+
+    async def latest_session_created_by_working_dir(self, working_dir: str) -> SessionCreatedRow | None:
+        """The most recent ``py.session.created`` row for one working directory.
+
+        The ``--continue`` selection lookup (OP-R4-3 conservative reading):
+        the recorded ``data["working_dir"]`` string must be exactly equal — no
+        normalization, no prefix, no case folding, no separator folding. Every
+        created row is decoded fail-closed in the deterministic
+        ``created DESC, session_id DESC`` order (an undecodable row anywhere
+        fails the query, the prompt_by_run_id discipline), a session appearing
+        twice is StorageCorrupt, and ``None`` means no session was ever
+        created in this directory (the caller's fresh-session branch).
+        """
+        if not isinstance(working_dir, str) or not working_dir:
+            raise ValueError("working_dir must be a non-empty string")
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_SESSION_CREATED_ALL)).fetchall()
+        decoded: list[SessionCreatedRow] = []
+        seen: set[str] = set()
+        for row in rows:
+            record = self._decode_created_row(str(row.session_id), row)
+            if record.session_id in seen:
+                raise _corrupt(
+                    REASON_CREATED_ROW_DUPLICATED,
+                    f"session {record.session_id} has more than one py.session.created row",
+                    {"reason": REASON_CREATED_ROW_DUPLICATED, "session_id": record.session_id},
+                )
+            seen.add(record.session_id)
+            decoded.append(record)
+        for record in decoded:
+            recorded = record.data.get("working_dir")
+            if isinstance(recorded, str) and recorded == working_dir:
+                return record
+        return None
+
+    def _decode_created_row(self, session_id: str, row: Any) -> SessionCreatedRow:
+        """Decode one created row's raw columns, fail closed (§3.2.1 read boundary).
+
+        The version pin mirrors the dedupe-row discipline: the registry
+        registers 1/2/3 and the commit path rejects anything else, so a stored
+        row outside the set is corruption — never coerced through the nearest
+        wire model. Details carry the sanitized reason + session id only.
+        """
+        version = int(row.version)
+        if version not in _SESSION_CREATED_VERSIONS:
+            raise _corrupt(
+                REASON_CREATED_ROW_UNEXPECTED_VERSION,
+                f"session {session_id} has a py.session.created row of unregistered version {version}",
+                {"reason": REASON_CREATED_ROW_UNEXPECTED_VERSION, "session_id": session_id, "version": version},
+            )
+        try:
+            data = _json_column(row.data)
+        except ValueError as error:
+            raise _corrupt(
+                REASON_CREATED_ROW_DECODE_FAILED,
+                f"session {session_id} has an undecodable py.session.created row",
+                {"reason": REASON_CREATED_ROW_DECODE_FAILED, "session_id": session_id},
+            ) from error
+        if not isinstance(data, dict):
+            raise _corrupt(
+                REASON_CREATED_ROW_DECODE_FAILED,
+                f"session {session_id} has a py.session.created row whose data is not a JSON object",
+                {"reason": REASON_CREATED_ROW_DECODE_FAILED, "session_id": session_id},
+            )
+        return SessionCreatedRow(session_id=session_id, version=version, created=int(row.created), data=data)
 
     def _decode_prompt_row(self, session_id: str, row: Any) -> AcceptedPrompt:
         """Decode one events row into AcceptedPrompt, fail closed (§3.2.1 read boundary).
