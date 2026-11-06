@@ -1,0 +1,3332 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "models": {
+    "ConfigSnapshot": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "R1 minimal legal config snapshot (CORE-CONTRACTS §6.1, T-A-002 ruling).\n\nExactly ``{\"schema_version\": 1, \"permission_rules\": []}``: both fields must be\npresent, rules must be empty, and no extra keys (an embedded hash is rejected —\nthe digest lives only in event data ``snapshot_hash``). Executable snapshots\n(R3+) use a new schema_version; version 1 decoding and old fixtures are kept.",
+      "properties": {
+        "permission_rules": {
+          "items": {
+            "$ref": "#/$defs/JsonObject"
+          },
+          "maxItems": 0,
+          "title": "Permission Rules",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "permission_rules"
+      ],
+      "title": "ConfigSnapshot",
+      "type": "object"
+    },
+    "ConfigSnapshotV2": {
+      "$defs": {
+        "InstructionSource": {
+          "additionalProperties": false,
+          "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",
+          "properties": {
+            "path": {
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "text"
+          ],
+          "title": "InstructionSource",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "SnapshotLimits": {
+          "additionalProperties": false,
+          "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",
+          "properties": {
+            "context_limit": {
+              "minimum": 1,
+              "title": "Context Limit",
+              "type": "integer"
+            },
+            "max_steps": {
+              "minimum": 1,
+              "title": "Max Steps",
+              "type": "integer"
+            },
+            "output_reserve": {
+              "minimum": 1,
+              "title": "Output Reserve",
+              "type": "integer"
+            },
+            "safety_margin": {
+              "minimum": 0,
+              "title": "Safety Margin",
+              "type": "integer"
+            },
+            "temperature": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Temperature"
+            },
+            "timeout_s": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout S",
+              "type": "number"
+            }
+          },
+          "required": [
+            "context_limit",
+            "output_reserve",
+            "timeout_s",
+            "safety_margin",
+            "max_steps"
+          ],
+          "title": "SnapshotLimits",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "R3-S6 executable config snapshot (CORE-CONTRACTS §6.1 L287, schema_version 2).\n\nDeliberately a standalone model, NOT a ``ConfigSnapshot`` subclass: v1 is\nthe fixed minimal domain whose canonical text and fingerprint are frozen\n(§6.2/§9 L368); v2 is the executable face (§6.1 L289) where every runtime\nfield is explicit and none carries a fabricated default. MCP refs and\nboot fingerprints are omitted outright (R4 face, disclosed) rather than\ndefaulted, per the §6.1 L291 no-silent-backfill spirit; ``endpoint_ref``\nis the sanitized provider base URL (userinfo/query stripped, loader-side\nnormalization); the provider stays ``maas`` (Phase 1, OP-R3-10).",
+      "properties": {
+        "endpoint_ref": {
+          "minLength": 1,
+          "title": "Endpoint Ref",
+          "type": "string"
+        },
+        "instructions": {
+          "items": {
+            "$ref": "#/$defs/InstructionSource"
+          },
+          "title": "Instructions",
+          "type": "array"
+        },
+        "limits": {
+          "$ref": "#/$defs/SnapshotLimits"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "permission_rules": {
+          "items": {
+            "$ref": "#/$defs/JsonObject"
+          },
+          "title": "Permission Rules",
+          "type": "array"
+        },
+        "roots": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Roots",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "model",
+        "endpoint_ref",
+        "roots",
+        "permission_rules",
+        "instructions",
+        "limits"
+      ],
+      "title": "ConfigSnapshotV2",
+      "type": "object"
+    },
+    "ConfigSnapshotV3": {
+      "$defs": {
+        "InstructionSource": {
+          "additionalProperties": false,
+          "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",
+          "properties": {
+            "path": {
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "text"
+          ],
+          "title": "InstructionSource",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "McpServerRef": {
+          "additionalProperties": false,
+          "description": "One host-tier local MCP server reference + its boot fingerprint (§6.1 L287, R4-S3).\n\nThe v3 snapshot's MCP face: ``server`` is the host-tier server name;\n``command`` is the argv list (exec'd directly, never through a shell);\n``env_refs`` are the environment KEY NAMES the server needs — values\nnever ride the snapshot (§6.2.1/L302: secrets and credentials stay\nreferences); ``fingerprint`` is the deterministic startup digest over\nserver+command+env_refs (OP-R4-2 conservative default: ``cwd`` is\ncarried but excluded from the digest — the launch identity the policy\nbinds to is argv + referenced environment shape, §5.2 L268).",
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "title": "Command",
+              "type": "array"
+            },
+            "cwd": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cwd"
+            },
+            "env_refs": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Env Refs",
+              "type": "array"
+            },
+            "fingerprint": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Fingerprint",
+              "type": "string"
+            },
+            "server": {
+              "minLength": 1,
+              "title": "Server",
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "command",
+            "fingerprint"
+          ],
+          "title": "McpServerRef",
+          "type": "object"
+        },
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "SnapshotLimits": {
+          "additionalProperties": false,
+          "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",
+          "properties": {
+            "context_limit": {
+              "minimum": 1,
+              "title": "Context Limit",
+              "type": "integer"
+            },
+            "max_steps": {
+              "minimum": 1,
+              "title": "Max Steps",
+              "type": "integer"
+            },
+            "output_reserve": {
+              "minimum": 1,
+              "title": "Output Reserve",
+              "type": "integer"
+            },
+            "safety_margin": {
+              "minimum": 0,
+              "title": "Safety Margin",
+              "type": "integer"
+            },
+            "temperature": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Temperature"
+            },
+            "timeout_s": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout S",
+              "type": "number"
+            }
+          },
+          "required": [
+            "context_limit",
+            "output_reserve",
+            "timeout_s",
+            "safety_margin",
+            "max_steps"
+          ],
+          "title": "SnapshotLimits",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "R4-S3 executable config snapshot (§6.1 L287, schema_version 3).\n\nStandalone like v2 (NOT a ``ConfigSnapshotV2`` subclass): each schema\nversion pins its own domain, and a subclass would make every v2-typed\n``isinstance`` gate (the service create/coerce routing, the CLI\nface) silently accept v3 rows. Adds exactly one face over v2:\n``mcp_servers``, the host-tier local MCP server references with their\nstartup fingerprints (§6 L287). Required with no default — a snapshot\nwithout the face must say so explicitly with ``[]`` (§6.1 L291\nno-fabrication spirit).",
+      "properties": {
+        "endpoint_ref": {
+          "minLength": 1,
+          "title": "Endpoint Ref",
+          "type": "string"
+        },
+        "instructions": {
+          "items": {
+            "$ref": "#/$defs/InstructionSource"
+          },
+          "title": "Instructions",
+          "type": "array"
+        },
+        "limits": {
+          "$ref": "#/$defs/SnapshotLimits"
+        },
+        "mcp_servers": {
+          "items": {
+            "$ref": "#/$defs/McpServerRef"
+          },
+          "title": "Mcp Servers",
+          "type": "array"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "permission_rules": {
+          "items": {
+            "$ref": "#/$defs/JsonObject"
+          },
+          "title": "Permission Rules",
+          "type": "array"
+        },
+        "roots": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Roots",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 3,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "model",
+        "endpoint_ref",
+        "roots",
+        "permission_rules",
+        "instructions",
+        "limits",
+        "mcp_servers"
+      ],
+      "title": "ConfigSnapshotV3",
+      "type": "object"
+    },
+    "DurableEvent": {
+      "$defs": {
+        "BaseModel": {
+          "properties": {},
+          "title": "BaseModel",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "Committed event: draft + seq, allocated per session inside the DB transaction (seq >= 1).",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/BaseModel"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent",
+      "type": "object"
+    },
+    "EphemeralEvent": {
+      "$defs": {
+        "BaseModel": {
+          "properties": {},
+          "title": "BaseModel",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "Live-only envelope (§3.1): no version, no seq, no durable cursor.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/BaseModel"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "session_id",
+        "created_at",
+        "data"
+      ],
+      "title": "EphemeralEvent",
+      "type": "object"
+    },
+    "EventDraft": {
+      "$defs": {
+        "BaseModel": {
+          "properties": {},
+          "title": "BaseModel",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "Pre-commit draft (§3.1): id/type/version/session_id/created_at/data/metadata, no seq.\n\nIDs are generated before the first retry attempt and reused across retries. The\nregistry is not consulted at construction time; commit-time validation owns\ntype/version/membership checks (§3.2).",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/BaseModel"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data"
+      ],
+      "title": "EventDraft",
+      "type": "object"
+    },
+    "InstructionSource": {
+      "additionalProperties": false,
+      "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "text"
+      ],
+      "title": "InstructionSource",
+      "type": "object"
+    },
+    "McpServerRef": {
+      "additionalProperties": false,
+      "description": "One host-tier local MCP server reference + its boot fingerprint (§6.1 L287, R4-S3).\n\nThe v3 snapshot's MCP face: ``server`` is the host-tier server name;\n``command`` is the argv list (exec'd directly, never through a shell);\n``env_refs`` are the environment KEY NAMES the server needs — values\nnever ride the snapshot (§6.2.1/L302: secrets and credentials stay\nreferences); ``fingerprint`` is the deterministic startup digest over\nserver+command+env_refs (OP-R4-2 conservative default: ``cwd`` is\ncarried but excluded from the digest — the launch identity the policy\nbinds to is argv + referenced environment shape, §5.2 L268).",
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "cwd": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cwd"
+        },
+        "env_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Env Refs",
+          "type": "array"
+        },
+        "fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Fingerprint",
+          "type": "string"
+        },
+        "server": {
+          "minLength": 1,
+          "title": "Server",
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "command",
+        "fingerprint"
+      ],
+      "title": "McpServerRef",
+      "type": "object"
+    },
+    "PermissionClosedData": {
+      "additionalProperties": false,
+      "description": "``py.permission.closed`` v1 data (§3.1 L140): system close, never a fake host reject.\n\n``outcome`` covers expiry, cancellation (including the unconnected-approval\ncase, §5.2 L268) and restart recovery closure (§3.3).",
+      "properties": {
+        "outcome": {
+          "enum": [
+            "expired",
+            "cancelled",
+            "restart"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "permission_id": {
+          "minLength": 1,
+          "title": "Permission Id",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "permission_id",
+        "outcome",
+        "reason"
+      ],
+      "title": "PermissionClosedData",
+      "type": "object"
+    },
+    "PermissionExpiredData": {
+      "additionalProperties": false,
+      "description": "``py.permission.expired`` v1 data (§3.1 L140): expiry-check terminal of a saved decision.",
+      "properties": {
+        "decision_id": {
+          "minLength": 1,
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_id",
+        "reason"
+      ],
+      "title": "PermissionExpiredData",
+      "type": "object"
+    },
+    "PermissionRepliedData": {
+      "additionalProperties": false,
+      "description": "``py.permission.replied`` v1 data (§3.1 L140): the host reply.\n\n§5.2 L268: only an actual reject/once/always reply writes this event (a\npolicy deny never fakes a host reply); §7 L173: the first legal\ntransition wins and a late reply cannot override a closed permission.\n``source`` is pinned to ``host`` for v1 (the only approval channel).",
+      "properties": {
+        "permission_id": {
+          "minLength": 1,
+          "title": "Permission Id",
+          "type": "string"
+        },
+        "reply": {
+          "enum": [
+            "once",
+            "always",
+            "reject"
+          ],
+          "title": "Reply",
+          "type": "string"
+        },
+        "source": {
+          "const": "host",
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "permission_id",
+        "reply",
+        "source"
+      ],
+      "title": "PermissionRepliedData",
+      "type": "object"
+    },
+    "PermissionRequestedData": {
+      "additionalProperties": false,
+      "description": "``py.permission.requested`` v1 data (§3.1 L140): approval for one pending call.\n\n``expires_at`` is the approval deadline (§5.2's 300 s default is producer\npolicy, not wire shape). Ownership of ``execution_id``/``input_hash``\nagainst the folded tool plan is commit-time fold validation (R3-S1), not\nwire shape.",
+      "properties": {
+        "action": {
+          "minLength": 1,
+          "title": "Action",
+          "type": "string"
+        },
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "input_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Hash",
+          "type": "string"
+        },
+        "permission_id": {
+          "minLength": 1,
+          "title": "Permission Id",
+          "type": "string"
+        },
+        "resources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Resources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "permission_id",
+        "execution_id",
+        "action",
+        "resources",
+        "input_hash",
+        "expires_at"
+      ],
+      "title": "PermissionRequestedData",
+      "type": "object"
+    },
+    "PermissionRevokedData": {
+      "additionalProperties": false,
+      "description": "``py.permission.revoked`` v1 data (§3.1 L140): host revocation of a saved decision.",
+      "properties": {
+        "decision_id": {
+          "minLength": 1,
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_id",
+        "reason"
+      ],
+      "title": "PermissionRevokedData",
+      "type": "object"
+    },
+    "PermissionSavedData": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "``py.permission.saved`` v1 data (§3.1 L140/§5.2): one saved always-decision.\n\n``scope``/``rule`` carry the concrete, displayable action/resource binding\n(§5.2: no unbounded wildcards; shell rules bind the full command/cwd).\nTheir inner shape is policy-owned — R3-S1 has no producer, so the wire\npins them as JSON objects, the ``ToolRequestedData.input`` precedent for\ntool-owned shapes. ``expires_at`` is optional (None = no explicit expiry;\nactivation is still bounded by ``boot_id``). Only decisions of the current\nboot activate (§5.2).",
+      "properties": {
+        "boot_id": {
+          "minLength": 1,
+          "title": "Boot Id",
+          "type": "string"
+        },
+        "decision_id": {
+          "minLength": 1,
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "rule": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "scope": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "decision_id",
+        "scope",
+        "rule",
+        "boot_id"
+      ],
+      "title": "PermissionSavedData",
+      "type": "object"
+    },
+    "PromptAcceptedData": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "UserMessage": {
+          "additionalProperties": false,
+          "description": "User-authored session message (§2.1 ``user`` row).\n\n``files`` stays out until media lands (M6): the R1 v1 wire has no optional\n``files`` field (CORE-CONTRACTS §2.1, T-A-003 option b) — a ``files`` key\n(even an empty list) on the wire is rejected here by ``extra=\"forbid\"``\nrather than silently dropped; Phase 1 callers send plain text and a non-empty\nfiles list is rejected as UnsupportedCapability at the tool/config layer.",
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "id": {
+              "minLength": 1,
+              "pattern": "^msg_",
+              "title": "Id",
+              "type": "string"
+            },
+            "metadata": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "user",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "created_at",
+            "text"
+          ],
+          "title": "UserMessage",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.prompt.accepted`` v1 data (§3.1): request_id + run_id + the accepted user message.",
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/UserMessage"
+        },
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "run_id",
+        "message"
+      ],
+      "title": "PromptAcceptedData",
+      "type": "object"
+    },
+    "ReasoningDeltaData": {
+      "additionalProperties": false,
+      "description": "``py.reasoning.delta`` ephemeral data (§3.1 L140): live preview only, never persisted.",
+      "properties": {
+        "delta": {
+          "title": "Delta",
+          "type": "string"
+        },
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "part_id": {
+          "minLength": 1,
+          "title": "Part Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "part_id",
+        "delta"
+      ],
+      "title": "ReasoningDeltaData",
+      "type": "object"
+    },
+    "ReasoningFinalizedData": {
+      "additionalProperties": false,
+      "description": "``py.reasoning.finalized`` v1 data (§3.1 L127): same shape as text, batch-ordered by ordinal.",
+      "properties": {
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "part_id": {
+          "minLength": 1,
+          "title": "Part Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "part_id",
+        "ordinal",
+        "text"
+      ],
+      "title": "ReasoningFinalizedData",
+      "type": "object"
+    },
+    "RunCancelRequestedData": {
+      "additionalProperties": false,
+      "description": "``py.run.cancel_requested`` v1 data (§3.1 L125): user/shutdown intent; never overrides a result.",
+      "properties": {
+        "reason": {
+          "enum": [
+            "user",
+            "shutdown"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "reason"
+      ],
+      "title": "RunCancelRequestedData",
+      "type": "object"
+    },
+    "RunFinishedData": {
+      "$defs": {
+        "CoreError": {
+          "additionalProperties": false,
+          "description": "Stable wire shape for every error crossing a seam (§8).",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/CoreErrorCode"
+            },
+            "details": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "message": {
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "title": "CoreError",
+          "type": "object"
+        },
+        "CoreErrorCode": {
+          "description": "Closed code registry from §8; R1 slices surface a subset of it.\n\nLater slices may need more codes, but codes are never removed or\nrenumbered: they are part of the wire contract.",
+          "enum": [
+            "ValidationError",
+            "UnsupportedCapability",
+            "NotFound",
+            "SessionBusy",
+            "Conflict",
+            "IdempotencyConflict",
+            "InvalidCursor",
+            "PermissionDenied",
+            "ApprovalUnavailable",
+            "ApprovalExpired",
+            "ToolTimeout",
+            "ToolFailed",
+            "ExecutionUnknown",
+            "ProviderUnavailable",
+            "ProviderStreamInterrupted",
+            "ContextLimitExceeded",
+            "SlowConsumer",
+            "StorageCorrupt",
+            "MigrationRequired",
+            "SessionReadOnly",
+            "SessionClosed",
+            "LifecycleCleanupFailed"
+          ],
+          "title": "CoreErrorCode",
+          "type": "string"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "``py.run.finished`` v1 data (§3.1 L138): folded outcome; idle messages project from this.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CoreError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "outcome"
+      ],
+      "title": "RunFinishedData",
+      "type": "object"
+    },
+    "RunStartedData": {
+      "additionalProperties": false,
+      "description": "``py.run.started`` v1 data (§3.1 L124): run identity only.",
+      "properties": {
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "title": "RunStartedData",
+      "type": "object"
+    },
+    "SessionCreatedData": {
+      "$defs": {
+        "ConfigSnapshot": {
+          "additionalProperties": false,
+          "description": "R1 minimal legal config snapshot (CORE-CONTRACTS §6.1, T-A-002 ruling).\n\nExactly ``{\"schema_version\": 1, \"permission_rules\": []}``: both fields must be\npresent, rules must be empty, and no extra keys (an embedded hash is rejected —\nthe digest lives only in event data ``snapshot_hash``). Executable snapshots\n(R3+) use a new schema_version; version 1 decoding and old fixtures are kept.",
+          "properties": {
+            "permission_rules": {
+              "items": {
+                "$ref": "#/$defs/JsonObject"
+              },
+              "maxItems": 0,
+              "title": "Permission Rules",
+              "type": "array"
+            },
+            "schema_version": {
+              "const": 1,
+              "title": "Schema Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schema_version",
+            "permission_rules"
+          ],
+          "title": "ConfigSnapshot",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash.",
+      "properties": {
+        "config_snapshot": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "snapshot_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Snapshot Hash",
+          "type": "string"
+        },
+        "working_dir": {
+          "minLength": 1,
+          "title": "Working Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "working_dir",
+        "config_snapshot",
+        "snapshot_hash"
+      ],
+      "title": "SessionCreatedData",
+      "type": "object"
+    },
+    "SessionCreatedDataV2": {
+      "$defs": {
+        "ConfigSnapshotV2": {
+          "additionalProperties": false,
+          "description": "R3-S6 executable config snapshot (CORE-CONTRACTS §6.1 L287, schema_version 2).\n\nDeliberately a standalone model, NOT a ``ConfigSnapshot`` subclass: v1 is\nthe fixed minimal domain whose canonical text and fingerprint are frozen\n(§6.2/§9 L368); v2 is the executable face (§6.1 L289) where every runtime\nfield is explicit and none carries a fabricated default. MCP refs and\nboot fingerprints are omitted outright (R4 face, disclosed) rather than\ndefaulted, per the §6.1 L291 no-silent-backfill spirit; ``endpoint_ref``\nis the sanitized provider base URL (userinfo/query stripped, loader-side\nnormalization); the provider stays ``maas`` (Phase 1, OP-R3-10).",
+          "properties": {
+            "endpoint_ref": {
+              "minLength": 1,
+              "title": "Endpoint Ref",
+              "type": "string"
+            },
+            "instructions": {
+              "items": {
+                "$ref": "#/$defs/InstructionSource"
+              },
+              "title": "Instructions",
+              "type": "array"
+            },
+            "limits": {
+              "$ref": "#/$defs/SnapshotLimits"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "permission_rules": {
+              "items": {
+                "$ref": "#/$defs/JsonObject"
+              },
+              "title": "Permission Rules",
+              "type": "array"
+            },
+            "roots": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Roots",
+              "type": "array"
+            },
+            "schema_version": {
+              "const": 2,
+              "title": "Schema Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schema_version",
+            "model",
+            "endpoint_ref",
+            "roots",
+            "permission_rules",
+            "instructions",
+            "limits"
+          ],
+          "title": "ConfigSnapshotV2",
+          "type": "object"
+        },
+        "InstructionSource": {
+          "additionalProperties": false,
+          "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",
+          "properties": {
+            "path": {
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "text"
+          ],
+          "title": "InstructionSource",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "SnapshotLimits": {
+          "additionalProperties": false,
+          "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",
+          "properties": {
+            "context_limit": {
+              "minimum": 1,
+              "title": "Context Limit",
+              "type": "integer"
+            },
+            "max_steps": {
+              "minimum": 1,
+              "title": "Max Steps",
+              "type": "integer"
+            },
+            "output_reserve": {
+              "minimum": 1,
+              "title": "Output Reserve",
+              "type": "integer"
+            },
+            "safety_margin": {
+              "minimum": 0,
+              "title": "Safety Margin",
+              "type": "integer"
+            },
+            "temperature": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Temperature"
+            },
+            "timeout_s": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout S",
+              "type": "number"
+            }
+          },
+          "required": [
+            "context_limit",
+            "output_reserve",
+            "timeout_s",
+            "safety_margin",
+            "max_steps"
+          ],
+          "title": "SnapshotLimits",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.session.created`` v2 data (§6.1 L287): the executable v2 snapshot.\n\nSubclasses v1 so every frozen consumer that types the field as\n``SessionCreatedData`` (the state fold's isinstance gate, the projector's\ncanonical_json store) accepts v2 rows unchanged; overrides only\n``config_snapshot``. The inherited model validator recomputes the digest\non every decode (§6.2 L297 drift re-check) through the generalized\n``compute_snapshot_hash``.",
+      "properties": {
+        "config_snapshot": {
+          "$ref": "#/$defs/ConfigSnapshotV2"
+        },
+        "snapshot_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Snapshot Hash",
+          "type": "string"
+        },
+        "working_dir": {
+          "minLength": 1,
+          "title": "Working Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "working_dir",
+        "config_snapshot",
+        "snapshot_hash"
+      ],
+      "title": "SessionCreatedDataV2",
+      "type": "object"
+    },
+    "SessionCreatedDataV3": {
+      "$defs": {
+        "ConfigSnapshotV3": {
+          "additionalProperties": false,
+          "description": "R4-S3 executable config snapshot (§6.1 L287, schema_version 3).\n\nStandalone like v2 (NOT a ``ConfigSnapshotV2`` subclass): each schema\nversion pins its own domain, and a subclass would make every v2-typed\n``isinstance`` gate (the service create/coerce routing, the CLI\nface) silently accept v3 rows. Adds exactly one face over v2:\n``mcp_servers``, the host-tier local MCP server references with their\nstartup fingerprints (§6 L287). Required with no default — a snapshot\nwithout the face must say so explicitly with ``[]`` (§6.1 L291\nno-fabrication spirit).",
+          "properties": {
+            "endpoint_ref": {
+              "minLength": 1,
+              "title": "Endpoint Ref",
+              "type": "string"
+            },
+            "instructions": {
+              "items": {
+                "$ref": "#/$defs/InstructionSource"
+              },
+              "title": "Instructions",
+              "type": "array"
+            },
+            "limits": {
+              "$ref": "#/$defs/SnapshotLimits"
+            },
+            "mcp_servers": {
+              "items": {
+                "$ref": "#/$defs/McpServerRef"
+              },
+              "title": "Mcp Servers",
+              "type": "array"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "permission_rules": {
+              "items": {
+                "$ref": "#/$defs/JsonObject"
+              },
+              "title": "Permission Rules",
+              "type": "array"
+            },
+            "roots": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Roots",
+              "type": "array"
+            },
+            "schema_version": {
+              "const": 3,
+              "title": "Schema Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schema_version",
+            "model",
+            "endpoint_ref",
+            "roots",
+            "permission_rules",
+            "instructions",
+            "limits",
+            "mcp_servers"
+          ],
+          "title": "ConfigSnapshotV3",
+          "type": "object"
+        },
+        "InstructionSource": {
+          "additionalProperties": false,
+          "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",
+          "properties": {
+            "path": {
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "text"
+          ],
+          "title": "InstructionSource",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "McpServerRef": {
+          "additionalProperties": false,
+          "description": "One host-tier local MCP server reference + its boot fingerprint (§6.1 L287, R4-S3).\n\nThe v3 snapshot's MCP face: ``server`` is the host-tier server name;\n``command`` is the argv list (exec'd directly, never through a shell);\n``env_refs`` are the environment KEY NAMES the server needs — values\nnever ride the snapshot (§6.2.1/L302: secrets and credentials stay\nreferences); ``fingerprint`` is the deterministic startup digest over\nserver+command+env_refs (OP-R4-2 conservative default: ``cwd`` is\ncarried but excluded from the digest — the launch identity the policy\nbinds to is argv + referenced environment shape, §5.2 L268).",
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "title": "Command",
+              "type": "array"
+            },
+            "cwd": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cwd"
+            },
+            "env_refs": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Env Refs",
+              "type": "array"
+            },
+            "fingerprint": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Fingerprint",
+              "type": "string"
+            },
+            "server": {
+              "minLength": 1,
+              "title": "Server",
+              "type": "string"
+            }
+          },
+          "required": [
+            "server",
+            "command",
+            "fingerprint"
+          ],
+          "title": "McpServerRef",
+          "type": "object"
+        },
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "SnapshotLimits": {
+          "additionalProperties": false,
+          "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",
+          "properties": {
+            "context_limit": {
+              "minimum": 1,
+              "title": "Context Limit",
+              "type": "integer"
+            },
+            "max_steps": {
+              "minimum": 1,
+              "title": "Max Steps",
+              "type": "integer"
+            },
+            "output_reserve": {
+              "minimum": 1,
+              "title": "Output Reserve",
+              "type": "integer"
+            },
+            "safety_margin": {
+              "minimum": 0,
+              "title": "Safety Margin",
+              "type": "integer"
+            },
+            "temperature": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Temperature"
+            },
+            "timeout_s": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout S",
+              "type": "number"
+            }
+          },
+          "required": [
+            "context_limit",
+            "output_reserve",
+            "timeout_s",
+            "safety_margin",
+            "max_steps"
+          ],
+          "title": "SnapshotLimits",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.session.created`` v3 data (§6.1 L287, R4-S3): the executable v3 snapshot.\n\nSubclasses v2 so every frozen consumer typing the field as\n``SessionCreatedData``/``SessionCreatedDataV2`` (the state fold's\nisinstance gate, the projector's canonical_json store) accepts v3 rows\nunchanged; overrides only ``config_snapshot``. The inherited model\nvalidator recomputes the digest on every decode (§6.2 L297 drift\nre-check) through the three-version ``compute_snapshot_hash``.",
+      "properties": {
+        "config_snapshot": {
+          "$ref": "#/$defs/ConfigSnapshotV3"
+        },
+        "snapshot_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Snapshot Hash",
+          "type": "string"
+        },
+        "working_dir": {
+          "minLength": 1,
+          "title": "Working Dir",
+          "type": "string"
+        }
+      },
+      "required": [
+        "working_dir",
+        "config_snapshot",
+        "snapshot_hash"
+      ],
+      "title": "SessionCreatedDataV3",
+      "type": "object"
+    },
+    "SnapshotLimits": {
+      "additionalProperties": false,
+      "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",
+      "properties": {
+        "context_limit": {
+          "minimum": 1,
+          "title": "Context Limit",
+          "type": "integer"
+        },
+        "max_steps": {
+          "minimum": 1,
+          "title": "Max Steps",
+          "type": "integer"
+        },
+        "output_reserve": {
+          "minimum": 1,
+          "title": "Output Reserve",
+          "type": "integer"
+        },
+        "safety_margin": {
+          "minimum": 0,
+          "title": "Safety Margin",
+          "type": "integer"
+        },
+        "temperature": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Temperature"
+        },
+        "timeout_s": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "context_limit",
+        "output_reserve",
+        "timeout_s",
+        "safety_margin",
+        "max_steps"
+      ],
+      "title": "SnapshotLimits",
+      "type": "object"
+    },
+    "StepFinishedData": {
+      "$defs": {
+        "AssistantMessage": {
+          "additionalProperties": false,
+          "description": "§2.1 L28 assistant row: model/parts/status plus optional terminal facts.\n\nThe optional fields are the v1 wire set named by the contract itself\n(finish/raw_finish/usage/cost_usd/error/completed_at); *new* fields later\nmean a version bump + upcaster (§8 L348), never same-version optionals.",
+          "properties": {
+            "completed_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Completed At"
+            },
+            "cost_usd": {
+              "anyOf": [
+                {
+                  "pattern": "^\\d+(\\.\\d+)?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cost Usd"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CoreError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "finish": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinishReason"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "id": {
+              "minLength": 1,
+              "pattern": "^msg_",
+              "title": "Id",
+              "type": "string"
+            },
+            "metadata": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "parts": {
+              "items": {
+                "discriminator": {
+                  "mapping": {
+                    "reasoning": "#/$defs/AssistantReasoningPart",
+                    "text": "#/$defs/AssistantTextPart",
+                    "tool": "#/$defs/AssistantToolPart"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/AssistantTextPart"
+                  },
+                  {
+                    "$ref": "#/$defs/AssistantReasoningPart"
+                  },
+                  {
+                    "$ref": "#/$defs/AssistantToolPart"
+                  }
+                ]
+              },
+              "title": "Parts",
+              "type": "array"
+            },
+            "raw_finish": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw Finish"
+            },
+            "status": {
+              "enum": [
+                "running",
+                "completed",
+                "failed",
+                "interrupted"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "type": {
+              "const": "assistant",
+              "title": "Type",
+              "type": "string"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Usage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "created_at",
+            "model",
+            "parts",
+            "status"
+          ],
+          "title": "AssistantMessage",
+          "type": "object"
+        },
+        "AssistantReasoningPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: reasoning part — optional per endpoint, never assumed present.",
+          "properties": {
+            "part_id": {
+              "minLength": 1,
+              "title": "Part Id",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "reasoning",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "part_id",
+            "text"
+          ],
+          "title": "AssistantReasoningPart",
+          "type": "object"
+        },
+        "AssistantTextPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: text part — ``part_id`` + ``text``.",
+          "properties": {
+            "part_id": {
+              "minLength": 1,
+              "title": "Part Id",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "part_id",
+            "text"
+          ],
+          "title": "AssistantTextPart",
+          "type": "object"
+        },
+        "AssistantToolPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: tool call part — the full plan/result state.\n\n``content`` is a required key (possibly ``[]`` while the call is pending);\nthe \"at least one model-readable text\" rule applies to tool terminal states\n(py.tool.finished, §2.1 L72), not to pending plans. State/effect vocabulary\nper §2.1 L35; transition legality is fold-owned (R2-S2), not wire-owned.",
+          "properties": {
+            "content": {
+              "items": {
+                "discriminator": {
+                  "mapping": {
+                    "file": "#/$defs/ToolFileContent",
+                    "text": "#/$defs/ToolTextContent"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ToolTextContent"
+                  },
+                  {
+                    "$ref": "#/$defs/ToolFileContent"
+                  }
+                ]
+              },
+              "title": "Content",
+              "type": "array"
+            },
+            "effect_status": {
+              "enum": [
+                "not_started",
+                "completed",
+                "unknown"
+              ],
+              "title": "Effect Status",
+              "type": "string"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CoreError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "execution_id": {
+              "minLength": 1,
+              "title": "Execution Id",
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "name": {
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "pending",
+                "running",
+                "succeeded",
+                "failed",
+                "denied",
+                "cancelled",
+                "unknown"
+              ],
+              "title": "State",
+              "type": "string"
+            },
+            "structured_output": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "tool_call_id": {
+              "minLength": 1,
+              "title": "Tool Call Id",
+              "type": "string"
+            },
+            "type": {
+              "const": "tool",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "execution_id",
+            "name",
+            "input",
+            "state",
+            "effect_status",
+            "content"
+          ],
+          "title": "AssistantToolPart",
+          "type": "object"
+        },
+        "CoreError": {
+          "additionalProperties": false,
+          "description": "Stable wire shape for every error crossing a seam (§8).",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/CoreErrorCode"
+            },
+            "details": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "message": {
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "title": "CoreError",
+          "type": "object"
+        },
+        "CoreErrorCode": {
+          "description": "Closed code registry from §8; R1 slices surface a subset of it.\n\nLater slices may need more codes, but codes are never removed or\nrenumbered: they are part of the wire contract.",
+          "enum": [
+            "ValidationError",
+            "UnsupportedCapability",
+            "NotFound",
+            "SessionBusy",
+            "Conflict",
+            "IdempotencyConflict",
+            "InvalidCursor",
+            "PermissionDenied",
+            "ApprovalUnavailable",
+            "ApprovalExpired",
+            "ToolTimeout",
+            "ToolFailed",
+            "ExecutionUnknown",
+            "ProviderUnavailable",
+            "ProviderStreamInterrupted",
+            "ContextLimitExceeded",
+            "SlowConsumer",
+            "StorageCorrupt",
+            "MigrationRequired",
+            "SessionReadOnly",
+            "SessionClosed",
+            "LifecycleCleanupFailed"
+          ],
+          "title": "CoreErrorCode",
+          "type": "string"
+        },
+        "FinishReason": {
+          "description": "§2.3 L97: logical finish reasons; raw provider strings ride in raw_finish/raw_reason.",
+          "enum": [
+            "stop",
+            "tool_calls",
+            "length",
+            "filter",
+            "unknown"
+          ],
+          "title": "FinishReason",
+          "type": "string"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "ToolFileContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L70: ``{type: \"file\", uri, mime, name?}``.\n\nEncodable/decodable on the wire (history keeps a restricted reference), but\nwith media disabled the URI must not be read or sent to the model — that\ngate is a runtime rule (§2.1 L72, M6), not a wire constraint.",
+          "properties": {
+            "mime": {
+              "minLength": 1,
+              "title": "Mime",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "type": {
+              "const": "file",
+              "title": "Type",
+              "type": "string"
+            },
+            "uri": {
+              "minLength": 1,
+              "title": "Uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri",
+            "mime"
+          ],
+          "title": "ToolFileContent",
+          "type": "object"
+        },
+        "ToolTextContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L69: ``{type: \"text\", text}`` — the only content type R2 produces.",
+          "properties": {
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "title": "ToolTextContent",
+          "type": "object"
+        },
+        "Usage": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: five optional non-negative token counts; null means unknown.\n\nA count the endpoint did not report is ``null`` on the wire, never a\ndisguised ``0`` — only an actual provider zero is zero. ``cost_usd`` is a\nsibling field on the carrying message/chunk (§2.1 L28, §2.3 L96), not a\nUsage member: usage is metered data, cost is priced data.",
+          "properties": {
+            "cache_read": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Read"
+            },
+            "cache_write": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Write"
+            },
+            "input": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Input"
+            },
+            "output": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output"
+            },
+            "reasoning": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reasoning"
+            }
+          },
+          "title": "Usage",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.step.finished`` v1 data (§3.1 L132): self-contained terminal message.",
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/AssistantMessage"
+        },
+        "step_id": {
+          "minLength": 1,
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "message"
+      ],
+      "title": "StepFinishedData",
+      "type": "object"
+    },
+    "StepGeneratedData": {
+      "$defs": {
+        "AssistantMessage": {
+          "additionalProperties": false,
+          "description": "§2.1 L28 assistant row: model/parts/status plus optional terminal facts.\n\nThe optional fields are the v1 wire set named by the contract itself\n(finish/raw_finish/usage/cost_usd/error/completed_at); *new* fields later\nmean a version bump + upcaster (§8 L348), never same-version optionals.",
+          "properties": {
+            "completed_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Completed At"
+            },
+            "cost_usd": {
+              "anyOf": [
+                {
+                  "pattern": "^\\d+(\\.\\d+)?$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cost Usd"
+            },
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CoreError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "finish": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinishReason"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "id": {
+              "minLength": 1,
+              "pattern": "^msg_",
+              "title": "Id",
+              "type": "string"
+            },
+            "metadata": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "parts": {
+              "items": {
+                "discriminator": {
+                  "mapping": {
+                    "reasoning": "#/$defs/AssistantReasoningPart",
+                    "text": "#/$defs/AssistantTextPart",
+                    "tool": "#/$defs/AssistantToolPart"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/AssistantTextPart"
+                  },
+                  {
+                    "$ref": "#/$defs/AssistantReasoningPart"
+                  },
+                  {
+                    "$ref": "#/$defs/AssistantToolPart"
+                  }
+                ]
+              },
+              "title": "Parts",
+              "type": "array"
+            },
+            "raw_finish": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw Finish"
+            },
+            "status": {
+              "enum": [
+                "running",
+                "completed",
+                "failed",
+                "interrupted"
+              ],
+              "title": "Status",
+              "type": "string"
+            },
+            "type": {
+              "const": "assistant",
+              "title": "Type",
+              "type": "string"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Usage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "created_at",
+            "model",
+            "parts",
+            "status"
+          ],
+          "title": "AssistantMessage",
+          "type": "object"
+        },
+        "AssistantReasoningPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: reasoning part — optional per endpoint, never assumed present.",
+          "properties": {
+            "part_id": {
+              "minLength": 1,
+              "title": "Part Id",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "reasoning",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "part_id",
+            "text"
+          ],
+          "title": "AssistantReasoningPart",
+          "type": "object"
+        },
+        "AssistantTextPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: text part — ``part_id`` + ``text``.",
+          "properties": {
+            "part_id": {
+              "minLength": 1,
+              "title": "Part Id",
+              "type": "string"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "part_id",
+            "text"
+          ],
+          "title": "AssistantTextPart",
+          "type": "object"
+        },
+        "AssistantToolPart": {
+          "additionalProperties": false,
+          "description": "§2.1 L33: tool call part — the full plan/result state.\n\n``content`` is a required key (possibly ``[]`` while the call is pending);\nthe \"at least one model-readable text\" rule applies to tool terminal states\n(py.tool.finished, §2.1 L72), not to pending plans. State/effect vocabulary\nper §2.1 L35; transition legality is fold-owned (R2-S2), not wire-owned.",
+          "properties": {
+            "content": {
+              "items": {
+                "discriminator": {
+                  "mapping": {
+                    "file": "#/$defs/ToolFileContent",
+                    "text": "#/$defs/ToolTextContent"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/ToolTextContent"
+                  },
+                  {
+                    "$ref": "#/$defs/ToolFileContent"
+                  }
+                ]
+              },
+              "title": "Content",
+              "type": "array"
+            },
+            "effect_status": {
+              "enum": [
+                "not_started",
+                "completed",
+                "unknown"
+              ],
+              "title": "Effect Status",
+              "type": "string"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CoreError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "execution_id": {
+              "minLength": 1,
+              "title": "Execution Id",
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "name": {
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "pending",
+                "running",
+                "succeeded",
+                "failed",
+                "denied",
+                "cancelled",
+                "unknown"
+              ],
+              "title": "State",
+              "type": "string"
+            },
+            "structured_output": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "tool_call_id": {
+              "minLength": 1,
+              "title": "Tool Call Id",
+              "type": "string"
+            },
+            "type": {
+              "const": "tool",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "execution_id",
+            "name",
+            "input",
+            "state",
+            "effect_status",
+            "content"
+          ],
+          "title": "AssistantToolPart",
+          "type": "object"
+        },
+        "CoreError": {
+          "additionalProperties": false,
+          "description": "Stable wire shape for every error crossing a seam (§8).",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/CoreErrorCode"
+            },
+            "details": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "message": {
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "title": "CoreError",
+          "type": "object"
+        },
+        "CoreErrorCode": {
+          "description": "Closed code registry from §8; R1 slices surface a subset of it.\n\nLater slices may need more codes, but codes are never removed or\nrenumbered: they are part of the wire contract.",
+          "enum": [
+            "ValidationError",
+            "UnsupportedCapability",
+            "NotFound",
+            "SessionBusy",
+            "Conflict",
+            "IdempotencyConflict",
+            "InvalidCursor",
+            "PermissionDenied",
+            "ApprovalUnavailable",
+            "ApprovalExpired",
+            "ToolTimeout",
+            "ToolFailed",
+            "ExecutionUnknown",
+            "ProviderUnavailable",
+            "ProviderStreamInterrupted",
+            "ContextLimitExceeded",
+            "SlowConsumer",
+            "StorageCorrupt",
+            "MigrationRequired",
+            "SessionReadOnly",
+            "SessionClosed",
+            "LifecycleCleanupFailed"
+          ],
+          "title": "CoreErrorCode",
+          "type": "string"
+        },
+        "FinishReason": {
+          "description": "§2.3 L97: logical finish reasons; raw provider strings ride in raw_finish/raw_reason.",
+          "enum": [
+            "stop",
+            "tool_calls",
+            "length",
+            "filter",
+            "unknown"
+          ],
+          "title": "FinishReason",
+          "type": "string"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "ToolFileContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L70: ``{type: \"file\", uri, mime, name?}``.\n\nEncodable/decodable on the wire (history keeps a restricted reference), but\nwith media disabled the URI must not be read or sent to the model — that\ngate is a runtime rule (§2.1 L72, M6), not a wire constraint.",
+          "properties": {
+            "mime": {
+              "minLength": 1,
+              "title": "Mime",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "type": {
+              "const": "file",
+              "title": "Type",
+              "type": "string"
+            },
+            "uri": {
+              "minLength": 1,
+              "title": "Uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri",
+            "mime"
+          ],
+          "title": "ToolFileContent",
+          "type": "object"
+        },
+        "ToolTextContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L69: ``{type: \"text\", text}`` — the only content type R2 produces.",
+          "properties": {
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "title": "ToolTextContent",
+          "type": "object"
+        },
+        "Usage": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: five optional non-negative token counts; null means unknown.\n\nA count the endpoint did not report is ``null`` on the wire, never a\ndisguised ``0`` — only an actual provider zero is zero. ``cost_usd`` is a\nsibling field on the carrying message/chunk (§2.1 L28, §2.3 L96), not a\nUsage member: usage is metered data, cost is priced data.",
+          "properties": {
+            "cache_read": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Read"
+            },
+            "cache_write": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Write"
+            },
+            "input": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Input"
+            },
+            "output": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output"
+            },
+            "reasoning": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reasoning"
+            }
+          },
+          "title": "Usage",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.step.generated`` v1 data (§3.1 L128): the last event of the generation batch.\n\nThe embedded AssistantMessage is the complete call plan with every tool\npart pending/not_started; batch atomicity and consistency with the finalized\nparts are commit-time validation (§3.1 L144, R2-S2), not wire shape.",
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/AssistantMessage"
+        },
+        "step_id": {
+          "minLength": 1,
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "message"
+      ],
+      "title": "StepGeneratedData",
+      "type": "object"
+    },
+    "StepStartedData": {
+      "$defs": {
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.step.started`` v1 data (§3.1 L126): one generation attempt begins.\n\n``attempt`` >= 1; R2 always writes 1 (OP-6: no user-facing retry command,\na retry is a new prompt; attempt > 1 is reserved for recovery/retry faces).",
+      "properties": {
+        "attempt": {
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelRef"
+        },
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "step_id": {
+          "minLength": 1,
+          "title": "Step Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "step_id",
+        "message_id",
+        "model",
+        "attempt"
+      ],
+      "title": "StepStartedData",
+      "type": "object"
+    },
+    "TextDeltaData": {
+      "additionalProperties": false,
+      "description": "``py.text.delta`` ephemeral data (§3.1 L140): live preview only, never persisted.",
+      "properties": {
+        "delta": {
+          "title": "Delta",
+          "type": "string"
+        },
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "part_id": {
+          "minLength": 1,
+          "title": "Part Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "part_id",
+        "delta"
+      ],
+      "title": "TextDeltaData",
+      "type": "object"
+    },
+    "TextFinalizedData": {
+      "additionalProperties": false,
+      "description": "``py.text.finalized`` v1 data (§3.1 L127): full final text at message_id+part_id.\n\n``ordinal`` is 0-based and unique within the generation batch; batch ordering\nand second-finalized idempotency are commit-time rules (§3.1 L144, R2-S2).",
+      "properties": {
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "part_id": {
+          "minLength": 1,
+          "title": "Part Id",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "part_id",
+        "ordinal",
+        "text"
+      ],
+      "title": "TextFinalizedData",
+      "type": "object"
+    },
+    "ToolFinishedData": {
+      "$defs": {
+        "CoreError": {
+          "additionalProperties": false,
+          "description": "Stable wire shape for every error crossing a seam (§8).",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/CoreErrorCode"
+            },
+            "details": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "message": {
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "title": "CoreError",
+          "type": "object"
+        },
+        "CoreErrorCode": {
+          "description": "Closed code registry from §8; R1 slices surface a subset of it.\n\nLater slices may need more codes, but codes are never removed or\nrenumbered: they are part of the wire contract.",
+          "enum": [
+            "ValidationError",
+            "UnsupportedCapability",
+            "NotFound",
+            "SessionBusy",
+            "Conflict",
+            "IdempotencyConflict",
+            "InvalidCursor",
+            "PermissionDenied",
+            "ApprovalUnavailable",
+            "ApprovalExpired",
+            "ToolTimeout",
+            "ToolFailed",
+            "ExecutionUnknown",
+            "ProviderUnavailable",
+            "ProviderStreamInterrupted",
+            "ContextLimitExceeded",
+            "SlowConsumer",
+            "StorageCorrupt",
+            "MigrationRequired",
+            "SessionReadOnly",
+            "SessionClosed",
+            "LifecycleCleanupFailed"
+          ],
+          "title": "CoreErrorCode",
+          "type": "string"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ToolFileContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L70: ``{type: \"file\", uri, mime, name?}``.\n\nEncodable/decodable on the wire (history keeps a restricted reference), but\nwith media disabled the URI must not be read or sent to the model — that\ngate is a runtime rule (§2.1 L72, M6), not a wire constraint.",
+          "properties": {
+            "mime": {
+              "minLength": 1,
+              "title": "Mime",
+              "type": "string"
+            },
+            "name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Name"
+            },
+            "type": {
+              "const": "file",
+              "title": "Type",
+              "type": "string"
+            },
+            "uri": {
+              "minLength": 1,
+              "title": "Uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri",
+            "mime"
+          ],
+          "title": "ToolFileContent",
+          "type": "object"
+        },
+        "ToolTextContent": {
+          "additionalProperties": false,
+          "description": "§2.1 L69: ``{type: \"text\", text}`` — the only content type R2 produces.",
+          "properties": {
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "title": "ToolTextContent",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.tool.finished`` v1 data (§3.1 L131): terminal state + model-readable content.\n\n``state`` is terminal-only — pending/running live on AssistantToolPart and\nthe fold, never on the finished event. §2.1 L72: every terminal state carries\nat least one text content, including denied/cancelled/unknown explanations;\nfile-only content is rejected here, not at display time.",
+      "properties": {
+        "content": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "file": "#/$defs/ToolFileContent",
+                "text": "#/$defs/ToolTextContent"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/ToolTextContent"
+              },
+              {
+                "$ref": "#/$defs/ToolFileContent"
+              }
+            ]
+          },
+          "minItems": 1,
+          "title": "Content",
+          "type": "array"
+        },
+        "effect_status": {
+          "enum": [
+            "not_started",
+            "completed",
+            "unknown"
+          ],
+          "title": "Effect Status",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CoreError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "denied",
+            "cancelled",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "structured_output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "execution_id",
+        "state",
+        "effect_status",
+        "content"
+      ],
+      "title": "ToolFinishedData",
+      "type": "object"
+    },
+    "ToolInputDeltaData": {
+      "additionalProperties": false,
+      "description": "``py.tool.input.delta`` ephemeral data (§3.1 L140): raw argument fragments by call_index.",
+      "properties": {
+        "call_index": {
+          "minimum": 0,
+          "title": "Call Index",
+          "type": "integer"
+        },
+        "delta": {
+          "title": "Delta",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_index",
+        "delta"
+      ],
+      "title": "ToolInputDeltaData",
+      "type": "object"
+    },
+    "ToolProgressData": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "``py.tool.progress`` ephemeral data (§3.1 L140): adapter progress metadata by execution.",
+      "properties": {
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        }
+      },
+      "required": [
+        "execution_id"
+      ],
+      "title": "ToolProgressData",
+      "type": "object"
+    },
+    "ToolRequestedData": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ToolRef": {
+          "additionalProperties": false,
+          "description": "Catalog identity of a tool: ``(namespace, name, version)``.\n\n``version`` is the tool's own schema version (>= 1), not an event version;\n§8's closed-evolution rule for events applies to tool schemas by the same\nspirit — a changed input_schema ships as a new version, never a silent\nsame-version edit.",
+          "properties": {
+            "name": {
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "namespace": {
+              "minLength": 1,
+              "title": "Namespace",
+              "type": "string"
+            },
+            "version": {
+              "minimum": 1,
+              "title": "Version",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "namespace",
+            "name",
+            "version"
+          ],
+          "title": "ToolRef",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.tool.requested`` v1 data (§3.1 L129): raw request, resolved ref, canonical hash.\n\n``tool_ref`` is optional because the raw requested_name may fail catalog\nresolution (unknown tool); the failed/not_started terminal then lands on\npy.tool.finished. Identity/ownership constraints (§2.1 L37) are commit-time\nvalidation (R2-S2).",
+      "properties": {
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "input": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "input_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Hash",
+          "type": "string"
+        },
+        "message_id": {
+          "minLength": 1,
+          "pattern": "^msg_",
+          "title": "Message Id",
+          "type": "string"
+        },
+        "requested_name": {
+          "minLength": 1,
+          "title": "Requested Name",
+          "type": "string"
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "message_id",
+        "tool_call_id",
+        "execution_id",
+        "requested_name",
+        "input",
+        "input_hash"
+      ],
+      "title": "ToolRequestedData",
+      "type": "object"
+    },
+    "ToolStartedData": {
+      "additionalProperties": false,
+      "description": "``py.tool.started`` v1 data (§3.1 L130): execution confirmed after the permission decision.\n\npermission_decision uses the §5.2 effect vocabulary; R2 has no policy layer\n(read defaults to allow), so R2 producers always write \"allow\" — ask/deny\nbecome producible only from R3+ (float-reported, T-C1-013).",
+      "properties": {
+        "execution_id": {
+          "minLength": 1,
+          "title": "Execution Id",
+          "type": "string"
+        },
+        "input_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Input Hash",
+          "type": "string"
+        },
+        "permission_decision": {
+          "enum": [
+            "allow",
+            "ask",
+            "deny"
+          ],
+          "title": "Permission Decision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_id",
+        "permission_decision",
+        "input_hash"
+      ],
+      "title": "ToolStartedData",
+      "type": "object"
+    }
+  },
+  "module": "opencode.contracts.events",
+  "title": "opencode.contracts.events: unified JSON Schema (R5-S4, CORE-CONTRACTS section 1 L17)"
+}
