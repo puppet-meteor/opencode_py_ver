@@ -185,7 +185,9 @@ class StdioTransport:
         after the stdin EOF, escalate to a tree terminate, escalate again
         to a hard kill. Idempotent and concurrent-safe (one lock, one
         ``_closed`` re-check); every pending request fails with a lost
-        connection so no caller waits on a dead pipe.
+        connection so no caller waits on a dead pipe. A leader that
+        already exited on its own (the crash path) still gets its
+        surviving tree swept: the sweep belongs to every exit path.
         """
         async with self._close_lock:
             if self._closed:
@@ -213,6 +215,20 @@ class StdioTransport:
                             # Unreapable after two escalations: nothing left to
                             # try; the caller faces an unknown outcome (④).
                             pass
+                else:
+                    # The leader already exited on its own (the crash path: a
+                    # server that dies mid-session can leave descendants
+                    # alive in its process group or job). The tree sweep
+                    # belongs to every exit path, not only the live-leader
+                    # escalation: killpg on the dead leader's still-populated
+                    # group reaps the survivors, an empty group is the
+                    # ProcessLookupError the sweep already swallows, and the
+                    # Windows job terminate mirrors the KILL_ON_JOB_CLOSE
+                    # release at the end of close(). A leaderless group owes
+                    # no grace, so the terminate escalates straight to the
+                    # hard kill. Pinned by test_crash_sweeps_tree.
+                    self._terminate_tree()
+                    self._kill_tree_hard()
                 # Let the readers observe the pipes' EOF, bounded; a straggler
                 # (e.g. a grandchild holding the write end) is cancelled.
                 current = asyncio.current_task()
