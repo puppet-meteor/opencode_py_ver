@@ -27,17 +27,20 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
+from opencode.contracts.events import DurableEvent, McpServerRef
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
 from opencode.mcp import McpManager
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
+from opencode.session.recovery import RecoveryCoordinator, RecoveryGate, RecoveryReport, sweep_crash_temp_files
 from opencode.session.runner import DEFAULT_MAX_STEPS, EventCommitter, Runner
 from opencode.session.service import DEFAULT_CLOSE_TIMEOUT_S, AscendingIds, Clock, IdFactory
 from opencode.storage import (
@@ -48,6 +51,7 @@ from opencode.storage import (
     StoreValidationError,
     open_database,
 )
+from opencode.storage.store import EventBatch
 from opencode.tools import ToolLimits, ToolRegistry
 from opencode.tools.policy import DEFAULT_APPROVAL_TIMEOUT_S, ApprovalCoordinator, PermissionPolicy, PermissionRule
 from opencode.tools.registry import ToolAdapter
@@ -65,6 +69,50 @@ class _ProviderHandle(Protocol):
     def stream(self, request: GenerationRequest) -> AsyncIterator[ProviderChunk]: ...
 
     async def close(self) -> None: ...
+
+
+async def _startup_scan(coordinator: RecoveryCoordinator, roots: tuple[str, ...]) -> RecoveryReport:
+    """One App-startup pass: the row#27③ crash-temp sweep, then the recovery scan.
+
+    The sweep is host-operational hygiene over the declared roots (T-C1-028
+    ④-1 ruling: the composition-root path, never the session service layer);
+    its counters ride the recovery report. Sweep failures never block the
+    scan -- they are reported, not raised.
+    """
+    removed, errors = sweep_crash_temp_files(roots)
+    report = await coordinator.scan()
+    return replace(report, tmp_files_removed=removed, tmp_roots=roots, tmp_errors=errors)
+
+
+class _RecoveryGatedStore(SessionStore):
+    """The R4-S4 write gate (T-C1-037, OP-R4-6): SessionStore + startup recovery.
+
+    Wraps the composition root's real store, sharing its single
+    TransactionWriter (no second writer and no second lock set): the write
+    faces ``commit``/``rebuild``/``cleanup_failed`` first await the bound
+    startup recovery scan, then delegate unchanged. Reads are NOT gated
+    (§3.2.1: queries never trigger recovery) and the recovery coordinator
+    itself commits through the ungated inner store -- only the service-facing
+    writes wait. A scan failure propagates to every gated caller
+    (fail-closed: the composition root stays write-unavailable instead of
+    proceeding past a failed recovery).
+    """
+
+    def __init__(self, inner: SessionStore, gate: RecoveryGate) -> None:
+        self._writer = inner._writer
+        self._gate = gate
+
+    async def commit(self, session_id: str, batch: EventBatch, expected_seq: int) -> list[DurableEvent[Any]]:
+        await self._gate.wait()
+        return await super().commit(session_id, batch, expected_seq)
+
+    async def rebuild(self, session_id: str) -> None:
+        await self._gate.wait()
+        await super().rebuild(session_id)
+
+    async def cleanup_failed(self, session_id: str, run_id: str, reason: str) -> None:
+        await self._gate.wait()
+        await super().cleanup_failed(session_id, run_id, reason)
 
 
 class App:
@@ -99,6 +147,8 @@ class App:
         approval_timeout_s: float = DEFAULT_APPROVAL_TIMEOUT_S,
         rules: Sequence[PermissionRule] = (),
         mcp_manager: McpManager | None = None,
+        mcp_refs: Sequence[McpServerRef] | None = None,
+        sweep_roots: Sequence[str | Path] | None = None,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -108,6 +158,36 @@ class App:
         store = SessionStore(engine, projector=SessionProjector())
         repos = ReadRepositories(engine)
         shared_ids = ids if ids is not None else AscendingIds(clock)
+        # R4-S4 (T-C1-037): startup recovery wiring. OP-R4-6 conservative
+        # default: the composition root is unavailable for writes until the
+        # one startup recovery scan completes -- the service's store faces
+        # pass through _RecoveryGatedStore (the same single TransactionWriter,
+        # no second writer or lock set) while the recovery coordinator commits
+        # through the ungated inner store; reads stay ungated (§3.2.1). The
+        # scan is scheduled eagerly when a loop is already running and
+        # otherwise starts at the first gated write. ``mcp_refs`` declares the
+        # host's current MCP server references for the §6.1 L302 fingerprint
+        # comparison (None = the host declares no MCP face: no comparison);
+        # row #27③'s crash-temp sweep rides the same startup pass over
+        # ``sweep_roots`` (default: the working directory, the
+        # composition-root's declared root face).
+        resolved_working_dir = working_dir if working_dir is not None else os.getcwd()
+        recovery_gate = RecoveryGate()
+        gated_store = _RecoveryGatedStore(store, recovery_gate)
+        recovery_committer = EventCommitter(repos, store, self._bus, ids=shared_ids, clock=clock)
+        recovery_coordinator = RecoveryCoordinator(
+            engine=engine,
+            committer=recovery_committer,
+            current_mcp_servers=mcp_refs,
+            repos=repos,
+            ids=shared_ids,
+            clock=clock,
+        )
+        recovery_roots = (
+            tuple(str(root) for root in sweep_roots) if sweep_roots is not None else (resolved_working_dir,)
+        )
+        recovery_gate.bind(lambda: _startup_scan(recovery_coordinator, recovery_roots))
+        self._recovery_gate = recovery_gate
         runner: Runner | None = None
         approvals: ApprovalCoordinator | None = None
         policy: PermissionPolicy | None = None
@@ -140,10 +220,10 @@ class App:
                 max_steps=max_steps,
             )
         self._service = SessionService(
-            store=store,
+            store=gated_store,
             repos=repos,
             bus=self._bus,
-            working_dir=working_dir if working_dir is not None else os.getcwd(),
+            working_dir=resolved_working_dir,
             clock=clock,
             ids=shared_ids,
             engine=engine,
@@ -174,6 +254,11 @@ class App:
     def service(self) -> SessionService:
         """The §7 command surface."""
         return self._service
+
+    @property
+    def recovery_gate(self) -> RecoveryGate:
+        """The startup-recovery gate (T-C1-037); ``await gate.wait()`` yields the scan report."""
+        return self._recovery_gate
 
     @property
     def mcp_manager(self) -> McpManager | None:

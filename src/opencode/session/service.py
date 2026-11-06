@@ -1261,7 +1261,9 @@ class SessionService:
         the unconfirmable cleanup as LifecycleCleanupFailed. CancelledError is
         the close-timeout path's own signal -- the runner's handler has
         finalized the run (or left the open step to recovery) -- and is not
-        an error.
+        an error. R4-S4: a cross-process crash leaves the same non-terminal
+        durable log with no in-memory record; the startup recovery scan
+        (T-C1-037) closes it from the log alone.
         """
         assert self._runner is not None
         try:
