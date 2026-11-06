@@ -257,6 +257,27 @@ class ResolvedRuntime:
     snapshot: ConfigSnapshotV2 | ConfigSnapshotV3
 
 
+@dataclass(frozen=True, slots=True)
+class McpServerEntry:
+    """One validated host-tier local MCP server entry — the raw config values
+    (R4-S6, T-B-040 prescription 3 part two).
+
+    The composition face of the ``mcp.servers`` block: the validated argv
+    (``command[0]`` exec'd directly, ``command[1:]`` its arguments), the
+    declared environment map **with values** (§6 L304: the definition env is
+    the caller's to assemble — the config-declared value is the resolution
+    default, the host ``os.environ`` the override at composition time), and
+    the optional ``cwd``. Same deterministic name-sorted order and same
+    single validation path as :meth:`ConfigLoader._mcp_server_refs` (which
+    derives its refs from these entries — the two faces cannot drift).
+    """
+
+    name: str
+    command: tuple[str, ...]
+    environment: dict[str, str]
+    cwd: str | None
+
+
 # ---------------------------------------------------------------------------
 # Helpers: VCS root, endpoint sanitization, setting extraction.
 # ---------------------------------------------------------------------------
@@ -731,8 +752,8 @@ class ConfigLoader:
 
     # -- §6 L285/L287: host-tier MCP loading (R4-S3) --------------------------
 
-    def _mcp_server_refs(self) -> list[McpServerRef]:
-        """Validate the host-tier ``mcp`` block into snapshot refs (§6 L285/L287, R4-S3).
+    def mcp_server_entries(self) -> list[McpServerEntry]:
+        """Validate the host-tier ``mcp`` block into raw server entries (R4-S6, T-B-040 3b).
 
         Fail-closed matrix (TS ``LocalConfig`` L26-39 is the reference
         shape, not a port):
@@ -747,21 +768,28 @@ class ConfigLoader:
           ``codemode`` and every other extra field fail as unknown fields
           (the fixed protocol revision is manager-owned, not configurable).
         - ``command``: a non-empty argv list of non-empty strings.
-        - ``environment``: a string→string map — ONLY the sorted key names
-          enter the snapshot as ``env_refs`` (values never ride, §6.2.1/L302).
+        - ``environment``: a string→string map — the declared values ride
+          the entry (§6 L304: the definition env is the caller's to
+          assemble, the declared value being the resolution default); ONLY
+          the sorted key names enter the snapshot refs face as
+          ``env_refs`` (values never ride a snapshot, §6.2.1/L302).
         - ``cwd``: optional non-empty string, recorded as declared (the S4
           activation seam resolves it; this loader does not resolve paths).
         - ``disabled``: optional bool — a disabled server is excluded from
           the snapshot outright.
 
-        Determinism: servers are emitted sorted by name, so the canonical
-        snapshot hash is process- and file-order independent. Resolving
-        ``env_refs`` against the boot environment — and with it the
+        Determinism: entries are emitted sorted by name, so the canonical
+        snapshot hash is process- and file-order independent. Resolving the
+        declared env values against the boot environment — and with it the
         Windows-required-variables minimal-set ruling (T-B-038 ⑥②:
         SystemRoot/PATH etc. in ``definition.env``) — belongs to the S4/S5
-        activation wiring: this slice constructs no
+        activation wiring: this slice itself constructs no
         :class:`~opencode.mcp.manager.StdioServerDefinition` (the manager
-        demand for a complete minimal environment stays the caller's).
+        demand for a complete minimal environment stays the caller's —
+        the CLI composition root composes those from these entries). This
+        is the single validation path:
+        :meth:`_mcp_server_refs` derives its refs from these entries, so
+        the two faces cannot drift.
         """
         raw = self.load().values.get("mcp")
         if raw is None:
@@ -781,7 +809,7 @@ class ConfigLoader:
             return []
         if not isinstance(servers, dict):
             raise ConfigError("'mcp.servers' must be a JSON object keyed by server name")
-        refs: list[McpServerRef] = []
+        entries: list[McpServerEntry] = []
         for name in sorted(servers):
             if not name:
                 raise ConfigError("'mcp.servers' keys must be non-empty server names")
@@ -822,30 +850,47 @@ class ConfigLoader:
             cwd = entry.get("cwd")
             if cwd is not None and (not isinstance(cwd, str) or not cwd):
                 raise ConfigError(f"'mcp.servers.{name}.cwd' must be a non-empty string or null")
-            env_refs = sorted(environment)
             # Type-level narrowing: the shape check above proved every argv
             # entry is a non-empty string; the comprehension only restates
             # that for the checker (JsonValue list -> list[str]).
             argv = [item for item in command if isinstance(item, str)]
-            # Final fail-closed gate: the model's own validators (and the
-            # fingerprint digest's UTF-8 encode — it runs during argument
-            # evaluation, BEFORE pydantic sees the strings) catch what the
-            # shape checks above cannot express — e.g. an unpaired surrogate
-            # in any string — and surface as one named ConfigError, never a
-            # raw library error (the loader's exit-2 face).
+            # Same restatement for the environment map (dict[str, JsonValue]
+            # -> dict[str, str]): the shape check proved every value is a
+            # string, so the filter never drops a real entry.
+            declared_env = {key: value for key, value in environment.items() if isinstance(value, str)}
+            entries.append(McpServerEntry(name=name, command=tuple(argv), environment=declared_env, cwd=cwd))
+        return entries
+
+    def _mcp_server_refs(self) -> list[McpServerRef]:
+        """Derive the snapshot refs from :meth:`mcp_server_entries` (§6 L285/L287, R4-S3).
+
+        Single validation path: the entries method owns every shape check
+        (and the name-sorted order); this method only projects each entry
+        onto the refs face — sorted ``env_refs`` key names, declared argv
+        and cwd, and the boot fingerprint. The final fail-closed gate stays
+        here: the model's own validators (and the fingerprint digest's
+        UTF-8 encode — it runs during argument evaluation, BEFORE pydantic
+        sees the strings) catch what the shape checks cannot express —
+        e.g. an unpaired surrogate in any string — and surface as one
+        named ConfigError, never a raw library error (the loader's exit-2
+        face).
+        """
+        refs: list[McpServerRef] = []
+        for entry in self.mcp_server_entries():
+            env_refs = sorted(entry.environment)
             try:
                 refs.append(
                     McpServerRef(
-                        server=name,
-                        command=list(argv),
-                        cwd=cwd,
+                        server=entry.name,
+                        command=list(entry.command),
+                        cwd=entry.cwd,
                         env_refs=env_refs,
-                        fingerprint=mcp_startup_fingerprint(name, argv, env_refs),
+                        fingerprint=mcp_startup_fingerprint(entry.name, entry.command, env_refs),
                     )
                 )
             except (ValidationError, UnicodeEncodeError) as error:
                 raise ConfigError(
-                    f"the 'mcp.servers.{name}' entry is not a legal local server reference: {error}"
+                    f"the 'mcp.servers.{entry.name}' entry is not a legal local server reference: {error}"
                 ) from error
         return refs
 

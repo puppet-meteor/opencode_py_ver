@@ -28,6 +28,7 @@ from opencode.contracts.events import (
     ConfigSnapshotV2,
     SessionCreatedData,
     SessionCreatedDataV2,
+    SessionCreatedDataV3,
     compute_snapshot_hash,
     upcast_session_created,
 )
@@ -450,7 +451,7 @@ def _ok_response(*deltas: str) -> ScriptedResponse:
     return ScriptedResponse(frames=[Frame(text_delta_frame(delta)) for delta in deltas] + [Frame(finish_frame("stop"))])
 
 
-def test_cli_end_to_end_config_supplied_runtime_and_v2_snapshot_in_db(
+def test_cli_end_to_end_config_supplied_runtime_and_v3_snapshot_in_db(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     host = _ServerHost([_ok_response("hel", "lo")])
@@ -486,13 +487,14 @@ def test_cli_end_to_end_config_supplied_runtime_and_v2_snapshot_in_db(
         row = connection.execute("SELECT version, data FROM events WHERE type = 'py.session.created'").fetchone()
     assert row is not None
     version, raw = row
-    assert version == 2
+    assert version == 3
     payload = json.loads(raw) if isinstance(raw, str | bytes) else raw
-    data = SessionCreatedDataV2.model_validate(payload)
+    data = SessionCreatedDataV3.model_validate(payload)
     assert Path(data.working_dir) == tmp_path
     assert data.config_snapshot.model.model == "fake-model"
     assert data.config_snapshot.limits.context_limit == 100000
     assert data.config_snapshot.instructions[0].text == "You are the test agent."
+    assert data.config_snapshot.mcp_servers == []
 
     runtime = upcast_session_created(data)
     assert runtime.snapshot is not None
