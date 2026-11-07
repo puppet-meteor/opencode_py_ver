@@ -37,7 +37,7 @@ from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
 from opencode.contracts.events import DurableEvent, McpServerRef
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
-from opencode.mcp import McpManager
+from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdapter
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
 from opencode.session.recovery import RecoveryCoordinator, RecoveryGate, RecoveryReport, sweep_crash_temp_files
@@ -53,8 +53,14 @@ from opencode.storage import (
 )
 from opencode.storage.store import EventBatch
 from opencode.tools import ToolLimits, ToolRegistry
-from opencode.tools.policy import DEFAULT_APPROVAL_TIMEOUT_S, ApprovalCoordinator, PermissionPolicy, PermissionRule
-from opencode.tools.registry import ToolAdapter
+from opencode.tools.policy import (
+    DEFAULT_APPROVAL_TIMEOUT_S,
+    ApprovalCoordinator,
+    McpToolBinding,
+    PermissionPolicy,
+    PermissionRule,
+)
+from opencode.tools.registry import ToolAdapter, mcp_tool_spec
 
 
 class _ProviderHandle(Protocol):
@@ -191,6 +197,7 @@ class App:
         runner: Runner | None = None
         approvals: ApprovalCoordinator | None = None
         policy: PermissionPolicy | None = None
+        registry: ToolRegistry | None = None
         if provider is not None:
             assert settings is not None  # validated above
             approvals = ApprovalCoordinator(clock=clock, timeout_s=approval_timeout_s)
@@ -236,9 +243,16 @@ class App:
         )
         # R4-S2 wiring: the MCP manager is App-owned but lifecycle-closed by
         # the service (§7 L339: MCP -> provider -> DB); the caller injects it
-        # explicitly -- config loading is the S3 face, so App registers no
-        # MCP tools itself and only owns the close.
+        # explicitly -- config loading is the S3 face. P2-S0 (§6 L304)
+        # upgraded the ownership from "close only" to the full
+        # spawn+bind+close lifecycle: start_mcp_servers() spawns each
+        # snapshot-declared stdio server, registers its remote tools and
+        # pins the policy bindings, while close() keeps the unchanged
+        # §7 L339 order.
         self._mcp_manager = mcp_manager
+        self._mcp_refs = tuple(mcp_refs) if mcp_refs is not None else ()
+        self._registry = registry
+        self._policy = policy
 
     @property
     def database(self) -> Database:
@@ -264,6 +278,59 @@ class App:
     def mcp_manager(self) -> McpManager | None:
         """The owned MCP server manager (None = no MCP servers in this composition)."""
         return self._mcp_manager
+
+    async def start_mcp_servers(self) -> tuple[tuple[str, Exception], ...]:
+        """P2-S0 (§6 L304): spawn, catalog and bind every configured stdio server.
+
+        The App's spawn+bind ownership face (the close keeps §7 L339): each
+        injected ``mcp_servers`` ref is started through the owned manager
+        (spawn -> initialize -> tools/list), its remote tools are registered
+        under the fixed ``mcp`` namespace and every ``mcp__<name>`` action is
+        pinned to the server's startup fingerprint plus the registry's MCP
+        catalog digest (:meth:`PermissionPolicy.bind_mcp_tools`, §5.2 L268).
+        The digest is taken once after every registration, so the bound
+        catalog version is the boot's final provider-visible face. A server
+        that fails to start is one ``(server, error)`` pair -- the manager
+        keeps its failed marker and no empty tool face is registered -- and
+        the remaining servers still start; the driving host surfaces each
+        failure itself. A ref without a manager registration or a
+        cross-server tool-name collision is a wiring defect and propagates
+        (fail closed, never silent).
+        """
+        if self._mcp_manager is None:
+            return ()
+        if self._registry is None or self._policy is None:
+            raise StoreValidationError("MCP servers require the provider composition (tools and policy)")
+        started: list[tuple[McpServerRef, tuple[MCPRemoteTool, ...]]] = []
+        failures: list[tuple[str, Exception]] = []
+        for ref in self._mcp_refs:
+            try:
+                tools = await self._mcp_manager.start_server(ref.server)
+            except (McpConnectError, OSError) as error:
+                # The manager carries its failed marker for the
+                # handshake/catalog faces; an OSError here is a spawn-level
+                # failure (e.g. a missing binary) that face does not mark --
+                # either way nothing is registered for the server and the
+                # boot continues with the rest (④ disclosed).
+                failures.append((ref.server, error))
+                continue
+            for tool in tools:
+                self._registry.register_mcp(
+                    ref.server,
+                    MCPToolAdapter(
+                        manager=self._mcp_manager,
+                        server=ref.server,
+                        tool=tool,
+                        spec=mcp_tool_spec(tool.name, tool.description, tool.input_schema),
+                    ),
+                )
+            started.append((ref, tools))
+        catalog_version = self._registry.mcp_catalog_version()
+        for ref, tools in started:
+            binding = McpToolBinding(server=ref.server, fingerprint=ref.fingerprint, catalog_version=catalog_version)
+            for tool in tools:
+                self._policy.bind_mcp_tools(f"mcp__{tool.name}", binding)
+        return tuple(failures)
 
     async def close(self) -> None:
         """Release in order: the service lifecycle first, then the engine/lock."""

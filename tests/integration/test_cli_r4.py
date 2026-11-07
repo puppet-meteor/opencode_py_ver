@@ -16,10 +16,11 @@ scan closes the orphan pending permission (``permission.closed
 cancelled``), the same action re-asks in the new boot (boot_id isolation:
 a saved decision from the dead boot never auto-activates), and a reply
 aimed at the OLD permission id is explicitly refused. The MCP composition
-test (T8) proves registration-only wiring: definitions carry the declared
-env keys resolved against ``os.environ`` (plus the win32 minimal set),
-no server process is ever spawned, and the App lifecycle closes the
-manager.
+test (T8) proves the composition-level wiring: definitions carry the declared
+env keys resolved against ``os.environ`` (plus the win32 minimal set), the
+session-start spawn attempt surfaces its failure as one stderr line, and the
+App lifecycle closes the manager. The full production spawn/list/call
+contract lives in ``test_mcp_production.py``.
 """
 
 from __future__ import annotations
@@ -515,6 +516,7 @@ def test_continue_stops_on_mcp_fingerprint_drift(
         )
         without_server = _write_json(tmp_path / "without-mcp.json", {"model": "fake-model", "context_limit": 100000})
         assert main(_argv(db_path, f"{base_url}/v1", "--config", str(with_server), "hello")) == 0
+        capsys.readouterr()  # drain boot 1's own one-line MCP spawn failure (session-start spawn, P2-S0)
         assert _event_count(db_path, "py.session.created") == 1
         code = main(_argv(db_path, f"{base_url}/v1", "--config", str(without_server), "--continue"))
     finally:
@@ -659,19 +661,19 @@ def test_restart_chain_closes_orphan_reasks_and_refuses_the_old_permission_id(
 
 
 # ---------------------------------------------------------------------------
-# T8: the MCP composition (registration only, zero spawn, lifecycle close).
+# T8: the MCP composition (definition registration + session-start spawn, lifecycle close).
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_composition_registers_definitions_without_spawning_and_closes(
+def test_mcp_composition_registers_and_spawns_definitions_and_closes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """T8 (§6 L304 first sentence): one declared stdio server becomes one
     registered definition — env keys resolved against ``os.environ`` with the
     config value as fallback, plus the win32 minimal set (skipped assertions
-    elsewhere) — no process is ever spawned (the marker binary stays
-    unexecuted, the server stays pending), and the App lifecycle closes the
-    manager."""
+    elsewhere) — the session-start spawn runs through the production path
+    (the marker binary executes, its failure is one stderr line, not a
+    traceback), and the App lifecycle closes the manager."""
     monkeypatch.chdir(tmp_path)
     marker = tmp_path / "spawned.marker"
     spawn_command = [
@@ -722,12 +724,15 @@ def test_mcp_composition_registers_definitions_without_spawning_and_closes(
     if sys.platform == "win32":
         assert "SystemRoot" in definition.env
         assert "PATH" in definition.env
-    assert not marker.exists(), "registration must never spawn the server process"
-    # The zero-spawn face after the lifecycle close: close marks every entry
-    # "stopped" (never connected/failed — the never-started terminal), the
-    # catalog stays empty, and the marker binary never ran.
+    assert marker.exists(), "the session-start spawn must have run the marker binary"
+    # The spawn-failure face after the lifecycle close: the marker command
+    # exits before speaking MCP (no handshake), so the entry is marked
+    # failed, no tool face is registered, and the boot continued past it.
+    captured_err = capsys.readouterr().err
+    assert "MCP server 'probe' failed to start" in captured_err
+    assert "Traceback" not in captured_err
     assert manager.status("probe") == "stopped"
     assert manager.tools("probe") is None
-    assert manager.server_error("probe") is None
+    assert manager.server_error("probe") is not None
     assert manager.closed, "the App lifecycle must have closed the injected manager"
     assert _event_count(db_path, "py.session.created") == 1
