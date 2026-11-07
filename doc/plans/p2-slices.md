@@ -75,6 +75,8 @@ Phase 1 ─┬─ M1 存储/同机多进程 ────────────
 
 ### 2.0 P2-S0（条件性微票——OP-P2-2 路 A 定夺后执行）：OP-R5-1 生产 MCP 接线微票
 
+> **状态（#166 记档）：已执行闭合**——T-C1-050/T-C1-050C 落地（生产 spawn+bind 接线：`App.start_mcp_servers` app.py L282-333 全生命周期+5 生产测试 658L+T8/T5 期望翻转）+T-B-055 评审 PASS 0/0/0/3+并回 `5a5511c`（#166）；门禁新基线 1139/clean/format rc 0/mypy 110。Done L13 生产路径可达性首次闭合；ADR-0002 B.2-6/B.4 现态翻新归 T-A-012（A 席票）。
+
 - **两路评估（硬输入①；r5-slices §3 行 1 已定夺并入本规划——#163 ⑩+#164 台账补记）**：
   - **路 A（B 建议采纳）=设行最小接线票**：生产 CLI 路径对显式配置的 stdio server 执行 spawn+bind——闭合 Done L13「一个显式配置的 stdio MCP server 能列出和调用工具，断线不自动重跑有副作用的调用」的**生产路径可达性**（现态=注册不 spawn：cli.py `_compose_mcp_manager` L517-530 add_server 从不 spawn；run 级路由由组合根测试直组 MCPToolAdapter 承载[test_cli_r4.py L666]——T8 既定 #152 调度器裁决；ADR-0002 B.2-6 保守记现态零预写）。
   - **路 B（否决回退）=§6 L148 降级路**：PHASE1-SLIM L148 原文「预算超出时先移出 R4 的 MCP 扩展证明，发布为“core preview”；保留 S3 adapter 接口和工具契约」——Phase 1 已全量交付无超支，此路现势=纯记档不扩码：README MCP 节+parity 已知限制+platform-support §9 B2 行强化「不宣称 MCP 生产可用」。

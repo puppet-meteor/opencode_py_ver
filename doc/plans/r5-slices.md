@@ -113,7 +113,7 @@
 
 | # | 项 | 来源 | 处置（建议；定夺归调度器/A） |
 |---|---|---|---|
-| 1 | bind_mcp_tools 生产 spawn+bind 接线立项评估 | r4-exit-evidence §7（T-B-044 处方 5）+硬输入③ | **OP-R5-1 已定夺（#163 ⑩；#164 台账补记）**：并入 Phase 2 规划评估——B 建议的设行最小接线票（Done L13「一个显式配置的 stdio MCP server 能列出和调用工具」生产路径可达性）与 §6 L148 降级路径（core preview→README/parity 已知限制+不宣称 MCP 可用）两路均入 Phase 2 规划素材，B 席规划票评估后定载体（现态=组合根测试直组 MCPToolAdapter，生产 CLI 注册不 spawn=T8 既定 #152 调度器裁决；ADR 0002 B.2-6 保守记现态零预写） |
+| 1 | bind_mcp_tools 生产 spawn+bind 接线立项评估 | r4-exit-evidence §7（T-B-044 处方 5）+硬输入③ | **OP-R5-1 已定夺（#163 ⑩；#164 台账补记）**：并入 Phase 2 规划评估——B 建议的设行最小接线票（Done L13「一个显式配置的 stdio MCP server 能列出和调用工具」生产路径可达性）与 §6 L148 降级路径（core preview→README/parity 已知限制+不宣称 MCP 可用）两路均入 Phase 2 规划素材，B 席规划票评估后定载体（现态=组合根测试直组 MCPToolAdapter，生产 CLI 注册不 spawn=T8 既定 #152 调度器裁决；ADR 0002 B.2-6 保守记现态零预写——**行 1 已闭合（#166）**：P2-S0=T-C1-050/050C 生产 spawn+bind 落地（App.start_mcp_servers 全生命周期）+T-B-055 评审 PASS 0/0/0/3+并回 `5a5511c`——Done L13 两半句生产路径首次闭合；ADR-0002 B.2-6/B.4 现态翻新归 T-A-012） |
 | 2 | src 存量 34 处历史 TS mapping 注释清理评估 | r4-exit-evidence §7（T-B-044 nit-2）+硬输入③ | **建议登记不设行**：非义务低优先零行为面（34 处=调度器亲证口径为准；B 复核 grep 为超集口径[「TS:」109 命中/「mapping」51 命中]不构成反证）；Phase 2 卡片/后续触达顺手票承载 |
 | 3 | 故障矩阵 L131 后两句（新 catalog/boot_id 旧批准失效）e2e 直载 | r4-exit-evidence §7（T-B-044 nit-3）+硬输入③ | **建议登记不设行**：L116「不在此时补做此前缺失的基础测试」红线；间接承载在册（S3 catalog/指纹 re-ask+S6 T7 boot_id 隔离+S2 断线 unknown）+已知覆盖缺口记档；后续 catalog 轮换票顺手直载（原文先例） |
 | 4 | R0-B probe 等待环加固（L318-331 共享冲突零重试+半写行零容忍） | #155 fixup CI attempt-1 实测+硬输入③ | **R5-M1 已定夺（#163 ⑨；#165 台账补记）**：不设独立微票——probe 等待环加固并入 Phase 2 规划评估（T-B-054 硬输入②给承载载体建议，技术方案见 §2.7 存档）；服务发布检查 CI 稳定性；tools/ 面（非 src 冻结面）；attempt-2/3 病态取证独立不混同 |
