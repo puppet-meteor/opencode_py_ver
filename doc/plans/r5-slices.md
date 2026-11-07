@@ -105,7 +105,7 @@
 
 ### 2.7 并行线（非 C 席主序列，随调度器穿插）
 
-- **R5-M1 probe 加固微票**（台账行 4，建议设行）：`tools/r0/platform_probe.py` L318-331 `_wait_for_tree_markers`——Set-Content 写句柄共享冲突（exists()→read_text() 即读零重试）+`int()` 半写行零容忍（#155 fixup attempt-1 实测面）：标记读 retry（短退避重读）+解析失败续轮询（不因 PermissionError/ValueError 提前失败）；tests/r0/test_platform_probe.py 零回归+加固分支落测；服务发布检查 CI 稳定性；attempt-2/3 病态 runner 取证在调度日志，与本加固项独立不混同（硬输入③原文口径）。
+- **R5-M1 probe 加固——已定夺不设独立微票（#163 ⑨；#165 台账补记）**：并入 Phase 2 规划评估（T-B-054 硬输入②承载载体建议），技术方案存档：`tools/r0/platform_probe.py` L318-331 `_wait_for_tree_markers`——Set-Content 写句柄共享冲突（exists()→read_text() 即读零重试）+`int()` 半写行零容忍（#155 fixup attempt-1 实测面）：标记读 retry（短退避重读）+解析失败续轮询（不因 PermissionError/ValueError 提前失败）；tests/r0/test_platform_probe.py 零回归+加固分支落测；服务发布检查 CI 稳定性；attempt-2/3 病态 runner 取证在调度日志，与本加固项独立不混同（硬输入③原文口径）。
 - **R5-A1 ADR 更新（A 席线）——已闭合**（T-A-011 交付+调度器验收+T-B-053 PASS 0/0/0/1；B-baseline `d653088` merge `dd9421f` 随 #164 入库）：0001 状态行刷新（「已采纳为规划基线；实现/平台行为尚待测试验证」→实测验证态+r4/r5 证据引用）；0002 评估/撰写=启动恢复协调器（Python 专有无 TS 蓝本——r4-slices §4 差异表 1）+MCP 自研最小 JSON-RPC stdio client（OP-R4-1 用户裁决）两决策；**doc/adr/ 写权归 A 席**（ORCHESTRATION §1 路径所有权）——B/C 零触碰，素材（各评审/exit-evidence 引注）由调度器随任务书供给。
 - **R5-MAAS 短会话 smoke（形态待定夺=OP-R5-2）**：B 方案——**C-1 显式本地票**（非 CI 网络，L144）；时点建议 S5 前（parity 一次翻全）；证据面建议 `doc/evidence/r5/maas-session.md`（脱敏沿 r0/platform.json `_leak_self_check`+provider.md 先例：主机路径/凭据/endpoint 占位化，prompt 以最小无害示例记录）+parity provider 行终翻；端点/凭据=调度器供给（外部输入等待另计——ROADMAP L72）；Done L10 语义=「多轮文本+流式工具调用」最小短会话（≥2 轮/≥1 工具流式）+fake server 无网络复现已由 R0-R2 测试承载（对账引用即可）。
 
@@ -116,7 +116,7 @@
 | 1 | bind_mcp_tools 生产 spawn+bind 接线立项评估 | r4-exit-evidence §7（T-B-044 处方 5）+硬输入③ | **OP-R5-1 已定夺（#163 ⑩；#164 台账补记）**：并入 Phase 2 规划评估——B 建议的设行最小接线票（Done L13「一个显式配置的 stdio MCP server 能列出和调用工具」生产路径可达性）与 §6 L148 降级路径（core preview→README/parity 已知限制+不宣称 MCP 可用）两路均入 Phase 2 规划素材，B 席规划票评估后定载体（现态=组合根测试直组 MCPToolAdapter，生产 CLI 注册不 spawn=T8 既定 #152 调度器裁决；ADR 0002 B.2-6 保守记现态零预写） |
 | 2 | src 存量 34 处历史 TS mapping 注释清理评估 | r4-exit-evidence §7（T-B-044 nit-2）+硬输入③ | **建议登记不设行**：非义务低优先零行为面（34 处=调度器亲证口径为准；B 复核 grep 为超集口径[「TS:」109 命中/「mapping」51 命中]不构成反证）；Phase 2 卡片/后续触达顺手票承载 |
 | 3 | 故障矩阵 L131 后两句（新 catalog/boot_id 旧批准失效）e2e 直载 | r4-exit-evidence §7（T-B-044 nit-3）+硬输入③ | **建议登记不设行**：L116「不在此时补做此前缺失的基础测试」红线；间接承载在册（S3 catalog/指纹 re-ask+S6 T7 boot_id 隔离+S2 断线 unknown）+已知覆盖缺口记档；后续 catalog 轮换票顺手直载（原文先例） |
-| 4 | R0-B probe 等待环加固（L318-331 共享冲突零重试+半写行零容忍） | #155 fixup CI attempt-1 实测+硬输入③ | **建议设行微票 R5-M1**（§2.7）：服务发布检查 CI 稳定性；tools/ 面（非 src 冻结面）；attempt-2/3 病态取证独立不混同 |
+| 4 | R0-B probe 等待环加固（L318-331 共享冲突零重试+半写行零容忍） | #155 fixup CI attempt-1 实测+硬输入③ | **R5-M1 已定夺（#163 ⑨；#165 台账补记）**：不设独立微票——probe 等待环加固并入 Phase 2 规划评估（T-B-054 硬输入②给承载载体建议，技术方案见 §2.7 存档）；服务发布检查 CI 稳定性；tools/ 面（非 src 冻结面）；attempt-2/3 病态取证独立不混同 |
 | 5 | R4 float-reported 边界全集（S2 协议面 12 项未覆盖/POSIX 腿 CI 承载/S6 T5② 漂移面等） | r4-exit-evidence §7 L87（以各评审件为准） | **维持登记**：S5 已知限制清单化+S6 Done 对账逐件引注承载；零独立行 |
 | 6 | r4-slices §3 行 3-6 r3 登记级残留（frozen-invoker 评估结论/#28 nit-2·3 条件触发/#30 六项顺手/#26 rg 测试卫生+编号歧义记档） | r4-slices §3（「不触达则顺延 R5+」原文） | **维持登记**：R5 各切片触达对应文件时顺手条款承载（沿 R4 先例）；r4-exit-evidence §7 已收口 R4 面处置；非 R5 义务不设独立行；r3 行#26/#27 编号歧义维持调度器在册裁定 |
 
