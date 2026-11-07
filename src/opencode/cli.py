@@ -523,8 +523,9 @@ def _compose_mcp_manager(loader: ConfigLoader) -> McpManager | None:
     boot ``os.environ`` with the config-declared value as the fallback
     (os.environ wins: a secret the operator exported overrides the file),
     plus the win32 minimal set (T-B-038 ⑥②). Registration only:
-    ``add_server`` never spawns — no server process exists until a call
-    demands one (zero-side-effect composition; the App owns the close).
+    ``add_server`` never spawns here — P2-S0 moved the spawn to session
+    start (``App.start_mcp_servers``: §6 L304 first sentence, the driving
+    path spawns, lists and binds) and the App owns the close.
     No entries -> no manager (``None`` = the App's no-MCP composition).
     """
     entries = loader.mcp_server_entries()
@@ -807,7 +808,8 @@ async def _drive(
     max_steps, system_prompt all come from it, §6.1 L302); the App's
     ``working_dir`` is the RECORDED directory (never silently re-rooted);
     ``mcp_manager``/``mcp_refs`` are the host's current MCP composition —
-    registration only, closed by the App lifecycle (§7 L339).
+    spawned and bound at session start (P2-S0, §6 L304) and closed by the
+    App lifecycle (§7 L339).
     """
     global _ACTIVE_INPUT
     # R4-S6: idempotency keys on (session_id, request_id, text), and a
@@ -842,6 +844,13 @@ async def _drive(
     # gate first keeps the scan-before-driving order total (fail-closed: a
     # scan failure surfaces here exactly as it would at the first write).
     await app.recovery_gate.wait()
+    # P2-S0 (§6 L304 first sentence): session start spawns every explicitly
+    # configured stdio server, lists and binds its tools. A failed startup
+    # is one stderr line per server (the manager keeps the failed marker,
+    # the tool face never gains a silent empty entry) and the boot continues.
+    mcp_failures = await app.start_mcp_servers()
+    for server, error in mcp_failures:
+        print(f"opencode: MCP server {server!r} failed to start: {error}", file=sys.stderr)
     repl_input = _ReplInput(lines, run_reader=not prompt_text)
     try:
         if session_id is None:
