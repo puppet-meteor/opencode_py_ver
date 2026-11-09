@@ -151,6 +151,14 @@ _BUILTIN_VALUES: JsonObject = {
     "max_steps": DEFAULT_MAX_STEPS,
 }
 
+#: §6.3 (M6-skills, P2-S1): the conventional skills directory under the
+#: project root -- ``<project_root>/.opencode-py/skills/``. The manifest file
+#: name (``skills.json``) is the catalog's own constant
+#: (:data:`opencode.skills.catalog.SKILLS_MANIFEST_NAME`); this loader owns
+#: only the root path shape (a conventional path face -- NOT a config-file
+#: key and NOT anything riding a config snapshot, §6.1).
+_SKILLS_DIR_PARTS: tuple[str, ...] = (".opencode-py", "skills")
+
 
 class ConfigError(Exception):
     """The layered config face is broken (§6): discovery, parse, merge, or a semantic violation."""
@@ -560,6 +568,22 @@ class ConfigLoader:
         for layer in layers[1:]:
             merged = _merge_json(merged, layer.values)
         return LayeredConfig(layers=tuple(layers), values=merged)
+
+    # -- §6.3 (M6-skills, P2-S1): skills discovery root ------------------------
+
+    def skills_directory(self) -> Path:
+        """§6.3 (M6-skills P2-S1): the conventional skills discovery root.
+
+        ``<project_root>/.opencode-py/skills/`` -- derived from the SAME
+        project root the §6 L283 layer chain uses (one loader source, no
+        drift: the CLI pin / nearest-VCS-root determination is the
+        constructor's, not a second copy). This is the config face of skills
+        discovery only -- it names the conventional root: existence is the
+        catalog's own named error to raise, and nothing here rides any
+        config snapshot (the §6.1 schema_version faces are untouched;
+        skills discovery is a non-snapshot config face).
+        """
+        return self._project_root.joinpath(*_SKILLS_DIR_PARTS)
 
     # -- §6 L287: runtime resolution -----------------------------------------
 

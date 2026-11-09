@@ -1,0 +1,12 @@
+{
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Review",
+      "path": "code-review/SKILL.md",
+      "size": 78,
+      "hash": "70152FA897CE94831325A87EFAE0039C6AF197EF1E70527E5551E14DA3731EF8",
+      "source": "project"
+    }
+  ]
+}

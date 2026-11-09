@@ -1,0 +1,20 @@
+{
+  "skills": [
+    {
+      "id": "code-review",
+      "name": "Code Review",
+      "path": "code-review/SKILL.md",
+      "size": 78,
+      "hash": "70152fa897ce94831325a87efae0039c6af197ef1e70527e5551e14da3731ef8",
+      "source": "project"
+    },
+    {
+      "id": "empty-skill",
+      "name": "Empty Skill",
+      "path": "empty-skill/SKILL.md",
+      "size": 0,
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "source": "project"
+    }
+  ]
+}

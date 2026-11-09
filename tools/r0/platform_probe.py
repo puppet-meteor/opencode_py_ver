@@ -52,6 +52,16 @@ WORKER_TIMEOUT_SECONDS = 40.0
 TIMEOUT_SCENARIO_BUDGET_SECONDS = 3.0
 BUSY_TIMEOUT_MS = 5000
 
+#: R5-M1 marker-read hardening (r5-slices §2.7; #155 fixup attempt-1 evidence):
+#: attempts per poll round and the short backoff between them. A read that
+#: loses the race with the writer's Set-Content handle (a sharing violation
+#: surfaces as PermissionError, an OSError) or a torn line (``int()`` raising
+#: ValueError on the half-written value) retries this many times with this
+#: backoff, then gives the round up to the outer poll loop -- neither failure
+#: may propagate out of the probe prematurely.
+MARKER_READ_ATTEMPTS = 3
+MARKER_READ_BACKOFF_SECONDS = 0.01
+
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[2] / "doc" / "evidence" / "r0" / "platform.json"
 
 
@@ -315,18 +325,51 @@ def _ps_tree_script(interpreter_exe: str) -> str:
     return _PS_TREE_SCRIPT.replace("__R0B_INTERPRETER__", escaped)
 
 
+def _read_marker_pids(marker: Path) -> dict[str, int] | None:
+    """Best-effort parse of one PID marker file; ``None`` means "try again later".
+
+    R5-M1 hardening (r5-slices §2.7): transient failures -- the writer still
+    holding the handle (a Windows sharing violation surfaces as
+    PermissionError, an OSError) or a torn line whose value is not yet a
+    complete integer (``int()`` raising ValueError) -- retry with a short
+    backoff, then give up for THIS poll round: the caller keeps polling
+    until the deadline instead of letting a half-written marker fail the
+    whole probe.
+    """
+    for attempt in range(MARKER_READ_ATTEMPTS):
+        try:
+            pids: dict[str, int] = {}
+            for line in marker.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" in line:
+                    role, value = line.split("=", 1)
+                    pids[role] = int(value)
+            return pids
+        except (OSError, ValueError):
+            if attempt + 1 < MARKER_READ_ATTEMPTS:
+                time.sleep(MARKER_READ_BACKOFF_SECONDS)
+    return None
+
+
 def _wait_for_tree_markers(child_marker: Path, grandchild_marker: Path, timeout: float) -> dict[str, int]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         pids: dict[str, int] = {}
-        if child_marker.exists() and grandchild_marker.exists():
-            for marker in (child_marker, grandchild_marker):
-                for line in marker.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if "=" in line:
-                        role, value = line.split("=", 1)
-                        pids[role] = int(value)
-            if "child" in pids and "grandchild" in pids:
-                return pids
+        complete = True
+        for marker in (child_marker, grandchild_marker):
+            if not marker.exists():
+                complete = False
+                break
+            parsed = _read_marker_pids(marker)
+            if parsed is None:
+                # R5-M1 hardening: an unreadable or torn marker keeps the
+                # round incomplete; polling continues until the deadline
+                # (TimeoutError) instead of propagating PermissionError or
+                # ValueError out of the probe.
+                complete = False
+                break
+            pids.update(parsed)
+        if complete and "child" in pids and "grandchild" in pids:
+            return pids
         time.sleep(0.05)
     raise TimeoutError("child/grandchild markers not observed in time")
 
