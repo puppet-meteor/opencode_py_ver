@@ -133,6 +133,9 @@ from opencode.tools.builtin import (
     FsWriteAdapter,
     GitDiffAdapter,
     GitStatusAdapter,
+    GitWorktreeAddAdapter,
+    GitWorktreeListAdapter,
+    GitWorktreeRemoveAdapter,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
 
@@ -833,6 +836,9 @@ async def _drive(
             BashAdapter(),
             GitStatusAdapter(roots=runtime.roots),
             GitDiffAdapter(roots=runtime.roots),
+            GitWorktreeAddAdapter(roots=runtime.roots),
+            GitWorktreeListAdapter(roots=runtime.roots),
+            GitWorktreeRemoveAdapter(roots=runtime.roots),
         ),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,

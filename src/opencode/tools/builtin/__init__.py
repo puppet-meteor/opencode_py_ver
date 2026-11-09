@@ -9,8 +9,10 @@ provides the implementations. R3-S6 (CORE-CONTRACTS §6 L287): the six fs
 adapters accept an optional keyword-only ``roots`` constructor argument
 (host config-declared extra roots, empty by default = the R2 single-root
 semantics; the session working_dir always stays a root). P2-S6 (M2-git)
-adds the read-only git pair ``git__status`` / ``git__diff`` (T-C1-053) --
-same ``roots`` constructor shape.
+adds the read-only git pair ``git__status`` / ``git__diff`` (T-C1-053) and
+P2-S7 (M2-git) the approved worktree trio ``git__worktree_add`` /
+``git__worktree_list`` / ``git__worktree_remove`` (T-C1-055) -- same
+``roots`` constructor shape.
 """
 
 from opencode.tools.builtin.bash import (
@@ -49,6 +51,9 @@ from opencode.tools.builtin.git import (
     GIT_VERSION,
     GitDiffAdapter,
     GitStatusAdapter,
+    GitWorktreeAddAdapter,
+    GitWorktreeListAdapter,
+    GitWorktreeRemoveAdapter,
 )
 from opencode.tools.builtin.glob import (
     GLOB_DEFAULT_LIMIT,
@@ -183,4 +188,7 @@ __all__ = [
     "FsWriteAdapter",
     "GitDiffAdapter",
     "GitStatusAdapter",
+    "GitWorktreeAddAdapter",
+    "GitWorktreeListAdapter",
+    "GitWorktreeRemoveAdapter",
 ]
