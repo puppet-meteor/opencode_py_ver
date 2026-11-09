@@ -15,11 +15,11 @@
 | `doc/reference/schema/messages.json` | `models`×8 | messages 模块全模型 | 29706 |
 | `doc/reference/schema/llm.json` | `models`×17 | llm 模块全模型（含 `_ChunkBase`） | 42378 |
 | `doc/reference/schema/tools.json` | `models`×3 | `ToolRef` / `ToolSpec` / `ToolResult` | 8504 |
-| `doc/reference/schema/events.json` | `models`×34 | events 模块全模型（含 3 泛型信封） | 101624 |
-| `doc/reference/schema/event-envelopes.json` | `durable`×21 + `ephemeral`×4 + `generic`×3 | 注册表参数化信封 | 119351 |
+| `doc/reference/schema/events.json` | `models`×35 | events 模块全模型（含 3 泛型信封） | 102734 |
+| `doc/reference/schema/event-envelopes.json` | `durable`×22 + `ephemeral`×4 + `generic`×3 | 注册表参数化信封 | 122043 |
 
 - **粒度**：模块边界 = 机械稳定枚举单元（`vars(module)` + `issubclass(BaseModel)` + `__module__` 归属过滤，重导出零重复）；信封单独按注册表定义参数化；六接缝是语义维度，不在工件内分文件，由本清单显式承载（任务书 1a）。
-- **durable 键** = `versioned_type` 形如 `py.session.created.1`，共 21 键（R1 2：`py.session.created.1`、`py.prompt.accepted.1`；R2 durable 11；R3 permission 6；session_created v2/v3 各 1）；**ephemeral 键** = `py.<type>`，4 键（`py.text.delta` 等）；**generic** = `EventDraft` / `DurableEvent` / `EphemeralEvent` 未参数化泛型，其 `data` 面为任意对象——即 unknown_type / unknown_version 探针的 schema 靶。
+- **durable 键** = `versioned_type` 形如 `py.session.created.1`，共 22 键（R1 2：`py.session.created.1`、`py.prompt.accepted.1`；R2 durable 11；R3 permission 6；session_created v2/v3 各 1；skills 1：`py.skill.activated.1`——T-C1-052a 增）；**ephemeral 键** = `py.<type>`，4 键（`py.text.delta` 等）；**generic** = `EventDraft` / `DurableEvent` / `EphemeralEvent` 未参数化泛型，其 `data` 面为任意对象——即 unknown_type / unknown_version 探针的 schema 靶。
 - **序列化**：`json.dumps(indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)` + 尾换行、`newline="\n"`（dump_fixtures.py 先例 + 键排序消除 dict 插入序依赖）。字节确定性双证：进程内 `build_artifacts()` 连调相等（测试钉）+ 跨进程重跑 6 文件 SHA256 全等（会话内两轮实测）。
 
 ## 2. 六接缝 × 证据矩阵（契约模型 / fixture / 行为锚 / 适配器）
@@ -30,12 +30,12 @@
 | S2 §4 live 与 durable feed | events 4（ephemeral data） | 16 | `tests/contract/test_events.py`（R2 正/负例与 run 元数据组） | `tests/integration/test_eventlog.py`、`test_bus_commit.py`（真实 SQLite 事件日志/总线提交）+ `tests/contract/test_bus.py` |
 | S3 §5 工具、权限与生命周期 | tools 3 + events permission 6 = 9 | 18 | `tests/contract/test_permission_events.py`、`test_tools.py`、`test_tool_listing.py` | `tests/integration/test_tool_bash.py`、`test_tool_read.py`、`test_tool_static_trio.py`、`test_tool_write_edit.py`（真实 fs/bash 工具）；`tests/integration/mcp_stdio_server.py`（fake stdio MCP 服务端） |
 | S4 §3（S6+S4）唯一事件写入、投影与数据库 | events 15（3 信封 + 12 durable data） | 49 | `tests/contract/test_events.py`（R1/R2 正负例、注册表探针组） | `tests/integration/test_store_commit.py`、`test_projector.py`、`test_rebuild.py`、`test_recovery.py`、`test_migrations.py`（真实 SQLite + alembic） |
-| S5 §6 配置、指令和 MCP 信任 | events 9（snapshot / session_created 家族） | 9 | `tests/contract/test_config.py`（TestSessionCreatedV2Wire）、`test_mcp_naming.py`（TestSessionCreatedV3Wire） | `tests/integration/test_config_loader.py`（真实 fs 配置加载） |
+| S5 §6 配置、指令和 MCP 信任 | events 10（snapshot / session_created 家族 + skills 激活记录，T-C1-052a） | 9 | `tests/contract/test_config.py`（TestSessionCreatedV2Wire）、`test_mcp_naming.py`（TestSessionCreatedV3Wire） | `tests/integration/test_config_loader.py`（真实 fs 配置加载） |
 | S6 §7 应用命令接口和任务所有权 | 0（运行时资源，非 wire 模型） | 0（见注） | `tests/integration/test_service.py`、`test_service_run.py`、`test_cli.py`、`test_cli_r3.py`、`test_cli_r4.py`、`test_e2e*.py` | 真实 service/CLI 进程面（无 fake） |
 
 注（S1/S6 零 fixture 属预期，非缺口）：92 个落盘 fixture 全部是事件 wire 面（`events_*.json`）。S1 的消息/生成 wire 形状由模型 + 单测内联构造锁定（R1 起即此口径，CORE-CONTRACTS §1 L17），其统一 schema 面由本任务工件补齐；S6 命令面是运行时行为（无 wire 模型），由集成测试承载。两接缝的模型/行为锚/适配器证据列均非空。
 
-## 3. 模型→接缝映射（63 = errors 1 + messages 8 + events 34 + llm 17 + tools 3）
+## 3. 模型→接缝映射（64 = errors 1 + messages 8 + events 35 + llm 17 + tools 3）
 
 | 模块 | 接缝 | 模型 |
 |---|---|---|
@@ -46,9 +46,9 @@
 | `contracts/events.py` | S3 | `PermissionClosedData` `PermissionExpiredData` `PermissionRepliedData` `PermissionRequestedData` `PermissionRevokedData` `PermissionSavedData` |
 | `contracts/tools.py` | S3 | `ToolRef` `ToolResult` `ToolSpec` |
 | `contracts/events.py` | S4 | 信封：`EventDraft` `DurableEvent` `EphemeralEvent`；durable data：`PromptAcceptedData` `ReasoningFinalizedData` `RunCancelRequestedData` `RunFinishedData` `RunStartedData` `StepFinishedData` `StepGeneratedData` `StepStartedData` `TextFinalizedData` `ToolFinishedData` `ToolRequestedData` `ToolStartedData` |
-| `contracts/events.py` | S5 | `ConfigSnapshot` `ConfigSnapshotV2` `ConfigSnapshotV3` `InstructionSource` `McpServerRef` `SessionCreatedData` `SessionCreatedDataV2` `SessionCreatedDataV3` `SnapshotLimits` |
+| `contracts/events.py` | S5 | `ConfigSnapshot` `ConfigSnapshotV2` `ConfigSnapshotV3` `InstructionSource` `McpServerRef` `SessionCreatedData` `SessionCreatedDataV2` `SessionCreatedDataV3` `SkillActivatedData` `SnapshotLimits` |
 
-计数：S1 25 + S2 4 + S3 9 + S4 15 + S5 9 + S6 0 + 跨接缝 1 = 63。
+计数：S1 25 + S2 4 + S3 9 + S4 15 + S5 10 + S6 0 + 跨接缝 1 = 64。
 
 ## 4. fixture 枚举（92；接缝分布 S2:16 / S3:18 / S4:49 / S5:9）
 
@@ -151,9 +151,9 @@
 
 | 类别 | 数量 | 拒绝面（锚） |
 |---|---|---|
-| 正例 | 25 | 与注册表 25 条定义一一对应（R1 2 + R2 15 + R3 permission 6 + R3 config v2 1 + R4 config v3 1；events.py L939/L947/L971/L988/L1000，`default_event_registry` L1005） |
+| 正例 | 25 | 注册表 26 条定义（R1 2 + R2 15 + R3 permission 6 + R3 config v2 1 + R4 config v3 1 + skills 1——T-C1-052a）；正例与其中 25 条一一对应，skills 定义 fixture 归 P2-S2 实现切片（§6.3 L357），为在册待闭合缺口；events.py L979/L987/L1011/L1028/L1040/L1052，`default_event_registry` L1057 |
 | 反例·schema 级 | 48 | bad_extension 25（envelope/typed data `extra="forbid"`，CORE-CONTRACTS §1 L15）+ missing_field 23（`required` 缺失拒绝） |
-| 反例·行为级 | 19 | missing_run_id 15（`_require_run_metadata`，events.py L732）+ bad_hash 2（`_snapshot_hash_verified`，events.py L337）+ 注册表探针 2（`UnknownEventTypeError` L808 / `UnknownEventVersionError` L812；raise 于 L907/L908/L917） |
+| 反例·行为级 | 19 | missing_run_id 15（`_require_run_metadata`，events.py L772）+ bad_hash 2（`_snapshot_hash_verified`，events.py L337）+ 注册表探针 2（`UnknownEventTypeError` L848 / `UnknownEventVersionError` L852；raise 于 L947/L948/L957） |
 
 ## 6. UNSUPPORTED_CAPABILITY 三面对账
 
@@ -170,9 +170,9 @@
 
 | 规则 | 锚 | 为何 schema 面不覆盖 |
 |---|---|---|
-| run_id 元数据规则 | `_require_run_metadata`（events.py L732） | metadata 是 JsonObject 自由键，键存在性约束非 JSON Schema 可表达 |
+| run_id 元数据规则 | `_require_run_metadata`（events.py L772） | metadata 是 JsonObject 自由键，键存在性约束非 JSON Schema 可表达 |
 | 快照摘要 | `compute_snapshot_hash` / `_snapshot_hash_verified`（events.py L337） | 内容哈希是计算性校验 |
-| 注册表成员资格 | `UnknownEventTypeError` / `UnknownEventVersionError`（L808/L812） | 类型/版本全集是注册表运行时状态，泛型信封 `data` 面为任意对象 |
+| 注册表成员资格 | `UnknownEventTypeError` / `UnknownEventVersionError`（L848/L852） | 类型/版本全集是注册表运行时状态，泛型信封 `data` 面为任意对象 |
 | durability 路由 | `EventDefinition.durability`（注册表属性） | durable/ephemeral 分派不是信封 schema 字段 |
 | ≥1 可读文本 | `_has_model_readable_text`（events.py L585） | 跨字段计数约束 |
 | env_refs 规范形 | `McpServerRef.env_refs` field_validator（events.py L264/L274） | 规范化语义（计算性），schema 只钉容器形状 |
@@ -181,9 +181,9 @@
 
 ## 8. 对账结论（零差异）
 
-1. **63 vs 53**：调度器 grep 预核 53 = 「class 行含 `BaseModel` 字样」的行匹配口径；机械枚举 63 = 53 + 10 条子类声明行（`SessionCreatedDataV2` / `SessionCreatedDataV3` 与 8 个 `(*Chunk)` chunk 子类声明行无 `BaseModel` 字样）。两口径皆真、非契约缺陷；工件覆盖全 63。
+1. **64 vs 54**：调度器 grep 预核口径 53（R5-S4 时点）+1（T-C1-052a `SkillActivatedData`，class 行含 `BaseModel` 字样）= 54；机械枚举 64 = 54 + 10 条子类声明行（`SessionCreatedDataV2` / `SessionCreatedDataV3` 与 8 个 `(*Chunk)` chunk 子类声明行无 `BaseModel` 字样）。两口径皆真、非契约缺陷；工件覆盖全 64。
 2. **92 fixture lock-diff**：工件 + 测试内置最小 JSON Schema 校验器（draft 2020-12 pydantic 发射子集）重放全部 92 个 fixture，分类 25 正例 / 48 schema 级 / 19 行为级与消费面测试语义一致，零差异。
-3. **25 正例 ↔ 25 注册表定义**一一对应（§5）。
+3. **25 正例 ↔ 26 注册表定义**：25 条已注册定义与正例一一对应；+1 skills 定义（T-C1-052a）fixture 归 P2-S2（§6.3 L357），缺口在册（§5）。
 4. **接缝分布闭合**：16 + 18 + 49 + 9 = 92；S1/S6 零 fixture 属预期（§2 注）。
 
 ——生成/锁定/测试执行细节与门禁数字见 `doc/orchestration/progress/T-C1-045.md`。

@@ -32,6 +32,7 @@ from opencode.contracts.events import (
     R3_CONFIG_EVENT_DEFINITIONS,
     R3_PERMISSION_EVENT_DEFINITIONS,
     R4_CONFIG_EVENT_DEFINITIONS,
+    SKILL_EVENT_DEFINITIONS,
     DurableEvent,
     EphemeralEvent,
     EventDefinition,
@@ -47,16 +48,18 @@ SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema"
 MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools)
 
 #: The public definition tuples ``default_event_registry()`` composes
-#: (events.py L1005-1015, read at R5-S4). Importing the tuples -- not the
-#: registry's private dicts -- keeps the generator on public surface only.
-#: A future sixth tuple would need to be added here too (disclosed in the
-#: T-C1-045 progress file; the registry exposes no enumeration API).
+#: (events.py L1057-1068, re-anchored at T-C1-052a). Importing the tuples --
+#: not the registry's private dicts -- keeps the generator on public surface
+#: only. The sixth tuple (SKILL_EVENT_DEFINITIONS, py.skill.activated) was
+#: added here by T-C1-052a, fulfilling the T-C1-045 disclosure; the registry
+#: still exposes no enumeration API.
 ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R1_EVENT_DEFINITIONS,
     *R2_EVENT_DEFINITIONS,
     *R3_PERMISSION_EVENT_DEFINITIONS,
     *R3_CONFIG_EVENT_DEFINITIONS,
     *R4_CONFIG_EVENT_DEFINITIONS,
+    *SKILL_EVENT_DEFINITIONS,
 )
 
 

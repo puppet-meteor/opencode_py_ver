@@ -1648,6 +1648,46 @@
       "title": "SessionCreatedDataV3",
       "type": "object"
     },
+    "SkillActivatedData": {
+      "additionalProperties": false,
+      "description": "``py.skill.activated`` v1 data (§3.1 L142; §6.3 L334-343): the durable\nactivation record -- identity (skill_id/source), provenance\n(path/hash/size) and the bounded instruction body carried on the event,\nso restore replays the saved content and never re-reads disk (§6.3 L345).",
+      "properties": {
+        "body": {
+          "title": "Body",
+          "type": "string"
+        },
+        "hash": {
+          "title": "Hash",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "size": {
+          "title": "Size",
+          "type": "integer"
+        },
+        "skill_id": {
+          "title": "Skill Id",
+          "type": "string"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_id",
+        "source",
+        "path",
+        "hash",
+        "size",
+        "body"
+      ],
+      "title": "SkillActivatedData",
+      "type": "object"
+    },
     "SnapshotLimits": {
       "additionalProperties": false,
       "description": "The §6.1 L287 limits block of a v2 snapshot (RuntimeSettings + max_steps).\n\nWire shape of the runtime knobs the §7 L339 face consumes; every field is\nexplicit (no fabricated defaults, §6.1 L291) and the integer-semantic\nfields reject bools (§1 rule) with the field's own name.",

@@ -59,9 +59,10 @@ PINNED_COUNTS = {"positive": 25, "schema-level": 48, "behavior-level": 19}
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
 #: misses 10 subclass-only declarations -- both counts are reconciled in the
-#: inventory, the artifact covers all 63 actual pydantic models).
-PINNED_MODEL_COUNTS = {"errors.json": 1, "events.json": 34, "llm.json": 17, "messages.json": 8, "tools.json": 3}
-PINNED_DURABLE_KEYS = 21
+#: inventory, the artifact covers all 64 actual pydantic models, +1
+#: SkillActivatedData at T-C1-052a).
+PINNED_MODEL_COUNTS = {"errors.json": 1, "events.json": 35, "llm.json": 17, "messages.json": 8, "tools.json": 3}
+PINNED_DURABLE_KEYS = 22
 PINNED_EPHEMERAL_KEYS = 4
 
 
@@ -281,7 +282,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (63 models; see the inventory)."""
+    """The artifacts enumerate the full model face (64 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
