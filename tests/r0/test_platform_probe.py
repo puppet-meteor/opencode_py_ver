@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from tools.r0.platform_probe import (
@@ -257,3 +258,96 @@ def test_evidence_generation_modes_and_leak_guard() -> None:
     leaky = build_evidence([CheckResult("path_containment", "verified", {"detail": str(Path.home())})], [], "manual")
     with pytest.raises(ValueError, match="leak"):
         _leak_self_check(leaky)
+
+
+# ---------------------------------------------------------------------------
+# R5-M1 hardening (r5-slices §2.7; carried by T-C1-051): _wait_for_tree_markers
+# must survive marker reads that lose the race with the writer's Set-Content
+# handle (sharing violation -> PermissionError) and torn half-written lines
+# (int() -> ValueError) -- retry with a short backoff, then keep polling to the
+# deadline TimeoutError; never propagate the transient error out of the probe.
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_tree_markers_retries_sharing_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.r0.platform_probe import _wait_for_tree_markers
+
+    with tempfile.TemporaryDirectory() as raw:
+        scenario = Path(raw)
+        child = scenario / "child.marker"
+        grandchild = scenario / "grandchild.marker"
+        child.write_text("child=4242\n", encoding="utf-8")
+        grandchild.write_text("grandchild=4243\n", encoding="utf-8")
+        original = Path.read_text
+        attempts: list[str] = []
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            attempts.append(self.name)
+            if len(attempts) <= 2:
+                raise PermissionError(5, "Access is denied (simulated sharing violation)")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", flaky)
+        pids = _wait_for_tree_markers(child, grandchild, timeout=5.0)
+        assert pids == {"child": 4242, "grandchild": 4243}
+        assert len(attempts) >= 3  # the failed reads were retried, not fatal
+
+
+def test_wait_for_tree_markers_tolerates_half_written_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.r0.platform_probe import _wait_for_tree_markers
+
+    with tempfile.TemporaryDirectory() as raw:
+        scenario = Path(raw)
+        child = scenario / "child.marker"
+        grandchild = scenario / "grandchild.marker"
+        child.write_text("child=4242\n", encoding="utf-8")
+        grandchild.write_text("grandchild=4243\n", encoding="utf-8")
+        original = Path.read_text
+        reads: list[str] = []
+
+        def torn(self: Path, *args: Any, **kwargs: Any) -> str:
+            reads.append(self.name)
+            if len(reads) <= 6:  # two fully failed poll rounds before the writer finishes
+                return "child=\n" if self.name.startswith("child") else "grandchild=\n"
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", torn)
+        pids = _wait_for_tree_markers(child, grandchild, timeout=5.0)
+        assert pids == {"child": 4242, "grandchild": 4243}
+        assert len(reads) >= 7  # it polled past the torn rounds instead of failing
+
+
+def test_wait_for_tree_markers_survives_persistent_read_denial(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.r0.platform_probe import _wait_for_tree_markers
+
+    with tempfile.TemporaryDirectory() as raw:
+        scenario = Path(raw)
+        child = scenario / "child.marker"
+        grandchild = scenario / "grandchild.marker"
+        child.write_text("child=4242\n", encoding="utf-8")
+        grandchild.write_text("grandchild=4243\n", encoding="utf-8")
+
+        def denied(self: Path, *args: Any, **kwargs: Any) -> str:
+            raise PermissionError(5, "Access is denied (simulated sharing violation)")
+
+        monkeypatch.setattr(Path, "read_text", denied)
+        with pytest.raises(TimeoutError, match="markers not observed"):
+            _wait_for_tree_markers(child, grandchild, timeout=0.3)
+
+
+def test_wait_for_tree_markers_survives_permanently_torn_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools.r0.platform_probe import _wait_for_tree_markers
+
+    with tempfile.TemporaryDirectory() as raw:
+        scenario = Path(raw)
+        child = scenario / "child.marker"
+        grandchild = scenario / "grandchild.marker"
+        child.write_text("child=4242\n", encoding="utf-8")
+        grandchild.write_text("grandchild=4243\n", encoding="utf-8")
+
+        def torn(self: Path, *args: Any, **kwargs: Any) -> str:
+            return "child=\n" if self.name.startswith("child") else "grandchild=\n"
+
+        monkeypatch.setattr(Path, "read_text", torn)
+        with pytest.raises(TimeoutError, match="markers not observed"):
+            _wait_for_tree_markers(child, grandchild, timeout=0.3)
