@@ -79,6 +79,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: enumeration, another zero-behavior closure (the bash__run row #28
 #: precedent, same shape; ``git`` deliberately NOT added to
 #: ``_ASK_NAMESPACES``).
+#: P2-S7 added the worktree trio (T-C1-055), same closure shape:
+#: ``git__worktree_list`` declares side_effects=False so the fallback
+#: already allowed it, while ``git__worktree_add``/``git__worktree_remove``
+#: declare side_effects=True so the fallback already asked (the residual
+#: rule, L646-662) -- the explicit keys document the trio inside the
+#: closed enumeration; ``git`` still NOT added to ``_ASK_NAMESPACES``.
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -89,6 +95,9 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "bash__run": "ask",
     "git__status": "allow",
     "git__diff": "allow",
+    "git__worktree_list": "allow",
+    "git__worktree_add": "ask",
+    "git__worktree_remove": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.
