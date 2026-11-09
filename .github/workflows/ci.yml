@@ -23,7 +23,7 @@ jobs:
       - name: Lock check
         run: uv lock --check
       - name: Sync locked environment
-        run: uv sync --locked
+        run: uv sync --locked --extra server
       - name: Test suite (R0 contracts + R1 integration, full)
         run: uv run pytest -q
       - name: Platform probe (R0-B)
