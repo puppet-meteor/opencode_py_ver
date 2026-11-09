@@ -1,6 +1,6 @@
 """FastAPI transport over the §7 command surface (P2-S3 / M5-A, PHASE2-MODULES §7).
 
-Six routes over one :class:`~opencode.app.App` composition. The transport is
+Seven routes over one :class:`~opencode.app.App` composition. The transport is
 pure (L101: error-to-HTTP mapping, no runner rewrite): validation, idempotency
 and conflict semantics stay in
 :class:`~opencode.session.service.SessionService`, so this module only shapes
@@ -12,6 +12,36 @@ requests and responses:
 * ``GET  /run/{run_id}/status``              -> RunStatus wire
 * ``GET  /session/{session_id}/messages``    -> MessagePage wire (limit 1..200, default 100)
 * ``POST /permission/{permission_id}/reply`` -> DecisionReceipt wire
+* ``GET  /session/{session_id}/events``      -> durable SSE stream (§7 L105)
+
+Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
+streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
+assembled here over ``app.database.engine`` + ``app.bus`` (the core
+composition is untouched). ``Last-Event-ID`` carries the
+``"{session_id}:{seq}"`` cursor: a malformed or cross-session header is
+rejected at the transport (400 InvalidCursor), while a well-formed cursor of
+an unknown session (404) or beyond the committed high watermark H (400, never
+an empty wait) fails at the follow context entry — the context is entered in
+the handler, so every pre-stream failure answers on the normal error face.
+Event frames carry ``id: {session_id}:{seq}`` (the client resume cursor) with
+the eight-field :class:`~opencode.contracts.events.DurableEvent` envelope as
+the data JSON (its ``evt_`` id is the client dedup key); the catch-up marker
+renders as the comment ``: synced {H}`` (no id — it never advances
+Last-Event-ID); an idle stream emits ``: keepalive`` comments every
+``SSE_KEEPALIVE_SECONDS``. The stream is durable-only (§4 L248: no ephemeral
+token replay in the first version) and strictly pull-shaped — the follow
+generator iterates inline in the response, so a slow consumer parks this
+generator at its yield (zero prefetch, zero unbounded buffers) and never
+blocks the runner (§7 L108: the bus is a wake signal, not a data path; the
+client may re-read the durable log after disconnecting). A frame over
+``MAX_SSE_FRAME_BYTES`` or a mid-stream storage failure answers one terminal
+``event: error`` frame with the §8 CoreError body and closes the stream (the
+200 is already on the wire, so the status cannot change; the non-retryable
+faces should not be blindly reconnected). Streams draw from their own
+concurrency budget (``MAX_CONCURRENT_SSE_STREAMS``) and never take one of the
+eight request slots — the two 429 faces share the SlowConsumer code with
+disjoint causes (connection capacity vs. slow-but-tolerated consumers, so a
+slow SSE reader is never an error).
 
 Security face (PHASE2-MODULES L106): the loopback binding is the host's face
 (:mod:`opencode.httpapi.serving`); this module enforces the single-user bearer
@@ -42,18 +72,20 @@ OP-P2-5).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from opencode.app import App
+from opencode.bus.eventlog import EventCursor, EventLog, LogItem, Synced
 from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.session.service import DecisionReceipt, RunRef, RunStatus, SessionRef
@@ -67,6 +99,15 @@ from opencode.storage.repos import MessagePage
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_CONCURRENT_REQUESTS = 8
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+#: §7 L105 durable SSE faces. ``SSE_KEEPALIVE_SECONDS`` paces the ``: keepalive``
+#: comments on an otherwise idle stream; ``MAX_SSE_FRAME_BYTES`` caps one
+#: serialized event frame (the 4 MiB response cap above applies to the six
+#: single-JSON routes, not to an unbounded stream); ``MAX_CONCURRENT_SSE_STREAMS``
+#: is the streams' own in-flight budget — a stream never takes a request slot.
+SSE_KEEPALIVE_SECONDS = 15.0
+MAX_CONCURRENT_SSE_STREAMS = 8
+MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024
 
 #: §7 L310 message pages over HTTP: the transport domain is narrower than the
 #: repository's 1..1000 clamp — out-of-domain values are 422 ValidationError
@@ -196,19 +237,155 @@ def _messages_wire(page: MessagePage) -> JsonObject:
     }
 
 
-class _GuardMiddleware:
-    """The single-user transport guard: token, Origin, concurrency (L106).
+# -- §7 L105: the durable SSE stream (CORE-CONTRACTS §4) --------------------
 
-    Pure ASGI (no BaseHTTPMiddleware): the three checks run synchronously in
-    loop order, so the in-flight counter needs no lock — the check and the
-    increment happen without an await between them. Rejections answer with a
-    §8 CoreError body directly; admitted requests flow to the inner app.
+
+def _last_event_id_cursor(request: Request, session_id: str) -> EventCursor | None:
+    """The ``Last-Event-ID`` header as this session's cursor (§4 L222).
+
+    An absent header is ``None`` — the seq-0 cursor, a full replay from the
+    beginning of the log. A present header must read ``"{session_id}:{seq}"``
+    (rsplit on the last colon, so a session id containing colons still parses)
+    with an ASCII-digit, non-negative seq for the path's own session; anything
+    else is a transport-level 400 InvalidCursor. A well-formed cursor beyond
+    the committed high watermark is NOT rejected here — the follow context
+    entry owns that state-dependent check (400, never an empty wait).
+    """
+    raw = request.headers.get("last-event-id")
+    if raw is None:
+        return None
+    header_session, separator, raw_seq = raw.rpartition(":")
+    if not separator or not header_session or not raw_seq.isascii() or not raw_seq.isdigit():
+        raise _TransportError(
+            400,
+            CoreError(
+                code=CoreErrorCode.INVALID_CURSOR,
+                message=f"Last-Event-ID {raw!r} is not a well-formed '{{session_id}}:{{seq}}' cursor",
+                retryable=False,
+                details={"session_id": session_id, "reason": "last_event_id_malformed"},
+            ),
+        )
+    if header_session != session_id:
+        raise _TransportError(
+            400,
+            CoreError(
+                code=CoreErrorCode.INVALID_CURSOR,
+                message=f"Last-Event-ID belongs to session {header_session!r}, not {session_id!r}",
+                retryable=False,
+                details={
+                    "session_id": session_id,
+                    "cursor_session_id": header_session,
+                    "reason": "last_event_id_session_mismatch",
+                },
+            ),
+        )
+    return EventCursor(session_id=session_id, seq=int(raw_seq))
+
+
+def _is_sse_request(scope: Scope) -> bool:
+    """``GET /session/{session_id}/events``: the route that holds a stream slot.
+
+    Matched structurally (three path segments: ``session``/id/``events``) so
+    the stream budget only ever counts requests the router itself would
+    accept as the stream route; anything else stays on the request budget.
+    """
+    if scope.get("method") != "GET":
+        return False
+    parts = (scope.get("path") or "").split("/")
+    return len(parts) == 4 and parts[0] == "" and parts[1] == "session" and bool(parts[2]) and parts[3] == "events"
+
+
+def _frame_for(item: LogItem) -> bytes:
+    """One SSE wire block: an event frame, or the ``: synced {H}`` comment.
+
+    Event frames carry ``id: {session_id}:{seq}`` — the exact Last-Event-ID
+    form a reconnecting client sends back — plus the full eight-field
+    DurableEvent envelope as one compact JSON data line; the Synced catch-up
+    marker is a comment (no id, no event type: it never advances
+    Last-Event-ID).
+    """
+    if isinstance(item, Synced):
+        return f": synced {item.cursor.seq}\n\n".encode()
+    data = json.dumps(item.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=False)
+    return f"id: {item.session_id}:{item.seq}\nevent: {item.type}\ndata: {data}\n\n".encode()
+
+
+def _error_frame(core: CoreError) -> bytes:
+    """The terminal ``event: error`` frame (the §8 CoreError wire, in-stream)."""
+    data = json.dumps(core.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=False)
+    return f"event: error\ndata: {data}\n\n".encode()
+
+
+async def _sse_frames(
+    follow: AbstractAsyncContextManager[AsyncIterator[LogItem]],
+    items: AsyncIterator[LogItem],
+) -> AsyncIterator[bytes]:
+    """Stream the already-entered follow context as SSE bytes (pull-shaped).
+
+    Exactly one ``__anext__`` is outstanding at a time, wrapped in a task so
+    an idle stream can still emit ``: keepalive`` comments — a plain
+    ``wait_for`` would cancel the follow at its park point and kill the
+    stream, so the timeout only ends the outer wait while the follow keeps
+    parking (§7 L108: a slow consumer suspends this generator, never the
+    runner; at most one decoded item is ever buffered). A StoreError raised
+    by the follow (a bad page mid-stream, after its healthy events were
+    already yielded) or a frame over MAX_SSE_FRAME_BYTES answers one terminal
+    ``event: error`` frame and ends the response. Leaving the generator —
+    normally, on disconnect, or on cancellation — cancels the outstanding
+    ``__anext__`` and leaves the follow context, which unregisters the
+    wakeup (断线/取消安全).
+    """
+    try:
+        pending: asyncio.Task[LogItem] | None = None
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(items.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=SSE_KEEPALIVE_SECONDS)
+            if not done:
+                yield b": keepalive\n\n"
+                continue
+            task, pending = pending, None
+            try:
+                item = task.result()
+            except StopAsyncIteration:
+                return
+            except StoreError as error:
+                yield _error_frame(error.core)
+                return
+            frame = _frame_for(item)
+            if len(frame) > MAX_SSE_FRAME_BYTES:
+                yield _error_frame(
+                    _validation(f"a single SSE event frame exceeds MAX_SSE_FRAME_BYTES ({MAX_SSE_FRAME_BYTES} bytes)")
+                )
+                return
+            yield frame
+    finally:
+        if pending is not None:
+            pending.cancel()
+            with suppress(asyncio.CancelledError, StopAsyncIteration, StoreError):
+                await pending
+        with suppress(Exception):
+            await follow.__aexit__(None, None, None)
+
+
+class _GuardMiddleware:
+    """The single-user transport guard: token, Origin, concurrency (L106/L105).
+
+    Pure ASGI (no BaseHTTPMiddleware): the checks run synchronously in loop
+    order, so the two in-flight counters (requests, SSE streams) need no lock
+    — the check and the increment happen without an await between them. A
+    stream counts against MAX_CONCURRENT_SSE_STREAMS for its whole response
+    lifetime (the middleware wraps the streaming body too), everything else
+    against MAX_CONCURRENT_REQUESTS, and neither budget feeds the other.
+    Rejections answer with a §8 CoreError body directly; admitted requests
+    flow to the inner app.
     """
 
     def __init__(self, app: ASGIApp, *, token: str) -> None:
         self.app = app
         self._token_bytes = token.encode("utf-8")
         self._inflight = 0
+        self._sse_inflight = 0
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -236,6 +413,29 @@ class _GuardMiddleware:
                 ),
                 403,
             )(scope, receive, send)
+            return
+        if _is_sse_request(scope):
+            # §7 L105: streams draw from their own budget and never take a
+            # request slot — eight hanging streams must not starve the six
+            # command routes (and a busy request face must not refuse streams).
+            if self._sse_inflight >= MAX_CONCURRENT_SSE_STREAMS:
+                await _error_response(
+                    CoreError(
+                        code=CoreErrorCode.SLOW_CONSUMER,
+                        message=(
+                            f"the server is at its concurrent SSE stream limit ({MAX_CONCURRENT_SSE_STREAMS}); "
+                            "retry later"
+                        ),
+                        retryable=True,
+                    ),
+                    429,
+                )(scope, receive, send)
+                return
+            self._sse_inflight += 1
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                self._sse_inflight -= 1
             return
         if self._inflight >= MAX_CONCURRENT_REQUESTS:
             await _error_response(
@@ -304,7 +504,7 @@ def create_app(app: App, *, token: str) -> FastAPI:
     ``token`` is the already-validated single-user token (the host reads and
     fail-closes ``OPENCODE_HTTP_TOKEN`` before listening); the docs faces
     (``/docs``, ``/redoc``, ``/openapi.json``) sit behind the same guard as
-    the six command routes — nothing on this app answers anonymously.
+    the seven routes — nothing on this app answers anonymously.
     """
     service = app.service
     api = FastAPI(
@@ -357,6 +557,28 @@ def create_app(app: App, *, token: str) -> FastAPI:
             limit=limit,
         )
         return _json_response(_messages_wire(page))
+
+    @api.get("/session/{session_id}/events")
+    async def session_events(session_id: str, request: Request) -> Response:
+        """§7 L105: the durable SSE stream (CORE-CONTRACTS §4 follow, over HTTP).
+
+        The EventLog is transport-assembled (engine + bus off the App, the
+        default registry — the same shape the runner composes). The follow
+        context is entered here, so its state-dependent validation answers on
+        the normal error face (404 unknown session, 400 cursor beyond H, 500
+        read-only diagnostic) before any stream byte is on the wire; the
+        generator only ever iterates the already-entered context and leaves
+        it on disconnect (its finally unregisters the wakeup).
+        """
+        cursor = _last_event_id_cursor(request, session_id)
+        log = EventLog(app.database.engine, bus=app.bus)
+        follow = log.follow(session_id, cursor)
+        items = await follow.__aenter__()
+        return StreamingResponse(
+            _sse_frames(follow, items),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @api.post("/permission/{permission_id}/reply")
     async def reply_permission(permission_id: str, request: Request) -> Response:
