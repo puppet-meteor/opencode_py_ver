@@ -1,6 +1,6 @@
 # OpenCode Python：先完成核心闭环，再按需扩展
 
-> 更新：2026-10-30。状态：实现前的设计基线；本文的验收项尚未实现。
+> 更新：2026-11-07。状态：核心已实现并经全量验证（pytest 1139/mypy 110/双 ruff 绿+CI 绿链；R5 收官证据=[r5-exit-evidence §8](reference/r5-exit-evidence.md)，当前基线含 P2-S0 生产 MCP 接线增量）；Phase 2 模块扩展按 [p2-slices](plans/p2-slices.md) 规划推进。core 0.1 尚未发布/稳定（tag 暂缓[OP-R5-4]）；平台已知限制在册（[platform-support §9](platform-support.md)），不可主张平台无限制。状态行刷新：2026-11-07（T-A-012；恢复与 MCP 增量见 [ADR-0002](adr/0002-recovery-coordinator-and-mcp-client.md)）。
 > 目标：Python 3.12+，单用户、本地 workspace、headless 优先。
 
 ## 1. 交付边界
@@ -85,7 +85,7 @@ CLI 和未来 server 都只调用 `SessionService`。Bus 是输出接口，不�
 
 ## 6. 技术与结构
 
-`Python 3.12+/asyncio + pydantic v2 + SQLAlchemy/aiosqlite/Alembic + openai + 官方 mcp SDK + rich + pytest/pytest-asyncio + ruff + mypy`。
+`Python 3.12+/asyncio + pydantic v2 + SQLAlchemy/aiosqlite/Alembic + openai + 自研 MCP stdio client + rich + pytest/pytest-asyncio + ruff + mypy`。MCP 客户端自研、官方 mcp SDK 不采用（manager/stdio/bridge 等自研四件；MCP server=显式配置 stdio spawn——[ADR-0002](adr/0002-recovery-coordinator-and-mcp-client.md) B 卷决策在册）。
 
 `openai`、MCP 和数据库对象留在适配器内部。配置 wire model 用 Pydantic；包含 callback、锁和运行时依赖的上下文用 dataclass/Protocol，避免把运行时服务塞进 JSON 模型。
 
