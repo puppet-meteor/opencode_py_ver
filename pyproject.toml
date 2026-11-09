@@ -12,6 +12,15 @@ dependencies = [
     "aiosqlite>=0.20",
 ]
 
+[project.optional-dependencies]
+# P2-S3 (M5-A, OP-P2-4): the optional local HTTP server face. Deferred imports
+# live only under src/opencode/httpapi/ -- core starts and works without this
+# extra; importing the server face without it reports UnsupportedCapability.
+server = [
+    "fastapi>=0.162.2,<1",
+    "uvicorn>=0.54.0,<1",
+]
+
 [project.scripts]
 opencode = "opencode.cli:main"
 
