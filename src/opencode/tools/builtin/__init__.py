@@ -8,7 +8,9 @@ registered by the host (R2-S6) via
 provides the implementations. R3-S6 (CORE-CONTRACTS §6 L287): the six fs
 adapters accept an optional keyword-only ``roots`` constructor argument
 (host config-declared extra roots, empty by default = the R2 single-root
-semantics; the session working_dir always stays a root).
+semantics; the session working_dir always stays a root). P2-S6 (M2-git)
+adds the read-only git pair ``git__status`` / ``git__diff`` (T-C1-053) --
+same ``roots`` constructor shape.
 """
 
 from opencode.tools.builtin.bash import (
@@ -31,6 +33,22 @@ from opencode.tools.builtin.edit import (
     EDIT_SPEC,
     EDIT_VERSION,
     FsEditAdapter,
+)
+from opencode.tools.builtin.git import (
+    GIT_DEFAULT_TIMEOUT_S,
+    GIT_DIFF_DESCRIPTION,
+    GIT_DIFF_INPUT_SCHEMA,
+    GIT_DIFF_NAME,
+    GIT_DIFF_SPEC,
+    GIT_MAX_OUTPUT_BYTES,
+    GIT_NAMESPACE,
+    GIT_STATUS_DESCRIPTION,
+    GIT_STATUS_INPUT_SCHEMA,
+    GIT_STATUS_NAME,
+    GIT_STATUS_SPEC,
+    GIT_VERSION,
+    GitDiffAdapter,
+    GitStatusAdapter,
 )
 from opencode.tools.builtin.glob import (
     GLOB_DEFAULT_LIMIT,
@@ -104,6 +122,18 @@ __all__ = [
     "EDIT_NAMESPACE",
     "EDIT_SPEC",
     "EDIT_VERSION",
+    "GIT_DEFAULT_TIMEOUT_S",
+    "GIT_DIFF_DESCRIPTION",
+    "GIT_DIFF_INPUT_SCHEMA",
+    "GIT_DIFF_NAME",
+    "GIT_DIFF_SPEC",
+    "GIT_MAX_OUTPUT_BYTES",
+    "GIT_NAMESPACE",
+    "GIT_STATUS_DESCRIPTION",
+    "GIT_STATUS_INPUT_SCHEMA",
+    "GIT_STATUS_NAME",
+    "GIT_STATUS_SPEC",
+    "GIT_VERSION",
     "GLOB_DEFAULT_LIMIT",
     "GLOB_DESCRIPTION",
     "GLOB_INPUT_SCHEMA",
@@ -151,4 +181,6 @@ __all__ = [
     "FsLsAdapter",
     "FsReadAdapter",
     "FsWriteAdapter",
+    "GitDiffAdapter",
+    "GitStatusAdapter",
 ]
