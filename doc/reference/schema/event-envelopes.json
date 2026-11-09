@@ -1778,6 +1778,109 @@
       "title": "DurableEvent[SessionCreatedDataV3]",
       "type": "object"
     },
+    "py.skill.activated.1": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "SkillActivatedData": {
+          "additionalProperties": false,
+          "description": "``py.skill.activated`` v1 data (§3.1 L142; §6.3 L334-343): the durable\nactivation record -- identity (skill_id/source), provenance\n(path/hash/size) and the bounded instruction body carried on the event,\nso restore replays the saved content and never re-reads disk (§6.3 L345).",
+          "properties": {
+            "body": {
+              "title": "Body",
+              "type": "string"
+            },
+            "hash": {
+              "title": "Hash",
+              "type": "string"
+            },
+            "path": {
+              "title": "Path",
+              "type": "string"
+            },
+            "size": {
+              "title": "Size",
+              "type": "integer"
+            },
+            "skill_id": {
+              "title": "Skill Id",
+              "type": "string"
+            },
+            "source": {
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill_id",
+            "source",
+            "path",
+            "hash",
+            "size",
+            "body"
+          ],
+          "title": "SkillActivatedData",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/SkillActivatedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[SkillActivatedData]",
+      "type": "object"
+    },
     "py.step.finished.1": {
       "$defs": {
         "AssistantMessage": {

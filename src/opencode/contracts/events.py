@@ -1,4 +1,4 @@
-"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3(+R4-config) subsets.
+"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3(+R4-config+skills) subsets.
 
 Decode is fail closed: unknown type/version, wrong durability, malformed JSON, or any
 schema violation raises and nothing is silently skipped or coerced. Field-level failures
@@ -68,6 +68,11 @@ PY_PERMISSION_CLOSED = "py.permission.closed"
 PY_PERMISSION_SAVED = "py.permission.saved"
 PY_PERMISSION_REVOKED = "py.permission.revoked"
 PY_PERMISSION_EXPIRED = "py.permission.expired"
+
+# Skills family (§3.1 L142 row): ``py.skill.activated`` -- the durable
+# activation record (§6.3). Producers (SkillCatalog.activate check order +
+# state fold) land in P2-S2; the registration below is contract face only.
+PY_SKILL_ACTIVATED = "py.skill.activated"
 
 EVENT_VERSION = 1
 
@@ -729,6 +734,41 @@ class PermissionExpiredData(BaseModel):
     reason: str = Field(min_length=1)
 
 
+# ---------------------------------------------------------------------------
+# Skills event data model (§3.1 L142 row; §6.3 L334-343). Plain wire fields
+# per the T-C1-052a ruling: the §6.3 field-table bounds (non-empty, hash
+# shape, body cap) are activation check-order semantics (§6.3 L345, P2-S2),
+# not wire constraints. extra="forbid" and the size bool guard stay, per the
+# §1 L16/L17 repo-wide rules.
+# ---------------------------------------------------------------------------
+
+#: Per-skill instruction body cap: the §6 L289 per-instruction limit (64 KiB).
+#: Consumed by the activation check order (P2-S2), not by the wire model.
+SKILL_BODY_MAX_BYTES = 64 * 1024
+
+
+class SkillActivatedData(BaseModel):
+    """``py.skill.activated`` v1 data (§3.1 L142; §6.3 L334-343): the durable
+    activation record -- identity (skill_id/source), provenance
+    (path/hash/size) and the bounded instruction body carried on the event,
+    so restore replays the saved content and never re-reads disk (§6.3 L345).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    skill_id: str
+    source: str
+    path: str
+    hash: str
+    size: int
+    body: str
+
+    @field_validator("size", mode="before")
+    @classmethod
+    def _size_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("size", value)
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -1002,8 +1042,20 @@ R4_CONFIG_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: Skills family (§3.1 L142 row; §6.3 L334-343): ``py.skill.activated`` --
+#: the durable activation record, one type. Kept in a separate tuple so the
+#: frozen R2 boundary pins hold (len(R2_EVENT_DEFINITIONS) == 15; no
+#: py.skill.* rows in R2) while ``default_event_registry`` resolves the full
+#: §3.1 table (T-C1-052a; producers/fold land in P2-S2). Durable per §6.3:
+#: the body rides the event, so the state fold restores it without disk
+#: re-read.
+SKILL_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_SKILL_ACTIVATED, durability="durable", data_model=SkillActivatedData),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4 event subsets (§3.1 rows through R4-S3)."""
+    """Fresh registry over the R1+R2+R3+R4+skills event subsets (§3.1 rows; skills per §6.3)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1011,5 +1063,6 @@ def default_event_registry() -> EventRegistry:
             *R3_PERMISSION_EVENT_DEFINITIONS,
             *R3_CONFIG_EVENT_DEFINITIONS,
             *R4_CONFIG_EVENT_DEFINITIONS,
+            *SKILL_EVENT_DEFINITIONS,
         )
     )
