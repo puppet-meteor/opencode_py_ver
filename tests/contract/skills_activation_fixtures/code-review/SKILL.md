@@ -1,0 +1,1 @@
+Review staged changes for correctness, tests, and doc drift before committing.

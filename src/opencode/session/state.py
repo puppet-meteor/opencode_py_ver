@@ -76,6 +76,7 @@ from opencode.contracts.events import (
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
     PY_RUN_STARTED,
+    PY_SKILL_ACTIVATED,
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
     PY_STEP_STARTED,
@@ -93,6 +94,7 @@ from opencode.contracts.events import (
     RunCancelRequestedData,
     RunFinishedData,
     RunStartedData,
+    SkillActivatedData,
     StepFinishedData,
     StepGeneratedData,
     StepStartedData,
@@ -298,6 +300,23 @@ class DecisionInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillInfo:
+    """One durable activation record folded from ``py.skill.activated`` (§6.3 L334-343).
+
+    The mirror of the event data: identity (skill_id/source), provenance
+    (path/hash/size) and the saved bounded body -- the recovery face (§6.3
+    L345/L354: restore replays this saved content, never re-reads disk).
+    """
+
+    skill_id: str
+    source: str
+    path: str
+    hash: str
+    size: int
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
 class FinalizedPart:
     """A committed ``py.text.finalized``/``py.reasoning.finalized`` value."""
 
@@ -341,6 +360,12 @@ class SessionState:
     finalized: dict[tuple[str, str], FinalizedPart] = field(default_factory=dict)
     permissions: dict[str, PermissionInfo] = field(default_factory=dict)
     decisions: dict[str, DecisionInfo] = field(default_factory=dict)
+    # §6.3 P2-S2: the durable activation records, keyed by the declared body
+    # path -- the §6 L287 path-dedup face (one path, one saved body). Same
+    # content re-activates idempotently, changed content replaces the entry;
+    # the hash-change confirmation gate lives on the §7 host command face
+    # only, so a replayed record never needs confirmation.
+    skills: dict[str, SkillInfo] = field(default_factory=dict)
 
     @property
     def created(self) -> bool:
@@ -401,6 +426,8 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_permission_revoked(state, event)
     if event.type == PY_PERMISSION_EXPIRED:
         return _apply_permission_expired(state, event)
+    if event.type == PY_SKILL_ACTIVATED:
+        return _apply_skill_activated(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -1053,6 +1080,38 @@ def _terminate_decision(state: SessionState, event: DurableEvent[Any], terminal:
             f"decision {data.decision_id} is already {decision.state.value} (event {event.id})"
         )
     return _with_decision(state, event, replace(decision, state=terminal, reason=data.reason))
+
+
+def _apply_skill_activated(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.skill.activated``: register one activated skill in the fold (§6.3 L332-343).
+
+    The activation audit already happened on the host face (size -> path ->
+    trust -> hash, §6.3 L308-329); the fold only replays the committed
+    verdict, so it never re-reads disk (recovery semantics: the state fold
+    carries the saved content, a damaged record is a §3.2.1 read-only
+    diagnostic, never a re-activation). Session-scoped with no run linkage.
+    Idempotent by design: the skills map is keyed by the declared path (the
+    §6 path-dedup face), so the same content replays as a no-op and changed
+    content replaces -- replays are never rejected; the host-side
+    confirmation gate owns the hash-change refusal (§6.3 L347-350).
+    """
+    if not isinstance(event.data, SkillActivatedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected SkillActivatedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    data = event.data
+    skills = dict(state.skills)
+    skills[data.path] = SkillInfo(
+        skill_id=data.skill_id,
+        source=data.source,
+        path=data.path,
+        hash=data.hash,
+        size=data.size,
+        body=data.body,
+    )
+    return replace(state, skills=skills, applied_seq=event.seq)
 
 
 # -- shared helpers -----------------------------------------------------------

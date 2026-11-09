@@ -1,0 +1,17 @@
+{
+  "id": "evt_0000000000000000000000000002",
+  "type": "py.skill.activated",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-02T08:00:01Z",
+  "data": {
+    "skill_id": "code-review",
+    "source": "project",
+    "path": "code-review/SKILL.md",
+    "hash": "70152fa897ce94831325a87efae0039c6af197ef1e70527e5551e14da3731ef8",
+    "size": 78,
+    "body": "Review staged changes for correctness, tests, and doc drift before committing."
+  },
+  "metadata": {},
+  "seq": 2
+}
