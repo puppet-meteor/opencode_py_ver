@@ -73,6 +73,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: Python-side conservative default is the sanctioned fallback (CORE-CONTRACTS
 #: §5.2 L266: the enumeration is the authority, side_effects is the residual
 #: rule), recorded here per ledger row #28.
+#: P2-S6 added ``git__status``/``git__diff`` (T-C1-053): the read-only git
+#: pair declares side_effects=False, so the out-of-table fallback already
+#: allowed both -- the explicit keys document the pair inside the closed
+#: enumeration, another zero-behavior closure (the bash__run row #28
+#: precedent, same shape; ``git`` deliberately NOT added to
+#: ``_ASK_NAMESPACES``).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -81,6 +87,8 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__write": "ask",
     "fs__edit": "ask",
     "bash__run": "ask",
+    "git__status": "allow",
+    "git__diff": "allow",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.
