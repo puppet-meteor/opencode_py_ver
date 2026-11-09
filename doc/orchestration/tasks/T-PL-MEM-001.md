@@ -1,5 +1,6 @@
-# T-PL-MEM-001（v2，评审修订稿）「Agent Memory 长期存储未来规划方案书」规划票任务包
+# T-PL-MEM-001（v3，选型增补稿）「Agent Memory 长期存储未来规划方案书」规划票任务包
 
+> v3 说明（调度器 2026-11-09 增补）：L0/L1 底座选型定案=CSS OpenSearch 引擎线（≥ 2.19.0，见 A 节第 5/9 条）；向量能力交付双轨（先关键词后补向量 / 一步到位）登记（A 节第 9 条 + §8 骨架 + U-7）；S-3/S-5/S-6 随之改写；证据表增 13/14/15 三行与外源锚点注记。其余 v2 结构与纪律不动，v2 说明仍适用。
 > v2 说明：经三席独立评审（架构完备性/治理合规/华为云落地，各有条件通过）修订；12 项跨席必修全部应用。本文件为可直接派发版本。
 
 ---
@@ -20,10 +21,15 @@
 2. **选型**：外挂 TencentDB-Agent-Memory 2.0.3（开源，Node ≥22.16；核心 MemoryCore gateway，可选 MemoryProxy/MemoryPanel/MemoryKnowledge）。**不进宿主进程、不与沙箱合镜像**。理由：(a) 记忆是第二持久库，吸收将违反宿主单一 durable 写入路径契约；(b) L0→L3 提取产物非确定性、不可重放，不能作为宿主事件溯源状态，只能外置为投影存在；(c) 多运行时（Python+Node）耦合。补强理由（方案书 §1 展开）：记忆生命周期独立于沙箱（须比沙箱存活更久）、跨沙箱多租户共享、凭证隔离（中心侧凭证不进沙箱）、独立升级节奏。
 3. **接入缝**：宿主侧走 S3 工具缝——注册三工具 `memory_search` / `conversation_search` / `read_scene`，经 registry/invoker/policy 链（审批默认 ask），失败走既有 error→unknown 语义。**fail-soft 精确口径**：读工具失败返回结构化错误载荷（服务不可用），语义层标 unknown、主链路继续；**禁止将 unknown 折叠为「无相关记忆」断言**；审计日志须区分 empty-result 与 service-unavailable。工具实现内部使用官方 Python SDK `tencentdb_agent_memory`；契约锚 = v2/v3 REST（Bearer + serviceId）。
 4. **ask 的 headless 语义（方案书 §4/§7 展开）**：headless 无交互审批者时，ask = 拒绝并按 fail-soft 降级（不挂起主链路）；审批粒度候选（逐次调用/逐会话/逐 space）登记为待裁决。
-5. **云约束（硬约束）**：华为云。计算 = CCE（标准 K8s）；存储映射：DCS（Redis 协议→分布式锁+任务队列，协议级直连，**实例类型选型见 S-4**）；CSS（Elasticsearch/OpenSearch→L0/L1，需自写 IMemoryStore 适配器，召回融合复用产品客户端 RRF 路径，**向量原语可用性见 S-5**）；OBS（版本化→L2/L3 文件，需自写 IStorageBackend 适配器，**append 语义见 S-2**）。**SFS 不承载任何数据库底座**（SQLite-on-NFS 禁忌）；仅可作纯文件交换面（seed/export），若采用须声明 close-to-open 一致性口径与清理生命周期（归 U-3）。
+5. **云约束（硬约束）**：华为云。计算 = CCE（标准 K8s）；存储映射：DCS（Redis 协议→分布式锁+任务队列，协议级直连，**实例类型选型见 S-4**）；CSS（**选型已定（调度器 2026-11-09）：OpenSearch 引擎线，版本 ≥ 2.19.0**，现役商用镜像 2.19.0/3.4.0→L0/L1，需自写 IMemoryStore 适配器——检索三腿/融合能力位/向量交付双轨口径见第 9 条，**向量原语可用性见 S-5**）；OBS（版本化→L2/L3 文件，需自写 IStorageBackend 适配器，**append 语义见 S-2**）。**SFS 不承载任何数据库底座**（SQLite-on-NFS 禁忌）；仅可作纯文件交换面（seed/export），若采用须声明 close-to-open 一致性口径与清理生命周期（归 U-3）。
 6. **HA 模型**：不自建主备；gateway 无状态多副本（Deployment ×N + Service/LB + /health 探活，readiness 含 DCS 连通性检查）。**一致性分三层（措辞钉死，禁止笼统「强一致」）**：(1) 写路径单点串行（Redis 锁+写确认）；(2) 检索可见性按服务语义分别定义——OBS 单对象强一致/多对象与 list 最终一致、CSS 近实时（写后立读需 refresh=wait_for 或读主分片）、DCS 异步主备复制（切换窗口可能丢锁丢写，由 S-4 幂等兜底）；(3) 语义层最终一致（L1/L2/L3 异步 LLM 管线：每 5 轮对话触发 L1、L2 每 5min、L3 每 10min；多副本轮次计数语义待验证）。L1+ 为派生数据，**可由 L0 全量重建**（队列丢失的补偿基线）。
 7. **多租户**：serviceId/spaceId 隔离，分配粒度待裁决（U-2，含 CSS 索引隔离策略：共享索引+过滤器 vs index-per-tenant）。MemoryProxy 透明代理路线降级为 PoC 备选（绕审计链 + 首轮交互式 session-init 不匹配 headless）。
 8. **演进路线**：P0 单机 PoC（合成数据优先，真实数据须脱敏并过审批；退出判据=三工具贯通+fail-soft 演练+一次完整 L0→L3 提取闭环）→ P1 适配器 spike（S-1~S-9）→ P2 产品化能力卡（单租户单副本试点）→ P3 多副本+多租户（副本>1+租户>1+隔离审计）。P0/P1 部分可并行（S-3/网络类 spike 不依赖 P0 产出）。**当前全部未排期**。
+9. **L0/L1 底座选型与向量能力交付口径（调度器 2026-11-09 v3 增补；方案书中作为规划前提呈现，非 A 席实施裁决，与 §0 状态行口径不冲突）**：
+   - **底座 = CSS OpenSearch 引擎线，版本 ≥ 2.19.0**（现役商用镜像 2.19.0/3.4.0）。依据：(a) OS 2.19+ score-ranker-processor 原生 RRF（rank_constant 默认 60），与产品客户端 rrfMerge（RRF_K=60）、TCVDB 服务端 rerank k=60 同公式同常数——排序语义全链路一致；(b) CSS 的 Elasticsearch 线封顶 7.10.2、无原生融合（无 RRF/retriever API；向量=自研 GRAPH_SQ4/SQ8 专有 API）——选 CSS 即选 OpenSearch 线；(c) 排除候选留档：RDS PG+pgvector（无服务端 RRF，融合须 SQL 手写或客户端）。
+   - **适配器检索三腿**：BM25 腿=jieba 预分词空格连接 token 字段+whitespace 分词（产品侧 app 端预分词、store 端零中文 analyzer 依赖，证据表 13）；向量腿=开源标准 k-NN（CSS 自研向量引擎为备选、API 专有性较强，见 S-5）；融合腿=客户端 rrfMerge 兜底（能力位 nativeHybridSearch=false，零服务端依赖、任意版本可用）或 hybrid query+RRF pipeline 原生短路（能力位=true；前提=集群内 embedding 模型，因 auto-recall 短路仅传文本[证据表 14]；TCVDB hybridSearch 形态同构参照[证据表 15]）。
+   - **kNN 为底座硬性选择标准（已满足）；L1 schema 预留 768 维向量字段**（对齐产品 sqlite vec0 默认维度口径），双路径共用、互迁零 schema 成本。
+   - **向量能力交付双轨并列（两轨均完整展开、不预选；归 U-7 与 S-3 档位联动）**：**路径 A「先关键词后补向量」**=Day-1 strategy=keyword+embedding.provider=none（写入不计算向量；schema 仍预留向量字段）→ 补向量三步：选定 embedding 档位（S-3）→ L0 重建回填重嵌入（L1+ 可由 L0 全量重建、万级记录分钟级、FTS v1→v3 jieba 重建先例；S-6）→ strategy 翻转 hybrid+召回走 knn+match 双路客户端 rrfMerge，条件具备再翻原生能力位；代价=回填窗口，收益=Day-1 零模型依赖。**路径 B「一步到位」**=Day-1 strategy=hybrid+embedding 档位就位（local 离线档为候选起步形态，见 S-3）+写入时嵌入、向量随写积累，无回填窗口；代价=Day-1 即引入 embedding 依赖（可用性/延迟/常驻资源），收益=语义召回与去重质量 Day-1 即达上限。
 
 ## 【B. 证据表】（锚点事实，可经 2.0.3 官方开源源码包独立核验；核验日期 2026-11-09；方案书中锚点须直指源码包/宿主文件，禁止锚到任务包或方案书自身）
 
@@ -43,8 +49,12 @@
 | 10c | M6 HTTP MCP 卡未落地 | 宿主 doc/plans/p2-slices.md | 接入缝差距 |
 | 11 | 参考源码：TencentDB-Agent-Memory 2.0.3（官方开源源码包） | github.com/TencentCloud/TencentDB-Agent-Memory | 方案书内引用口径（本机缓存路径不入方案书） |
 | 12 | 宿主治理口径：ROADMAP §5 + CORE-CONTRACTS 六接缝 | 宿主 doc/ROADMAP.md §5、doc/CORE-CONTRACTS.md | §1/§10 治理参照 |
+| 13 | 产品侧中文预分词：@node-rs/jieba cutForSearch 空格连接 token 入库，store 端仅需 whitespace 分词 | MemoryCore/src/core/store/tokenize.ts | 适配器零中文 analyzer 依赖（S-5 原「中文 analyzer 选型」项据此收窄） |
+| 14 | nativeHybridSearch 能力位 + hybrid 短路单请求仅传文本 searchL1Hybrid({query, topK})；无能力位则客户端 rrfMerge 兜底 | src/core/store/types.ts L256、src/core/hooks/auto-recall.ts L462-468/L521-528 | 能力位=true 的前提=store 侧可自行产生查询向量（服务端/集群内模型），否则走兜底 |
+| 15 | TCVDB 原生混合单请求=ann（服务端 embedding，field「text」）+match（sparse_vector）+rerank{rrf, k:60} | src/core/store/tcvdb/memory-store.ts L1062-1091 | 原生融合形态参照（OS hybrid query+RRF pipeline 同构；k=60 三方[产品 rrfMerge/TCVDB/OS]一致） |
 
 锚点纪律：锚点不达标条目须补勘至文件级后方可写入方案书。
+外源锚点（2026-11-09 核验；非源码包可核，方案书引用须标注核验日期）：华为云 CSS 官方文档（Elasticsearch 线支持版本仅 7.6.2/7.10.2、主力=7.10.2；OpenSearch 线 1.3.6/2.17.1/2.19.0/3.4.0；官方指引「需使用 ES 8+ 新特性→推荐 OpenSearch」；ES 7.10.2 向量=自研 GRAPH_SQ4/SQ8 索引[HNSW+SQ 量化]）＝support.huaweicloud.com；OpenSearch 官方文档（score-ranker-processor RRF 自 2.19 引入、rank_constant 默认 60）＝docs.opensearch.org。
 
 ## 【C. 任务】：撰写方案书 doc/plans/memory-longterm-plan.md
 
@@ -59,7 +69,7 @@
 - §5 华为云适配工程**四件套**：适配器×2 + conformance 测试（参照上游测试组织）+ E2E smoke + 迁移（双写-比对-切换-回收四步单列）；工作量表述以 spike 结果为前提再估、任何周期数字仅覆盖适配器本体；fork vs 上游 PR 两条路线对比与各自决策要件（**选择归 U-4，不预设双轨或单轨**）
 - §6 HA 与一致性模型：三层一致性表 + **故障域九项**（gateway 挂[liveness/readiness 分列]/Redis 挂[含主备切换双锁]/CSS 抖动/OBS 抖动/LLM·embedding 端点不可用/网络分区/CNI·egress 策略/凭证过期轮换/升级窗口）×三列（受影响路径[读/写/管线]×层[L0–L3]×恢复动作[重跑/补跑/熔断]）+ 定时任务所有权模型（集中调度或 Redis 锁 leader）+ RPO/RTO 候选值
 - §7 安全与多租户（Bearer、serviceId 策略+CSS 索引隔离、审批默认 ask、凭证注入、**数据生命周期与删除语义**）
-- §8 演进路线（P0→P3，每阶段触发/退出/回退三要素，**退出条件必须含量化阈值与失败即止损条款**；P1→P2 = 立项裁决点显式标注；当前全部未排期）
+- §8 演进路线（P0→P3，每阶段触发/退出/回退三要素，**退出条件必须含量化阈值与失败即止损条款**；P1→P2 = 立项裁决点显式标注；当前全部未排期；**向量能力交付双轨并列展开（A 节第 9 条口径：路径 A「先关键词后补向量」/路径 B「一步到位」——两轨均含触发/退出/回退与切换成本，不预选，归 U-7）**）
 - §9 风险与开放问题（fork 维护、embedding 端点与召回质量、管线幂等、OBS append、上游 v2.0.x 演进、**成本模型、数据合规/保留策略、多副本重复提取**）
 - §10 与宿主治理体系的关系（M6 外挂簇、A 座裁决位；**不修改 CORE-CONTRACTS/六接缝语义，仅经 S3 既有扩展点接入**）
 - §11 容量与成本模型（CSS 索引/OBS 增长/副本×QPS/管线 token 消耗×沙箱数）
@@ -73,8 +83,9 @@
 - U-4 fork vs 上游 PR 维护策略（配套 S-8 实测证据）
 - **U-5 摄入/写路径**（候选并列：(a) 显式 S3 写工具走审批链；(b) 宿主侧 SDK 定向推送/事件导出桥；(c) 网关代理模式——方案书必须给出设计或显式登记待裁决，**不得空缺**）
 - **U-6 S3 工具集边界**（是否增补：显式记忆写入/遗忘工具[与 U-5 联动]、枚举原语[list spaces/scenes]、read_scene 粒度与分页）
+- **U-7 向量能力交付路径**（路径 A「先关键词后补向量」vs 路径 B「一步到位」，A 节第 9 条口径；与 S-3 embedding 档位联动；两轨同底座同 schema 互迁零成本——方案书双轨完整展开、只列利弊不预选）
 
-**Spike 验证项（只登记，P1 内容）**：S-1 IMemoryStore 接口面勘察+上游测试组织+调度器多副本行为；S-2 OBS append 语义 vs COS Append+追加对象限制矩阵+限流延迟实测；S-3 MAAS /v1/embeddings 可得性+模型/维度/限流清单；S-4 DCS 实例类型选型+命令/Lua 兼容矩阵+主备切换窗口/丢锁率实测+任务重跑幂等；S-5 CSS 版本选型与检索原语实测（dense_vector/kNN 可用性、中文 analyzer 选型含插件可装性、refresh 语义）；S-6 embedding 模型选型与召回质量基线（recall@k 对照+存量重嵌入判定）；S-7 沙箱→中心网络实测（延迟 P99/并发上限/断连重试→fail-soft 阈值）；S-8 fork 与上游 v2.0.x dry-run merge 成本实测；S-9 华为栈最小 E2E smoke（CCE+DCS+CSS+OBS+MAAS 写入→提取→召回闭环）。（可选 S-10：DR 演练）
+**Spike 验证项（只登记，P1 内容）**：S-1 IMemoryStore 接口面勘察+上游测试组织+调度器多副本行为；S-2 OBS append 语义 vs COS Append+追加对象限制矩阵+限流延迟实测；S-3 embedding 档位实测（档位序 none[Noop，路径 A Step-1]→local[node-llama-cpp embeddinggemma-300m GGUF 全离线，写入路径常驻资源]→remote[MAAS /v1/embeddings 可得性+模型/维度/限流清单]；与交付路径联动：路径 B=Day-1 即选 local 或 remote；集群内模型=翻原生能力位 nativeHybridSearch=true 的前提）；S-4 DCS 实例类型选型+命令/Lua 兼容矩阵+主备切换窗口/丢锁率实测+任务重跑幂等；S-5 CSS OpenSearch 底座实测（版本口径 2.19.0/3.4.0——RRF 融合需 ≥2.19、不选 1.3.6/2.17.1[仅归一化融合]；jieba 预分词 token 字段+whitespace 分词的 BM25 检索质量[原「中文 analyzer 选型」项据证据表 13 收窄取消]；向量腿选型=开源 k-NN 插件 vs CSS 自研向量引擎[API 标准性/迁移成本]；hybrid query+score-ranker-processor[RRF，rank_constant=60]端到端验证+客户端 rrfMerge 兜底同步验证；BM25 无界分→score 饱和归一化标定[TCVDB 0.33·s/(s+1) 先例]；refresh 语义[写后立读]；hybrid 各子查询的隔离 filter 携带）；S-6 embedding 模型选型与召回质量基线（recall@k 对照；存量重嵌入判定=路径 A 补向量回填成本项——L1+ 可由 L0 重建、万级记录分钟级、FTS v1→v3 重建先例）；S-7 沙箱→中心网络实测（延迟 P99/并发上限/断连重试→fail-soft 阈值）；S-8 fork 与上游 v2.0.x dry-run merge 成本实测；S-9 华为栈最小 E2E smoke（CCE+DCS+CSS+OBS+MAAS 写入→提取→召回闭环）。（可选 S-10：DR 演练）
 
 **禁止事项**：不写任何代码；不改宿主与 Agent-Memory 源码包任何文件（方案书为唯一写面）；不预写任何裁决；不宣称未验证事实为已验证（推测性内容显式标「待验证」）；不给"全量 TS 对齐"式总工期承诺；文档内代码/配置示例必须标注「示意，未编译未测试」。
 
@@ -83,7 +94,7 @@
 **验收 checklist**（调度器逐项复核）：
 1. [机器] git status --porcelain 仅 `?? doc/plans/memory-longterm-plan.md` 一条，其余零改动
 2. [机器] §0–§13 标题齐全（grep）；状态行含「未排期/未裁决/不落地」精确串
-3. [机器] 证据表 ≥13 条（含 10a/10b/10c 分计）且锚点为路径样式；U-1~U-6、S-1~S-9 编号与数量存在
+3. [机器] 证据表 ≥13 条（含 10a/10b/10c 分计）且锚点为路径样式；U-1~U-7、S-1~S-9 编号与数量存在
 4. [机器] P0–P3 各阶段含「触发/退出/回退」关键词；全文「已验证/已支持/已完成」token 扫描（命中转人工判合法引用）
 5. [人工] 每节含 ≥1 表或 ≥3 实义要点且无占位文本；U/S 项开放未预写的语义判断（无「双轨」式暗含倾向）；写/摄入路径有设计或显式登记待裁决（不得空缺）；锚点内容抽查 3 条实核
 6. [人工] 故障域九项×三列展开；一致性措辞无笼统「强一致」
