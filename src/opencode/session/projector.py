@@ -101,6 +101,7 @@ from opencode.contracts.events import (
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
     PY_RUN_STARTED,
+    PY_SKILL_ACTIVATED,
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
     PY_STEP_STARTED,
@@ -362,6 +363,8 @@ class SessionProjector:
             await self._project_r2(connection, event)
         elif event.type in _PERMISSION_TYPES:
             await self._project_permission(connection, event)
+        elif event.type == PY_SKILL_ACTIVATED:
+            await self._project_skill(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -484,6 +487,22 @@ class SessionProjector:
         pre, digest = await self._pre_state(connection, event)
         post = _fold(pre, event)
         await self._write_permission_diff(connection, event, pre, post)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_skill(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.skill.activated`` event (§6.3 L332-343); no read-model row of its own.
+
+        The activation record lives in the fold state -- the skills map
+        keyed by declared path -- and in the event log itself; §6.3 defines
+        no skills read-model table (zero new tables), so unlike the
+        permission face this dispatch branch writes no diff: pre-state, one
+        fold, the applied_seq advance, then the cache update. The saved
+        instruction body rides the fold state, so recovery replays the
+        saved content and never re-reads disk (§6.3 L345/L354).
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
         await self._advance_applied_seq(connection, event)
         await self._remember_fold_state(connection, event, post, digest)
 

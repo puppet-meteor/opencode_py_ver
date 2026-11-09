@@ -1,11 +1,12 @@
-"""M6-skills P2-S1 contract tests (CORE-CONTRACTS §6.3): SkillCatalog.list discovery.
+"""M6-skills P2-S1 catalog contract tests (CORE-CONTRACTS §6.3): SkillCatalog.list discovery.
 
-Covers the T-C1-051 faces:
+Covers the T-C1-051 faces (the T-C1-052 activation faces live in
+``test_skill_activation.py``):
 
 * 正常 -- the discovery roundtrip: a manifest entry maps onto
   :class:`~opencode.skills.catalog.SkillEntry` field by field, and ``list()``
-  observes only (no activation face exists, no body is read, nothing outside
-  the manifest is touched).
+  observes only (no body is read on this face, nothing outside the manifest
+  is touched; activation is the separate audited ``activate`` face).
 * 失败 -- every discovery branch is one explicit
   :class:`~opencode.skills.catalog.SkillDiscoveryError`: missing directory,
   missing manifest, corrupt JSON/UTF-8, wrong manifest shape, and each entry
@@ -58,6 +59,7 @@ NEGATIVE_FIXTURES = [
     "skills_manifest_entry_bad_size.json",
     "skills_manifest_entry_bad_hash.json",
     "skills_manifest_entry_duplicate_id.json",
+    "skills_manifest_duplicate_key.json",
 ]
 
 
@@ -169,11 +171,12 @@ class TestObservationOnly:
         assert after == before
         assert manifest.read_text(encoding="utf-8") == content_before
 
-    def test_catalog_public_face_is_list_only(self) -> None:
-        """P2-S1 slice boundary: the §6.3 method table's activate is the P2-S2
-        face; the catalog exposes exactly ``list`` today."""
+    def test_catalog_public_face_is_list_and_activate(self) -> None:
+        """The §6.3 method table, both halves landed: ``list`` observes
+        (P2-S1), ``activate`` audits (P2-S2) -- the catalog exposes exactly
+        these two."""
         public = [name for name in dir(SkillCatalog) if not name.startswith("_")]
-        assert public == ["list"]
+        assert public == ["activate", "list"]
 
 
 class TestDiscoveryFailures:

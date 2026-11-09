@@ -67,6 +67,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from opencode.bus import VolatileBus
+from opencode.bus.eventlog import MAX_READ_LIMIT, EventCursor, EventLog
 from opencode.contracts import (
     EVENT_VERSION,
     PY_PROMPT_ACCEPTED,
@@ -85,12 +86,15 @@ from opencode.contracts import (
 from opencode.contracts.events import (
     PY_PERMISSION_REVOKED,
     PY_RUN_CANCEL_REQUESTED,
+    PY_SKILL_ACTIVATED,
     ConfigSnapshotV3,
     PermissionRevokedData,
     RunCancelRequestedData,
     SessionCreatedDataV3,
+    SkillActivatedData,
 )
 from opencode.session.state import SessionStatus
+from opencode.skills import SkillActivationReceipt, SkillCatalog
 from opencode.storage import (
     EventBatch,
     IdempotencyConflictError,
@@ -152,6 +156,12 @@ DEFAULT_CLOSE_TIMEOUT_S = 30.0
 REASON_APPROVAL_RUN_CANCELLED = "run cancelled while awaiting approval"
 REASON_APPROVAL_SHUTDOWN = "service close while awaiting approval"
 REASON_DECISION_REVOKED = "revoked by host"
+
+#: §6.3 L347-350 sanitized reason for the re-activation refusal: a committed
+#: ``py.skill.activated`` carries a different body hash for the same skill id
+#: or the same declared path, and the host did not pass
+#: ``confirm_hash_change=True``.
+REASON_SKILL_HASH_CHANGED = "skill body hash changed since the committed activation"
 
 #: Grace period after a hard task cancel at close-timeout: the runner's
 #: CancelledError handler still commits the honest unknown/interrupted
@@ -471,6 +481,7 @@ class SessionService:
         mcp_close: Callable[[], Awaitable[None]] | None = None,
         approvals: ApprovalCoordinator | None = None,
         policy: PermissionPolicy | None = None,
+        catalog: SkillCatalog | None = None,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
     ) -> None:
         if not isinstance(working_dir, str) or not working_dir:
@@ -510,6 +521,14 @@ class SessionService:
         # into the ToolRegistry.
         self._approvals = approvals
         self._policy = policy
+        # P2-S2 wiring: the §6.3 skill catalog (the activation check-order
+        # gate). Optional like approvals/policy -- the direct-construction
+        # faces stay unchanged; the App composition passes the
+        # discovery-backed instance.
+        self._catalog = catalog
+        # Lazily-built event-log reader for the re-activation confirmation
+        # gate (committed py.skill.activated events, §6.3 L347-350).
+        self._skill_log: EventLog | None = None
         self._close_timeout_s = float(close_timeout_s)
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
@@ -1061,6 +1080,151 @@ class SessionService:
             return
         assert conflict is not None
         raise conflict
+
+    # -- §7 skills (§6.3 activation half) -------------------------------------
+
+    async def activate(
+        self,
+        session_id: str,
+        skill_id: str,
+        source: str,
+        expected_hash: str,
+        *,
+        confirm_hash_change: bool = False,
+    ) -> SkillActivationReceipt:
+        """Activate one discovered skill: audit, gate, commit ``py.skill.activated``.
+
+        The §6.3 fixed check order (大小→路径→信任→hash) runs before the
+        session lock is taken -- pure filesystem validation against the
+        current discovery state, state-independent like the prompt argument
+        checks (the store's own validate-before-lock pattern). Inside the
+        lock: the record status gate (a read_only_diagnostic session never
+        activates), the re-activation confirmation gate (§6.3 L347-350: a
+        committed activation with a different hash for the same skill id or
+        the same declared path is refused unless the host explicitly passes
+        ``confirm_hash_change=True``; same-hash re-activation is idempotent
+        and commits a second audit event), then the durable commit with
+        bounded ConflictError retries. The activation grants nothing (§6.3
+        L351-353): no permission, no execution -- only the audit record,
+        returned as the receipt.
+        """
+        _require_session_id_arg(session_id)
+        if not isinstance(confirm_hash_change, bool):
+            raise StoreValidationError("confirm_hash_change must be a bool (no implicit conversion)")
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        if self._catalog is None:
+            raise StoreValidationError("activate requires the skill catalog (catalog=)")
+        receipt = self._catalog.activate(skill_id, source, expected_hash)
+
+        async with self._session_lock(session_id):
+            record = await self._read_record(session_id)
+            status = record.status
+            if status == SessionStatus.READ_ONLY_DIAGNOSTIC:
+                raise SessionReadOnlyError(
+                    f"session {session_id} is read_only_diagnostic", details={"session_id": session_id}
+                )
+            if status == SessionStatus.CLEANUP_FAILED:
+                raise LifecycleCleanupFailedError(
+                    f"session {session_id} failed resource cleanup", details={"session_id": session_id}
+                )
+            if status == SessionStatus.CLOSED:
+                raise SessionClosedError(f"session {session_id} is closed", details={"session_id": session_id})
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._require_hash_change_confirmation(session_id, receipt, confirm_hash_change=confirm_hash_change)
+            await self._commit_activated(session_id, receipt)
+            return receipt
+
+    async def _require_hash_change_confirmation(
+        self, session_id: str, receipt: SkillActivationReceipt, *, confirm_hash_change: bool
+    ) -> None:
+        """The §6.3 L347-350 re-activation gate: a changed hash needs explicit confirmation.
+
+        Reads the session's committed ``py.skill.activated`` events (paged;
+        worst-case bounded by the log) and keeps the last committed hash per
+        skill id and per declared path. The union is deliberately
+        conservative: either face -- same id with a different hash, or same
+        path with a different hash -- means the body changed under a face
+        the host may not have been looking at, so both refuse without the
+        explicit ``confirm_hash_change=True``. A same-hash re-activation
+        passes (the fold is idempotent; the commit still writes the audit
+        event).
+        """
+        after: EventCursor | None = None
+        by_skill: dict[str, str] = {}
+        by_path: dict[str, str] = {}
+        log = self._activation_log()
+        while True:
+            page = await log.read(session_id, after, MAX_READ_LIMIT)
+            for event in page.items:
+                if event.type == PY_SKILL_ACTIVATED and isinstance(event.data, SkillActivatedData):
+                    by_skill[event.data.skill_id] = event.data.hash
+                    by_path[event.data.path] = event.data.hash
+            if not page.has_more:
+                break
+            after = page.next_cursor
+        previous = by_skill.get(receipt.skill_id)
+        if previous is None:
+            previous = by_path.get(receipt.path)
+        if previous is not None and previous != receipt.hash and not confirm_hash_change:
+            raise ConflictError(
+                f"skill {receipt.skill_id!r} was already activated with a different body hash "
+                f"({previous} -> {receipt.hash}); pass confirm_hash_change=True to confirm the change",
+                details={
+                    "session_id": session_id,
+                    "skill_id": receipt.skill_id,
+                    "path": receipt.path,
+                    "previous_hash": previous,
+                    "new_hash": receipt.hash,
+                    "reason": REASON_SKILL_HASH_CHANGED,
+                },
+            )
+
+    async def _commit_activated(self, session_id: str, receipt: SkillActivationReceipt) -> None:
+        """Commit one ``py.skill.activated`` under the session lock (§6.3 L332-343).
+
+        Bounded ConflictError retries with the same batch (the scheduled
+        runner commits concurrently, so a stale expected_seq is retried);
+        there is no dedupe key -- a same-hash re-activation is a legal
+        second audit event, and the changed-hash case is fenced by the
+        confirmation gate, not by idempotency.
+        """
+        draft = EventDraft[SkillActivatedData](
+            id=self._ids.event_id(),
+            type=PY_SKILL_ACTIVATED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=self._clock(),
+            data=receipt.durable_record(),
+            metadata={},
+        )
+        batch = EventBatch(self._ids.batch_id(), (draft,))
+        conflict: ConflictError | None = None
+        for _ in range(_COMMIT_ATTEMPTS):
+            expected_seq = await self._repos.log_high(session_id)
+            try:
+                committed = await self._store.commit(session_id, batch, expected_seq)
+            except ConflictError as error:
+                conflict = error
+                continue
+            self._bus.notify(session_id, committed)
+            return
+        assert conflict is not None
+        raise conflict
+
+    def _activation_log(self) -> EventLog:
+        """The lazily-built event-log reader for the confirmation gate.
+
+        The engine is the wiring discriminant (same as the run faces): a
+        service constructed without one cannot read the committed log, so it
+        fails closed with StoreValidationError instead of skipping the gate.
+        """
+        if self._skill_log is None:
+            if self._engine is None:
+                raise StoreValidationError("activate requires the storage engine (engine=)")
+            self._skill_log = EventLog(self._engine, repos=self._repos)
+        return self._skill_log
 
     # -- §7 close -------------------------------------------------------------
 
