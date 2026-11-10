@@ -65,6 +65,7 @@ from opencode.session.service import (
     RunStatus,
 )
 from opencode.storage import (
+    ConflictError,
     LifecycleCleanupFailedError,
     NotFoundError,
     ReadRepositories,
@@ -209,6 +210,7 @@ class _Gate:
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
+        self.entered = asyncio.Event()
 
     def open(self) -> None:
         self.event.set()
@@ -314,6 +316,7 @@ class _ScriptedProvider:
             if _is_chunk(item):
                 yield item
             elif isinstance(item, _Gate):
+                item.entered.set()
                 await item.event.wait()
 
     async def close(self) -> None:
@@ -564,6 +567,7 @@ async def test_cancel_mid_run_commits_intent_and_finalizes_interrupted(tmp_path:
     async with _run_app(db_path, provider) as app:
         session_id, run_ref = await _create_prompted(app.service)
         await _await_run_status(app.service, run_ref.run_id, frozenset({RunStatusValue.RUNNING}))
+        await gate.entered.wait()  # CI-176: the stream is provably parked before cancel commits
 
         cancel_task = asyncio.create_task(app.service.cancel(run_ref.run_id))
         cancelling = await _await_run_status(
@@ -803,6 +807,36 @@ async def test_close_commits_shutdown_intent_and_closes_the_provider(tmp_path: P
 
         await app.close()  # repeated close reuses the finished cleanup task
         assert provider.close_count == 1
+
+
+async def test_close_tolerates_conflict_error_on_shutdown_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#174 regression: the Phase 1 intent commit exhausts its ConflictError
+    retries, so the intent row is never committed -- yet close() completes.
+    The cooperative signal still fires (the parked ``app.wait`` tool releases
+    on it), the run folds to interrupted, the provider closes once, and the
+    uncommitted intent is left to R4 durable recovery (CORE-CONTRACTS L464)."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    provider = _ScriptedProvider([[_tool_script("app.wait", "t1")]])
+    waiter = _CancellableAdapter()
+
+    async with _run_app(db_path, provider, adapters=[waiter]) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        await _await_tool_start(waiter)
+
+        async def _conflicting_intent(session_id: str, run_id: str, reason: str) -> None:
+            raise ConflictError(f"scripted conflict committing the {reason} intent for {session_id}/{run_id}")
+
+        monkeypatch.setattr(app.service, "_commit_cancel_intent", _conflicting_intent)
+
+        await app.close()
+
+        assert app.service.closed is True
+        assert provider.close_count == 1
+        assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
+        assert _event_data(db_path, session_id, "py.run.cancel_requested") == []
 
 
 async def test_concurrent_close_reuses_one_cleanup_task(tmp_path: Path) -> None:
