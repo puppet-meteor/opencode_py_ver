@@ -25,7 +25,13 @@ Deny list (OP-R3-2, plan §3 item 25 / §4 difference table 5, L96 hard
 constraint): a minimal advisory regex set -- a hit prepends a warning to
 the result but **never blocks**; the TS ``shell/scan.ts`` 2409-line
 lexer is deliberately not ported. §5.3 L276 last sentence, verbatim
-truth: a dangerous-command regex cannot prove safety.
+truth: a dangerous-command regex cannot prove safety. The C2 enrichment
+(T-C1-065) widens that scan with the structured decode from
+:mod:`opencode.shellparse` (quote-masked and line-continuation-masked
+forms now reach the hint); the raw regex floor, the label priority order
+and the frozen advisory text are unchanged, and a parse failure
+degrades to the raw floor (advisory material only -- the parse face
+never touches the execution path).
 
 TS mapping (recorded fingerprint #102): ``tool/plugin/shell.ts`` (293L)
 -- ``DEFAULT_TIMEOUT_MS`` L24, the timeout=0-disables semantics (L55
@@ -61,6 +67,7 @@ from opencode.process import (
     resolve_interpreter,
     run_command,
 )
+from opencode.shellparse import parse_bash
 
 if TYPE_CHECKING:
     # Annotation-only: importing the runtime package here would create an
@@ -135,10 +142,41 @@ _ADVISORY_TEXT = (
 )
 
 
+def _decoded_scan_surfaces(command: str) -> tuple[str, ...]:
+    """The C2 enrichment faces (T-C1-065): each pipeline stage's joined decoded
+    argv plus each decoded argv item, from the :mod:`opencode.shellparse` prototype.
+
+    Advisory material only. Fail-open: a parse anomaly (ShellParseError or any
+    other exception from the parse face) yields no faces -- the raw regex floor
+    alone decides, exactly as before the enrichment.
+    """
+    try:
+        parsed = parse_bash(command)
+    except Exception:
+        return ()
+    surfaces: list[str] = []
+    for statement in parsed.statements:
+        for segment in statement.segments:
+            argv = segment.argv
+            surfaces.append(" ".join(argv))
+            surfaces.extend(argv)
+    return tuple(surfaces)
+
+
 def _deny_label(command: str) -> str | None:
-    """The first deny-list label matching ``command``, or None (advisory only)."""
+    """The first deny-list label matching ``command``, or None (advisory only).
+
+    C2 enrichment (T-C1-065): the scan surface is the raw command string (the
+    historical floor, preserved verbatim) plus the structured decode of the
+    same string. Quote masking (``rm -rf "/"``) and line-continuation masking
+    (``rm \\<newline>-rf /``) now reach the advisory face; a parse failure
+    degrades to the raw floor unchanged. The label priority stays the tuple
+    order of ``_DENY_HINT_PATTERNS``: the first pattern hitting any surface
+    wins. A hit only prepends the advisory text -- never a block.
+    """
+    surfaces = (command, *_decoded_scan_surfaces(command))
     for label, pattern in _DENY_HINT_PATTERNS:
-        if pattern.search(command):
+        if any(pattern.search(surface) for surface in surfaces):
             return label
     return None
 

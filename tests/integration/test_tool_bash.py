@@ -17,7 +17,13 @@ test plan, all five branches:
    flood-then-hang face proves the reader kept draining past the cap
    (the original byte count reaches the full payload although the process
    is killed mid-sleep).
-4. deny hint fires but never blocks (L96: advisory only, not a sandbox).
+4. deny hint fires but never blocks (L96: advisory only, not a sandbox). The
+   C2 enrichment (T-C1-065) widens the deny scan with the structured decode
+   from ``opencode.shellparse``: quote-masked (``rm -rf "/"``) and
+   line-continuation-masked forms now reach the advisory face while the raw
+   regex floor, the label priority order and the frozen advisory text stay
+   byte-identical; a parse failure degrades to the raw floor (fail-open to
+   today's behavior, never to silence).
 5. Windows/Linux dual-platform subprocess commands (PHASE1-SLIM L94):
    every command is built per platform. A-PLATFORM disclosure: only the
    Windows leg ran in anger on this host; the Unix (bash/killpg) leg is
@@ -82,9 +88,11 @@ from opencode.process.interpreter import resolve_interpreter
 from opencode.session import RunStatusValue, SessionService
 from opencode.session.context import RuntimeSettings
 from opencode.session.service import DecisionReceipt, IdFactory, RunStatus
+from opencode.shellparse import parse_bash
 from opencode.storage import NotFoundError
 from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry
 from opencode.tools.builtin import BASH_DEFAULT_TIMEOUT_S, BASH_MAX_OUTPUT_BYTES, BashAdapter
+from opencode.tools.builtin.bash import _ADVISORY_TEXT, _deny_label
 
 if _PLATFORM == "win32":
     import ctypes
@@ -464,6 +472,76 @@ async def test_bash_deny_hint_fires_but_does_not_block(tmp_path: Path) -> None:
     assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
     joined = "\n".join(_texts(outcome))
     assert "mentions mkfs somewhere" in joined  # it executed
+    assert "[advisory]" in joined
+    assert "filesystem format" in joined
+
+
+# ---------------------------------------------------------------------------
+# branch 4, C2 enrichment (T-C1-065): the structured decode widens the scan
+# ---------------------------------------------------------------------------
+
+
+def test_deny_label_hits_quote_masked_root_deletion() -> None:
+    """``rm -rf "/"``: the raw regex's trailing lookahead breaks on the closing
+    quote; the decoded argv (``rm``, ``-rf``, ``/``) lays the bare ``/`` open."""
+    assert _deny_label('rm -rf "/"') == "recursive root/home deletion"
+
+
+def test_deny_label_hits_line_continuation_masked_root_deletion() -> None:
+    """``rm \\<newline>-rf /``: the raw face's ``\\s+`` chain breaks on the backslash;
+    the decoded argv (continuation removed) matches again."""
+    assert _deny_label("rm \\\n-rf /") == "recursive root/home deletion"
+
+
+def test_deny_label_parse_failure_keeps_the_raw_regex_path() -> None:
+    """``echo $(mkfs ...)`` fails to parse (command substitution is unsupported)
+    and still hits through the raw face: fail-open to today's behavior, never
+    to silence -- a parse anomaly neither widens nor narrows the raw hits."""
+    assert _deny_label("echo $(mkfs /dev/sda)") == "filesystem format"
+
+
+def test_deny_label_empty_argv_item_is_lazy() -> None:
+    """T-B-076 MINOR-2: a trailing line continuation leaves an empty argv item;
+    an empty string matches no non-empty deny regex (laziness, no special case)."""
+    assert parse_bash("echo \\\n").statements[0].segments[0].argv == ("echo", "")
+    assert _deny_label("echo \\\n") is None
+
+
+def test_deny_label_new_hits_carry_the_frozen_advisory_text() -> None:
+    """Strict increment: the enrichment widens only WHICH commands get a label;
+    a newly-hit command renders the frozen ``_ADVISORY_TEXT`` byte-identically."""
+    label = _deny_label('rm -rf "/"')
+    assert label == "recursive root/home deletion"
+    assert _ADVISORY_TEXT.format(label=label) == (
+        "[advisory] the command matches a known dangerous pattern (recursive root/home "
+        "deletion); the deny list is an advisory hint, not a sandbox -- the command "
+        "was not blocked"
+    )
+
+
+async def test_bash_quote_masked_deny_hint_advises_without_blocking(tmp_path: Path) -> None:
+    """Disclosed imprecision of the enriched surface: a harmless echo whose
+    quoted argument carries the dangerous words now gets the advisory -- and
+    still executes (advisory, never a block)."""
+    _interpreter_or_skip()
+    outcome = await _run(tmp_path, {"command": 'echo "rm -rf /"'})
+
+    assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
+    joined = "\n".join(_texts(outcome))
+    assert "rm -rf /" in joined  # it executed
+    assert "[advisory]" in joined
+    assert "recursive root/home deletion" in joined
+
+
+async def test_bash_unparsable_command_still_runs_with_raw_advisory(tmp_path: Path) -> None:
+    """A parse failure never pollutes the execution path: the command runs
+    through the raw-regex advisory face and the tool succeeds (a parse anomaly
+    never becomes a TOOL_FAILED -- the parse face serves advisory only)."""
+    _interpreter_or_skip()
+    outcome = await _run(tmp_path, {"command": "echo $(mkfs /dev/sda)"})
+
+    assert (outcome.state, outcome.effect_status) == ("succeeded", "completed")
+    joined = "\n".join(_texts(outcome))
     assert "[advisory]" in joined
     assert "filesystem format" in joined
 
