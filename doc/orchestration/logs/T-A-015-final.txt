@@ -1,0 +1,95 @@
+# T-A-015 PHASE3 四项架构分叉终裁
+
+## 1. 主脑调用引擎的工具形态
+
+**终裁：选择 (a)。** 在 `src/opencode/tools/` 注册原生 `workflow.run`，只注入主脑 agent 的 `ToolRegistry`；工人 registry 不注册该工具。
+
+**依据：**
+
+- PHASE3 已规定 LangGraph 引擎与网关同进程运行（§2、§7）。
+- `ToolRegistry.snapshot/invoke` 已提供会话级 catalog、单一调用入口和串行锁（`src/opencode/tools/registry.py:206–220,373–428`）。
+- 工具必须经过 catalog、capability 和 policy；现有策略已有 host deny、根目录限制及审批顺序（`doc/CORE-CONTRACTS.md §5.1–§5.2`，`src/opencode/tools/policy.py:582–662`）。
+- 当前 MCP 管理器面向显式配置的外部 stdio server，拥有独立进程、握手、catalog、调用和未知结果生命周期（`src/opencode/mcp/manager.py:1–20,137–143,182–227`）。把同进程内部调用再包成 MCP 会重复引入 transport、生命周期、取消和未知结果边界。
+
+主脑工具仍必须调用同一 gateway validator。工人 capability、catalog 和 policy 中必须排除 `workflow.run`；gateway 还要拒绝工人身份的递归提交，并保留 depth 上限作为第二道防线。
+
+**落选代价与翻案条件：** 选择 MCP 会增加 stdio 子进程、协议转换、取消传播和错误映射成本。只有当主脑与引擎拆成独立进程、需要跨语言/远程调用，或需要稳定的跨进程协议时，才改用 MCP adapter。
+
+**§11 影响：** S4 改为验收原生 `WorkflowRunTool` 和主脑专属 registry 注入；增加主脑端到端调用、工人 catalog 不可见、递归调用拒绝测试。S1/S2 的 job API 和引擎实现不变。MCP 保留为未来跨进程边界。
+
+## 2. 工人会话隔离模型
+
+**终裁：选择 (b)+(c)。** 每个 `opencode_agent` 节点启动独立 `opencode run` 子进程，并为每个 job 建立独立 worktree；LangGraph 引擎仍留在网关进程内，不建立引擎进程池。
+
+**依据：**
+
+- PHASE3 已记录 worker CWD 会锁目录，完成后必须回收（§12）。
+- `process.run_command` 已支持显式 argv、超时、输出限额、Windows Job Object/Unix process group、进程树 kill/reap（`src/opencode/process/runner.py:188–240,262–275`）。
+- worktree 工具使用 detached checkout、禁止强制删除，并在删除前验证 clean（`src/opencode/tools/builtin/git.py:43–82,743–783`）。
+- 权限契约要求 host deny、root containment 优先；task brief 白名单只能约束输入，不能代替执行边界（`doc/CORE-CONTRACTS.md §5.2–§5.3`）。
+
+每个 worker 启动前应从干净 immutable ref 创建 job worktree，以该 worktree 作为 CWD 和唯一允许 root，注入最小 `ConfigSnapshot/PermissionPolicy`，关闭 `workflow.run` capability，并记录 pid、worktree、brief hash 和 budget。取消或超时必须杀整棵进程树，再处理 worktree。成功结果以结构化返回、文件事实、`git status/diff` 和验收门禁为准。
+
+成功 job 可在验收后转移/合并产出再删除 worktree；失败、取消或未知副作用的 dirty worktree 不得 force remove，应保留或隔离供诊断。若 job 内允许并发写节点，还必须串行化写入或再细分 worktree。
+
+**落选代价与翻案条件：** 同进程多会话会共享事件循环、CWD、权限和 capability，难以可靠硬杀，也容易产生上下文污染和递归调用。只有证明所有 worker 都是无副作用读任务，并已有等价的 OS sandbox、硬 kill、root 隔离和 capability 隔离，才可重新评估同进程模型。
+
+**§11 影响：** S3 增加子进程启动/握手、worktree 创建与回收、权限快照、预算 kill、结构化返回和干净基线验收。S5 取消 e2e 必须证明杀 worker 进程树，并明确 worktree 保留/清理策略。S1/S2 checkpoint 和 job 记录需带 worker、worktree、execution 引用；同步修订 §2、§5.2、§7、§8、§11 的进程描述。
+
+## 3. 持久化双写边界
+
+**终裁：选择网关 EventLog 为事实源、关系投影为唯一对外读模型。** job 状态、参数、结果和 trace 归网关持久化；LangGraph SQLite checkpointer 只保存图执行游标和图状态，不对外声明 job 状态。
+
+**依据：**
+
+- `doc/CORE-CONTRACTS.md §3.2–§3.3` 规定事件是事实源，事件提交和 projector 在同一 host store transaction 中完成，projector 可确定性 rebuild。
+- PHASE3 核心纪律要求 job、trace、会话映射归网关，`/jobs` 和 SSE 从同一 job projection 读取（§3、§5.4、§6）。
+- 外部副作用不具备跨两个 SQLite 数据库的 exactly-once 事务能力，因此不能把 checkpoint 与 host EventLog 假装成一个原子提交。
+
+提交顺序应为：网关先提交 job created/spec/params/hash/pipeline/session anchor；成功后才启动 LangGraph。checkpointer 只能作为 advisory cursor。节点结果经过结构化返回、工件和 git 事实验证后，网关再提交 job 状态与结果事件。使用稳定 `job_id/node_execution_id/idempotency_key`、lease、幂等状态迁移和补偿。
+
+恢复时先取得网关恢复所有权并检查 host 状态：
+
+- host terminal 优先，残留 checkpoint 不得复活 job；
+- host nonterminal 且 checkpoint/spec hash 匹配，才恢复 checkpoint；
+- host `created` 且无副作用，可重新启动；
+- checkpoint 缺失、损坏或副作用未知时 fail closed；
+- checkpoint 领先 host 时只能作为未确认事实，先由网关验证，再补写幂等 host 事件。
+
+**落选代价与翻案条件：** 让 checkpointer 成为唯一事实源，会把 API 状态、trace、恢复、session 和审计语义绑定到第三方 schema/lifecycle。只有未来完全迁移到 LangGraph 存储、所有对外 API 都由其 projection 提供，并具备跨数据库恢复协议时，才可翻案。
+
+**§11 影响：** S1 明确 job projection/EventLog 的权威性，并加入 host-ahead、checkpoint-ahead、缺失 checkpoint、terminal conflict 重启矩阵。S2 增加 checkpoint adapter、spec hash、lease、幂等和补偿测试。GET `/jobs` 与 SSE 只能读 host projection；§7/§8 的恢复描述改为“host 先判定，再恢复 checkpoint”。
+
+## 4. 直连路径与参数判定
+
+**终裁：采用严格、可枚举的 gateway 判定。** 直连必须同时满足：
+
+1. 请求来自结构化显式入口：slash `/skill-id`、前端按钮提交的 `skill_id`、保留语法 `skill:<canonical-id>`，或明确标记的精确 canonical ID 引用；
+2. `skill_id` 存在于当前 manifest；
+3. manifest 为 `execution: "langgraph"` 且 pipeline 引用存在；
+4. `params` 经 gateway 按 pipeline schema 严格验证：字段完整、类型正确、无未知字段。
+
+裸自然语言中出现 skill 显示名或 canonical name，即使完全相等，也进入主脑路径，不视为直连。前端只能预校验；主脑原生工具和 router 必须共用同一 gateway validator，并再次校验。
+
+缺参、未知 skill、错误 execution、缺 pipeline、未知字段或类型错误时，不创建直连 job；将原请求及可识别 hint 交给主脑。直连 envelope 至少包含 `skill_id`、canonical `params`、`conversation_anchor`，并由 gateway 加入 `session_id`、`request_id/idempotency_key`、`manifest_hash/pipeline_version` 和 `trace_id`。有用户会话的 job 必须绑定 session anchor；结果和 trace 直接写入 session/job projection，主脑可后续读取，但不经主脑转述充当控制通道。无会话 API 必须显式标注 `origin=api`，通过 job endpoint 取结果。
+
+**依据：** PHASE3 §1、§5.1、§7 已要求“明确 skill + manifest 声明 langgraph”才直连；`doc/CORE-CONTRACTS.md` 要求边界输入严格验证，模型输出不能绕过工具、catalog 或权限边界。
+
+**落选代价与翻案条件：** 宽松自然语言直连会造成误路由、意外执行，并把参数补全从主脑路径中移出。只有未来增加用户确认卡或结构化 intent 字段，同时保留 manifest、schema 和 gateway revalidation，才可扩大入口；不能用模糊匹配或意图分类替代显式入口。
+
+**§11 影响：** S5 增加 slash、button、保留精确语法、裸自然语言、缺参、未知 skill、错误 execution、缺 pipeline、extra/invalid params 的路由真值表，以及 session anchor、结果可见性和幂等测试。S4 原生工具与 S5 router 共用同一 envelope 和 validator；同步修订 §1、§5.1、§7、§11。
+
+## 5. 额外 blocker：`stalled` 不在 job 状态闭集内
+
+PHASE3 §5.4 的闭集是 `created/running/gated/done/failed/cancelled`，但 §8 又要求看门狗把卡死 job 标为 `stalled` 并重派。这必须在 S1 前解决。
+
+推荐正式加入：
+
+- `running → stalled`
+- `stalled → running` 仅允许一次重派
+- `stalled → failed/cancelled`
+- 持久化 `retry_count`、`attempt_id`、`stalled_reason`
+
+同时更新 GET、SSE、恢复协议和验收 fixtures。若不扩展状态闭集，就必须改为 `running + health=stalled`，不能继续同时使用两套未定义语义。
+
+本任务仅做只读终裁：未修改文件、未执行 Git 写操作、未运行测试；工作树既有变化保持原样。
