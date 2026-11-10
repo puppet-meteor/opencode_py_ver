@@ -1,4 +1,4 @@
-"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3(+R4-config+skills) subsets.
+"""Event wire contracts (CORE-CONTRACTS §3.1): envelopes, type+version registry, R1+R2+R3+R4+skills+compaction subsets.
 
 Decode is fail closed: unknown type/version, wrong durability, malformed JSON, or any
 schema violation raises and nothing is silently skipped or coerced. Field-level failures
@@ -24,7 +24,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationInfo, field_validator, model_validator
 
 from opencode.contracts.errors import CoreError
-from opencode.contracts.llm import ModelRef
+from opencode.contracts.llm import ModelRef, Usage
 from opencode.contracts.messages import (
     AssistantMessage,
     JsonObject,
@@ -73,6 +73,13 @@ PY_PERMISSION_EXPIRED = "py.permission.expired"
 # activation record (§6.3). Producers (SkillCatalog.activate check order +
 # state fold) land in P2-S2; the registration below is contract face only.
 PY_SKILL_ACTIVATED = "py.skill.activated"
+
+# Compaction family (§3.1 L176 row; §2.4 L108-139): ``py.context.compacted``
+# -- the durable effective-context-replacement record. The engine core
+# (threshold + lock/CAS capture-commit order + the injected summary face)
+# lands in P2-S8 slice one (T-C1-060); the registration below is contract
+# face only, like the skills precedent.
+PY_CONTEXT_COMPACTED = "py.context.compacted"
 
 EVENT_VERSION = 1
 
@@ -769,6 +776,48 @@ class SkillActivatedData(BaseModel):
         return _reject_bool("size", value)
 
 
+# ---------------------------------------------------------------------------
+# Compaction event data model (§3.1 L176 row; §2.4 L114-124 field table).
+# Unlike the skills precedent (whose §6.3 bounds live in the activation check
+# order, not the wire), the compaction contract pins its bounds ON the wire
+# table itself: covered_seq/retained_from/message_count are non-negative ints,
+# summary_text/summary_hash are non-empty strings, and model/usage reuse the
+# §2.2/§2.3 domains. extra="forbid" and the integer bool guards stay per the
+# §1 L16/L17 repo-wide rules.
+# ---------------------------------------------------------------------------
+
+
+class ContextCompactedData(BaseModel):
+    """``py.context.compacted`` v1 data (§3.1 L176; §2.4 L114-126): the
+    effective-context-replacement record. ``covered_seq`` is the settled
+    history boundary seq captured in-lock -- the expected_seq/CAS basis, so a
+    moved boundary discards the summary; ``retained_from`` is where the
+    retained history starts (the ContextBuilder's original-history origin,
+    §2.4 L119); ``summary_text``/``summary_hash`` carry the replacement body
+    and its identity digest (§2.4 L120-121); ``model``/``usage`` record the
+    extra model call (§2.4 L122-123, domains per §2.2/§2.3); ``message_count``
+    measures the covered interval (§2.4 L124). Not run-scoped: compaction is
+    engine-triggered, so no metadata.run_id is required (§3.1). The engine
+    core lands in P2-S8 slice one (T-C1-060); the ContextBuilder wiring and
+    the projector/fold faces land in the follow-up slice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    covered_seq: int = Field(ge=0)
+    retained_from: int = Field(ge=0)
+    summary_text: str = Field(min_length=1)
+    summary_hash: str = Field(min_length=1)
+    model: ModelRef
+    usage: Usage
+    message_count: int = Field(ge=0)
+
+    @field_validator("covered_seq", "retained_from", "message_count", mode="before")
+    @classmethod
+    def _integer_fields_not_bool(cls, value: Any, info: ValidationInfo) -> Any:
+        return _reject_bool(info.field_name or "", value)
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -1054,8 +1103,21 @@ SKILL_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: Compaction family (§3.1 L176 row; §2.4 L114-126): ``py.context.compacted``
+#: -- the durable effective-context-replacement record, one type. Kept in a
+#: separate tuple so the frozen R2 boundary pins hold (len(R2_EVENT_DEFINITIONS)
+#: == 15; no py.context.* rows in R2) while ``default_event_registry``
+#: resolves the full §3.1 table (T-C1-060; the engine core lands in P2-S8
+#: slice one, the ContextBuilder/projection wiring in slice two). Durable per
+#: §2.4: the replacement record itself is the recovery source of the
+#: effective context.
+COMPACTION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_CONTEXT_COMPACTED, durability="durable", data_model=ContextCompactedData),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4+skills event subsets (§3.1 rows; skills per §6.3)."""
+    """Fresh registry over the R1+R2+R3+R4+skills+compaction event subsets (§3.1; skills §6.3, compaction §2.4)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1064,5 +1126,6 @@ def default_event_registry() -> EventRegistry:
             *R3_CONFIG_EVENT_DEFINITIONS,
             *R4_CONFIG_EVENT_DEFINITIONS,
             *SKILL_EVENT_DEFINITIONS,
+            *COMPACTION_EVENT_DEFINITIONS,
         )
     )

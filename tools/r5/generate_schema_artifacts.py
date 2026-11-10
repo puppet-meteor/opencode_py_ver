@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from opencode.contracts import errors, events, llm, messages, tools
 from opencode.contracts.events import (
+    COMPACTION_EVENT_DEFINITIONS,
     R1_EVENT_DEFINITIONS,
     R2_EVENT_DEFINITIONS,
     R3_CONFIG_EVENT_DEFINITIONS,
@@ -48,11 +49,12 @@ SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema"
 MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools)
 
 #: The public definition tuples ``default_event_registry()`` composes
-#: (events.py L1057-1068, re-anchored at T-C1-052a). Importing the tuples --
+#: (events.py L1119-1131, re-anchored at T-C1-060). Importing the tuples --
 #: not the registry's private dicts -- keeps the generator on public surface
 #: only. The sixth tuple (SKILL_EVENT_DEFINITIONS, py.skill.activated) was
-#: added here by T-C1-052a, fulfilling the T-C1-045 disclosure; the registry
-#: still exposes no enumeration API.
+#: added here by T-C1-052a, fulfilling the T-C1-045 disclosure; the seventh
+#: (COMPACTION_EVENT_DEFINITIONS, py.context.compacted) by T-C1-060; the
+#: registry still exposes no enumeration API.
 ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R1_EVENT_DEFINITIONS,
     *R2_EVENT_DEFINITIONS,
@@ -60,6 +62,7 @@ ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R3_CONFIG_EVENT_DEFINITIONS,
     *R4_CONFIG_EVENT_DEFINITIONS,
     *SKILL_EVENT_DEFINITIONS,
+    *COMPACTION_EVENT_DEFINITIONS,
 )
 
 

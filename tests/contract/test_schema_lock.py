@@ -51,18 +51,19 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ENVELOPE_ARTIFACT = SCHEMA_DIR / "event-envelopes.json"
 
 #: Pinned census (doc/reference/r5-fixture-inventory.md closes the same counts):
-#: 25 positive, 48 schema-level negatives, 19 behavior-level negatives
-#: (15 missing run_id + 2 bad snapshot hash + 2 registry probes).
-PINNED_TOTAL = 92
-PINNED_COUNTS = {"positive": 25, "schema-level": 48, "behavior-level": 19}
+#: 26 positive, 49 schema-level negatives, 20 behavior-level negatives
+#: (15 missing run_id + 1 bad run_id + 2 bad snapshot hash + 2 registry probes;
+#: the compaction trio lands the py.context.compacted faces at T-C1-060).
+PINNED_TOTAL = 95
+PINNED_COUNTS = {"positive": 26, "schema-level": 49, "behavior-level": 20}
 
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
 #: misses 10 subclass-only declarations -- both counts are reconciled in the
-#: inventory, the artifact covers all 64 actual pydantic models, +1
-#: SkillActivatedData at T-C1-052a).
-PINNED_MODEL_COUNTS = {"errors.json": 1, "events.json": 35, "llm.json": 17, "messages.json": 8, "tools.json": 3}
-PINNED_DURABLE_KEYS = 22
+#: inventory, the artifact covers all 65 actual pydantic models, +1
+#: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060).
+PINNED_MODEL_COUNTS = {"errors.json": 1, "events.json": 36, "llm.json": 17, "messages.json": 8, "tools.json": 3}
+PINNED_DURABLE_KEYS = 23
 PINNED_EPHEMERAL_KEYS = 4
 
 
@@ -83,7 +84,7 @@ def _classify(name: str) -> str:
         return "positive"
     if name.endswith("_bad_extension.json") or name.endswith("_missing_field.json"):
         return "schema-level"
-    if name.endswith("_missing_run_id.json") or name.endswith("_bad_hash.json"):
+    if name.endswith("_missing_run_id.json") or name.endswith("_bad_hash.json") or name.endswith("_bad_run_id.json"):
         return "behavior-level"
     if name in ("events_unknown_type.json", "events_unknown_version.json"):
         return "behavior-level"
@@ -282,7 +283,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (64 models; see the inventory)."""
+    """The artifacts enumerate the full model face (65 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
@@ -302,13 +303,13 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 92-file closure (Done L16) and the pinned classification mix."""
+    """The 95-file closure (Done L16) and the pinned classification mix."""
 
     def test_fixture_directory_is_exactly_the_pinned_files(self) -> None:
         assert len(FIXTURE_FILES) == PINNED_TOTAL
         assert {path.name for path in FIXTURES_DIR.iterdir()} == set(FIXTURE_FILES)
 
-    def test_classification_counts_close_at_92(self) -> None:
+    def test_classification_counts_close_at_95(self) -> None:
         assert Counter(_classify(name) for name in FIXTURE_FILES) == PINNED_COUNTS
 
 
