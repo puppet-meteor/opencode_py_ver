@@ -14,7 +14,11 @@ With a provider this is the full R2 stack (r2-slices §2 R2-S7):
 ``EventLog`` -> ``EventCommitter`` -> ``ToolRegistry(sink=committer.sink)``
 -> ``Runner``, injected into ``SessionService`` as the scheduler (§7 L331)
 together with the engine (the runs read model + management-write seam) and
-the provider's ``close`` (§7 L337). Without one, the composition is the R1
+the provider's ``close`` (§7 L337), plus -- M6 slice three, T-C1-063 -- the
+real LLM-backed summary face (``ProviderSummarizer`` over the same provider
+and ``RuntimeSettings``) as the service's ``compaction_summarizer``, so the
+§2.4 compaction chain runs on real model calls in every R2 composition.
+Without one, the composition is the R1
 surface unchanged (storage + bus + session; the runs read model stays wired
 so ``run_status``/``cancel`` keep their §3.2 L187 face over stored runs).
 
@@ -40,6 +44,7 @@ from opencode.contracts.llm import GenerationRequest, ProviderChunk
 from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdapter
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
+from opencode.session.llm_summarizer import ProviderSummarizer
 from opencode.session.recovery import RecoveryCoordinator, RecoveryGate, RecoveryReport, sweep_crash_temp_files
 from opencode.session.runner import DEFAULT_MAX_STEPS, EventCommitter, Runner
 from opencode.session.service import DEFAULT_CLOSE_TIMEOUT_S, AscendingIds, Clock, IdFactory
@@ -195,6 +200,7 @@ class App:
         recovery_gate.bind(lambda: _startup_scan(recovery_coordinator, recovery_roots))
         self._recovery_gate = recovery_gate
         runner: Runner | None = None
+        summarizer: ProviderSummarizer | None = None
         approvals: ApprovalCoordinator | None = None
         policy: PermissionPolicy | None = None
         registry: ToolRegistry | None = None
@@ -226,6 +232,12 @@ class App:
                 limits=limits,
                 max_steps=max_steps,
             )
+            # M6 slice three (T-C1-063): the real LLM-backed summary face over
+            # the SAME provider and runtime settings -- the §2.4 L126 model
+            # call of the compaction chain, injected with the same conditional
+            # shape as ``provider_close`` below (None keeps the R1 dormant
+            # face strictly unchanged).
+            summarizer = ProviderSummarizer(provider=provider, settings=settings)
         self._service = SessionService(
             store=gated_store,
             repos=repos,
@@ -235,6 +247,7 @@ class App:
             ids=shared_ids,
             engine=engine,
             runner=runner,
+            compaction_summarizer=summarizer,
             provider_close=provider.close if provider is not None else None,
             mcp_close=mcp_manager.close if mcp_manager is not None else None,
             approvals=approvals,
