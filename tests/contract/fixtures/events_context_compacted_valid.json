@@ -1,0 +1,27 @@
+{
+  "id": "evt_00000000000000000000000066",
+  "type": "py.context.compacted",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-10T07:41:03Z",
+  "data": {
+    "covered_seq": 63,
+    "retained_from": 64,
+    "summary_text": "Session compaction record: the user drove a Python port review of the OpenCode event store - the CAS commit gate (expected_seq against the high watermark), the projector applied_seq advance, the skills activation record, and the compaction constants (trigger 40 settled messages, retained tail 8). The retained history continues from the eight latest settled messages.",
+    "summary_hash": "75bdc16c47b4931d34379979fd852cca3febfcf82c0b0816dc861b54dfcd34ec",
+    "model": {
+      "provider": "maas",
+      "model": "glm-5.3"
+    },
+    "usage": {
+      "input": 1843,
+      "output": 217,
+      "reasoning": 96,
+      "cache_read": 4021,
+      "cache_write": 1843
+    },
+    "message_count": 32
+  },
+  "metadata": {},
+  "seq": 72
+}

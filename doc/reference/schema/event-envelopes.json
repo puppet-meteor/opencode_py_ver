@@ -1,6 +1,212 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "durable": {
+    "py.context.compacted.1": {
+      "$defs": {
+        "ContextCompactedData": {
+          "additionalProperties": false,
+          "description": "``py.context.compacted`` v1 data (§3.1 L176; §2.4 L114-126): the\neffective-context-replacement record. ``covered_seq`` is the settled\nhistory boundary seq captured in-lock -- the expected_seq/CAS basis, so a\nmoved boundary discards the summary; ``retained_from`` is where the\nretained history starts (the ContextBuilder's original-history origin,\n§2.4 L119); ``summary_text``/``summary_hash`` carry the replacement body\nand its identity digest (§2.4 L120-121); ``model``/``usage`` record the\nextra model call (§2.4 L122-123, domains per §2.2/§2.3); ``message_count``\nmeasures the covered interval (§2.4 L124). Not run-scoped: compaction is\nengine-triggered, so no metadata.run_id is required (§3.1). The engine\ncore lands in P2-S8 slice one (T-C1-060); the ContextBuilder wiring and\nthe projector/fold faces land in the follow-up slice.",
+          "properties": {
+            "covered_seq": {
+              "minimum": 0,
+              "title": "Covered Seq",
+              "type": "integer"
+            },
+            "message_count": {
+              "minimum": 0,
+              "title": "Message Count",
+              "type": "integer"
+            },
+            "model": {
+              "$ref": "#/$defs/ModelRef"
+            },
+            "retained_from": {
+              "minimum": 0,
+              "title": "Retained From",
+              "type": "integer"
+            },
+            "summary_hash": {
+              "minLength": 1,
+              "title": "Summary Hash",
+              "type": "string"
+            },
+            "summary_text": {
+              "minLength": 1,
+              "title": "Summary Text",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/Usage"
+            }
+          },
+          "required": [
+            "covered_seq",
+            "retained_from",
+            "summary_text",
+            "summary_hash",
+            "model",
+            "usage",
+            "message_count"
+          ],
+          "title": "ContextCompactedData",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "ModelRef": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: ``{provider, model}``; Phase 1 provider is fixed to maas.",
+          "properties": {
+            "model": {
+              "minLength": 1,
+              "title": "Model",
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "title": "ModelRef",
+          "type": "object"
+        },
+        "Usage": {
+          "additionalProperties": false,
+          "description": "§2.1 L74: five optional non-negative token counts; null means unknown.\n\nA count the endpoint did not report is ``null`` on the wire, never a\ndisguised ``0`` — only an actual provider zero is zero. ``cost_usd`` is a\nsibling field on the carrying message/chunk (§2.1 L28, §2.3 L96), not a\nUsage member: usage is metered data, cost is priced data.",
+          "properties": {
+            "cache_read": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Read"
+            },
+            "cache_write": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cache Write"
+            },
+            "input": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Input"
+            },
+            "output": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Output"
+            },
+            "reasoning": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Reasoning"
+            }
+          },
+          "title": "Usage",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/ContextCompactedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[ContextCompactedData]",
+      "type": "object"
+    },
     "py.permission.closed.1": {
       "$defs": {
         "JsonObject": {
