@@ -1,6 +1,6 @@
 # PHASE3-ORCHESTRATOR：网关编排层设计 + 代码演进切片规划（v2）
 
-> 版本：v2，2026-11-10。v1 = 同日架构讨论收敛稿（43e3040）；v2 = orch-178 三席评审收敛——A 席四分叉终裁（T-A-015）+ B 席结构化审查（T-B-068：blocker 1/major 9/minor 7/nit 3）+ C-1 席实现核验（T-C1-059：12 条名不副实 + S1 四项隐藏前置）。逐项修数见附录 A/B。
+> 版本：v2.1，2026-11-10。v1 = 同日架构讨论收敛稿（43e3040）；v2 = orch-178 三席评审收敛——A 席四分叉终裁（T-A-015）+ B 席结构化审查（T-B-068：blocker 1/major 9/minor 7/nit 3）+ C-1 席实现核验（T-C1-059：12 条名不副实 + S1 四项隐藏前置）；v2.1 = 同日用户定夺 rider：路径①拆为可裁剪尾件 S5b（§1 实施顺位 + §11 S5a/S5b 分行）。逐项修数见附录 A/B。
 > 形式：按 `multi-agent-orchestration-guide.md` 的席位/纪律/协议/看门狗形式构建。
 > 用途：作为 opencode-2.2.2-py 后续代码演进规划（PHASE1-SLIM / PHASE2-MODULES 之后的新 Phase）。
 > 状态：计划 v2（评审收敛，待排期）。争议裁决基准 = `doc/CORE-CONTRACTS.md`（下称 CC）+ 本文档。
@@ -9,7 +9,7 @@
 
 ## 0. 一句话方案
 
-**常驻网关（orchestrator，进程内长出，扩展现有 httpapi）+ OC 主脑默认路径（方案匹配/参数提取 → `workflow.run` 原生工具 submit/poll）+ 显式 skill 声明 langgraph 才直连引擎（四条件严格判定）+ 工件协议（manifest 扩展/pipeline spec/task brief/py.job.* 事件族/trace）+ 两条通道（对话/控制）+ 预算看门狗 + 工人子进程隔离（每 job 独立 worktree）。**
+**常驻网关（orchestrator，进程内长出，扩展现有 httpapi）+ OC 主脑默认路径（方案匹配/参数提取 → `workflow.run` 原生工具 submit/poll）+ 显式 skill 声明 langgraph 才直连引擎（四条件严格判定，S5b 可裁剪尾件）+ 工件协议（manifest 扩展/pipeline spec/task brief/py.job.* 事件族/trace）+ 两条通道（对话/控制）+ 预算看门狗 + 工人子进程隔离（每 job 独立 worktree）。**
 席位之间不直接通信：一切经网关状态机与持久化工件；智能外购自 OC 的 agent loop，自建面只做"不智能但必须可靠"的部分（路由/调度/事件/权限）。
 
 ## 1. 目标与非目标（路由规则，用户定案原文保留）
@@ -34,6 +34,8 @@
 裸自然语言中出现 skill 显示名或 canonical name——即使完全相等——一律路径②；纯自然语言、缺结构化 params、未知 skill、错误 execution、缺 pipeline、未知字段或类型错误 → 路径②，原请求+可识别 hint 交主脑。不做模糊匹配、不做意图分类，规则可枚举可测试。
 
 **直连信封（v2 新增定义）：** 至少含 `skill_id`、canonical `params`、`conversation_anchor`；网关注入 `session_id`、`request_id/idempotency_key`、`manifest_hash/pipeline_version`、`trace_id`。有用户会话的 job 必绑 session anchor，结果与 trace 写 job 投影供主脑后续读取（知情不经转述）；无会话 API 显式标注 `origin=api`，经 job 端点取结果。前端只能预校验；主脑原生工具与 router 共用同一 gateway validator 并再次校验。
+
+**实施顺位（v2.1，用户 2026-11-10 定夺）：路径①为可裁剪尾件（S5b）**——功能上路径②完全覆盖直连（主脑同样检索 catalog、选型、填参、提交），路径①的全部价值 = 省一轮大模型（延迟 + 成本），属纯优化项。S1–S4 全量走路径②先跑通；S5b（router+信封+真值表）是否落地，待 S1–S4 运行数据（直连命中率/主脑绕行成本）与用户届约定夺。本节四条件门为 S5b 完整规格，保留不删。
 
 **非目标（本阶段明确排除，留后续 Phase）：** 小模型意图分类/模糊路由；主脑现场编写 ad-hoc spec（v1 引擎只执行已注册 pipeline）；无 agent 直答问答路径；引擎独立 worker 进程池（v1 进程内 asyncio 足够）。
 
@@ -209,9 +211,10 @@ contracts/                          + py.job.* 事件定义 + 卡片/trace 契�
 | **S2** | 引擎最小环：pipeline 加载 + 编译 + checkpointer + 顺序执行（节点仅 `llm_call`/`tool`）——**LangGraph 依赖加录 + 版本锁定 + CI 面（C#9）** | 固定 spec fixture 跑通；断点续跑测试；语义门拒绝路径测试；双库边界（job 表事实源）断言 |
 | **S3** | workers.py + `opencode_agent` 节点：子进程 + worktree 生命周期、前摄拦截三件、预算杀三件（**max-tokens 执法新建**，C#11）、结构化返回 | brief 渲染/白名单前摄拒收/预算杀/结构化返回四组契约测试；集成测试起真实工人会话（fake_openai_server 模式）；取消杀进程树断言 |
 | **S4** | brain_driver + 原生 workflow 工具 + 主脑默认路径（路径②） | 每 agent 注册表实例（工人 catalog 不可见 workflow.run）+ 递归提交拒绝测试；e2e：消息→主脑→submit→poll→结果回注（fake_openai_server） |
-| **S5** | manifest 扩展 + router 直连（路径①）+ human_gate + 取消传播 | manifest 夹具（valid/bad/unknown/missing-pipeline）；直连/落回**四条件真值表**测试（slash/按钮/保留语法/裸 NL/缺参/未知 skill/错误 execution/extra params）；gate 弹卡-批复-改参-续跑 e2e；取消全链 e2e |
+| **S5a（必建）** | manifest 扩展 + human_gate + 取消传播 | manifest 夹具（valid/bad/unknown/missing-pipeline）；gate 弹卡-批复-改参-续跑 e2e；取消全链 e2e |
+| **S5b（可裁剪，待定夺）** | router 直连（路径①）+ 直连信封 + 前端预校验契约 | 直连/落回**四条件真值表**测试（slash/按钮/保留语法/裸 NL/缺参/未知 skill/错误 execution/extra params）；动工前置 = S5a + S1–S4 运行数据 + 用户届约定夺 |
 
-依赖链 S1→S2→S3/S4→S5 单向；S3/S4 可在 S2 后并行（文件集零交集）。每片独立 worktree + 分支提交 + 审查 + merge，台账走 `doc/ORCHESTRATION.md` 现行流程。
+依赖链 S1→S2→S3/S4→S5a 单向；S3/S4 可在 S2 后并行（文件集零交集）；S5b 依赖 S5a，另需 S1–S4 运行数据与用户届约定夺方可动工（v2.1）。每片独立 worktree + 分支提交 + 审查 + merge，台账走 `doc/ORCHESTRATION.md` 现行流程。
 
 ## 12. 已知坑（继承 guide §12 实测 + 本设计新增；v2 修订）
 
