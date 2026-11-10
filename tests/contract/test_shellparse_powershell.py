@@ -238,3 +238,60 @@ def test_package_docstring_carries_the_red_lines_and_the_ps_sentence() -> None:
     assert "not an os sandbox" in doc
     assert "ask/deny" in doc
     assert "powershell" in doc
+
+
+# ---------------------------------------------------------------------------
+# T-C1-066 additions: the `` `u{...}`` negative pin and the source-level
+# code-family pin
+# ---------------------------------------------------------------------------
+
+
+def test_unicode_escape_form_reaches_the_script_block_rejection() -> None:
+    """T-B-077 S-2: `` `u{...}`` (the PS 6+ unicode escape form) is not decoded
+    -- the ``{`` reaches the script-block rejection (no dedicated diagnosis).
+
+    The golden negative ``unicode-escape-form`` pins the face positionally
+    (offset 15 = the ``{``); this pin labels the disclosed approximation."""
+    with pytest.raises(ShellParseError) as info:
+        parse_powershell("Write-Output `u{263A}")
+    assert info.value.code == "unsupported-construct"
+
+
+def _error_call_code_literals(module_filename: str) -> set[str]:
+    """AST-scan a parser module: the first-argument literals of every ``self._error(...)`` call."""
+    source_path = _PACKAGE_DIR / module_filename
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    codes: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_error"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            continue
+        code = node.args[0]
+        assert isinstance(code, ast.Constant) and isinstance(code.value, str), (module_filename, node.lineno)
+        codes.add(code.value)
+    return codes
+
+
+def test_source_error_calls_stay_within_the_declared_seven() -> None:
+    """T-B-077 S-3: every ``_error(...)`` call site in powershell.py raises a
+    code *literal* from the declared seven-code family.
+
+    The corpus pin above covers corpus->codes; this covers source->codes, so
+    a future eighth code cannot drift into the parser without golden
+    coverage (the closed set is pinned at both ends)."""
+    codes = _error_call_code_literals("powershell.py")
+    assert codes, "the parser does raise"
+    assert codes <= {
+        "unclosed-single-quote",
+        "unclosed-double-quote",
+        "unclosed-brace",
+        "empty-variable-name",
+        "dangling-escape",
+        "empty-command",
+        "unsupported-construct",
+    }
