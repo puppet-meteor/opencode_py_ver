@@ -215,6 +215,9 @@ class _Gate:
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
+        # Set the moment the scripted stream reaches the gate: proof that the
+        # run task is parked mid-stream ("running" alone pins only run.started).
+        self.entered = asyncio.Event()
 
     def open(self) -> None:
         self.event.set()
@@ -316,6 +319,7 @@ class _ScriptedProvider:
             if _is_chunk(item):
                 yield item
             elif isinstance(item, _Gate):
+                item.entered.set()
                 await item.event.wait()
 
     async def close(self) -> None:
@@ -1222,6 +1226,11 @@ async def test_concurrency_limit_answers_429_slow_consumer(tmp_path: Path) -> No
         ref = await _http_prompt(api, session_id, "hello", "req_1")
         run_id = str(ref["run_id"])
         await _await_http_status(api, run_id, {"running"})
+        # "running" only proves py.run.started committed: between it and the
+        # gate the run task still crosses awaits where a cancel-first intent
+        # folds it early (§2.1 L59/L65, §3.1 L125) and the cancels would all
+        # answer at once. Park proof first (T-C1-061b), then fire the cancels.
+        await asyncio.wait_for(gate.entered.wait(), timeout=5.0)
         tasks = [asyncio.create_task(_asgi_json(api, "POST", f"/run/{run_id}/cancel")) for _ in range(9)]
         done, pending = await asyncio.wait(tasks, timeout=1.0)
         assert len(done) == 1 and len(pending) == 8
