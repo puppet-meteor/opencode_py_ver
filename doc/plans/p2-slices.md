@@ -106,12 +106,78 @@ Phase 1 ─┬─ M1 存储/同机多进程 ────────────
 - **测试策略（L110 验收原文）**：「客户端创建 session、prompt、读终态；断线/重连、重复请求、错误码、未认证请求、审批和 shutdown 都有集成测试。以单 worker 启动为正例，第二 worker/server、reload 复制或数据目录锁冲突为明确失败用例。」——平台面：loopback 绑定/端口占用 Windows/POSIX 双 CI。
 - **验收标准**：L110 逐句+L112 边界句（「只选 M5 即可在单进程服务中接入外部 UI。多进程共享库先做 M1；公网/多租户需要额外的 TLS/部署、用户隔离、配额和权限设计，不包含在 2–3 周预算」——如实记档不越界）。
 
-### 2.3 M2-git 子项（默认序第 3 首切片 P2-S6；其余子项卡片级）
+### 2.3 M2：本地执行扩展（git 子项已毕 P2-S6/P2-S7；余量三子项切片细拆——T-B-075 规划产出票，2026-11-11）
 
 - **目标（L67 约束原文）**：「先 status/diff，再提供受审批的 worktree 操作；记录 cwd/roots 和冲突，禁止静默覆盖未提交文件」+M2 验收（L70 原文）：「每个已选子项有平台与取消测试；运行中的配置快照不受文件事件偷偷修改；现有 S3 权限和退出行为不回退。仅需要 git 的用户不必安装 watcher 或 PTY。」
 - **改动点（L61 原文）**：「tools adapter、ConfigSnapshot 的显式 reload capability、S6 资源管理；拆子项验收。」
-- **切片拆分**：**P2-S6**=git status/diff 工具 adapter（受审批执行——S3 policy 面；输出限额/超时/取消沿用既有工具面）+平台（Windows/POSIX git 面双 CI）+取消测试；worktree 操作=后续切片（受审批+记录 cwd/roots/冲突+禁静默覆盖——连接 M6 worktree/snapshot 卡，依赖图 L25-26）。B 判读：git 子项可零新依赖先行（subprocess git 面），卡片开始时按 L36 列可选依赖复核。
-- **其余子项卡片级摘要（约束/退出条件 L65/L66/L68 原文照录）**：watcher=「watchfiles 等库验证后接入；去重/合并变更，只提示或在 idle 显式创建新快照，不改变运行中审批」；shell 解析=「Bash/PowerShell 各自打样；以选定 TS 用例比较行为，解析失败继续 ask/deny；AST 分析也不是 OS 沙箱」；PTY=「Unix/Windows 分别验证 resize、Ctrl-C、编码、进程树退出，再确定库；未验证的平台不开启」——各自独立切片/卡，库引入走 OP-P2-4。
+- **切片拆分（已毕态记档——T-B-075 现读刷新）**：**P2-S6**=git status/diff 工具 adapter（T-C1-053）+**P2-S7**=worktree 三 adapter（T-C1-055）均已落地（`src/opencode/tools/builtin/git.py` 882L 现读：`--no-optional-locks` 全局位形+`--` 分隔符钉位置参数+`--force` 结构性缺席+conflicts 记录面+PATH 发现/版本检查；`tools/policy.py` `_DEFAULT_EFFECTS` 显式键闭集=allow/ask 模型——status/diff/worktree_list=allow、worktree_add/remove=ask；tests/contract/test_git_tools.py 390L[只读对]+test_git_worktree_tools.py[三件套]normal/failure/platform 三面+④ 强制浮报形）。M2-git 先例三面=余量三子项的实现/权限/测试锚（git.py+policy.py+双测试文件）。
+- **余量三子项细拆（T-B-075，2026-11-11 规划产出——§2 头部「够派发时再细拆」条款兑现；用户裁决①「M6 线先于 M2 余量」[OP-P2-1，CORE-CONTRACTS Changelog T-A-014 记档]=本线启动先序，M6 skills/compaction 线已毕）**：约束/退出条件原文照录——watcher=「watchfiles 等库验证后接入；去重/合并变更，只提示或在 idle 显式创建新快照，不改变运行中审批」（L65）；shell 解析=「Bash/PowerShell 各自打样；以选定 TS 用例比较行为，解析失败继续 ask/deny；AST 分析也不是 OS 沙箱」（L66）；PTY=「Unix/Windows 分别验证 resize、Ctrl-C、编码、进程树退出，再确定库；未验证的平台不开启」（L68）——四子项独立可选（L63-68 子项表+L70「仅需要 git 的用户不必安装 watcher 或 PTY」）。**细拆落位=§2.3 扩充（非新增 §2.x）——理由：§2 按默认序模块组织，M2 全部子项归 §2.3 一处；本行原即「卡片级摘要」占位（§2.4 头部「够派发时再细拆」的 M2 承载面）；新增 §2.x 将落位在 §2.4「其余模块」摘要之后，破坏模块序。**
+
+- **余量线读基锚证（T-B-075 本会话现读，非预写）**：
+  - 库现态：pyproject.toml 仅 `server` extra（fastapi/uvicorn——P2-S3/OP-P2-4 先例，L19-22）；uv.lock 全文检索 `watchfiles|watchdog|winpty|ptyprocess|pexpect|conpty` **零命中**——三子项中 watcher/PTY 的库引入=全新依赖面（OP-P2-4），shell 解析=零新依赖。
+  - 在库文档评估（2026-11-11 现查；零安装零写）：**watchfiles** v1.3.0（2026-09-21，MIT，Rust notify 后端，`awatch` 异步迭代器，Windows ReadDirectoryChangesW/Linux inotify/macOS FSEvents+轮询兜底，Rust 级 debounce/批量合并，Py3.10–3.15，uvicorn `--reload` 同后端）；**watchdog**=备选（纯 Python observer+Linux inotify C 扩展，API 较宽）；**pywinpty** 3.1.2（2026-10-28，MIT，ConPTY 原生+winpty 回退，`PTY(cols,rows)`/`spawn`/`read`/`write`/`set_size`/`isalive` 面，仅 Windows，Py≥3.10，Spyder 生态维护）；PyConPTY（GPL-3.0，小项目）=许可证+规模双否决不入候选；**POSIX PTY=stdlib**（`os.openpty`+termios+signal）零新依赖——**PTY extra 仅 Windows 需 pywinpty**（platform marker `sys_platform=='win32'`）。
+  - TS 锚现态（doc/source-baseline.json 59 文件在册亲证）：`packages/core/src/shell/scan.ts`+`shell/select.ts`+`shell/result.ts`+`tool/plugin/shell.ts` 四件**在册**——shell 解析子项的 TS 比较面源文件=照录非新引用；TS **测试用例文件不在册**（「选定 TS 用例」若需 test file:line=新引用→停下上浮面，见下 ④ 判定）。PTY/watcher 的 TS 载体**不在册**（bash.py 在册映射 #102 已声明「no background/persistent-pty face」差异）——PTY=零 TS 锚 Python 侧新设计（git.py 先例形）；watcher=PHASE2-MODULES L65 原文锚即可。
+  - 平台面基线：platform-support §5 进程树回收（Windows Job Object `KILL_ON_CLOSE`/POSIX 进程组，本地+CI 双绿，孙进程独立断言）+§7 解释器显式选择（powershell.exe `-NoProfile`/bash `-c`，全程 argv 无 `shell=True`）；PHASE1-SLIM L150 Windows 红线原文=PTY/shell 子项平台判定基准。
+  - 契约接缝现态（CORE-CONTRACTS 现读）：§6 L338「Phase 1 无热重载」=watcher reload capability 的翻面点；§6.1/§6.2 快照版本+canonical hash 路径沿用；§5.3 L312/L313 shell 显式解释器+受控子进程纪律；§5.2 L304 shell 规则绑定完整 command/cwd；§3.1 新事件类型→注册+schema-lock 解锁（T-C1-052a 先例）。
+
+- **① 三子项卡片启动八项形（T-B-075 交付物；规划级八项=范围/契约锚/依赖/平台面/验收/风险/估计/就绪度。PHASE2-MODULES L36 原文形定位：「每张卡片开始时列出：用户场景、必需契约、修改点、可选依赖、失败行为、fixture、安装/停用方式和数据升级方案」——开工级八项由实现任务书按 L36 原文承载，本规划级八项为其排期前研判浓缩）**：
+
+  **watcher 卡**：
+  - 范围：文件变更监视（会话 roots+配置源）——去重/合并变更通知；只提示或在 idle 显式创建新快照；**不改变运行中审批**（L65/L70 红线）；ConfigSnapshot 显式 reload capability（M2 改动点 L61）。
+  - 契约锚：CC §6（S5——L338 翻面点）+§6.1/§6.2（新快照走版本路径+hash 重验，不静默改写旧快照含义）+§3.1（通知事件若落 durable/ephemeral 注册面→schema-lock 解锁）+§5.2（审批面零触碰红线）。
+  - 依赖：watchfiles（或 watchdog，spike 定）extras 块——OP-P2-4 路由；**A 席 S5 契约补充票前置**。
+  - 平台面：三 OS 库后端；仅本机已测文件系统（网络盘不可靠——M1 L53 同口径）；取消/close 必须回收 watch 任务（§7 无后台任务遗留纪律）。
+  - 验收：L70 逐句（平台+取消测试；运行中配置快照不受文件事件偷偷修改**落测**；S3 权限/退出行为零回退；未装 extras core 正常+调用报 UnsupportedCapability[L41]）+L65 逐句（去重/合并；只提示或 idle 显式新快照）。
+  - 风险：§5 L156 watcher 行（在册缓解：只提示或 idle 显式新快照+reload 显式 capability+L70 落测）+事件风暴/抖动（库级 debounce+Python 侧合并）+watch 任务泄漏（close 回收测试）。
+  - 估计：0.5–1 周（M2 3–5 周子项份额，L5 粗估口径）。
+  - 就绪度：**中**——契约票+OP-P2-4+库验证三前置；实现面零存量（纯新增）。
+
+  **shell 解析卡**：
+  - 范围：Bash/PowerShell 命令解析**打样**（各自）；解析产物仅供给 advisory 提示面（bash.py `_DENY_HINT_PATTERNS` 五正则的富化：结构化分解/子命令识别）；解析失败继续 ask/deny（fail-safe 固定）；**AST 分析不宣称 OS 沙箱**（L66+PHASE1-SLIM L96「命令 deny 清单只能辅助提示，不是 shell 沙箱」+§5.3 L312 末句「危险命令正则不能证明安全」三重红线）。
+  - 契约锚：CC §5.3（L312）+§5.2（L304——**本卡零触碰**：shell 规则绑定完整 command/cwd 不变）；bash.py 现态（OP-R3-2 advisory 集+TS scan.ts 2409L 不移植的既定差异在册）。
+  - 依赖：**零新依赖**（纯 Python 解析打样；无 OP-P2-4 面、无库 spike 前置）。
+  - 平台面：双语法（bash+PowerShell）各自打样各自测试；Windows/POSIX 双 CI。
+  - 验收：L66 逐句+L70（平台/取消测试+S3 零回退）；解析失败→ask/deny 不变落测；advisory 提示永不 block 落测（现状语义保持）。
+  - 风险：范围蔓延至 policy 语义（缓解：越界=停下上浮 A 席契约票）；安全宣称越界（缓解：docstring+验收句钉「非沙箱」）。
+  - 估计：0.5–1.5 周。
+  - 就绪度：**最高**——三前置全零（无契约票/无 OP-P2-4/无 spike），纯增量写面。
+
+  **PTY 卡**：
+  - 范围：PTY 执行面**最小形**——单调用交互窗口（spawn PTY→命令运行→pty-merged 输出捕获→完成返回）；Ctrl-C=取消路径、resize=运行中尺寸变更两原语经 spike 验证后接入；**常驻/后台交互会话形态=卡外**（需 S3/S6 契约扩展，如需另立卡）。
+  - 契约锚：CC §5.3（L313 受控子进程/超时/进程树回收纪律延续）+§5.2（新工具名进默认表=ask 形，git 三件套先例）；ToolSpec/ToolResult 既有形承载（单调用形态**无契约变更**）。
+  - 依赖：Windows=pywinpty（ConPTY）extras 块（marker `win32`）——OP-P2-4；POSIX=stdlib 零依赖；**spike 票前置**（L68「再确定库」——验证先于定库）。
+  - 平台面：L68 四项（resize/Ctrl-C/编码/进程树退出）Unix/Windows **分别**验证；L150 Windows 红线（进程树回收验证失败→该能力不得发布为支持）；**未验证的平台不开启**（能力协商拒绝面）。
+  - 验收：L68 逐句+L70；四原语平台测试；取消=Ctrl-C 传递+树回收断言（孙进程独立断言，platform-support §5 形）。
+  - 风险：ConPTY 边缘行为（编码/resize 竞态/winpty 回退面）；Job Object×ConPTY 交互（杀树是否覆盖 pseudoconsole 子进程——spike 判据项）；平台不对齐（一平台失败→该平台不开启，非全子项失败）。
+  - 估计：1–2 周（平台重）。
+  - 就绪度：**最低**——spike+OP-P2-4+平台红线验证三前置，风险面最大。
+
+- **② 切片细拆至可派发粒度**（默认序前 2-3 切片给到任务书级；**编号=调度器派发时定**——沿 §2.4 compaction 复估记档「编号调度器后续定」先例；下文以 W/C/T 工作标签呈现；每切片票形 45-90min，测试统摄条款 §2 头部沿用）：
+
+  **shell 解析（就绪序先行，见 ⑥）**：
+  - **C1（解析打样-bash）**：新模块目录（`src/opencode/shellparse/`，命名任务书定）bash 语法打样——引号/转义/变量/命令分隔/管道分解为结构化中间形；纯函数零副作用；golden fixture 集（正例=合法命令分解；反例=畸形输入→显式 parse 失败信号，绝不猜修——§1 fail-closed 口径）；TS 比较面=在册四源文件行为对照（照录非新引用），比较语料若需 TS test file:line→停下上浮（④ 判定）；**零 src 既有文件触碰**（bash.py 富化在 C2）。
+  - **C2（解析打样-PowerShell+advisory 富化接线）**：PowerShell 语法打样（同形同测）+bash.py `_deny_label` 富化接线（解析产物→结构化提示，advisory-only 语义不变——提示永不 block 落测）+解析失败→现状 ask/deny 路径零变化落测；平台双 CI。
+  - **C3（收口，按需）**：比较矩阵记档（parity 面）+边缘 fixture 扩充（编码/超长行/控制字符——§5.3 L315 转义面）；若 C1/C2 已覆盖则并入 C2 不独立成片（派发时裁量）。
+
+  **watcher**：
+  - **W1（库验证+通知面）**：库验证**合并入本切片**（B 建议呈裁——判据见 ③）；watchfiles `awatch` 接入（新模块目录）+去重/合并（库级 debounce+Python 侧合并）+**只提示**面（宿主通知——通知事件注册面按契约票定义；若契约票裁定通知不走事件注册则按其裁定）；红线落测：事件风暴中运行中快照 byte-identical+审批面零变化；extras 未装→core 正常+UnsupportedCapability。
+  - **W2（idle 显式新快照+reload capability）**：**A 席契约票前置落地后派发**；宿主显式 reload 命令→新快照（§6.1 版本路径+§6.2 canonical hash 重验+L338「明确停住并要求宿主重新配置/批准」语义承接）+idle 判定+boot_id/saved decision 交互按契约票；watch 任务 close 回收测试。
+  - **W3（平台/取消收口）**：双 OS 平台矩阵（事件交付/丢失窗口如实记档）+取消/close 全路径+网络盘不可靠面如实披露（不宣称支持）。
+
+  **PTY**：
+  - **T0（spike 票——独立前置，不与实现切片合并）**：见 ③。
+  - **T1（PTY 执行面-Windows）**：pywinpty ConPTY 单调用形态（pty-merged 捕获+Ctrl-C 取消+resize 原语）+进程树回收断言（Job Object×ConPTY 交互——T0 判据延伸）+新工具注册（默认表 ask 形，git 三件套先例）+extras marker `win32`。
+  - **T2（PTY 执行面-POSIX）**：stdlib `os.openpty` 同形态+resize/SIGWINCH+编码+进程组回收；**T1/T2 平台门独立**（一平台不过→该平台不开启，L68 末句）。
+  - （常驻交互会话形态=卡外，如需另立卡走 A 席契约票。）
+
+- **③ spike 计划（watcher/PTY 库验证票形——目标/判据/止损）**：
+  - **watcher spike（W1 内嵌段，可合并判定=可合并）**：目标=watchfiles 双平台事件交付/debounce 边界/`awatch` 停止语义验证；判据=①双 OS 事件到达且可合并去重 ②停止/取消后 watch 线程/任务可回收（无泄漏）③风暴/背压面 bounded；止损=任一判据不过→停片浮报、子项重规划（换 watchdog 备选或降级轮询——重规划归 B 席后续票）。合并理由=库 API 面窄（异步迭代器）+uvicorn 同后端生态成熟，风险在自有语义（去重/红线）不在库；独立 spike 票增加整票周期不增证据面。
+  - **PTY spike（T0 独立票，不合并）**：目标=pywinpty（Windows）/`os.openpty`（POSIX）四原语验证——**resize**（运行中 `set_size`/SIGWINCH）、**Ctrl-C**（`\x03` 写入→中断语义）、**编码**（UTF-8 往返+非 ASCII 输出）、**进程树退出**（Job Object/进程组杀树覆盖 PTY 子进程+孙进程——L150 红线面）；判据=四原语×双平台各自可证（探针脚本+证据记档，r0 platform_probe 形）；止损=平台原语不可证→该平台「不开启」记档（L68 末句），不阻塞另一平台；库不可用（安装/wheel 失败）→浮报 OP-P2-4 面。不合并理由=L68 明序「验证→再定库」+四原语×双平台=独立工作量，混入实现片会爆 45-90min 票形。
+
+- **④ shell 解析子项范围判定（TS 比较面触达评估——「零新 TS 引用」纪律）**：在册四源文件（scan.ts/select.ts/result.ts/tool-plugin-shell.ts——source-baseline.json 现读亲证）的引用=**照录非新引用**（p2-slices 头部 TS 锚纪律既有口径）；「选定 TS 用例」（L66）的比较语料选择若确需 TS **测试文件** file:line（不在册）→实现切片**停下上浮**调度器补 doc/source-baseline.json 指纹（59 条在册口径）后方可引。B 建议呈裁：比较语料优先=在册源文件内嵌行为+Python 侧 golden fixture 自锚（零新 TS 引用路径）；TS test 引用仅在其不可替代时按上浮面申请。范围红线：解析产物仅进 advisory 提示面（④ 范围判定与卡面一致）——任何 §5.2 绑定/匹配语义触达=停下上浮 A 席契约票。
+- **⑤ OP-P2-4 呈裁材料（可选依赖 extras/uv.lock 写权路由——沿 OP-R4-1/OP-R5-3 先例形，不预写裁决）**：面额=watcher extras（`watchfiles>=1.3,<2`，或 spike 后改定 watchdog）+PTY extras（`pywinpty>=3.1,<4; sys_platform=='win32'`——POSIX 侧 stdlib 零依赖，marker 保 POSIX 安装零面额）；shell 解析零面额。路 A（**B 建议呈裁**）=调度器亲改 pyproject extras 块+亲跑 `uv add --optional`/`uv lock` 更新 uv.lock+worktree venv 预同步（本票环境同形：`uv sync --all-extras --all-groups` 预跑）——理由：uv.lock 为 §4 冻结面（§8 任务书模板「pyproject/uv.lock 零触碰」条款的依据）；`server` extra 先例（P2-S3/M5-A）即此路；spike/实现票保持零写权例外，依赖面纯读。路 B（备选）=任务书显式授权单块（pyproject extras 块+uv.lock 再生成单次授权）——代价=冻结面开口先例+lock 哈希面对 C 席可见，B 不建议。时点：watcher extras 在 W1 派发前落位；PTY extras 在 T0 spike 派发前落位（spike 亦需库在环境——调度器预装）。
+- **⑥ 首切片推荐+就绪序（B 建议呈裁，不预写裁决）**：推荐先行=**shell 解析 C1**——理由=三前置全零（无契约票/无 OP-P2-4/无库 spike，三子项中唯一可即刻派发）；纯增量写面（新模块目录，零 src 既有文件触碰）；M2-git 先例三面直接复用（spec/权限默认表/测试形）；风险面最小（advisory-only+解析失败 fail-safe 固定）。就绪序=**shell 解析（C1→C2）→ watcher（契约票→W1→W2）→ PTY（T0→T1/T2）**（就绪度驱动；watcher/PTY 互不依赖可并行，四子项独立可选 L63-68）。前置票清单：C1=**无**；W1=OP-P2-4 watcher extras（路 A）；W2=**A 席 S5 契约补充票**（ConfigSnapshot reload capability 语义+通知事件注册+schema-lock 解锁——沿 T-A-013/014 先例形，OP-P2-5 路由）+W1；T0=OP-P2-4 PTY extras；T1/T2=T0 通过+L150 红线验证记档。**A 席契约票判定汇总**：watcher=**需要**（S5 面——reload capability+通知事件面）；shell 解析=**不需要**（advisory 范围内；越界即停下上浮）；PTY=**不需要**（单调用最小形；常驻交互形态如启则需另票）。
+- **PHASE3 相关性判定（T-B-075 现读定，记档级；PHASE3 排期本身=用户面，本票不定）**：PHASE3-ORCHESTRATOR v2.1（评审收敛「待排期」）与 M2 余量三子项=**无硬序依赖，可独立排期**。接缝盘点：①其 §5.3/§11 工人 job worktree 消费的是 M2-git **已毕面**（P2-S6/P2-S7 worktree 三 adapter），非余量三子项依赖；②events.py/schema-lock 解锁=共享面（PHASE3 S1 `py.job.*` 事件族 vs watcher 通知事件）——顺序排期则各自解锁（T-C1-052a 先例形），并行排期需调度器协调解锁次序；③进程原语=PHASE3 §13 复用 `run_command`（预算杀/工人杀树）与 PTY 新面平行不冲突，PTY 的 L150 红线验证证据对两者共用；④PHASE3 §5.3 工人 ConfigSnapshot 注入=最小静态面（roots+host deny+register_saved 三件），与 watcher reload capability 无交互。
 
 ### 2.4 其余模块/卡片级摘要（卡片开始时按 L36 八项列出，够派发时再细拆）
 
