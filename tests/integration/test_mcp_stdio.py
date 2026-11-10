@@ -108,8 +108,14 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-async def _wait_pids_gone(pids: Sequence[int], *, timeout_s: float = 10.0) -> None:
-    """Poll the probe until every pid is confirmed terminated (no child leak)."""
+async def _wait_pids_gone(pids: Sequence[int], *, timeout_s: float = 30.0) -> None:
+    """Poll the probe until every pid is confirmed terminated (no child leak).
+
+    The 30s grace (T-C1-061, was 10s) widens the teardown window for loaded
+    CI runners: a slow sweep is not a leak, so only the wait is widened --
+    the green path still early-exits on the first clean poll and a true leak
+    still fails the same assert; just the red path waits longer.
+    """
     deadline = time.monotonic() + timeout_s
     remaining = set(pids)
     while remaining and time.monotonic() < deadline:

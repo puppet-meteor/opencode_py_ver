@@ -29,8 +29,10 @@ concurrent cancels are admitted in creation order and the ninth is refused.
 from __future__ import annotations
 
 import asyncio
+import email.message
 import importlib
 import inspect
+import io
 import json
 import sqlite3
 import subprocess
@@ -1364,6 +1366,15 @@ async def test_lifespan_startup_failure_bubbles_as_startup_failed(
 # ---------------------------------------------------------------------------
 
 
+def _is_connection_abort(error: BaseException) -> bool:
+    """True only for the loopback abort/reset faces (WinError 10053/10054 kin)."""
+    if isinstance(error, (ConnectionAbortedError, ConnectionResetError)):
+        return True
+    return isinstance(error, urllib.error.URLError) and isinstance(
+        error.reason, (ConnectionAbortedError, ConnectionResetError)
+    )
+
+
 def _urllib_call(
     base: str,
     method: str,
@@ -1371,7 +1382,20 @@ def _urllib_call(
     body: dict[str, Any] | None = None,
     *,
     token: str | None = _TOKEN,
+    attempts: int = 3,
+    backoff_s: float = 0.25,
+    open_fn: Callable[..., Any] | None = None,
 ) -> tuple[int, dict[str, str], dict[str, Any] | None]:
+    """One real-wire urllib call with a bounded retry on the connection-abort face.
+
+    Windows loopback can abort an established connection in the window right
+    after server boot (WinError 10053, T-C1-061 face 3); only that face is
+    retried -- an HTTP answer (an HTTPError of any status) is returned as-is
+    on the first attempt and a non-abort URLError is re-raised untouched, so
+    deterministic failures stay red. Three attempts with a short linear
+    backoff bound the green-path cost; an abort that exhausts the budget
+    re-raises on the last attempt (fail-visible).
+    """
     data = _json_body(body) if body is not None else None
     headers: dict[str, str] = {}
     if data is not None:
@@ -1379,16 +1403,95 @@ def _urllib_call(
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
-    try:
-        with _OPENER.open(request, timeout=10) as response:
-            payload: Any = json.loads(response.read())
-            lowered = {name.lower(): value for name, value in response.headers.items()}
-            return int(response.status), lowered, payload if isinstance(payload, dict) else None
-    except urllib.error.HTTPError as error:
-        raw = error.read()
-        payload = json.loads(raw) if raw else None
-        lowered = {name.lower(): value for name, value in error.headers.items()}
-        return int(error.code), lowered, payload if isinstance(payload, dict) else None
+    opener = open_fn if open_fn is not None else _OPENER.open
+    for attempt in range(1, attempts + 1):
+        try:
+            with opener(request, timeout=10) as response:
+                payload: Any = json.loads(response.read())
+                lowered = {name.lower(): value for name, value in response.headers.items()}
+                return int(response.status), lowered, payload if isinstance(payload, dict) else None
+        except urllib.error.HTTPError as error:
+            raw = error.read()
+            payload = json.loads(raw) if raw else None
+            lowered = {name.lower(): value for name, value in error.headers.items()}
+            return int(error.code), lowered, payload if isinstance(payload, dict) else None
+        except (ConnectionAbortedError, ConnectionResetError, urllib.error.URLError) as error:
+            if attempt == attempts or not _is_connection_abort(error):
+                raise
+            time.sleep(backoff_s * attempt)
+    raise AssertionError("unreachable: the retry loop always returns or re-raises")
+
+
+class _FakeResponse:
+    """Minimal urllib response stand-in: only the faces _urllib_call touches."""
+
+    def __init__(self, status: int, body: bytes, headers: dict[str, str]) -> None:
+        self.status = status
+        self._body = body
+        self.headers = headers
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_urllib_call_retries_connection_aborts_only() -> None:
+    """Injectability proof (T-C1-061 face 3): the retry is abort-face-only.
+
+    N-1 aborts then success recovers; a persistent abort exhausts the budget
+    and re-raises; an HTTP answer and a non-abort URLError are never retried
+    (call count 1) -- the deterministic faces stay fail-visible.
+    """
+    calls: list[int] = []
+
+    def abort_twice_then_answer(request: object, timeout: int) -> _FakeResponse:
+        calls.append(len(calls) + 1)
+        if len(calls) < 3:
+            raise ConnectionAbortedError(10053, "the established connection was aborted")
+        return _FakeResponse(200, b'{"ok": true}', {"Content-Type": "application/json"})
+
+    status, headers, payload = _urllib_call(
+        "http://127.0.0.1", "POST", "/session", attempts=3, backoff_s=0.0, open_fn=abort_twice_then_answer
+    )
+    assert status == 200 and payload == {"ok": True} and headers["content-type"] == "application/json"
+
+    calls.clear()
+
+    def always_abort(request: object, timeout: int) -> _FakeResponse:
+        calls.append(len(calls) + 1)
+        raise ConnectionAbortedError(10053, "the established connection was aborted")
+
+    with pytest.raises(ConnectionAbortedError):
+        _urllib_call("http://127.0.0.1", "GET", "/run/x/status", attempts=3, backoff_s=0.0, open_fn=always_abort)
+    assert len(calls) == 3
+
+    calls.clear()
+
+    def refuse_with_401(request: object, timeout: int) -> _FakeResponse:
+        calls.append(len(calls) + 1)
+        raise urllib.error.HTTPError(
+            "http://127.0.0.1/session", 401, "Unauthorized", email.message.Message(), io.BytesIO(b"")
+        )
+
+    status, _, payload = _urllib_call(
+        "http://127.0.0.1", "POST", "/session", token=None, attempts=3, backoff_s=0.0, open_fn=refuse_with_401
+    )
+    assert status == 401 and payload is None and len(calls) == 1
+
+    calls.clear()
+
+    def fail_dns(request: object, timeout: int) -> _FakeResponse:
+        calls.append(len(calls) + 1)
+        raise urllib.error.URLError(OSError("name resolution failed"))
+
+    with pytest.raises(urllib.error.URLError):
+        _urllib_call("http://127.0.0.1", "GET", "/", attempts=3, backoff_s=0.0, open_fn=fail_dns)
+    assert len(calls) == 1
 
 
 def test_uvicorn_smoke_serves_the_real_wire_single_worker(tmp_path: Path) -> None:

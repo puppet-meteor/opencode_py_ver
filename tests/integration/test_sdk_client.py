@@ -626,21 +626,85 @@ def test_malformed_and_foreign_stream_cursors_answer_400(client: OpencodeClient)
 # ---------------------------------------------------------------------------
 
 
+def _retry_on_connection_error[T](fn: Callable[[], T], *, attempts: int = 3, backoff_s: float = 0.25) -> T:
+    """Bounded re-send on the SDK connection face only (T-C1-061 face 4).
+
+    A Windows loopback abort (WinError 10053) surfaces as
+    ``OpencodeConnectionError`` (errors.py L65, an ``OpencodeClientError``
+    child; raised at client.py L250/L276); ``OpencodeApiError`` (errors.py
+    L38) is a *sister* class, not a child, so an HTTP answer -- 401 included
+    -- is never caught and never retried: it propagates on the first attempt.
+    ``OpencodeStreamError`` (errors.py L53) only wraps a terminal SSE
+    ``event: error`` frame after a 200, so it cannot occur on a 401 probe
+    and is not caught either. A persistent connection failure re-raises once
+    the budget is exhausted (fail-visible).
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except OpencodeConnectionError:
+            if attempt == attempts:
+                raise
+            time.sleep(backoff_s * attempt)
+    raise AssertionError("unreachable: the retry loop always returns or re-raises")
+
+
 def test_unauthenticated_requests_answer_401_on_both_faces(client: OpencodeClient, running: _Running) -> None:
     wrong = OpencodeClient(base_url=running.base, token="wrong-token")
     with pytest.raises(OpencodeApiError) as excinfo:
-        wrong.create_session(_SNAPSHOT_BODY)
+        _retry_on_connection_error(lambda: wrong.create_session(_SNAPSHOT_BODY))
     assert excinfo.value.status_code == 401
     assert excinfo.value.core is not None
     assert excinfo.value.core.code is CoreErrorCode.PERMISSION_DENIED
     assert excinfo.value.core.retryable is False
     ref = _create(client)  # a real session for the stream probe
-    stream = wrong.stream_events(ref.session_id)
+    # a fresh stream per attempt: a broken iterator must not be reused (the
+    # connection is issued lazily on the first read, so a re-send is whole)
     with pytest.raises(OpencodeApiError) as excinfo:
-        next(stream)
+        _retry_on_connection_error(lambda: next(wrong.stream_events(ref.session_id)))
     assert excinfo.value.status_code == 401
     assert excinfo.value.core is not None
     assert excinfo.value.core.code is CoreErrorCode.PERMISSION_DENIED
+
+
+def test_connection_retry_helper_recovers_exhausts_and_keeps_api_errors_first_attempt() -> None:
+    """Injectability proof (T-C1-061 face 4): the retry is connection-face-only.
+
+    N-1 connection errors then success recover; a persistent connection
+    failure exhausts the budget and re-raises; an ``OpencodeApiError`` (any
+    HTTP answer) is never retried -- call count 1 -- so the deterministic
+    401 face stays fail-visible.
+    """
+    calls: list[int] = []
+
+    def flaky() -> int:
+        calls.append(len(calls) + 1)
+        if len(calls) < 3:
+            raise OpencodeConnectionError("POST /session never answered")
+        return 42
+
+    assert _retry_on_connection_error(flaky, attempts=3, backoff_s=0.0) == 42
+    assert len(calls) == 3
+
+    calls.clear()
+
+    def persistent() -> int:
+        calls.append(len(calls) + 1)
+        raise OpencodeConnectionError("POST /session never answered")
+
+    with pytest.raises(OpencodeConnectionError):
+        _retry_on_connection_error(persistent, attempts=3, backoff_s=0.0)
+    assert len(calls) == 3
+
+    calls.clear()
+
+    def refused() -> int:
+        calls.append(len(calls) + 1)
+        raise OpencodeApiError(401, None)
+
+    with pytest.raises(OpencodeApiError):
+        _retry_on_connection_error(refused, attempts=3, backoff_s=0.0)
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
