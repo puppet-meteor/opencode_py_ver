@@ -637,8 +637,13 @@ def _retry_on_connection_error[T](fn: Callable[[], T], *, attempts: int = 3, bac
     ``OpencodeStreamError`` (errors.py L53) only wraps a terminal SSE
     ``event: error`` frame after a 200, so it cannot occur on a 401 probe
     and is not caught either. A persistent connection failure re-raises once
-    the budget is exhausted (fail-visible).
+    the budget is exhausted (fail-visible). Guard rider (T-B-070
+    recommendation 1 / T-C1-062): ``attempts < 1`` is the only input that
+    could fall through the loop to the unreachable tail line, so it is
+    rejected up front -- the assertion face below stays frozen.
     """
+    if attempts < 1:
+        raise ValueError(f"attempts must be >= 1, got {attempts}")
     for attempt in range(1, attempts + 1):
         try:
             return fn()

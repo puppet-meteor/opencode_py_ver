@@ -115,7 +115,7 @@ compaction 挂既有接缝（PHASE2-MODULES L123 前置列）：S1 ContextBuilde
 
 | 字段 | 约束 |
 |---|---|
-| `covered_seq` | 非负 int；锁内捕获的 settled 历史边界 seq——短提交锁内 expected_seq/CAS 校验的基准，边界变化即丢弃该摘要 |
+| `covered_seq` | 非负 int；锁内捕获的 settled 历史边界 seq——被短提交锁内 expected_seq/CAS 守护的覆盖边界（措辞精确化，T-B-069 建议 1/T-C1-062 rider：CAS 的字面基数=同锁捕获的 log_high 水位 H；retained 尾存在时 covered_seq 恒小于 H，以其作 expected_seq 字面值不可实现；实装方向更严——任意日志前进即丢弃摘要），边界变化即丢弃该摘要 |
 | `retained_from` | 非负 int；retained history 起始边界——ContextBuilder 生成时保留的原始历史起点 |
 | `summary_text` | 非空 str；释放锁后生成的摘要正文（replacement 内容面） |
 | `summary_hash` | 非空 str；摘要标识，随事件持久化供提交校验与审计比对 |
@@ -202,7 +202,7 @@ EventBatch.id 是稳定 batch_id，批内下标为 batch_ordinal；重试复用�
 
 `expected_seq: int >= 0` 是调用方对提交前 H 的预期值，不是目标 seq，也不是独立水位；它可以因竞态落后，只有全新批次在写事务内满足 expected_seq=H 才能提交。健康时也等于 A，但不能只信 A 而不核对日志。A≠H、日志缺口/重复或非法 seq 是 StorageCorrupt，按 §3.2.1 隔离；它们不是调用方的 Conflict，不得通过改 expected_seq 继续写。健康库中旧批次的完全相同重试即使 expected_seq 落后仍返回原提交，不推进 A/H、不再次投影或通知。
 
-SessionService、runner 和所有合法的 SessionStore 调用方必须在同一会话提交锁内读取 H/A，并把观察到的 H 作为 expected_seq；active 且完整时该值就是 A。调用方不能用任意较新的值“跳过”事件，也不能把 applied_seq 当作无需核对日志的替代值。
+SessionService、runner 和所有合法的 SessionStore 调用方必须在同一会话提交锁内读取 H/A，并把观察到的 H 作为 expected_seq；active 且完整时该值就是 A。调用方不能用任意较新的值“跳过”事件，也不能把 applied_seq 当作无需核对日志的替代值。compaction 引擎同此（措辞精确化，T-B-069 建议 1/T-C1-062 rider，零行为差）：其 CAS 字面基数=同锁捕获的 log_high 水位（H），事件字段 covered_seq/retained_from 是该 CAS 守护的边界事实而非 CAS 字面基数；实装方向更严——任意日志前进（不止边界消息变化）即丢弃摘要。
 
 依据：锁定 TS `packages/core/src/bus.ts:321–327,338–395` 的 `commitDurableEvent` 读取 latest 并核对重放；`bus.ts:582–655` 的 `publishAll` 在同一事务分配连续 seq、执行 projector、保存事件；`packages/core/src/event/sql.ts:4–25` 的 `EventSequenceTable/EventTable` 保存聚合水位与唯一 seq。**TS 无对应物 + Python 侧论证**：TS 没有 expected_seq 或 sessions.applied_seq；Python 同步投影要求 A=H，显式乐观并发防止调用方把基于旧状态的新事件接到新日志上。
 

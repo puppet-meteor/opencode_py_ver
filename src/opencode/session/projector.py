@@ -91,6 +91,7 @@ from opencode.contracts import (
     default_event_registry,
 )
 from opencode.contracts.events import (
+    PY_CONTEXT_COMPACTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
     PY_PERMISSION_REPLIED,
@@ -365,6 +366,8 @@ class SessionProjector:
             await self._project_permission(connection, event)
         elif event.type == PY_SKILL_ACTIVATED:
             await self._project_skill(connection, event)
+        elif event.type == PY_CONTEXT_COMPACTED:
+            await self._project_context_compacted(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -500,6 +503,25 @@ class SessionProjector:
         fold, the applied_seq advance, then the cache update. The saved
         instruction body rides the fold state, so recovery replays the
         saved content and never re-reads disk (§6.3 L345/L354).
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_context_compacted(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.context.compacted`` event (§2.4 L126; T-C1-062).
+
+        The replacement record's read-model footprint is deliberately EMPTY:
+        the effective view lives in the fold (:mod:`opencode.session.state`
+        materializes the summary + retained tail in ``SessionState.messages``),
+        and §2.4 L134 pins that the original log and tool results are never
+        rewritten and physical deletion belongs to M1 -- so the
+        sessions/messages/tool_executions/runs/permissions rows stay exactly
+        as they are. The only projection write is the applied_seq advance,
+        which is what keeps the A=H invariant over the compacted stream (the
+        store re-verifies A=H+n before committing, §3.2 L201). Same cache
+        shape as the skills face: pre-state, one fold, advance, cache update.
         """
         pre, digest = await self._pre_state(connection, event)
         post = _fold(pre, event)

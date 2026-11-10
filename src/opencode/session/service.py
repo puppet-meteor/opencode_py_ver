@@ -93,7 +93,14 @@ from opencode.contracts.events import (
     SessionCreatedDataV3,
     SkillActivatedData,
 )
-from opencode.session.state import SessionStatus
+from opencode.session.compaction import (
+    CompactionEngine,
+    SettledHistoryView,
+    SettledMessage,
+    SummaryGenerator,
+)
+from opencode.session.state import SessionState, SessionStatus
+from opencode.session.state import apply as apply_event
 from opencode.skills import SkillActivationReceipt, SkillCatalog
 from opencode.storage import (
     EventBatch,
@@ -483,6 +490,7 @@ class SessionService:
         policy: PermissionPolicy | None = None,
         catalog: SkillCatalog | None = None,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
+        compaction_summarizer: SummaryGenerator | None = None,
     ) -> None:
         if not isinstance(working_dir, str) or not working_dir:
             raise StoreValidationError("working_dir must be a non-empty string")
@@ -529,6 +537,22 @@ class SessionService:
         # Lazily-built event-log reader for the re-activation confirmation
         # gate (committed py.skill.activated events, §6.3 L347-350).
         self._skill_log: EventLog | None = None
+        # M6 compaction wiring (§2.4, T-C1-062): the summary-generation seam.
+        # Everything else the engine needs is real and local -- this service's
+        # store (the §3.2 commit face), the settled read face below (the
+        # EventLog fold + log_high), the shared id factory/clock, and this
+        # service's own per-session commit lock -- so only the model-call face
+        # is injected. None keeps the pre-M6 face exactly (no trigger, zero
+        # behavior change); the engine is built lazily on the first trigger.
+        self._compaction_summarizer = compaction_summarizer
+        self._compaction_engine: CompactionEngine | None = None
+        self._compaction_log: EventLog | None = None
+        # The last compaction failure per session (§2.4 L132: the CONTEXT
+        # guarantee is "no replacement"; the error itself is kept here --
+        # recorded, inspectable, never silently dropped -- and the stateless
+        # engine retries on the next trigger. Not surfaced on any §7 command
+        # face yet: compaction has no host command (§2.4 L110).
+        self._compaction_errors: dict[str, BaseException] = {}
         self._close_timeout_s = float(close_timeout_s)
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
@@ -1226,6 +1250,109 @@ class SessionService:
             self._skill_log = EventLog(self._engine, repos=self._repos)
         return self._skill_log
 
+    # -- M6 compaction internals (§2.4, T-C1-062) ---------------------------------
+
+    def _compaction_event_log(self) -> EventLog:
+        """The lazily-built event-log reader for the settled read face.
+
+        Same wiring discriminant as ``_activation_log``: a service constructed
+        without the storage engine cannot fold the committed log, so the read
+        face fails closed with StoreValidationError instead of half-answering.
+        """
+        if self._compaction_log is None:
+            if self._engine is None:
+                raise StoreValidationError("compaction requires the storage engine (engine=)")
+            self._compaction_log = EventLog(self._engine, repos=self._repos)
+        return self._compaction_log
+
+    def _compaction(self) -> CompactionEngine | None:
+        """The lazily-built §2.4 engine, or ``None`` while the face is dormant.
+
+        Dormant = no summarizer injected (the pre-M6 face, zero behavior).
+        Built once over REAL faces only: this service's store (the §3.2 commit
+        interface), the settled read face (``settled_history`` below -- the
+        EventLog fold plus the repos' log_high), the shared id factory and
+        clock, and this service's own per-session commit lock (§3.2 L209: the
+        capture, the H read and the short commit lock are the same lock every
+        other commit path takes).
+        """
+        if self._compaction_summarizer is None:
+            return None
+        if self._compaction_engine is None:
+            self._compaction_engine = CompactionEngine(
+                store=self._store,
+                history=self,
+                summarizer=self._compaction_summarizer,
+                ids=self._ids,
+                clock=self._clock,
+                lock=self._session_lock,
+            )
+        return self._compaction_engine
+
+    async def settled_history(self, session_id: str) -> SettledHistoryView:
+        """The real settled read face (§2.4 L118/L126): fold the committed log.
+
+        The engine calls this INSIDE the per-session commit lock (its capture
+        phase), so the messages and the watermark below are read under the
+        same lock the §3.2 expected_seq/CAS basis uses. ``settled`` here means
+        "present in the committed fold with a settling seq": user messages
+        settle at ``py.prompt.accepted``, terminal assistants at
+        ``py.step.finished``, idle rows at ``py.run.finished`` -- a
+        still-open step's generated message rides at its landing seq (the
+        engine's boundary math sees it exactly where the fold does; an open
+        step is recovery's face to close, §3.3 L210). The materialized
+        compaction summary is ``None``-linked and never counted: it is the
+        replacement face, not history, which also keeps the strictly
+        ascending seqs the engine's fail-closed view validation requires.
+        """
+        log = self._compaction_event_log()
+        state = SessionState()
+        after: EventCursor | None = None
+        while True:
+            page = await log.read(session_id, after=after)
+            for event in page.items:
+                state = apply_event(state, event)
+            if not page.has_more:
+                break
+            after = page.next_cursor
+        settled = tuple(
+            SettledMessage(message=message, seq=seq)
+            for message, seq in zip(state.messages, state.message_seqs, strict=True)
+            if seq is not None
+        )
+        return SettledHistoryView(messages=settled, log_high=await self._repos.log_high(session_id))
+
+    async def _post_run_compaction(self, session_id: str) -> None:
+        """The threshold trigger: one engine pass after a run settles (§2.4 L128).
+
+        Trigger-point ruling (contract leaves the location blank -- §2.4 L128
+        names only the threshold, so this is the minimal-intrusion pick,
+        recorded in T-C1-062): post-settlement. The session is quiescent (no
+        in-flight generation consumes the state mid-replacement), the run's
+        own outcome is already terminal and cannot be corrupted by a
+        compaction failure, and the settled history is at its local maximum
+        when the check runs. The engine itself is stateless per call: every
+        trigger re-checks the threshold, so a skipped or failed pass simply
+        retries on the next settlement. Failure policy (§2.4 L132): the red
+        line is the CONTEXT -- zero replacement, zero partial writes; the
+        engine's exception propagates to here and is recorded per session in
+        ``_compaction_errors`` (never dropped, never folded into the run's
+        schedule-error channel -- the run already settled). ``CancelledError``
+        is not caught: a close-time cancel aborts the pass like every other
+        await here. Only a committed event notifies the bus (§3.2 L159 step 5
+        shape; below_threshold and the discarded pass are no-ops).
+        """
+        engine = self._compaction()
+        if engine is None:
+            return
+        try:
+            outcome = await engine.compact(session_id)
+        except Exception as error:  # §2.4 L132: no replacement, error recorded per session
+            self._compaction_errors[session_id] = error
+            return
+        if outcome.event is not None:
+            self._bus.notify(session_id, [outcome.event])
+
     # -- §7 close -------------------------------------------------------------
 
     async def close(self) -> None:
@@ -1443,17 +1570,27 @@ class SessionService:
         finalized the run (or left the open step to recovery) -- and is not
         an error. R4-S4: a cross-process crash leaves the same non-terminal
         durable log with no in-memory record; the startup recovery scan
-        (T-C1-037) closes it from the log alone.
+        (T-C1-037) closes it from the log alone. A NORMAL completion (the
+        run settled, whatever its terminal outcome) is followed by one
+        threshold-checked compaction pass (§2.4 L128, ``_post_run_compaction``
+        -- dormant unless the summarizer seam is injected).
         """
         assert self._runner is not None
+        settled = False
         try:
             await self._runner.run(session_id, run_id)
+            settled = True
         except asyncio.CancelledError:
             raise
         except Exception as error:  # recorded here; surfaced by cancel/close
             self._schedule_errors[run_id] = error
         finally:
             self._tasks.pop(run_id, None)
+        if settled:
+            # §2.4 L128 (T-C1-062): the run settled -- one threshold-checked
+            # compaction pass follows it. A cancelled or crashed runner never
+            # reaches here (no trigger, no replacement, §2.4 L132 matrix).
+            await self._post_run_compaction(session_id)
 
     async def _commit_cancel_intent(self, session_id: str, run_id: str, reason: Literal["user", "shutdown"]) -> None:
         """Commit one ``py.run.cancel_requested`` under the session lock.

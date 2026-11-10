@@ -1394,8 +1394,13 @@ def _urllib_call(
     on the first attempt and a non-abort URLError is re-raised untouched, so
     deterministic failures stay red. Three attempts with a short linear
     backoff bound the green-path cost; an abort that exhausts the budget
-    re-raises on the last attempt (fail-visible).
+    re-raises on the last attempt (fail-visible). Guard rider (T-B-070
+    recommendation 1 / T-C1-062): ``attempts < 1`` is the only input that
+    could fall through the loop to the unreachable tail line, so it is
+    rejected up front -- the assertion face below stays frozen.
     """
+    if attempts < 1:
+        raise ValueError(f"attempts must be >= 1, got {attempts}")
     data = _json_body(body) if body is not None else None
     headers: dict[str, str] = {}
     if data is not None:
