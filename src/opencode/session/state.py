@@ -25,6 +25,18 @@ read-model writes live in :mod:`opencode.session.projector` and the rebuild
 replays the log through this same fold. Event types outside the folded subset
 raise instead of being skipped (fail closed).
 
+M6 compaction (§2.4 L126, T-C1-062): ``py.context.compacted`` materializes the
+effective context view INSIDE the fold. The handler replaces the covered
+prefix of ``messages`` with one summary ``UserMessage`` (id deterministically
+derived from the event id, body = ``summary_text``) and keeps the retained
+tail -- every message whose settling seq is at or after ``retained_from``.
+``message_seqs`` (the parallel settling-seq tuple) is the linkage: ``None``
+marks the materialized summary itself, which is NOT settled history (the
+engine's next-pass read face skips it, keeping the strictly-ascending seq
+invariant; §2.4 L118/L126). The original log and the messages read model are
+never rewritten (§2.4 L133/L134): only the folded LLM-request view changes;
+``compaction`` carries the latest boundary facts for audit and read faces.
+
 Legacy compatibility (plan §0.2): R1 logs (created + accepted*, several accepted
 per session) fold identically through the R2 rules -- the fold adds no "previous
 run must be terminal before the next accepted" gate; a repeated run identity under
@@ -66,6 +78,7 @@ from opencode.contracts import (
     canonical_json,
 )
 from opencode.contracts.events import (
+    PY_CONTEXT_COMPACTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
     PY_PERMISSION_REPLIED,
@@ -84,6 +97,7 @@ from opencode.contracts.events import (
     PY_TOOL_FINISHED,
     PY_TOOL_REQUESTED,
     PY_TOOL_STARTED,
+    ContextCompactedData,
     PermissionClosedData,
     PermissionExpiredData,
     PermissionRepliedData,
@@ -317,6 +331,24 @@ class SkillInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactionInfo:
+    """The latest ``py.context.compacted`` boundary facts folded into the state.
+
+    The mirror of the §2.4 L116-124 event fields the read faces need: the
+    covered boundary (``covered_seq``), the retained start (``retained_from``),
+    the summary identity digest, and the covered message count. The summary
+    body itself is NOT duplicated here -- it is materialized as the summary
+    ``UserMessage`` at the head of ``messages`` (the effective view), so there
+    is exactly one carrier for the replacement text.
+    """
+
+    covered_seq: int
+    retained_from: int
+    summary_hash: str
+    message_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class FinalizedPart:
     """A committed ``py.text.finalized``/``py.reasoning.finalized`` value."""
 
@@ -366,6 +398,18 @@ class SessionState:
     # the hash-change confirmation gate lives on the §7 host command face
     # only, so a replayed record never needs confirmation.
     skills: dict[str, SkillInfo] = field(default_factory=dict)
+    # §2.4 M6 (T-C1-062): the settling-seq linkage parallel to ``messages`` --
+    # the seq of the event that settled each message (prompt.accepted for
+    # user, step.finished for a terminal assistant, run.finished for idle;
+    # step.generated's landing seq while a step is still open). ``None`` marks
+    # the materialized compaction summary message (the replacement face, not
+    # settled history). Maintained by every message-appending handler; the
+    # compaction filter and the engine's real settled read face run over it.
+    message_seqs: tuple[int | None, ...] = ()
+    # §2.4 M6 (T-C1-062): the latest effective-context-replacement boundary
+    # facts (None before the first compaction event folds). Only the newest
+    # record matters -- each compaction replaces the whole prior view.
+    compaction: CompactionInfo | None = None
 
     @property
     def created(self) -> bool:
@@ -428,6 +472,8 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_permission_expired(state, event)
     if event.type == PY_SKILL_ACTIVATED:
         return _apply_skill_activated(state, event)
+    if event.type == PY_CONTEXT_COMPACTED:
+        return _apply_context_compacted(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -489,6 +535,7 @@ def _apply_prompt(state: SessionState, event: DurableEvent[Any]) -> SessionState
         active_run_id=event.data.run_id,
         runs=runs,
         messages=(*state.messages, event.data.message),
+        message_seqs=(*state.message_seqs, event.seq),
     )
 
 
@@ -574,6 +621,7 @@ def _apply_run_finished(state: SessionState, event: DurableEvent[Any]) -> Sessio
         applied_seq=event.seq,
         runs={**state.runs, run.run_id: replace(run, status=RunStatus(event.data.outcome), error=event.data.error)},
         messages=(*state.messages, idle),
+        message_seqs=(*state.message_seqs, event.seq),
         active_run_id=None if state.active_run_id == event.data.run_id else state.active_run_id,
     )
 
@@ -717,6 +765,7 @@ def _apply_step_generated(state: SessionState, event: DurableEvent[Any]) -> Sess
         },
         tools=tools,
         messages=(*state.messages, message),
+        message_seqs=(*state.message_seqs, event.seq),
     )
 
 
@@ -761,6 +810,7 @@ def _apply_step_finished(state: SessionState, event: DurableEvent[Any]) -> Sessi
         assert isinstance(existing, AssistantMessage)
         _require_finished_consistency(state, event, existing, message)
         messages = (*state.messages[:index], message, *state.messages[index + 1 :])
+        message_seqs = (*state.message_seqs[:index], event.seq, *state.message_seqs[index + 1 :])
     else:
         # §3.3 L212: without a generated plan only the committed finalized
         # text may compose an interrupted/failed terminal message.
@@ -774,11 +824,13 @@ def _apply_step_finished(state: SessionState, event: DurableEvent[Any]) -> Sessi
                 f"step {step.step_id} cannot complete without a generated plan (event {event.id})"
             )
         messages = (*state.messages, message)
+        message_seqs = (*state.message_seqs, event.seq)
     return replace(
         state,
         applied_seq=event.seq,
         steps={**state.steps, step.step_id: replace(step, status=StepStatus(message.status))},
         messages=messages,
+        message_seqs=message_seqs,
     )
 
 
@@ -1112,6 +1164,70 @@ def _apply_skill_activated(state: SessionState, event: DurableEvent[Any]) -> Ses
         body=data.body,
     )
     return replace(state, skills=skills, applied_seq=event.seq)
+
+
+def _apply_context_compacted(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.context.compacted``: materialize the effective view (§2.4 L126).
+
+    The event RECORDS the replacement; this handler IS the replacement for
+    the folded LLM-request view: the covered prefix of ``messages`` becomes
+    exactly one summary ``UserMessage`` (deterministic id from the event id,
+    body = ``summary_text``), and the retained tail keeps every message whose
+    settling seq is at or after ``retained_from`` -- call/result pairs can
+    never split across the boundary (§2.4 L133: whole messages move or stay).
+    The summary's ``message_seqs`` entry is ``None``: it is the replacement
+    face, not settled history, so the engine's next-pass read face skips it
+    and the strictly-ascending seq invariant over the settled view survives a
+    compaction. The original log and the messages read model are untouched
+    (§2.4 L134: physical deletion is M1's face); a second compaction event
+    simply replaces the view again.
+    """
+    if not isinstance(event.data, ContextCompactedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected ContextCompactedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"{event.type} requires an active session (event {event.id})")
+    if len(state.message_seqs) != len(state.messages):
+        # Unreachable for any state built by this fold (every appending
+        # handler maintains the parallel tuple); fail closed rather than zip
+        # truncating the boundary filter silently (④ disclosure).
+        raise IllegalTransitionError(
+            f"message linkage is broken ({len(state.message_seqs)} seqs for {len(state.messages)} messages) "
+            f"(event {event.id})"
+        )
+    data = event.data
+    retained = [
+        (message, seq)
+        for message, seq in zip(state.messages, state.message_seqs, strict=True)
+        if seq is not None and seq >= data.retained_from
+    ]
+    summary = UserMessage(
+        id=f"msg_summary_{event.id}",
+        type="user",
+        created_at=event.created_at,
+        metadata={
+            "compaction": {
+                "covered_seq": data.covered_seq,
+                "retained_from": data.retained_from,
+                "summary_hash": data.summary_hash,
+                "message_count": data.message_count,
+            }
+        },
+        text=data.summary_text,
+    )
+    return replace(
+        state,
+        applied_seq=event.seq,
+        messages=(summary, *(message for message, _ in retained)),
+        message_seqs=(None, *(seq for _, seq in retained)),
+        compaction=CompactionInfo(
+            covered_seq=data.covered_seq,
+            retained_from=data.retained_from,
+            summary_hash=data.summary_hash,
+            message_count=data.message_count,
+        ),
+    )
 
 
 # -- shared helpers -----------------------------------------------------------

@@ -790,8 +790,13 @@ class SkillActivatedData(BaseModel):
 class ContextCompactedData(BaseModel):
     """``py.context.compacted`` v1 data (§3.1 L176; §2.4 L114-126): the
     effective-context-replacement record. ``covered_seq`` is the settled
-    history boundary seq captured in-lock -- the expected_seq/CAS basis, so a
-    moved boundary discards the summary; ``retained_from`` is where the
+    history boundary seq captured in-lock -- the coverage boundary guarded by
+    the commit-phase expected_seq/CAS, whose literal basis is the log_high
+    watermark (H) captured in the same lock (precision rider, T-B-069
+    recommendation 1 / T-C1-062: with a retained tail present, covered_seq is
+    always below H, so it can never serve as the expected_seq literal; the
+    implementation is stricter -- ANY log advance discards the summary);
+    ``retained_from`` is where the
     retained history starts (the ContextBuilder's original-history origin,
     §2.4 L119); ``summary_text``/``summary_hash`` carry the replacement body
     and its identity digest (§2.4 L120-121); ``model``/``usage`` record the
