@@ -1286,6 +1286,22 @@ class SessionService:
                 # fenced its writes, so its intent is skipped and the signal
                 # still fires (the runner drains on its own terminal path).
                 pass
+            except ConflictError:
+                # #174: the check-first + CAS retry loop exhausted its
+                # attempts, so this run's intent row is NOT committed -- but
+                # the close lifecycle itself must not die here: the
+                # cooperative signal below still fires, Phases 1.5/2/3 still
+                # run, and close() still reaches _closed=True. The
+                # uncommitted intent on a non-terminal run is owned by R4
+                # durable startup recovery (CORE-CONTRACTS L464), never by a
+                # shutdown hook. TS alignment: run-coordinator.ts L142-162
+                # fires interrupt fire-and-forget ("nobody benefits from
+                # waiting out cleanup here ... must acknowledge immediately
+                # even when finalizers are slow"), and execution.ts L110-146
+                # routes lifecycle-report failures through reportLifecycle
+                # (tapCause -> logError -> asVoid): a shutdown-face publish
+                # failure is logged, never escalated.
+                pass
             if self._runner is not None:
                 self._runner.cancel_event(_run_id).set()
         # Phase 1.5 (OP-9, T-C1-026): NOW resolve every pending approval
