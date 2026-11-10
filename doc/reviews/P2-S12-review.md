@@ -1,0 +1,14 @@
+# P2-S12 评审报告 · 席位B · T-B-073（T-C1-061b httpapi 429 slow-consumer triage 微评审）
+
+- 对象与自证：worktree p2-s12 B-baseline 12dc5d0（父 3d92591=main #183 检查点 21:28:01）；评审 diff 恰 2 路径（M tests/integration/test_httpapi_server.py +9/−0 + A doc/orchestration/progress/T-C1-061b.md 74 行）；起讫 HEAD 恒定零 git 写（porcelain 起讫均 0，本报告为唯一写面）；src/** 零触+其余测试零触 numstat 亲证。
+- 五面复核（全 PASS）：
+  1. 票面纪律+写面：2 路径↔两授权件映射成立（写①条件=假说 (a) 已定谳——进度件①节定谳在先，条件触发合规）；断言面冻结亲证（+9/−0 纯增量三处：_Gate +3[注释 2+entered @L220]/provider gate 分支 +1[set @L322]/测试体 +5[注释 4+wait_for @L1233]；L1236-1246 数量断言/429+SlowConsumer+retryable/[200]*8/interrupted/wire 形全为 diff 上下文零动）；席位纪律史（票面 SEAT-LAUNCH 21:37:30→SEAT-EXIT 0 @21:59:03 ~21.5min 同步收口）引票面记档。
+  2. 根因定谳链独立评审（核心）：成立+推翻正当。十窗 src 锚亲证——早折叠三窗全设计内且全先于泊流（run() L461-463 pre-check/_step_loop L505-508 步顶/L558-566 step.started 被拒→StoreError→重读→finalize）；泊流点=_consume L701 async-for；锚（_await_http_status 轮询 runs 表）只证 run.started 落表（L466 提交后可见），至泊流尚跨 L503 读+L541 写两 await=pre-park 窗，CI 负载（#182 较 #177 慢 ~90s）撑宽至 10ms 轮询可命中；红形推演自洽（intent 先落→早折叠 interrupted→gate 未达 task 出册→8 泊位齐返+第 9 个 429→1s 完成集=9→assert (9==1)）；(b) 证伪成立（projector 注入 store 单写路径 L63-65，终态与 runs 表同事务原子，锚见 running⟹终态必未提交）；(c) 证伪成立（WAL+busy_timeout=5000 db.py L39-40/L149-156 读滞后不超前，幻影终态不可构造；StoreError-crash 副候选诚实保留——httpapi 面同形不可辨但负载形状+docs-only 零差+rerun 零现归 (a) 优势证据）；前序 face ② 前提修正成立（done=9 不要求终态先于 cancel，漏检环=锚未钉泊流态）。
+  3. 修复形核验：等价论证成立——entered.set() 于 generator gate 分支同步先行（L322）、其后唯一 await=event.wait() 本身→测试 wait() 返回⟹run task 已悬于 gate（早折叠三窗已全越过）；已泊流后 cancel 语义确定（intent 仅置 cancelling、流不中途断→8 必泊 await task L938-942+guard 8 槽 app.py L100→第 9 个 429→done=1/pending=8）；5s 界=诚实失败面（TimeoutError 显式红非悬挂）；另一 _Gate 消费者（lifespan shutdown @L1329-1333）零涉及 entered（全文件恰 3 命中，L1369 系注释词）；零断言弱化终判成立。
+  4. 门禁+WDAC 处置：四件全对齐派发基线（见下独立复跑）；C 席 install 族 4F WinError 4551 单独复跑可重复=#167 环境面处置核实（与改动解耦论证成立：失败面=子进程拉起已装 CLI，改动在另一文件另一进程）；B 复跑 0F 与调度器 0F 两读数佐证机器 WDAC 态波动=环境面非代码面。
+  5. 浮报+后继候选：④ 6 项完整性抽查成立（第 1 项 pre-park 早折叠 httpapi 面未钉=后继票候选、第 2 项 cancel crash 路径 _fail_cleanup httpapi 面未测=上浮候选——grep 亲证 LifecycleCleanupFailed 于 service/recovery 层有测、httpapi 面零覆盖，口径准确）；⑤ 存量兼容声明核实（唯一代码写=授权①三处纯增量，diff 亲证）。
+- B 独立四门禁复跑（uv run 原生前台，同步收口）：pytest 收集 1444、1442P+2S+0F @349.62s exit 0（本轮 install 族零 WDAC 失败；1 warning=aiosqlite 线程 Event loop is closed 尾部清理面，记档观察）；ruff check . all passed exit 0；ruff format --check . 433 files already formatted exit 0（=432+进度件；本报告落盘后终态口径 434）；mypy 族门口径 132 source files 0 errors exit 0。
+- 终裁：PASS 0 阻断/0 重大/0 次要/1 建议。建议1=浮报第 1+2 项（pre-park 早折叠 httpapi 面未钉+cancel crash _fail_cleanup httpapi 面未测）呈调度器立后继票/上浮裁决——本票根因窗即未钉面，钉住方为完整闭环。
+- 处方（呈调度器）：①并回为 #184+主树四门禁+temproot main-184；②翻牌 ORCH 台账 T-C1-061b DONE+票/进度/报告入库；③浮报 1/2 后继票裁决（建议1 同项）；④记档 WDAC 三方波动（C 4F/B 0F/调度器 0F）+aiosqlite 尾部 warning 观察面。
+- 时钟：门禁收口 2026-11-10 22:22:40（Get-Date 工具读数）；B 席位会话 ses_orch_B2；评审窗 22:13-22:23。
+sha256=4b0fa08d705330b3a257fc41df89fc3a51cef2c7e60b6ed861fccb7632002327（Get-FileHash -Algorithm SHA256；本行之前文件内容，调度器截去本行对证）
