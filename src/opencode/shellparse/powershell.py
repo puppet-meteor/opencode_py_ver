@@ -45,7 +45,9 @@ Disclosed prototype approximations (advisory-grade, not exec-grade):
   `f `v `a `0 `` to their control characters, `` `e `` to ESC (PS 6+
   semantics; PS 5.1 would keep ``e`` literal); every other escaped char
   lands literally (the PS rule) and `` ` `` + newline is a removed line
-  continuation;
+  continuation; `` `u{...}`` (the PS 6+ unicode escape form) is not
+  decoded -- it reaches the script-block rejection through ``{`` rather
+  than a dedicated diagnosis;
 - single-quote ``''`` doubling decodes to one literal ``'`` (the PS rule --
   bash would yield adjacent parts instead);
 - variables are recognized, never evaluated; ``$?`` is the only automatic

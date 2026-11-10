@@ -92,7 +92,7 @@ from opencode.shellparse import parse_bash
 from opencode.storage import NotFoundError
 from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry
 from opencode.tools.builtin import BASH_DEFAULT_TIMEOUT_S, BASH_MAX_OUTPUT_BYTES, BashAdapter
-from opencode.tools.builtin.bash import _ADVISORY_TEXT, _deny_label
+from opencode.tools.builtin.bash import _ADVISORY_TEXT, _DENY_HINT_PATTERNS, _deny_label
 
 if _PLATFORM == "win32":
     import ctypes
@@ -517,6 +517,29 @@ def test_deny_label_new_hits_carry_the_frozen_advisory_text() -> None:
         "deletion); the deny list is an advisory hint, not a sandbox -- the command "
         "was not blocked"
     )
+
+
+def test_deny_label_union_order_priority_label_migration_edge() -> None:
+    """T-B-077 MINOR-1 (prescription (a), permanent pin): cross-pattern label
+    migration under the union-order priority semantics -- the label of a
+    previously-hit command CAN migrate to an earlier pattern once the decoded
+    surface reveals it. Expected behavior, not a defect.
+
+    ``echo "rm -rf /" ; mkfs /dev/sda``: on the raw face alone the quoted
+    ``"/"`` breaks pattern 1's trailing lookahead, so the pre-enrichment label
+    is ``filesystem format`` (pattern 3, via mkfs); the structured decode then
+    joins the first statement's argv into ``echo rm -rf /``, which hits
+    pattern 1 -- an earlier tuple entry. Both labels truthfully describe
+    dangerous content in the command (advisory only, never a block; the
+    frozen advisory text template is unchanged).
+    """
+    command = 'echo "rm -rf /" ; mkfs /dev/sda'
+    raw_only = next(
+        (label for label, pattern in _DENY_HINT_PATTERNS if pattern.search(command)),
+        None,
+    )
+    assert raw_only == "filesystem format"  # the pre-enrichment floor (pattern 3)
+    assert _deny_label(command) == "recursive root/home deletion"  # migrated (pattern 1, decoded face)
 
 
 async def test_bash_quote_masked_deny_hint_advises_without_blocking(tmp_path: Path) -> None:

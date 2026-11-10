@@ -152,14 +152,18 @@ def _decoded_scan_surfaces(command: str) -> tuple[str, ...]:
     """
     try:
         parsed = parse_bash(command)
+        surfaces: list[str] = []
+        for statement in parsed.statements:
+            for segment in statement.segments:
+                argv = segment.argv
+                surfaces.append(" ".join(argv))
+                surfaces.extend(argv)
     except Exception:
+        # T-B-077 S-1: the surface-construction loop joins the parse call in
+        # the try domain (belt-and-braces -- the frozen IR's tuple iteration
+        # cannot raise, but "any exception from the parse face" now holds
+        # literally for the whole face).
         return ()
-    surfaces: list[str] = []
-    for statement in parsed.statements:
-        for segment in statement.segments:
-            argv = segment.argv
-            surfaces.append(" ".join(argv))
-            surfaces.extend(argv)
     return tuple(surfaces)
 
 

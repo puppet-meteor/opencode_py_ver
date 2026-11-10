@@ -226,3 +226,58 @@ def test_package_docstring_carries_the_three_red_lines() -> None:
     assert "advisory only" in doc
     assert "not an os sandbox" in doc
     assert "ask/deny" in doc
+
+
+# ---------------------------------------------------------------------------
+# T-C1-066 additions: the ``$-`` literal pin and the source-level code-family pin
+# ---------------------------------------------------------------------------
+
+
+def test_dollar_dash_stays_literal_divergence_accepted() -> None:
+    """T-B-076 SUGGESTION-1 (final acceptance): ``$-`` (bash's shell-flags
+    special parameter) is outside the pinned special set ``@*#?$!`` and stays
+    a literal argv item -- a known, accepted divergence from real bash, which
+    expands ``$-`` to the active shell option letters. Zero behavior risk for
+    an advisory prototype (variables are recognized, never evaluated); the
+    golden positive ``dollar-dash-literal`` pins the same face."""
+    assert parse_bash("echo $-").statements[0].segments[0].argv == ("echo", "$-")
+
+
+def _error_call_code_literals(module_filename: str) -> set[str]:
+    """AST-scan a parser module: the first-argument literals of every ``self._error(...)`` call."""
+    source_path = _PACKAGE_DIR / module_filename
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    codes: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_error"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ):
+            continue
+        code = node.args[0]
+        assert isinstance(code, ast.Constant) and isinstance(code.value, str), (module_filename, node.lineno)
+        codes.add(code.value)
+    return codes
+
+
+def test_source_error_calls_stay_within_the_declared_seven() -> None:
+    """T-B-077 S-3 (bash face, same-form pin): every ``_error(...)`` call site
+    in bash.py raises a code *literal* from the declared seven-code family.
+
+    The corpus pin above covers corpus->codes; this covers source->codes, so
+    a future eighth code cannot drift into the parser without golden
+    coverage."""
+    codes = _error_call_code_literals("bash.py")
+    assert codes, "the parser does raise"
+    assert codes <= {
+        "unclosed-single-quote",
+        "unclosed-double-quote",
+        "unclosed-brace",
+        "empty-variable-name",
+        "dangling-escape",
+        "empty-command",
+        "unsupported-construct",
+    }
