@@ -7,7 +7,8 @@
 
 - 2026-11-02 [T-A-002]：定稿 R1 最小配置快照及 canonical JSON/SHA-256、expected_seq 与 applied_seq 水位、仅持久化的 prompt/RunRef/幂等与拒绝顺序、坏事件只读诊断及投影/日志读取边界；与 B 草案的对齐见 §9。
 - 2026-11-02 [T-A-003]：裁决 R1 UserMessage 不含 files、py.* v1 严格 forbid 并以版本升级+upcaster 演进、evt_/msg_/ses_/run_ ID 前缀及整数拒绝 bool（§1/§2.1/§3.1/§8）；JSON Schema 由 R5 统一产出，各切片先以 fixture 锁定形状；ephemeral 生产类型注册留 R2，R1 不注册；CoreError.details 与解码异常家族差异追加至 parity.md，实施交接见 §10。
-- 2026-11-09 [T-A-013]：增补 M6-skills 规划契约——§6.3 skills 发现与激活（`SkillCatalog.list/activate` 签名、`SkillEntry`/`SkillActivationReceipt`/`py.skill.activated` 字段表、大小→路径→信任→hash 检查序、触发面枚举与三红线承接）、§3.1 增 `py.skill.activated` 事件行、§7 增 activate 审计命令行；语义逐句承载 PHASE2-MODULES L120/L130/L132 原文，增补面全部标注「规划契约，未实现」；P2-S1/P2-S2 实现切片派发前置（OP-P2-5=A 席线定夺，随 #168 记档）。
+- 2026-11-09 [T-A-013]：增补 M6-skills 规划契约——§6.3 skills 发现与激活（`SkillCatalog.list/activate` 签名、`SkillEntry`/`SkillActivationReceipt`/`py.skill.activated` 字段表、大小→路径→信任→hash 检查序、触发面枚举与三红线承接）、§3.1 增 `py.skill.activated` 事件行、§7 增 activate 审计命令行；语义逐句承载 PHASE2-MODULES L120/L130/L132 原文，增补面全部标注「规划契约，未实现」（该等标注已随 #171 skills 实现落地 [90f0073] 翻牌为已实现态——见 [T-A-014] Changelog 行）；P2-S1/P2-S2 实现切片派发前置（OP-P2-5=A 席线定夺，随 #168 记档）。
+- 2026-11-10 [T-A-014]：增补 M6-compaction 规划契约——§2.4 自动 compaction（`py.context.compacted` 七字段 payload 表、锁内捕获 settled 边界/hash→释放锁生成摘要→短提交锁 expected_seq/CAS 校验→边界变化即丢弃摘要的执行序、阈值/锁/CAS/边界变化丢弃/失败不替换的 fixture 行为要求、「失败/取消/崩溃不替换原上下文」与「永远不拆 call/result」红线、物理删除原日志另走 M1 归档设计）+§3.1 增 `py.context.compacted` 事件行；§7 零增补（卡片无宿主命令面）。语义逐句承载 PHASE2-MODULES L123/L130/L138/L159 原文，增补面标注「规划契约，未实现」，compaction 实现切片派发前置（OP-P2-1 用户裁决定序：M6 线先于 M2 余量→自动 compaction 卡）。同票随载 rider：§6.3 skills 六处「规划契约，未实现」标注随 #171 实现落地（90f0073）翻牌为已实现态——上限值以 src 现读 `SKILL_BODY_MAX_BYTES`（64 KiB）填入，生产注册面以 src 现读核证（`src/opencode/skills/catalog.py`+`__init__.py` 在库、`SessionService` 构造参数 `catalog`、events.py `PY_SKILL_ACTIVATED`/`SkillActivatedData`+registry 注册线）。
 
 ## 1. 共同规则
 
@@ -104,6 +105,38 @@ adapter 按 call_index 聚合工具 ID/名称碎片；runner 按同一 index 聚
 
 一次请求最多一个终止 chunk：finish 或 error。EOF 没有终止 chunk 视为流被中断；取消通过 CancelledError 传播。adapter 可以暂存 SDK 的 finish_reason，读完末尾 usage 后再发逻辑 finish；不能让 finish 后的 usage 丢失。provider_metadata 不能成为执行权限或恢复真相，保存前按敏感字段规则处理。
 
+### 2.4 自动 compaction（M6-compaction 规划契约，未实现）
+
+> 状态标注（PHASE2-MODULES L130 原文）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节与 §3.1 的 `py.context.compacted` 事件行是该句的 compaction 承载面，**规划契约，未实现**。本节只承载契约文本与 fixture 行为要求——fixture 文件建立归 compaction 实现切片（编号调度器后续定），本票不预建。§7 零增补：卡片无宿主命令面（skills activate 有 §7 审计命令行先例，compaction 卡无此面——由阈值触发的引擎面承载，非宿主显式命令）；若实现期研判需要命令面=超出卡片语义，停下浮报。
+
+compaction 挂既有接缝（PHASE2-MODULES L123 前置列）：S1 ContextBuilder（§2.2 既有面——「从历史 + 配置快照生成请求」的历史侧有效替换）+S6 新事件/投影。最低验收（PHASE2-MODULES L123 原文）：`context.compacted(covered_seq, retained_from, summary_hash, model, usage)`；阈值/锁/CAS 明确，不拆 call/result；失败/取消不替换原上下文。
+
+**事件面**：payload 七字段（PHASE2-MODULES L138「至少含」全量承载；§3.1 表行同步增补，规划契约未实现）：
+
+| 字段 | 约束 |
+|---|---|
+| `covered_seq` | 非负 int；锁内捕获的 settled 历史边界 seq——短提交锁内 expected_seq/CAS 校验的基准，边界变化即丢弃该摘要 |
+| `retained_from` | 非负 int；retained history 起始边界——ContextBuilder 生成时保留的原始历史起点 |
+| `summary_text` | 非空 str；释放锁后生成的摘要正文（replacement 内容面） |
+| `summary_hash` | 非空 str；摘要标识，随事件持久化供提交校验与审计比对 |
+| `model` | 生成摘要所用模型标识（ModelRef 域沿 §2.2） |
+| `usage` | 额外模型调用的用量记录——「额外模型调用也记录 usage」（Usage 域沿 §2.3） |
+| `message_count` | 非负 int；覆盖区间消息计数（覆盖面度量） |
+
+**执行语义**（PHASE2-MODULES L138 原文逐句）：compaction 以新 `py.context.compacted` 事件记录有效上下文替换，payload 至少含 covered_seq、retained_from、summary_text、summary_hash、model、usage、message_count。锁内捕获 settled 历史边界/hash，释放锁后生成摘要，再在短提交锁内用 expected_seq/CAS 校验；边界变化就丢弃该摘要。保留原始事件和工具结果，ContextBuilder 从已保存的 replacement + retained history 生成，永远不拆 call/result。摘要失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage；物理删除原日志另走 M1 归档设计。
+
+**阈值**：compaction 由明确阈值触发（上下文压力达阈值）；阈值具体值=契约待定面，实现切片定（沿 §6.3「上限值 P2-S2 定」先例形）。
+
+**红线承接**：
+
+- 「失败/取消/崩溃不替换原上下文」（L138）：摘要失败、取消或崩溃时原上下文原样保留，不部分替换、不以半成品摘要顶替；已产生的额外模型调用 usage 照记。
+- 「永远不拆 call/result」（L123/L138）：保留原始事件和工具结果；ContextBuilder 从已保存的 replacement + retained history 生成，call 与其 result 的配对在任何替换路径下不被拆开。
+- 「物理删除原日志另走 M1 归档设计」（L138）：本节只定义有效上下文替换，不定义日志删除。
+
+**fixture 行为要求**：阈值触发、锁/CAS 提交序、边界变化丢弃摘要、失败/取消/崩溃不替换原上下文，均须以正/反例 fixture 锁定形状与行为（沿 §1「以正/反例 JSON fixture 锁定 wire 形状」既有路径）；fixture 文件建立归 compaction 实现切片，本票不预建。
+
+**场景注记**（PHASE2-MODULES L159 原文锚，承载注记级不新建场景节）：「本地 CLI 自用：Phase 1 已能交付；按需要增加 skills、compaction 或 M2。」
+
 ## 3. S6 + S4：唯一事件写入、投影与数据库
 
 ### 3.1 事件 envelope 和清单
@@ -139,7 +172,8 @@ durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配
 | py.permission.saved | `decision_id, scope, rule, expires_at, boot_id`；仅当前进程的本 session |
 | py.permission.revoked / py.permission.expired | `decision_id, reason`；前者是宿主撤销，后者是到期检查产生 |
 | py.run.finished | `run_id, outcome, error?`；投影 idle 消息并释放 active run |
-| py.skill.activated | `skill_id, source, path, hash, size, body`；M6-skills 规划契约未实现（§6.3）——durable activation 记录（bounded 正文，上限值 P2-S2 定）；恢复使用已保存内容，不悄悄重读磁盘 |
+| py.skill.activated | `skill_id, source, path, hash, size, body`；M6-skills 已实现（§6.3——P2-S1/P2-S2 落地并回 #171 [90f0073]）——durable activation 记录（bounded 正文，上限值=src 现读 `SKILL_BODY_MAX_BYTES` 64 KiB）；恢复使用已保存内容，不悄悄重读磁盘 |
+| py.context.compacted | `covered_seq, retained_from, summary_text, summary_hash, model, usage, message_count`；M6-compaction 规划契约未实现（§2.4）——有效上下文替换记录：保留原始事件和工具结果，永远不拆 call/result；失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage |
 
 ephemeral 类型为 `py.text.delta/py.reasoning.delta`（message_id, part_id, delta）、`py.tool.input.delta`（call_index, delta）、`py.tool.progress`（execution_id, metadata）。delta 不落库；finalized/finished 必须含恢复所需的完整值。生产类型注册留 R2 随流式生产者落地；R1 生产注册表仅含 py.session.created/py.prompt.accepted 两个 durable 类型，ephemeral 只保留 envelope/注册机制和测试局部定义。
 
@@ -305,9 +339,9 @@ R1 `config_snapshot` 的字段全集精确为 `schema_version: Literal[1]`、`pe
 
 MCP 只支持显式用户配置的 stdio server，argv 直接 exec、不拼 shell，环境变量为最小集和显式 secret refs；启动前宿主确认该 server 的完整本机权限。SDK manager 拥有子进程、会话、退出栈和重连：调用超时/断线按 unknown 处理，不自动重试副作用；最多重建连接供下一次显式调用。远端 tools/list 改变后先建立新 catalog，不能用旧批准调用改名工具。
 
-### 6.3 skills 发现与激活（M6-skills 规划契约，未实现）
+### 6.3 skills 发现与激活（M6-skills 已实现——P2-S1/P2-S2 落地并回 #171 [90f0073]）
 
-> 状态标注（PHASE2-MODULES L130 原文）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节、§3.1 的 `py.skill.activated` 事件行与 §7 的 activate 审计命令行是该句的 skills 承载面，**规划契约，未实现**：`SkillCatalog` 当前零实现（纯新增面），生产类型注册随实现落地。本节只承载契约文本与 fixture 行为要求——fixture 文件建立归 P2-S1/P2-S2 实现切片，本票不预建。
+> 状态标注（PHASE2-MODULES L130 原文）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节、§3.1 的 `py.skill.activated` 事件行与 §7 的 activate 审计命令行是该句的 skills 承载面；该前置已执行并实现——**已实现态**（P2-S1/P2-S2 落地并回 #171 [90f0073]，原「规划契约，未实现」标注随 T-A-014 翻牌）：`SkillCatalog` 在库（`src/opencode/skills/catalog.py`+`__init__.py`——list/activate 两方法）；生产组合接线=`SessionService` 构造参数 `catalog: SkillCatalog | None`（service.py 现读核证）；生产类型注册面=`events.py` `PY_SKILL_ACTIVATED` 常量+`SkillActivatedData` 模型+registry 注册线（T-C1-052a 落地，schema-lock 同步解锁）；fixture 已随实现切片建立（`tests/contract/skills_fixtures/`，#169）。
 
 skills 的发现与装载挂既有接缝（PHASE2-MODULES L120 前置列）：S5 发现（skills 目录/清单）、S6 指令装载（激活命令写入 instructions snapshot）、S3 读取沿用既有工具/权限语义；无需 M3。最低验收（PHASE2-MODULES L120 原文）：`SkillCatalog.list/activate`；激活记录 source/path/hash/size；host 显式选择或受限触发，内容不授予权限，快照/恢复行为有 fixture。
 
@@ -331,7 +365,7 @@ skills 的发现与装载挂既有接缝（PHASE2-MODULES L120 前置列）：S5
 
 `SkillActivationReceipt`（审计回执面）：`skill_id, source, path, hash, size`——激活记录四元组（source/path/hash/size）加 skill_id；激活同时提交 §3.1 的 `py.skill.activated` durable 事件，回执据此可审计追溯。
 
-`py.skill.activated` 事件 data 字段（durable activation 记录——§3.1 表行同步增补，规划契约未实现）：
+`py.skill.activated` 事件 data 字段（durable activation 记录——§3.1 表行同步；已实现态：`SkillActivatedData` 落 events.py [T-C1-052a]，字段与下表一致）：
 
 | 字段 | 约束 |
 |---|---|
@@ -340,7 +374,7 @@ skills 的发现与装载挂既有接缝（PHASE2-MODULES L120 前置列）：S5
 | `path` | 非空 str；激活时通过路径检查的正文路径 |
 | `hash` | 非空 str；经检查序核验后的正文 SHA-256 摘要；重新激活时与已存值比对 |
 | `size` | 非负 int；正文字节数 |
-| `body` | 非空 str；经检查序的 bounded 指令正文。**上限值=契约待定面，P2-S2 定**；超限按 §6 指令面上限同一处置（明确报错，不静默截断入库） |
+| `body` | 非空 str；经检查序的 bounded 指令正文。**上限值=src 现读 `SKILL_BODY_MAX_BYTES`（64 KiB；P2-S2 定谳）**；超限按 §6 指令面上限同一处置（明确报错，不静默截断入库） |
 
 **激活语义**（PHASE2-MODULES L132 原文逐句）：skills 的激活是可审计命令：`activate(skill_id, source, expected_hash)` 把经大小/路径/信任检查的正文写入 instructions snapshot；模型只能建议，宿主策略决定是否激活。检查序固定为大小→路径→信任→hash——任一检查不过即拒绝并明确报错，不猜修、不跳过其后检查；hash 检查即正文摘要与 expected_hash 的比对，不符拒绝。durable activation 保存 bounded 正文、source/path/hash/size（即上表事件字段）；恢复使用已保存内容，不悄悄重读磁盘。重新激活时 hash 变化要求确认。
 
@@ -371,7 +405,7 @@ skills 的发现与装载挂既有接缝（PHASE2-MODULES L120 前置列）：S5
 | `messages(session_id, after_message_id?, limit=100) -> MessagePage` | 有序分页；cursor 必须属于该 session |
 | `run_status(run_id) -> RunStatus` | 运行、完成、失败、中断及错误信息 |
 | `close() -> None` | 按下述顺序取消并收回自有任务，关闭 provider/MCP/DB；不得遗留后台任务 |
-| `activate(skill_id, source, expected_hash) -> SkillActivationReceipt`（M6-skills 规划契约未实现） | 宿主可审计激活命令（`SkillCatalog.activate` 接缝，§6.3）：模型只能建议，宿主策略决定是否激活；经 §6.3 检查序的正文写入 instructions snapshot，激活记录 source/path/hash/size，提交 `py.skill.activated`（§3.1）；重新激活 hash 变化要求确认 |
+| `activate(skill_id, source, expected_hash) -> SkillActivationReceipt`（M6-skills 已实现，#171 [90f0073]） | 宿主可审计激活命令（`SkillCatalog.activate` 接缝，§6.3）：模型只能建议，宿主策略决定是否激活；经 §6.3 检查序的正文写入 instructions snapshot，激活记录 source/path/hash/size，提交 `py.skill.activated`（§3.1）；重新激活 hash 变化要求确认 |
 
 `SessionRef={session_id: str}`；`RunRef={session_id: str, run_id: str, request_id: str}`，三项均为非空字符串，session_id/run_id 另须满足 §3.1 的 ses_/run_ pattern，分别指向原 session、首次接受时生成的 run 和调用方请求，不含调度承诺；`RunStatus` 含上述标识及 `status: accepted/running/cancelling/succeeded/failed/interrupted`、可选 error。`MessagePage` 含 items、next_message_id 和 has_more；消息游标按投影顺序分页。`DecisionReceipt` 含 permission_id、decision 和 execution_id，不携带可复用执行权限。
 
