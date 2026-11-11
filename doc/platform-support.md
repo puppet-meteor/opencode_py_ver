@@ -32,6 +32,7 @@ R4/R5 全量套件（1134 测）本机复跑口径：Windows 11 + CPython 3.12.1
 
 - POSIX 上的 junction：`not_applicable`（junction 是 Windows 概念；POSIX 用 symlink 覆盖同一语义）。
 - 本地 Windows 本轮没有 unsupported 项；受限能力预期出现在 CI Windows（见下节）。
+- watcher 文件变更监视与网络文件系统（NFS/SMB/网络驱动器等不可靠文件系统）：不宣称支持——watcher 平台面仅覆盖本机与 CI runner 已实测的本地文件系统（CORE-CONTRACTS §6.4 L415 红线三、M1 L53 同口径）；通知丢失窗口如实记档且丢失无害（下一次变更或显式 reload 重补），不引入重试/补偿/确认机制（§6.4 裁定①延伸面）。
 
 ## 4. symlink/junction 权限限制
 
