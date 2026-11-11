@@ -704,9 +704,15 @@ def test_maas_env_is_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _maas_env() == ("https://maas.example/v1", "sk-test")
 
 
-def test_builtin_adapters_are_the_twelve_cli_tools_in_order() -> None:
+def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
+    """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073).
+
+    POSIX asserts the original twelve-name tuple unchanged; win32 asserts
+    the twelve plus the appended PTY T1 ``PtyRunAdapter`` (13 names), the
+    ``*pty_adapters()`` splice in ``_builtin_adapters``.
+    """
     names = tuple(type(adapter).__name__ for adapter in _builtin_adapters(("C:/work",)))
-    assert names == (
+    expected = (
         "FsReadAdapter",
         "FsLsAdapter",
         "FsGlobAdapter",
@@ -720,6 +726,10 @@ def test_builtin_adapters_are_the_twelve_cli_tools_in_order() -> None:
         "GitWorktreeListAdapter",
         "GitWorktreeRemoveAdapter",
     )
+    if sys.platform == "win32":
+        assert names == (*expected, "PtyRunAdapter")
+    else:
+        assert names == expected
 
 
 def test_run_migrations_upgrades_a_fresh_database_idempotently(tmp_path: Path) -> None:

@@ -53,6 +53,7 @@ from opencode.tools.builtin import (
     GitWorktreeAddAdapter,
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
+    pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
 from opencode.tools.registry import ToolAdapter
@@ -184,7 +185,12 @@ def _compose_mcp_manager(loader: ConfigLoader) -> McpManager | None:
 
 
 def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
-    """The twelve builtin tool adapters (the CLI ``_drive`` list, same order)."""
+    """The builtin tool adapters (the CLI ``_drive`` list, same order).
+
+    Platform gate: ``*pty_adapters()`` appends the win32-verified PTY T1
+    adapter on win32 and is empty elsewhere (PHASE2-MODULES L68: an
+    unverified platform is not enabled; T-B-087 ruling 2 / T-C1-073).
+    """
     return (
         FsReadAdapter(roots=roots),
         FsLsAdapter(roots=roots),
@@ -198,6 +204,7 @@ def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
         GitWorktreeAddAdapter(roots=roots),
         GitWorktreeListAdapter(roots=roots),
         GitWorktreeRemoveAdapter(roots=roots),
+        *pty_adapters(),
     )
 
 

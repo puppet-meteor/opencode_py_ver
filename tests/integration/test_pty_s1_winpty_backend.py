@@ -22,7 +22,7 @@ assign-before-proceed-gate discipline from T-C1-071 is preserved: the
 child's grandchild spawn is gated on PTY input that is only written
 after the job capture).
 
-Child-process discipline (CORE-CONTRACTS 搂5.3 L315): every child is the
+Child-process discipline (CORE-CONTRACTS §5.3 L315): every child is the
 explicit interpreter (``sys.executable -u -c``, argv form; never
 ``shell=True``), grandchildren are spawned explicitly by the child, the
 SIGINT disposition is installed explicitly in the ctrl_c child (an
