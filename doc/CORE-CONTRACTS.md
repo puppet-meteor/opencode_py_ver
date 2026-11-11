@@ -10,6 +10,8 @@
 - 2026-11-09 [T-A-013]：增补 M6-skills 规划契约——§6.3 skills 发现与激活（`SkillCatalog.list/activate` 签名、`SkillEntry`/`SkillActivationReceipt`/`py.skill.activated` 字段表、大小→路径→信任→hash 检查序、触发面枚举与三红线承接）、§3.1 增 `py.skill.activated` 事件行、§7 增 activate 审计命令行；语义逐句承载 PHASE2-MODULES L120/L130/L132 原文，增补面全部标注「规划契约，未实现」（该等标注已随 #171 skills 实现落地 [90f0073] 翻牌为已实现态——见 [T-A-014] Changelog 行）；P2-S1/P2-S2 实现切片派发前置（OP-P2-5=A 席线定夺，随 #168 记档）。
 - 2026-11-10 [T-A-014]：增补 M6-compaction 规划契约——§2.4 自动 compaction（`py.context.compacted` 七字段 payload 表、锁内捕获 settled 边界/hash→释放锁生成摘要→短提交锁 expected_seq/CAS 校验→边界变化即丢弃摘要的执行序、阈值/锁/CAS/边界变化丢弃/失败不替换的 fixture 行为要求、「失败/取消/崩溃不替换原上下文」与「永远不拆 call/result」红线、物理删除原日志另走 M1 归档设计）+§3.1 增 `py.context.compacted` 事件行；§7 零增补（卡片无宿主命令面）。语义逐句承载 PHASE2-MODULES L123/L130/L138/L159 原文，增补面标注「规划契约，未实现」，compaction 实现切片派发前置（OP-P2-1 用户裁决定序：M6 线先于 M2 余量→自动 compaction 卡）。同票随载 rider：§6.3 skills 六处「规划契约，未实现」标注随 #171 实现落地（90f0073）翻牌为已实现态——上限值以 src 现读 `SKILL_BODY_MAX_BYTES`（64 KiB）填入，生产注册面以 src 现读核证（`src/opencode/skills/catalog.py`+`__init__.py` 在库、`SessionService` 构造参数 `catalog`、events.py `PY_SKILL_ACTIVATED`/`SkillActivatedData`+registry 注册线）。
 
+- 2026-11-11 [T-A-016]：增补 M2-watcher 规划契约——§6.4 watcher 文件变更监视与显式 reload（裁定①只提示通知不走 py.* durable/ephemeral 事件注册面——§3.1 零增补、events.py 零新事件模型、schema-lock 裁定面零解锁；裁定②宿主显式 reload 命令→新快照=§6.1 版本路径+§6.2 canonical hash 重验，旧快照含义不静默改写；裁定③ idle 判定三条件口径（无在飞 run+无在飞审批+静默窗，阈值归实现切片）；裁定④ boot_id 不变+saved 决定跨快照保留审计不自动激活；「不改变运行中审批」红线明文）+§6 L338「Phase 1 无热重载」句翻面承接（显式 capability 非静默热重载——原句语义不变）。语义逐句承载 PHASE2-MODULES L61/L65/L70 与 p2-slices watcher 卡/W1/W2 原文，增补面全部标注「规划契约，未实现」（watcher 全线未实现——本票无既有标注翻牌面）；W1/W2 实现切片派发前置（沿 T-A-013/014 两步走先例第一步——B 席评审与 merge 归调度器后续）。
+
 ## 1. 共同规则
 
 - wire/persisted model 用 Pydantic v2；运行时资源用 dataclass/Protocol。所有集合使用工厂默认值，不共享可变容器。
@@ -335,7 +337,7 @@ R1 `config_snapshot` 的字段全集精确为 `schema_version: Literal[1]`、`pe
 
 依据：锁定 TS `packages/schema/src/session-event.ts:39–57` 的 `Created` 含 permissions/model 等创建字段，`packages/core/src/config/discovery.ts:15–25,59–145` 的 `Sources/discover` 定义发现来源；它们都没有 Python 的最小快照和 canonical hash。**TS 无对应物 + Python 侧论证**：R1 未接入 ConfigLoader/模型/工具，用关闭扩展字段的最小存储版本即可验证持久化，不制造运行权限；摘要仅覆盖非秘密配置内容，排除自身可避免递归，固定序列化字节可重启重算并检测漂移。
 
-快照是运行行为基线：存可重建的非秘密配置及指令文本，凭据只存引用；URL userinfo/query 和敏感键不能原样入库。恢复若工作目录失效、凭据引用失效或 MCP 启动指纹变化，明确停住并要求宿主重新配置/批准，不能静默换一套权限。Phase 1 无热重载。
+快照是运行行为基线：存可重建的非秘密配置及指令文本，凭据只存引用；URL userinfo/query 和敏感键不能原样入库。恢复若工作目录失效、凭据引用失效或 MCP 启动指纹变化，明确停住并要求宿主重新配置/批准，不能静默换一套权限。Phase 1 无热重载；M2 watcher 规划增补的显式 reload capability（§6.4，规划契约未实现）不改变本句语义——那是宿主显式命令经批准产生新快照的路径，不是静默热重载，文件事件本身永不触发快照或权限改写。
 
 MCP 只支持显式用户配置的 stdio server，argv 直接 exec、不拼 shell，环境变量为最小集和显式 secret refs；启动前宿主确认该 server 的完整本机权限。SDK manager 拥有子进程、会话、退出栈和重连：调用超时/断线按 unknown 处理，不自动重试副作用；最多重建连接供下一次显式调用。远端 tools/list 改变后先建立新 catalog，不能用旧批准调用改名工具。
 
@@ -389,6 +391,30 @@ skills 的发现与装载挂既有接缝（PHASE2-MODULES L120 前置列）：S5
 - 「host 显式选择或受限触发」（L120）：触发面以上述两径为全集，越界触发即拒绝。
 
 **fixture 行为要求**（L120「快照/恢复行为有 fixture」）：激活→快照写入→恢复往返、检查序各拒绝分支（大小/路径/信任/hash 不符）、重新激活 hash 变化确认、恢复不重读磁盘，均须以正/反例 fixture 锁定形状与行为（沿 §1「以正/反例 JSON fixture 锁定 wire 形状」既有路径）；fixture 文件建立归 P2-S1/P2-S2 实现切片，本票不预建。
+
+### 6.4 watcher 文件变更监视与显式 reload（M2-watcher 规划契约，未实现）
+
+> 状态标注（PHASE2-MODULES L130 原文口径）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节、§6 的 L338 翻面句与 Changelog 行是该句的 watcher 承载面，**规划契约，未实现**——watcher 全线未实现，本票无既有标注翻牌面。本节只承载契约语义与红线；库接入（watchfiles 或备选，OP-P2-4 extras 已前瞻声明）、去重/合并算法、idle/静默窗阈值、宿主通知 API 形状、新快照持久化承载形状均归 W1/W2 实现切片（编号调度器后续定），本票零代码零 fixture。语义逐句承载 PHASE2-MODULES L61/L65/L70 原文与 p2-slices watcher 卡/W1/W2 切片定义（本节四问=T-A-016 裁定面）。
+
+范围与接缝（PHASE2-MODULES L65 原文+p2-slices watcher 卡）：文件变更监视（会话 roots+配置源）；「去重/合并变更，只提示或在 idle 显式创建新快照，不改变运行中审批」。挂载点=S5 配置域（ConfigSnapshot 显式 reload capability——L61 改动点；§6.1/§6.2 快照版本与 canonical hash 路径沿用）+§5.2 审批面（零触碰红线）+§7 任务生命周期（watch 任务取消/close 回收，不遗留后台任务）。
+
+**裁定①——只提示通知不走 py.* 事件注册面（durable/ephemeral 均不注册；W1 消费）**：watcher 的去重/合并文件变更提示是宿主面通知信号，不是 session 业务事实——无投影/恢复语义（提示丢失无害：下一次变更或显式 reload 重补），因此不进 durable 日志、不进 Bus/投影路径、不产生任何状态变化；且 ephemeral envelope 强制 session 归属、运行内事件 metadata 须含 run_id（§3.1），而文件变更信号可在无任何 run 的 idle 期发生，强行纳入 session 事件域属于发明语义。裁定后果：§3.1 零增补（无新事件类型行）、events.py 零新事件模型、schema-lock 裁定面零解锁；W1 按本裁定实现宿主通知面（回调/队列形状归实现切片，宿主为唯一消费者）。若实现期评审推翻本裁定改走事件注册面：events.py 新 pydantic 事件模型（自动进 generate_schema_artifacts 收集面——T-C1-052a 先例）+schema-lock 解锁+§3.1 事件清单行增补+fixture 建立均归实现切片，并须回头修订本节与 Changelog。
+
+**裁定②——显式 reload capability（L338 翻面承接；W2 消费）**：快照刷新唯一路径=宿主显式 reload 命令。命令产生新快照：走 §6.1 版本路径（后续可执行快照使用新的 schema_version 并显式提供运行字段，保留版本 1 的解码与旧 fixture）+§6.2 canonical hash 重验（合法内容按重新规范化后的字节计算摘要，不能沿用旧摘要；提交与读取时重新验证，输入不符为 ValidationError）；旧快照含义不被静默改写——已存 py.session.created 及其 snapshot_hash 原样保留（§3.2 不删除日志前缀），新快照仅对显式 reload 之后的运行生效。L338「明确停住并要求宿主重新配置/批准，不能静默换一套权限」语义不变：本能力是显式 capability 非静默热重载——文件事件本身永不触发快照改写或权限变化，watcher 只提供提示与 idle 门槛下的显式 reload 机会，采纳与否归宿主定夺。
+
+**裁定③——idle 判定口径（W2 消费；语义归契约，阈值归实现切片）**：idle=三条件合取——①无在飞 run：reload 目标 session 无 accepted/running/cancelling 状态的 run（§2.1 状态域+§7 active-run 占用口径）；②无在飞审批：无 pending 的 py.permission.requested（§5.2 审批域，未回复未关闭未过期）；③静默窗：自①②最后清除时刻起经过实现切片定的静默窗口，且窗口内无新文件变更与命令活动（watcher 去重/合并纪律在 reload 门槛上的延伸——把抖动期内的变更合并为一次 reload 机会）。idle 判定是只读观察，不取消/中断任何在飞活动；显式 reload 在应用点按 §3.2 提交锁纪律原子复核 idle 前置，不满足即拒绝/顺延，绝不施于在飞 run/审批之上。静默窗与去重窗口的具体阈值=契约待定面，实现切片定（沿 §2.4 compaction 阈值先例形）。
+
+**裁定④——boot_id/saved decision 跨快照衔接（W2 消费；§5.2 现语义基准沿用，存量兼容声明）**：boot_id 语义不变——每次应用启动生成（§5.2 既有句），显式 reload 不是启动，不产生新 boot_id。旧快照下已记录的 saved 决定（py.permission.saved）跨快照边界与 §5.2 恢复边界同形：保留作审计（durable 日志 append-only），不自动激活于新快照 regime——「恢复后 saved 决定保留审计不自动激活」的既有边界沿快照变更轴延伸；新快照下的规则求值以该快照承载的 permission rules 为准，宿主新的 always 回复产生新决定（§5.2 既有机制沿用）。reload 本身不写任何权限事件、不撤销/不激活任何 saved 决定；旧 saved 决定在新快照 regime 下失效/存续的具体承载（到期、撤销事件或求值时门禁）归实现切片在「保留审计+不自动激活+审批面零触碰」语义内定。
+
+**红线（明文，四问共通）**：
+
+- 「不改变运行中审批」（L65）：只提示、idle 显式新快照、reload 均不得改变运行中审批——pending 审批的请求/回复/关闭路径与运行中权限求值在 watcher 全路径下保持不变（W1 红线落测面：事件风暴中运行中快照 byte-identical+审批面零变化）。
+- 「运行中的配置快照不受文件事件偷偷修改」（L70）：文件事件对运行中快照零写入；快照变更仅经裁定②的显式 reload 路径。
+- 「不静默改写旧快照含义」（§6.1/§6.2 沿用）：旧快照事实与新快照按版本路径并存，canonical hash 重验，旧 fixture 保持可读。
+- extras 未安装：core 全功能正常，watcher 能力调用报 UnsupportedCapability（§8 错误族）——「仅需要 git 的用户不必安装 watcher 或 PTY」（L70）。
+- watch 任务生命周期：取消/close 必须回收 watch 任务（§7 不遗留后台任务纪律）；平台面仅覆盖本机已测文件系统，网络盘不可靠不宣称支持（M1 L53 同口径）；事件风暴/背压面 bounded（库级 debounce+Python 侧去重合并）。
+
+**fixture 行为要求**：事件风暴中运行中快照 byte-identical+审批面零变化、只提示零状态变化（不落 durable 日志）、idle 门槛拒绝/顺延分支、显式 reload→新快照 §6.2 hash 重验往返、saved 决定跨快照保留审计不自动激活，均须以正/反例 fixture 锁定形状与行为（沿 §1「以正/反例 JSON fixture 锁定 wire 形状」既有路径）；fixture 文件建立归 W1/W2 实现切片，本票不预建。
 
 ## 7. S6：应用命令接口和任务所有权
 
