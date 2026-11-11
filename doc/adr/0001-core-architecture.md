@@ -1,6 +1,6 @@
 # ADR-0001：最小核心的所有权与兼容策略
 
-> 日期：2026-10-30。状态：已采纳；核心已实现并经 R5 收官全量验证（六切片收口；pytest 1134/mypy 109/双 ruff 绿+双 OS CI 绿链，证据=[r5-exit-evidence §8](../reference/r5-exit-evidence.md)）。core 0.1 尚未标记稳定/发布（tag 暂缓：真实 MAAS 短会话待端点供给[T-C1-048]——ROADMAP L62 稳定门）；平台已知限制 15 件在册（[platform-support §9](../platform-support.md)）。状态行刷新：2026-11-07（T-A-011；恢复与 MCP 增量见 [ADR-0002](0002-recovery-coordinator-and-mcp-client.md)）。
+> 日期：2026-10-30。状态：已采纳；核心已实现并经 R5 收官全量验证（六切片收口；pytest 1134/mypy 109/双 ruff 绿+双 OS CI 绿链，证据=[r5-exit-evidence §8](../reference/r5-exit-evidence.md)）。core 0.1 尚未标记稳定/发布（tag 待用户定夺：ROADMAP L62 稳定门的真实端点短会话证据已闭合——T-C1-048 证据回路 2026-11-11 入库，证据=[maas-real-session](../evidence/maas-real-session.md)）；平台已知限制 15 件在册（[platform-support §9](../platform-support.md)）。状态行刷新：2026-11-11（T-C1-048：L62 稳定门证据闭合；恢复与 MCP 增量见 [ADR-0002](0002-recovery-coordinator-and-mcp-client.md)）。
 > 契约：[CORE-CONTRACTS](../CORE-CONTRACTS.md)；路线：[ROADMAP](../ROADMAP.md)。
 
 ## 背景
