@@ -75,7 +75,7 @@ install returns ``UnsupportedCapability`` with the install pointer
 instantiated adapter on a non-win32 platform refuses the same way
 (defense in depth behind the composition gate).
 
-Deviations/diclosures (no TS anchor exists for this card -- no TS
+Deviations/disclosures (no TS anchor exists for this card -- no TS
 fingerprint is claimed): the surfaced exit code is the INTERPRETER
 layer's own code (Windows PowerShell exits 1 after an interrupted
 child; pwsh would propagate the child's 130) -- the direct-child
@@ -237,10 +237,11 @@ def _pty_problem() -> str | None:
 
 def pty_adapters() -> tuple[PtyRunAdapter, ...]:
     """The host composition gate: the adapter tuple splices into the builtin
-    tools on win32 only (the CLI ``_drive`` list consumes this; PHASE2-MODULES
-    L68). The httpapi ``_builtin_adapters`` face is NOT composed yet: its
-    pinning test freezes the exact adapter list, so composing there is an
-    A-seat decision (recorded as the disclosed deviation in T-C1-072).
+    tools on win32 only (PHASE2-MODULES L68: an unverified platform is not
+    enabled). Both host faces consume this: the CLI ``_drive`` list since
+    T-C1-072 and the httpapi ``_builtin_adapters`` list since T-C1-073
+    (B-seat T-B-087 ruling 2; the serving census pin test carries the
+    platform-conditional form -- POSIX twelve / win32 thirteen appended).
     """
     if sys.platform != "win32":
         return ()
