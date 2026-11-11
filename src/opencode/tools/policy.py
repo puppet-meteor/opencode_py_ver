@@ -85,6 +85,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: declare side_effects=True so the fallback already asked (the residual
 #: rule, L646-662) -- the explicit keys document the trio inside the
 #: closed enumeration; ``git`` still NOT added to ``_ASK_NAMESPACES``.
+#: P2-S8 added ``pty__run`` (T-C1-072, PTY T1 Windows): the single-call
+#: pseudoconsole execution tool spawns arbitrary commands, so it asks --
+#: the explicit key documents it in the closed enumeration with the same
+#: "ask" its declared side_effects=True already produced via the residual
+#: rule (the bash__run row #28 zero-behavior closure shape); ``pty`` NOT
+#: added to ``_ASK_NAMESPACES`` (the git-trio precedent).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -98,6 +104,7 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "git__worktree_list": "allow",
     "git__worktree_add": "ask",
     "git__worktree_remove": "ask",
+    "pty__run": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

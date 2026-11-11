@@ -14,7 +14,7 @@ impersonates a POSIX result on Windows or vice versa).
   both directions with no mojibake (echo round trip);
 - process-tree exit: a Job Object (Windows, ctypes direct -- r0 form) /
   process group (POSIX, ``os.killpg``) kill covers the PTY child AND a
-  grandchild the child spawned explicitly (CORE-CONTRACTS L150 red line).
+  grandchild the child spawned explicitly (PHASE1-SLIM L150 red line).
 
 Timing bounds are generous deadlines (CI slow-runner compatible, W1 spike
 precedent); no tight upper-bound asserts. Capability-restricted faces skip

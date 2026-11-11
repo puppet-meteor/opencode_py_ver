@@ -21,10 +21,10 @@ enabled):
   in both directions with no mojibake (echo round trip);
 - ``process_tree_exit``: a Windows Job Object (ctypes direct, r0 form) /
   POSIX process group kill covers the PTY child AND a grandchild the child
-  spawned explicitly (CORE-CONTRACTS L150 red line: the Job Object x
+  spawned explicitly (PHASE1-SLIM L150 red line: the Job Object x
   ConPTY interaction is this spike's core unknown).
 
-Child-process discipline (CORE-CONTRACTS 5.3 L313): every child is the
+Child-process discipline (CORE-CONTRACTS 5.3 L315): every child is the
 explicit interpreter (``sys.executable``, argv form; never ``shell=True``,
 never the platform default shell); grandchildren are spawned explicitly by
 the child through a PTY-input proceed gate so the kill verdict can never

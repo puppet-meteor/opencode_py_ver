@@ -88,6 +88,18 @@ from opencode.tools.builtin.ls import (
     LS_VERSION,
     FsLsAdapter,
 )
+from opencode.tools.builtin.pty import (
+    PTY_DEFAULT_TIMEOUT_S,
+    PTY_DESCRIPTION,
+    PTY_INPUT_SCHEMA,
+    PTY_MAX_OUTPUT_BYTES,
+    PTY_NAME,
+    PTY_NAMESPACE,
+    PTY_SPEC,
+    PTY_VERSION,
+    PtyRunAdapter,
+    pty_adapters,
+)
 from opencode.tools.builtin.read import (
     MAX_LINE_LENGTH,
     MAX_LINE_SUFFIX,
@@ -166,6 +178,14 @@ __all__ = [
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
+    "PTY_DEFAULT_TIMEOUT_S",
+    "PTY_DESCRIPTION",
+    "PTY_INPUT_SCHEMA",
+    "PTY_MAX_OUTPUT_BYTES",
+    "PTY_NAME",
+    "PTY_NAMESPACE",
+    "PTY_SPEC",
+    "PTY_VERSION",
     "READ_DESCRIPTION",
     "READ_INPUT_SCHEMA",
     "READ_NAME",
@@ -191,4 +211,6 @@ __all__ = [
     "GitWorktreeAddAdapter",
     "GitWorktreeListAdapter",
     "GitWorktreeRemoveAdapter",
+    "PtyRunAdapter",
+    "pty_adapters",
 ]
