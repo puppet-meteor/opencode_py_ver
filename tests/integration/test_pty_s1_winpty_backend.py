@@ -171,6 +171,12 @@ def _reap(proc: Any) -> None:
 
 def _pid_alive(pid: int) -> bool:
     """Process-level probe (WaitForSingleObject form, T0 _proc_alive)."""
+    if sys.platform != "win32":
+        # posix-mypy narrowing guard (the cli.py _enable_windows_ctrl_c
+        # early-guard form): everything below is win32-only ctypes and is
+        # statically unreachable under a posix check; at runtime these
+        # helpers are called only from the win32-gated S1 tests above.
+        return False
     lib = ctypes.windll.kernel32
     handle = lib.OpenProcess(_WIN_SYNCHRONIZE | _WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
@@ -193,6 +199,11 @@ def _wait_pids_gone(pids: tuple[int, ...], *, window_s: float = 10.0) -> None:
 
 def _exit_code(pid: int, *, window_s: float) -> int:
     """Wait for the process to terminate, then read its exit code."""
+    if sys.platform != "win32":
+        # posix-mypy narrowing guard (the _pid_alive form): this probe is
+        # win32-only ctypes, statically unreachable under a posix check and
+        # never called at runtime off the win32-gated S1 tests.
+        raise AssertionError("win32-only probe helper")
     lib = ctypes.windll.kernel32
     handle = lib.OpenProcess(_WIN_SYNCHRONIZE | _WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     assert handle, f"OpenProcess({pid}) failed"
