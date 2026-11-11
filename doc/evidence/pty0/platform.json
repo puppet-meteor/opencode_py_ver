@@ -1,0 +1,79 @@
+{
+  "probe_version": "pty0-1",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "machine": "AMD64",
+    "sys_platform": "win32",
+    "python": "3.12.16"
+  },
+  "generated": {
+    "by": "manual",
+    "probe": "tools/pty0/pty_probe.py"
+  },
+  "ci_verified": [],
+  "manual_verified": [
+    "resize",
+    "ctrl_c",
+    "encoding",
+    "process_tree_exit"
+  ],
+  "restricted": [],
+  "unsupported": [],
+  "checks": {
+    "resize": {
+      "status": "verified",
+      "mechanism": "pywinpty ConPTY PtyProcess.setwinsize (ResizePseudoConsole); child observes via os.get_terminal_size(fd=1) and prints a SIZE line on change",
+      "set_rows": 50,
+      "set_columns": 120,
+      "observed_before": "80x24",
+      "child_observed_new_size": true,
+      "observed_after": "120x50"
+    },
+    "ctrl_c": {
+      "status": "verified",
+      "mechanism": "pywinpty write '\\x03' -> console control event -> child KeyboardInterrupt (observable marker + exit code 130); both pywinpty backends are probed and recorded, the delivering one carries the verdict",
+      "backend_observations": [
+        {
+          "backend": "winpty (legacy agent)",
+          "interrupt_delivered": true,
+          "child_exit_code": 130,
+          "note": "interrupt marker observed"
+        },
+        {
+          "backend": "conpty (vendored pseudoconsole host)",
+          "interrupt_delivered": false,
+          "child_exit_code": null,
+          "note": "no interrupt marker within the observation window"
+        }
+      ],
+      "backend_used": "winpty (legacy agent)",
+      "marker_observed": true,
+      "child_exit_code": 130,
+      "child_alive_after_interrupt": false
+    },
+    "encoding": {
+      "status": "verified",
+      "mechanism": "ConPTY UTF-8 input/output round trip via pywinpty PtyProcess write/read",
+      "payload": "日本語 πλθ café naïve ♥",
+      "banner_observed": true,
+      "echo_observed": true,
+      "exact_match": true
+    },
+    "process_tree_exit": {
+      "status": "verified",
+      "mechanism": "win32 Job Object (JOB_OBJECT_LIMIT_KILL_ON_CLOSE, ctypes direct -- r0 form) assigned to the ConPTY child BEFORE the PTY-input proceed gate releases the grandchild; TerminateJobObject must cover the pseudoconsole child AND the grandchild",
+      "tree_shape": "probe -> PTY child (explicit interpreter) -> grandchild (explicit interpreter, PTY-input proceed gate)",
+      "grandchild_alive_before_kill": true,
+      "child_terminated": true,
+      "grandchild_terminated": true,
+      "all_exited_within_grace": true,
+      "elapsed_ms": 186
+    }
+  },
+  "notes": [
+    "sanitization: host paths <WORKSPACE>/<TEMP> placeholders only; no usernames, PIDs, prompts, secrets or endpoints recorded",
+    "restricted = capability untestable in this environment with a recorded reason, not a pass; failed = primitive not validated on this platform (platform not enabled per PHASE2-MODULES L68)",
+    "the POSIX leg is carried by CI dual-OS; the dispatcher closes that record (manual and ci_verified never impersonate each other)"
+  ]
+}
