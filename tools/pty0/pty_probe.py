@@ -97,7 +97,8 @@ _POSIX_RESIZE_MECHANISM = "fcntl TIOCSWINSZ on the pty master; child SIGWINCH ha
 _POSIX_CTRL_C_MECHANISM = (
     "ISIG line discipline: '\\x03' on the pty master -> SIGINT to the foreground process group; "
     "the child installs its own SIGINT disposition and reports its tty (os.ttyname) so the probe "
-    "can hold the slave open and the exit-time marker stays readable after the child exits"
+    "can hold the slave open and the exit-time marker stays readable after the child exits; the "
+    "marker match tolerates the ECHOCTL '^C' prefix the INTR echo can glue onto the marker line"
 )
 _POSIX_ENCODING_MECHANISM = "pty master UTF-8 echo round trip through the child's stdin/stdout"
 _POSIX_TREE_MECHANISM = (
@@ -1073,17 +1074,32 @@ def _posix_probe_ctrl_c() -> CheckResult:
                 details["slave_hold_error"] = str(exc)
         os.write(master_fd, b"\x03")
         marker_deadline = time.monotonic() + CTRL_C_OBSERVATION_WINDOW_SECONDS
-        marker = _read_until(reader, lambda text: _has_line(text, r"PYPROBE_INTERRUPTED"), marker_deadline, sink)
+        # The ECHOCTL echo of the \x03 just written can arrive WITHOUT a
+        # trailing newline: an empty pending input line (the probe writes only
+        # the INTR byte) echoes just "^C", so the child's marker line reaches
+        # the master glued to it -- "^CPYPROBE_INTERRUPTED". The marker match
+        # therefore tolerates that glued prefix.
+        marker = _read_until(
+            reader, lambda text: _has_line(text, r"(?:\^C)?PYPROBE_INTERRUPTED"), marker_deadline, sink
+        )
         details["marker_observed"] = marker
         if not marker:
             # A negative record still reports the OBSERVED child state, never
-            # assumed liveness (a silently dead child must not read as alive).
+            # assumed liveness (a silently dead child must not read as alive),
+            # plus the raw read tail and the hold state so the next record is
+            # self-diagnosing (echo glue vs lost bytes are distinguishable).
             exit_code = _posix_wait_exit(pid, POLL_INTERVAL_SECONDS)
             details["child_exit_code"] = exit_code
             details["child_alive_after_interrupt"] = exit_code is None
-            return CheckResult(
-                "ctrl_c", "failed", details, reason="x03 produced no observable interrupt within the observation window"
-            )
+            details["slave_held"] = slave_fd is not None
+            details["sink_tail"] = repr(_normalize_output("".join(sink))[-160:])
+            if exit_code == 130:
+                reason = (
+                    "interrupt delivered (exit 130) but the PYPROBE_INTERRUPTED line was not observed at the master"
+                )
+            else:
+                reason = "x03 produced no observable interrupt within the observation window"
+            return CheckResult("ctrl_c", "failed", details, reason=reason)
         exit_code = _posix_wait_exit(pid, EXIT_TIMEOUT_SECONDS)
         details["child_exit_code"] = exit_code
         details["child_alive_after_interrupt"] = exit_code is None
