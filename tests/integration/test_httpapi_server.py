@@ -705,11 +705,13 @@ def test_maas_env_is_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
-    """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073).
+    """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073; the
+    linux branch added by the T2 authorization T-C1-074).
 
-    POSIX asserts the original twelve-name tuple unchanged; win32 asserts
-    the twelve plus the appended PTY T1 ``PtyRunAdapter`` (13 names), the
-    ``*pty_adapters()`` splice in ``_builtin_adapters``.
+    Every unverified platform (darwin etc.) asserts the original twelve-name
+    tuple unchanged; win32 (the T1 winpty-agent face) and linux (the T2
+    stdlib face) assert the twelve plus the appended ``PtyRunAdapter``
+    (13 names), the ``*pty_adapters()`` splice in ``_builtin_adapters``.
     """
     names = tuple(type(adapter).__name__ for adapter in _builtin_adapters(("C:/work",)))
     expected = (
@@ -726,7 +728,7 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
         "GitWorktreeListAdapter",
         "GitWorktreeRemoveAdapter",
     )
-    if sys.platform == "win32":
+    if sys.platform == "win32" or sys.platform == "linux":
         assert names == (*expected, "PtyRunAdapter")
     else:
         assert names == expected

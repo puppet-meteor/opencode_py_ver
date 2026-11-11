@@ -38,11 +38,14 @@ Test plan (one red/green per primitive, plus the registration faces):
    never stops on truncation, L315).
 8. registration: the §5.2 default table carries ``pty__run`` = ask
    (git-trio closure shape), the platform gate composes the adapter on
-   win32 only (PHASE2-MODULES L68: an unverified platform is not
-   enabled; the POSIX face is the independent T2 ticket, zero POSIX
-   implementation here), and both capability-refusal faces (missing
-   extras, non-win32 direct call) return UnsupportedCapability (r0b-2:
-   restricted is never a bare exception and never a fake success).
+   the verified platforms (win32 + linux; PHASE2-MODULES L68: an
+   unverified platform is not enabled -- darwin and friends compose
+   nothing), and both capability-refusal faces (missing win32 extras,
+   unverified-platform direct call) return UnsupportedCapability
+   (r0b-2: restricted is never a bare exception and never a fake
+   success). The linux runtime legs live in
+   ``test_tool_pty_posix.py`` (CI ubuntu is the authoritative POSIX
+   verification face).
 
 ④ disclosures: the exit code surfaced by the tool is the INTERPRETER
 layer's own code (PowerShell exits 1 on this host after an interrupted
@@ -75,6 +78,7 @@ from opencode.process.interpreter import resolve_interpreter
 from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry
 from opencode.tools.builtin import PTY_DEFAULT_TIMEOUT_S, PtyRunAdapter, pty_adapters
 from opencode.tools.builtin.bash import BASH_DEFAULT_TIMEOUT_S
+from opencode.tools.builtin.pty import _pty_problem
 from opencode.tools.policy import _DEFAULT_EFFECTS
 
 if _PLATFORM == "win32":
@@ -102,7 +106,7 @@ def _winpty_or_skip() -> None:
     if sys.platform != "win32":
         pytest.skip(
             "T1 platform gate: the Windows PTY face is verified on win32 only; "
-            "the POSIX leg is the independent T2 ticket (p2-slices L170)"
+            "the POSIX runtime legs live in test_tool_pty_posix.py (p2-slices L170)"
         )
     if find_spec("winpty") is None:
         pytest.skip("restricted: pywinpty extras not installed (pip install 'opencode-py[pty]')")
@@ -537,9 +541,30 @@ def test_pty_default_table_is_ask() -> None:
     assert _DEFAULT_EFFECTS["pty__run"] == "ask"
 
 
-def test_pty_platform_gate_composes_on_win32_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pty_platform_gate_composes_on_verified_platforms(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T2: linux is the verified POSIX face (pure stdlib, zero extras) -- the
+    # monkeypatched composition leg asserts the single adapter there.
     monkeypatch.setattr(sys, "platform", "linux")
-    assert pty_adapters() == ()
+    adapters = pty_adapters()
+    assert len(adapters) == 1
+    assert isinstance(adapters[0], PtyRunAdapter)
+
+
+def test_pty_problem_is_none_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    # R0 (T2 red): the linux gate opens -- pure stdlib, nothing to require.
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _pty_problem() is None
+
+
+def test_pty_problem_refuses_unverified_platforms_with_l68_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R2 (T2 red): darwin and every other unverified platform stay refused.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    problem = _pty_problem()
+    assert problem is not None
+    assert "not verified" in problem
+    assert "an unverified platform is not enabled" in problem
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the win32 composition face is observable on win32")
@@ -564,17 +589,17 @@ async def test_pty_extras_missing_is_unsupported_capability(tmp_path: Path, monk
     assert "opencode-py[pty]" in texts
 
 
-async def test_pty_direct_posix_call_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Defense in depth: the composition gate keeps the tool out of the POSIX
-    # catalog entirely, but a directly instantiated adapter also refuses.
-    import opencode.tools.builtin.pty as pty_module
-
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(pty_module, "find_spec", lambda name: None)
+async def test_pty_direct_unverified_platform_call_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Defense in depth: the composition gate keeps the tool out of the
+    # catalog on unverified platforms, but a directly instantiated adapter
+    # also refuses (linux is a verified, enabled running face since T2;
+    # darwin stands in for every unverified platform).
+    monkeypatch.setattr(sys, "platform", "darwin")
     outcome = await _run(tmp_path, {"command": "echo hi"})
 
     assert outcome.state == "failed"
     assert outcome.error is not None and outcome.error.code is CoreErrorCode.UNSUPPORTED_CAPABILITY
+    assert "not verified" in "\n".join(_texts(outcome))
 
 
 # ---------------------------------------------------------------------------
