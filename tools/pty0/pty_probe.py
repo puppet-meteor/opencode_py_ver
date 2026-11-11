@@ -94,7 +94,10 @@ _WIN_TREE_MECHANISM = (
     "must cover the pseudoconsole child AND the grandchild"
 )
 _POSIX_RESIZE_MECHANISM = "fcntl TIOCSWINSZ on the pty master; child SIGWINCH handler + os.get_terminal_size(fd=1)"
-_POSIX_CTRL_C_MECHANISM = "ISIG line discipline: '\\x03' on the pty master -> SIGINT to the foreground process group"
+_POSIX_CTRL_C_MECHANISM = (
+    "ISIG line discipline: '\\x03' on the pty master -> SIGINT to the foreground process group; "
+    "the child installs its own SIGINT disposition so an inherited block/ignore cannot mask it"
+)
 _POSIX_ENCODING_MECHANISM = "pty master UTF-8 echo round trip through the child's stdin/stdout"
 _POSIX_TREE_MECHANISM = (
     "posix process group (os.forkpty session leader); os.killpg SIGKILL must cover the pty child AND the grandchild"
@@ -260,7 +263,16 @@ while time.monotonic() < end:
 """
 
 _CTRL_C_CHILD_SCRIPT = """\
-import sys, time
+import signal, sys, time
+# The SIGINT disposition is installed explicitly, never inherited: the CI
+# process tree (runner -> bash -> pytest) can carry SIGINT blocked or ignored,
+# and both states survive fork+exec -- an inherited mask keeps the signal
+# pending forever, an inherited ignore discards it. The SIGWINCH child installs
+# its handler explicitly for the same reason: when the primitive under test is
+# the delivery itself, the disposition must be controlled, not inherited.
+if hasattr(signal, "pthread_sigmask"):
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT])
+signal.signal(signal.SIGINT, signal.default_int_handler)
 print("READY", flush=True)
 try:
     time.sleep(__PTY0_BUDGET__)
@@ -1010,8 +1022,11 @@ def _posix_probe_ctrl_c() -> CheckResult:
         marker = _read_until(reader, lambda text: _has_line(text, r"PYPROBE_INTERRUPTED"), marker_deadline, sink)
         details["marker_observed"] = marker
         if not marker:
-            details["child_exit_code"] = None
-            details["child_alive_after_interrupt"] = True
+            # A negative record still reports the OBSERVED child state, never
+            # assumed liveness (a silently dead child must not read as alive).
+            exit_code = _posix_wait_exit(pid, POLL_INTERVAL_SECONDS)
+            details["child_exit_code"] = exit_code
+            details["child_alive_after_interrupt"] = exit_code is None
             return CheckResult(
                 "ctrl_c", "failed", details, reason="x03 produced no observable interrupt within the observation window"
             )
