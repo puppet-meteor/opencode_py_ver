@@ -238,8 +238,16 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("prompt", nargs="*", help="single-shot prompt words (space-joined); omit for the REPL")
     parser.add_argument("--db", default="opencode.db", help="database file path (default ./opencode.db)")
-    parser.add_argument("--base-url", default=None, help="MAAS base URL (env OPENCODE_PY_BASE_URL fallback)")
-    parser.add_argument("--api-key", default=None, help="MAAS API key (env OPENCODE_PY_API_KEY fallback)")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="MAAS base URL (flag > env OPENCODE_PY_BASE_URL > the product/global config 'endpoint' layer)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="MAAS API key (flag > env OPENCODE_PY_API_KEY > the product/global config 'api_key' layer)",
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -253,7 +261,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="model name (required unless a config layer supplies it; CLI overrides config, §6 L283)",
+        help="model name (required unless a config/product layer supplies it; CLI overrides config, §6 L283)",
     )
     parser.add_argument(
         "--context-limit",
@@ -299,21 +307,38 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.base_url = args.base_url or os.environ.get("OPENCODE_PY_BASE_URL")
     args.api_key = args.api_key or os.environ.get("OPENCODE_PY_API_KEY")
-    if not args.base_url:
-        parser.error("--base-url is required (or set OPENCODE_PY_BASE_URL)")
-    if not args.api_key:
-        parser.error("--api-key is required (or set OPENCODE_PY_API_KEY)")
     # §6 L283 layer-aware completeness (R3-S6): --model/--context-limit are no
     # longer argparse-required — a config layer may supply them; the CLI flag
-    # wins when both are present. Discovery runs once here so a broken config
-    # fails on the argparse exit-2 face; ConfigErrors after this point (the
-    # full resolve in main) land on exit 70 instead. R3-S7: the load-time
-    # ``permission.rules`` entry-shape validation rides the same face (必答②).
+    # wins when both are present. T-C1-049: the credentials walk the SAME layer
+    # fallback — 'endpoint'/'api_key' ride the product/global tiers (the
+    # product bridge reads the TS opencode gateway config) and the model
+    # arrives from the product tier's models first key, so none of
+    # --base-url/--api-key/--model is required once the gateway is configured.
+    # Discovery runs once here so a broken config fails on the argparse exit-2
+    # face; ConfigErrors after this point (the full resolve in main) land on
+    # exit 70 instead. R3-S7: the load-time ``permission.rules`` entry-shape
+    # validation rides the same face (必答②).
     try:
         layered = ConfigLoader(global_config=args.config, project_root=args.project_root).load()
     except ConfigError as error:
         parser.error(f"config: {error}")
     values = layered.values
+    # T-C1-049 credential fallback: CLI flag > env > merged layers (the
+    # product/global tiers carry 'endpoint'/'api_key'). A layer value that is
+    # not a non-empty string counts as absent — fail closed, never a blind
+    # assign; nothing read is ever echoed back in the error below.
+    endpoint = values.get("endpoint")
+    args.base_url = args.base_url or (endpoint if isinstance(endpoint, str) and endpoint else None)
+    layer_api_key = values.get("api_key")
+    args.api_key = args.api_key or (layer_api_key if isinstance(layer_api_key, str) and layer_api_key else None)
+    if not args.base_url:
+        parser.error(
+            "--base-url is required (or set OPENCODE_PY_BASE_URL, or supply 'endpoint' in the product/global config)"
+        )
+    if not args.api_key:
+        parser.error(
+            "--api-key is required (or set OPENCODE_PY_API_KEY, or supply 'api_key' in the product/global config)"
+        )
     if args.model is None and values.get("model") is None:
         parser.error('--model is required (or set "model" in a config file)')
     if args.context_limit is None and values.get("context_limit") is None:

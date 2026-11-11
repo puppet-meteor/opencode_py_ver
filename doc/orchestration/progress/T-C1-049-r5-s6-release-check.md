@@ -1,0 +1,54 @@
+> 席位注记（T-C1-049 产品级配置桥席位 · p2-s19 · 2026-11-11）：本文件原路径为 `doc/orchestration/progress/T-C1-049.md`，系 R5-S6 席位（发布检查+Done 对账+exit-evidence+r5-slices 收口，2026-11-07 落盘）的完成件。票号跨纪元复用（R5 纪元 T-C1-049=本文件；P2 纪元 T-C1-049=产品级配置桥）致同路径冲突——P2 席位按票面「新建」口径落盘时覆盖本文件，发现后即刻将原内容**逐字节原样**恢复于本路径（仅前置本注记 banner，banner 以下零改动；字节同一性以 blob hash 亲证 `d23a4ef9`）。原历史版本亦可经 `git show eb24cdd:doc/orchestration/progress/T-C1-049.md` 直取。
+# T-C1-049 进度（席位C-1 · R5-S6 发布检查+Done 对账+exit-evidence+r5-slices 收口）
+
+- 会话起点（创建时刻首读时钟）：2026-11-07 05:36:28
+- 基线自证（git log -1 / status 现读）：分支 r5-s6；HEAD=333c95f3bc0ddcb1d6334569a5ca95a1927d5941（fixup #162，与派发票面一致）；工作树 clean（首建本文件前零改动）。
+- 写权限恰 4 项（票面口径）：A doc/reference/r5-exit-evidence.md；M doc/plans/r5-slices.md（仅 L4 状态行，零哈希零 verdict 预写）；A doc/orchestration/progress/T-C1-049.md（本文件）；temproot scratch（零入库）。
+
+## ① 方案审视发现（勘察时戳 2026-11-07 05:42:20）
+
+- **任务书亲读**（doc/orchestration/tasks/T-C1-049.md 40L 全文）：三条纪律通知（时间戳阶梯休眠不重置/门禁前台承载/终报数字纪律）+写权限 4 项+门禁四件基线（pytest 1134/ruff clean/format exit 0 ~344/mypy 109）+止损 45min 均在册。
+- **spec 源现读重锚**：r5-slices.md 187L（L4 状态行=「S6 起待派」+S1-S5 闭合实值+§0.1 checkpoint 链 #157-#162+§2.6 S6 收口义务+§3 台账+§6 OP-R5-*）；PHASE1-SLIM.md 152L（L9-17 Done 九项/L23 汇总义务/L28 tag 前置/L40 表行/L111 交付五项/L113-116 验收 ABC+验证行）；ROADMAP.md L62 稳定门原文（「真/假适配器、golden fixture 和失败场景验证后才标为该版本稳定」）——禁继承行号，全部本会话亲读。
+- **素材源现读重锚**：release-and-backup.md 108L §1-§4（发布清单五小节=S3 承载物，§头部动态条款要求 S6 以最新实测为准——本票即执行面）；platform-support.md 103L（§1 平台三行+§1.1 CI 链 S5 时点态[止于 #160+#161 在飞]+§9 已知限制 15 件 A3/B5/C3/D4 亲数）；parity.md 87L（L3 头部实测态+L14 verified 8+待 MAAS 终翻 1+deferred 5+L28 provider 行「待」亲证）；README.md 160L（L7/L40/L83/L119/L134/L152 章节锚）；r4-exit-evidence.md 1199L 模式参照（头部声明块/§0 切片表/§6 门禁表/§7 边界/附录 A file 级分组枚举）；r5-fixture-inventory.md 189L（92 件枚举 25/48/19+63 模型+6 工件）。
+- **证据锚重锚结果**：test_cli_install.py L126/L139/L155/L177/L218/L239/L248 与 test_migrations.py L164/L240/L423/L574/L636/L685 与 S3 档一致（零漂移）；**cli.py `--continue`/`--session` 实锚 L281/L288（S3 档记 L280/L287，+1 漂移——以本会话现读为准）**；exit-code 常量 L148/L150/L152+L167+L343/L631/L637/L640/L861/L863/L892/L918 亲证；迁移链=src/opencode/storage/migrations/versions/0001_initial.py+0002_runs.py（0002 在库→验收 B「真实升级」触发条件成立，非「不适用」形）；fixtures 92 JSON 亲数；doc/adr 仅 0001（R5 期零新 ADR 现读枚举）；doc/evidence 仅 r0/（无 r5/ MAAS 证据——与 T-C1-048 未执行一致）；uv.lock 现读：pydantic 2.14.2/sqlalchemy 2.1.6/aiosqlite 0.22.1/openai 3.42.0/httpx2 2.16.0/alembic 1.20.1/pytest 9.2.0/pytest-asyncio 1.4.1/ruff 0.17.3/mypy 2.4.1。
+- **对账表结构**：Done 九项（L9-17）→预计 8 项绿+1 项分拆待（L10 前半真实 MAAS=「待」、L10 后半 fake server 已闭合；L17 子件中 parity=S5 已翻新闭合、ADR=R5 期零新卷+OP-R5-5 待定夺如实记档）；tag 前置门确认清单形态=OP-R5-4 调度器决策输入（门禁终值+CI 绿链+验收 ABC+Done 对账+MAAS「待」态，逐项可核零 tag 操作）。
+- **发布检查组织**：按 release-and-backup §1 五小节逐项证据化（§1.1 门禁四件以本票自跑终值替换 S3 快照[动态条款]→§1.2 CI 双 OS 绿链调度器供给锚照录[席位侧协议不可达]→§1.3 验收 A/B/C 三方映射→§1.4 Done 九项→§1.5 备份演练锚）；format 计数语义=ORCH L32 定谳（ruff 0.17.3 发现面含 .md，「N files」=py+md 合计，判定面恒为退出码 0；工作树口径含在席未跟踪文件）。
+- **素材映射**：exit-evidence 节构沿 r4 模式+R5 特有面（§0 R5 切片收口台账 S1-S6/验收 ABC+验证行/交付五项/Done 九项/PHASE1-SLIM R5 节对照/ROADMAP L62 稳定门/tag 前置门确认清单/collect-only 1134 枚举附录 A）。
+
+## ② 门禁四件数字+落点映射（时戳 2026-11-07 05:48:47，本票前台阻塞自跑，worktree r5-s6，CPython 3.12.16 亲证）
+
+| 门禁 | 终值（本会话工具读数照录） |
+|---|---|
+| `uv run python -m pytest -q`（temproot=PYTEST_DEBUG_TEMPROOT r5-s6） | **1134 passed**，254.37s（0:04:14），零失败零跳过零回归（基线 1134 ✓；本票零新测——collect-only 1134==基线 1134） |
+| `uv run ruff check .` | **All checks passed!**（退出码 0） |
+| `uv run ruff format --check .` | **344 files already formatted**（退出码 0；分解=111 tracked py+232 tracked md[#162 提交树合计 343]+1 本票进度 md[untracked `?? doc/orchestration/progress/T-C1-049.md` 亲证]——与任务书预期 ~344=343+进度 md 逐位吻合；ruff 0.17.3 计数含 .md=ORCH L32 定谳口径） |
+| `uv run python -m mypy src tools/r0 tools/r5 tests/r0 tests/contract tests/integration` | **Success: no issues found in 109 source files**（基线 109 ✓ 零漂移） |
+| 附加对账：`--collect-only -q` | **1134 tests collected**（1.13s）==pytest 1134 passed 闭合；44 file 级分组逐文件计数已机械转录（存档 temproot `pytest-tmp/r5-s6/collect-only-r5-s6.txt`，exit-evidence 附录 A 数据源）；R5 期新增 113=1021[S4 基线]+7[S1 test_cli_install]+3[S2 test_migrations 6→9]+103[S4 test_schema_lock] |
+
+- **落点映射**（exit-evidence 节↔spec 句）：§0 R5 切片收口台账↔r5-slices §0.1 checkpoint 链+L4；§1/§2/§3 验收 A/B/C↔PHASE1-SLIM L113/L114/L115 逐句；§4 验证行↔L116（发布检查√+MAAS「待」动态条款+parity 记录在册+红线复核零新测）；§5 交付五项↔L111；§6 Done 九项对账↔L9-17；§7 PHASE1-SLIM R5 节对照+ROADMAP L62 稳定门↔L23/L28/L40+L62；§8 tag 前置门确认清单↔OP-R5-4 调度器决策输入（零 tag 操作零版本号写）；附录 A↔r5-slices §2.6 测试计划 collect 终值枚举（spec L103「1021」为 R4 时点口径，本票现读 1134 为准）。
+- r5-slices L4 状态行翻牌形态=「S6 起待派」→「**R5 六切片全交付（S1-S6）——S6 评审与并回归调度器记档；T-C1-048 MAAS 待端点供给（动态条款）**」中间态（零哈希零 verdict 预写；S1-S5 既有闭合实值原样保留；#163 终态翻牌归调度器）。
+
+## ③ 强制浮报清单（时戳 2026-11-07 05:53:00；R2 定案四档归类）
+
+1. **协议不可达**：CI 双 OS 绿链——席位侧协议不可达，7 连 run id（`42260728594`→`42296887477`）**照录调度器供给锚**，未实测不冒充（exit-evidence §8 标注「④ 浮报，结论以调度器台账为准」）；platform-support §1.1 在册链为 S5 编写时点态（止于 #160+#161 在飞），本票零触碰该文件，#161/#162 run id 的该文件追加面归下一位触达者/调度器。
+2. **动态条款「待」（注记档，不虚过不冒充）**：真实 MAAS 短会话——T-C1-048 独立票（OP-R5-2 已裁），端点/凭据未供给=用户外部输入等待面在册；fake server 无网络复现面已由 R0-R2 测试承载（123 测引注）；parity L28 provider 行显式「待 MAAS smoke 终翻」；exit-evidence §4/§6 L10 行/§9 前置项 5 三处如实标「待」。
+3. **注记档**：ADR 更新=R5 期零新 ADR（doc/adr/ 现读枚举仅 0001）+OP-R5-5 待定夺（A 席线，doc/adr/ 写权归 A 席）——exit-evidence §5 行 4/§6 L17/§10 如实记档；无 0002 迁移「不适用」形不成立（0002_runs 在库亲证→真实升级触发条件成立且已验证 test_migrations.py L423）；依赖版本=pyproject/uv.lock 现读口径（未做逐依赖矩阵实测）；R5-M1 微票=席位侧未见派发/收口记录（调度台账为准）。
+4. **已测防御档**：format 计数语义=ORCH L32 定谳（ruff 0.17.3 发现面含 .md），本票实测 344=111 py+232 md+1 进度 md 与分解逐位吻合（非估算）；pytest/mypy/collect-only 全部本会话前台阻塞实测照录。
+
+## ④ 未决问题（席位侧无实现面未决；以下为调度器裁量/记档项，非本票阻塞）
+
+- OP-R5-4：tag 形态+版本号 0.0.1→0.1.0+创建时点（exit-evidence §9 确认清单=决策输入，逐项可核）。
+- OP-R5-5：ADR 更新范围与派发形态（A 席线 R5-A1）；OP-R5-1：bind_mcp_tools 生产接线 vs core preview 降级（台账行 1）。
+- T-C1-048：MAAS 端点/凭据供给时点（动态条款「待」的解除面）。
+- S6 评审与并回归+#163 终态翻牌（r5-slices §0.1 链延伸+L4 终态+并回哈希/评审结论）=调度器记档。
+- platform-support §1.1 CI 链 #161/#162 run id 追加=本票外（该文件只读）。
+- R5-M1 probe 加固微票派发与否（r5-slices §3 行 4，调度台账为准）。
+
+## ⑤ 存量兼容声明+顺手项记档（时戳 2026-11-07 05:53:00）
+
+- **全量基线 1134/109 零回归红线 ✓**：本票实测 pytest 1134 passed（254.37s 零失败零跳过）/mypy 109 source files 零问题/collect-only 1134==基线（零新测零漂移）。
+- **零代码票 ✓**：src/tests/migrations/pyproject.toml/uv.lock/.github/CI/source-baseline.json 全零触碰；`git status --porcelain` 自证恰 3 repo 写面=`M doc/plans/r5-slices.md`（diff --stat 亲证 1 insertion 1 deletion，仅 L4）+`?? doc/orchestration/progress/T-C1-049.md`+`?? doc/reference/r5-exit-evidence.md`；temproot scratch=`pytest-tmp/r5-s6/collect-only-r5-s6.txt`（collect 存档，repo 外零入库）。写面恰 4 授权逐项符合。
+- **只读面遵守 ✓**：parity.md/platform-support.md/r4-exit-evidence.md/release-and-backup.md/README.md/CORE-CONTRACTS/PHASE1-SLIM/ROADMAP/adr/orchestration 全零 M；platform-support §9 引用计数 15 件（A3/B5/C3/D4）按 T-B-051 勘误口径**现读亲数**（非继承）。
+- **顺手项（⑦ 条款）**：r5-slices §3 维持登记项——行 2/3/6 对应文件（src 注释/故障矩阵直载面/r3 残留文件）本票零触达，零顺手项触发；行 5（R4 float-reported 边界）的 S6 承载面=「Done 对账逐件引注」已作为本票主任务 1d 履行（exit-evidence §6 九项对账+§10 边界清单逐件引注 platform-support §9），非顺手增改。
+- **时间戳纪律自检**：本文件首建=会话起点戳 05:36:28（首读时钟）；①05:42:20/②05:48:47/③④⑤05:53:00 均「先 Get-Date 后落盘」单动作批零占位零回填；门禁全程前台阻塞承载完成后回合内回报（纪律通知 2）；终报数字全部本回合工具读数支撑（纪律通知 3）。
+- **止损面**：会话起点 05:36:28，③④⑤ 落盘 05:53:00，耗时 ~17min＜45min 线，未触发。

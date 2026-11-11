@@ -18,6 +18,7 @@ axis (in-process determinism vs subprocess realism) on purpose.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -28,7 +29,8 @@ from pathlib import Path
 
 import pytest
 
-from opencode.cli import escape_for_display, main
+from opencode.cli import _parse_arguments, escape_for_display, main
+from opencode.config import ConfigLoader
 from opencode.storage import open_database
 from opencode.storage.repos import ReadRepositories
 from tests.r0.fake_openai_server import (
@@ -357,3 +359,190 @@ def test_argparse_missing_required_args_exit_2() -> None:
             ]
         )
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# T-C1-049: the product config bridge CLI face — no explicit
+# --base-url/--api-key/--model needed when the TS product config exists.
+# Every test injects a tmp product config via XDG_CONFIG_HOME (the production
+# directory resolution) — the real ~/.config/opencode is never read.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _hermetic_cli_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scrub the ambient credential/provider env so the bridge tests are deterministic."""
+    monkeypatch.delenv("OPENCODE_PY_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENCODE_PY_API_KEY", raising=False)
+    monkeypatch.delenv("OPENCODE_PY_PROVIDER", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+
+def _inject_product_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, base_url: str, api_key: str, model: str
+) -> Path:
+    """Inject a tmp TS product config (nested gateway shape) under a tmp XDG home."""
+    xdg_home = tmp_path / "xdg-home"
+    config_dir = xdg_home / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        json.dumps(
+            {"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": {model: {}}}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    return config_dir
+
+
+def _global_with(tmp_path: Path, values: dict[str, object]) -> Path:
+    """A tmp -py global config supplying whatever the product tier cannot (context_limit)."""
+    global_path = tmp_path / "global.json"
+    global_path.write_text(json.dumps(values), encoding="utf-8")
+    return global_path
+
+
+def _no_product_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point the product dir at an empty tmp XDG home — the real ~/.config/opencode is never read."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg-home"))
+
+
+def test_parse_arguments_runs_three_flag_free_on_product_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None
+) -> None:
+    """T-C1-049 CLI face: with a product gateway config present, none of
+    --base-url/--api-key/--model is required — credentials backfill onto args
+    and the model rides the merged values (args.model stays None; the resolve
+    face reads it from the layer)."""
+    monkeypatch.chdir(tmp_path)
+    _inject_product_config(
+        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    global_path = _global_with(tmp_path, {"context_limit": 100000})
+    args = _parse_arguments(["--db", str(tmp_path / "x.db"), "--config", str(global_path)])
+    assert args.base_url == "https://product-gw.test/v1"
+    assert args.api_key == "r0-product-key"
+    assert args.model is None  # the model arrives via the merged values, not args
+    values = ConfigLoader(global_config=global_path).load().values  # same env: the product tier carries the model
+    assert values["model"] == "product-model"
+
+
+def test_explicit_flags_beat_the_product_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None
+) -> None:
+    """Precedence 1/3: the CLI flag overrides the product tier values."""
+    monkeypatch.chdir(tmp_path)
+    _inject_product_config(
+        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    global_path = _global_with(tmp_path, {"context_limit": 100000})
+    args = _parse_arguments(
+        [
+            "--db",
+            str(tmp_path / "x.db"),
+            "--config",
+            str(global_path),
+            "--base-url",
+            "https://flag-url.test/v1",
+            "--api-key",
+            "r0-flag-key",
+            "--model",
+            "flag-model",
+        ]
+    )
+    assert args.base_url == "https://flag-url.test/v1"
+    assert args.api_key == "r0-flag-key"
+    assert args.model == "flag-model"
+
+
+def test_env_beats_the_product_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None) -> None:
+    """Precedence 2/3: the OPENCODE_PY_* env vars override the product tier values."""
+    monkeypatch.chdir(tmp_path)
+    _inject_product_config(
+        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    global_path = _global_with(tmp_path, {"context_limit": 100000})
+    monkeypatch.setenv("OPENCODE_PY_BASE_URL", "https://env-url.test/v1")
+    monkeypatch.setenv("OPENCODE_PY_API_KEY", "r0-env-key")
+    args = _parse_arguments(["--db", str(tmp_path / "x.db"), "--config", str(global_path)])
+    assert args.base_url == "https://env-url.test/v1"
+    assert args.api_key == "r0-env-key"
+
+
+def test_global_endpoint_without_api_key_names_api_key_exit_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The partial-values face: a global config carrying 'endpoint' only (the
+    product bridge itself is all-or-nothing) resolves base_url and then fails
+    naming exactly the missing credential — api_key, never a value read."""
+    monkeypatch.chdir(tmp_path)
+    _no_product_config(monkeypatch, tmp_path)  # no product tier: only the global endpoint is present
+    global_path = _global_with(tmp_path, {"endpoint": "https://from-global.test/v1"})
+    with pytest.raises(SystemExit) as excinfo:
+        _parse_arguments(["--config", str(global_path)])
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "--api-key is required" in err
+    assert "OPENCODE_PY_API_KEY" in err
+    assert "--base-url is required" not in err  # the endpoint resolved; only api_key is missing
+    assert "https://from-global.test/v1" not in err  # zero value echo
+
+
+def test_product_credentials_never_echo_on_the_error_face(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The zero-echo pin: the bridge READ the credentials and a later
+    completeness error fires — nothing read may appear anywhere in the output."""
+    monkeypatch.chdir(tmp_path)
+    _inject_product_config(
+        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-never-echo", model="product-model"
+    )
+    # No context_limit anywhere: the context-limit completeness error fires AFTER
+    # the credentials resolved from the product tier.
+    with pytest.raises(SystemExit) as excinfo:
+        _parse_arguments(["--db", str(tmp_path / "x.db")])
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "r0-never-echo" not in captured.out
+    assert "r0-never-echo" not in captured.err
+
+
+def test_cli_runs_e2e_three_flag_free_on_product_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """main() unchanged: the product tier flows through BOTH loader calls
+    (parse-time completeness and the resolve face) — a full single-shot round
+    with no --base-url/--api-key/--model flags, and the product model reaching
+    the durable v3 snapshot."""
+    host = _ServerHost([_ok_response("hello")])
+    server_url = host.start()
+    try:
+        monkeypatch.chdir(tmp_path)
+        _inject_product_config(
+            monkeypatch, tmp_path, base_url=f"{server_url}/v1", api_key="r0-e2e-product-key", model="fake-model"
+        )
+        global_path = _global_with(tmp_path, {"context_limit": 100000})
+        code = main(["--db", str(tmp_path / "flag-free.db"), "--config", str(global_path), "say", "hello"])
+    finally:
+        host.stop()
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[final] hello" in out
+    assert "[run] succeeded" in out
+    assert "r0-e2e-product-key" not in out  # credentials never reach stdout
+    with sqlite3.connect(tmp_path / "flag-free.db") as connection:
+        row = connection.execute("SELECT data FROM events WHERE type = 'py.session.created'").fetchone()
+    assert row is not None
+    raw = row[0]
+    payload = json.loads(raw) if isinstance(raw, str | bytes) else raw
+    assert payload["config_snapshot"]["model"]["model"] == "fake-model"  # the product tier's model, durably
+    assert "r0-e2e-product-key" not in json.dumps(payload)  # zero-echo on the durable face too
