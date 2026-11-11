@@ -144,9 +144,9 @@ Phase 1 ─┬─ M1 存储/同机多进程 ────────────
 
   **PTY 卡**：
   - 范围：PTY 执行面**最小形**——单调用交互窗口（spawn PTY→命令运行→pty-merged 输出捕获→完成返回）；Ctrl-C=取消路径、resize=运行中尺寸变更两原语经 spike 验证后接入；**常驻/后台交互会话形态=卡外**（需 S3/S6 契约扩展，如需另立卡）。
-  - 契约锚：CC §5.3（L313 受控子进程/超时/进程树回收纪律延续）+§5.2（新工具名进默认表=ask 形，git 三件套先例）；ToolSpec/ToolResult 既有形承载（单调用形态**无契约变更**）。
+  - 契约锚：CC §5.3（L315 受控子进程/超时/进程树回收纪律延续）+§5.2（新工具名进默认表=ask 形，git 三件套先例）；ToolSpec/ToolResult 既有形承载（单调用形态**无契约变更**）。
   - 依赖：Windows=pywinpty（ConPTY）extras 块（marker `win32`）——OP-P2-4；POSIX=stdlib 零依赖；**spike 票前置**（L68「再确定库」——验证先于定库）。
-  - 平台面：L68 四项（resize/Ctrl-C/编码/进程树退出）Unix/Windows **分别**验证；L150 Windows 红线（进程树回收验证失败→该能力不得发布为支持）；**未验证的平台不开启**（能力协商拒绝面）。
+  - 平台面：L68 四项（resize/Ctrl-C/编码/进程树退出）Unix/Windows **分别**验证；PHASE1-SLIM L150 Windows 红线（进程树回收验证失败→该能力不得发布为支持）；**未验证的平台不开启**（能力协商拒绝面）。
   - 验收：L68 逐句+L70；四原语平台测试；取消=Ctrl-C 传递+树回收断言（孙进程独立断言，platform-support §5 形）。
   - 风险：ConPTY 边缘行为（编码/resize 竞态/winpty 回退面）；Job Object×ConPTY 交互（杀树是否覆盖 pseudoconsole 子进程——spike 判据项）；平台不对齐（一平台失败→该平台不开启，非全子项失败）。
   - 估计：1–2 周（平台重）。
