@@ -96,8 +96,8 @@ _WIN_TREE_MECHANISM = (
 _POSIX_RESIZE_MECHANISM = "fcntl TIOCSWINSZ on the pty master; child SIGWINCH handler + os.get_terminal_size(fd=1)"
 _POSIX_CTRL_C_MECHANISM = (
     "ISIG line discipline: '\\x03' on the pty master -> SIGINT to the foreground process group; "
-    "the child installs its own SIGINT disposition and the probe holds the slave open so the "
-    "exit-time marker stays readable after the child exits"
+    "the child installs its own SIGINT disposition and reports its tty (os.ttyname) so the probe "
+    "can hold the slave open and the exit-time marker stays readable after the child exits"
 )
 _POSIX_ENCODING_MECHANISM = "pty master UTF-8 echo round trip through the child's stdin/stdout"
 _POSIX_TREE_MECHANISM = (
@@ -264,7 +264,7 @@ while time.monotonic() < end:
 """
 
 _CTRL_C_CHILD_SCRIPT = """\
-import signal, sys, time
+import os, signal, sys, time
 # The SIGINT disposition is installed explicitly, never inherited: the CI
 # process tree (runner -> bash -> pytest) can carry SIGINT blocked or ignored,
 # and both states survive fork+exec -- an inherited mask keeps the signal
@@ -274,7 +274,22 @@ import signal, sys, time
 if hasattr(signal, "pthread_sigmask"):
     signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT])
 signal.signal(signal.SIGINT, signal.default_int_handler)
-print("READY", flush=True)
+# Report the child's own terminal so the probe parent can hold the slave side
+# open: the exit-time marker stays readable only while a slave descriptor
+# exists (the kernel flushes the master read queue once the last slave
+# descriptor closes). os.ttyname is the portable form -- os.ptsname does not
+# exist on Linux CPython. Platforms without os.ttyname print a bare READY and
+# the parent simply cannot hold the slave.
+_tty = ""
+if hasattr(os, "ttyname"):
+    try:
+        _tty = os.ttyname(0)
+    except OSError:
+        pass
+if _tty:
+    print("READY " + _tty, flush=True)
+else:
+    print("READY", flush=True)
 try:
     time.sleep(__PTY0_BUDGET__)
 except KeyboardInterrupt:
@@ -339,6 +354,12 @@ def _normalize_output(text: str) -> str:
 def _has_line(text: str, pattern: str) -> bool:
     """True when ``pattern`` (regex) matches a whole normalized output line."""
     return re.search(rf"(?:^|\n){pattern}(?:\n|$)", _normalize_output(text)) is not None
+
+
+def _ready_tty(sink: list[str]) -> str | None:
+    """The tty path reported on the child's READY line (None = bare READY)."""
+    m = re.search(r"(?:^|\n)READY (\S+)(?:\n|$)", _normalize_output("".join(sink)))
+    return m.group(1) if m else None
 
 
 def _read_until(
@@ -950,19 +971,21 @@ def _posix_kill_process_group(pgid: int) -> None:
     os.killpg(pgid, signal.SIGKILL)
 
 
-def _posix_hold_slave(master_fd: int) -> int:
-    """Open the pty slave and hold the descriptor open (O_NOCTTY).
+def _posix_hold_slave(slave_path: str) -> int:
+    """Open the pty slave by path and hold the descriptor open (O_NOCTTY).
 
     The ctrl_c child prints its interrupt marker and exits within
     microseconds, and once the LAST slave descriptor closes the kernel
     flushes the master read queue (reads then return EIO) -- the
     exit-time tail stays observable only while a slave descriptor is held.
+    The path comes from the child's own READY line (its os.ttyname(0)
+    report, the portable form: os.ptsname does not exist on Linux CPython).
     The win32 guard mirrors _posix_spawn: POSIX-only body, unreachable on
     Windows (mypy platform narrowing).
     """
     if sys.platform == "win32":
-        raise OSError("os.ptsname is a POSIX primitive")
-    return os.open(os.ptsname(master_fd), os.O_RDWR | os.O_NOCTTY)
+        raise OSError("opening a pty slave by path is a POSIX primitive")
+    return os.open(slave_path, os.O_RDWR | os.O_NOCTTY)
 
 
 def _posix_reap(pid: int, master_fd: int) -> None:
@@ -1027,16 +1050,27 @@ def _posix_probe_ctrl_c() -> CheckResult:
     script = _fill(_CTRL_C_CHILD_SCRIPT, budget=CHILD_BUDGET_SECONDS)
     pid, master_fd = _posix_spawn(script, (24, 80))
     reader = _posix_reader(master_fd)
-    # Keep the slave side open for the whole observation: the child prints the
-    # interrupt marker and exits within microseconds, and the tail would be
-    # flushed with the last slave descriptor (see _posix_hold_slave).
-    slave_fd = _posix_hold_slave(master_fd)
     sink: list[str] = []
     details: dict[str, Any] = {"mechanism": _POSIX_CTRL_C_MECHANISM}
+    # The slave descriptor is held from the moment the child is observably
+    # alive (its READY line carries the tty path) until the reap: while it is
+    # held the pty cannot hang up, so the exit-time marker stays readable
+    # instead of racing the poll interval against a microsecond exit (see
+    # _posix_hold_slave).
+    slave_fd: int | None = None
     try:
         deadline = time.monotonic() + MARKER_TIMEOUT_SECONDS
-        if not _read_until(reader, lambda text: _has_line(text, r"READY"), deadline, sink):
+        if not _read_until(reader, lambda text: _has_line(text, r"READY(?: \S+)?"), deadline, sink):
             return CheckResult("ctrl_c", "failed", details, reason="child never printed READY")
+        tty_path = _ready_tty(sink)
+        details["child_tty"] = tty_path or "unreported"
+        if tty_path:
+            try:
+                slave_fd = _posix_hold_slave(tty_path)
+            except OSError as exc:
+                # An unholdable slave degrades to the unhedged read race; the
+                # negative record below will still report the observed state.
+                details["slave_hold_error"] = str(exc)
         os.write(master_fd, b"\x03")
         marker_deadline = time.monotonic() + CTRL_C_OBSERVATION_WINDOW_SECONDS
         marker = _read_until(reader, lambda text: _has_line(text, r"PYPROBE_INTERRUPTED"), marker_deadline, sink)
@@ -1062,7 +1096,8 @@ def _posix_probe_ctrl_c() -> CheckResult:
         # Close the held slave first: the pty hangs up only when the last
         # slave descriptor closes, then the reap's master close completes the
         # documented teardown order.
-        os.close(slave_fd)
+        if slave_fd is not None:
+            os.close(slave_fd)
         _posix_reap(pid, master_fd)
 
 
