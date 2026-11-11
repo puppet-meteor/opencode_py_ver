@@ -43,6 +43,9 @@ packages = ["src/opencode"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "maas_real: real MAAS endpoint short-session evidence (opt-in: OPENCODE_PY_MAAS_REAL=1 plus resolvable gateway config; skipped otherwise)",
+]
 
 [tool.ruff]
 line-length = 120
