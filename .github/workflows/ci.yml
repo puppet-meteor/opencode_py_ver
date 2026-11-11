@@ -23,7 +23,14 @@ jobs:
       - name: Lock check
         run: uv lock --check
       - name: Sync locked environment
-        run: uv sync --locked --extra server
+        # OP-P2-4 CI face (post-W1 fixup, dispatcher-owned like pyproject/uv.lock):
+        # --all-extras matches the local gate shape (uv sync --all-extras
+        # --all-groups) so optional-face tests (httpapi, watcher, later pty on
+        # win32) actually run in CI. The old --extra server stopped at the
+        # server face and the #192 watcher extras declaration never reached
+        # CI, so the 18 W1 watcher tests failed at collection (ModuleNotFoundError:
+        # watchfiles) on both matrix jobs.
+        run: uv sync --locked --all-extras
       - name: Test suite (R0 contracts + R1 integration, full)
         run: uv run pytest -q
       - name: Platform probe (R0-B)
