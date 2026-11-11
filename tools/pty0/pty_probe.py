@@ -96,7 +96,8 @@ _WIN_TREE_MECHANISM = (
 _POSIX_RESIZE_MECHANISM = "fcntl TIOCSWINSZ on the pty master; child SIGWINCH handler + os.get_terminal_size(fd=1)"
 _POSIX_CTRL_C_MECHANISM = (
     "ISIG line discipline: '\\x03' on the pty master -> SIGINT to the foreground process group; "
-    "the child installs its own SIGINT disposition so an inherited block/ignore cannot mask it"
+    "the child installs its own SIGINT disposition and the probe holds the slave open so the "
+    "exit-time marker stays readable after the child exits"
 )
 _POSIX_ENCODING_MECHANISM = "pty master UTF-8 echo round trip through the child's stdin/stdout"
 _POSIX_TREE_MECHANISM = (
@@ -949,6 +950,21 @@ def _posix_kill_process_group(pgid: int) -> None:
     os.killpg(pgid, signal.SIGKILL)
 
 
+def _posix_hold_slave(master_fd: int) -> int:
+    """Open the pty slave and hold the descriptor open (O_NOCTTY).
+
+    The ctrl_c child prints its interrupt marker and exits within
+    microseconds, and once the LAST slave descriptor closes the kernel
+    flushes the master read queue (reads then return EIO) -- the
+    exit-time tail stays observable only while a slave descriptor is held.
+    The win32 guard mirrors _posix_spawn: POSIX-only body, unreachable on
+    Windows (mypy platform narrowing).
+    """
+    if sys.platform == "win32":
+        raise OSError("os.ptsname is a POSIX primitive")
+    return os.open(os.ptsname(master_fd), os.O_RDWR | os.O_NOCTTY)
+
+
 def _posix_reap(pid: int, master_fd: int) -> None:
     """Close the master (SIGHUP to the session), then reap the child."""
     try:
@@ -1011,6 +1027,10 @@ def _posix_probe_ctrl_c() -> CheckResult:
     script = _fill(_CTRL_C_CHILD_SCRIPT, budget=CHILD_BUDGET_SECONDS)
     pid, master_fd = _posix_spawn(script, (24, 80))
     reader = _posix_reader(master_fd)
+    # Keep the slave side open for the whole observation: the child prints the
+    # interrupt marker and exits within microseconds, and the tail would be
+    # flushed with the last slave descriptor (see _posix_hold_slave).
+    slave_fd = _posix_hold_slave(master_fd)
     sink: list[str] = []
     details: dict[str, Any] = {"mechanism": _POSIX_CTRL_C_MECHANISM}
     try:
@@ -1039,6 +1059,10 @@ def _posix_probe_ctrl_c() -> CheckResult:
             )
         return CheckResult("ctrl_c", "verified", details)
     finally:
+        # Close the held slave first: the pty hangs up only when the last
+        # slave descriptor closes, then the reap's master close completes the
+        # documented teardown order.
+        os.close(slave_fd)
         _posix_reap(pid, master_fd)
 
 
