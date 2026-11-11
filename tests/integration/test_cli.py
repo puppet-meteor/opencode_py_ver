@@ -362,7 +362,7 @@ def test_argparse_missing_required_args_exit_2() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-C1-049: the product config bridge CLI face — no explicit
+# T-C1-067: the product config bridge CLI face — no explicit
 # --base-url/--api-key/--model needed when the TS product config exists.
 # Every test injects a tmp product config via XDG_CONFIG_HOME (the production
 # directory resolution) — the real ~/.config/opencode is never read.
@@ -410,7 +410,7 @@ def _no_product_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def test_parse_arguments_runs_three_flag_free_on_product_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None
 ) -> None:
-    """T-C1-049 CLI face: with a product gateway config present, none of
+    """T-C1-067 CLI face: with a product gateway config present, none of
     --base-url/--api-key/--model is required — credentials backfill onto args
     and the model rides the merged values (args.model stays None; the resolve
     face reads it from the layer)."""

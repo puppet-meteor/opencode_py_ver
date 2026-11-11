@@ -583,7 +583,7 @@ def test_sanitize_endpoint_rejects_non_absolute_and_non_http() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-C1-049: the product bridge fifth layer (builtin < product < global <
+# T-C1-067: the product bridge fifth layer (builtin < product < global <
 # project(root→cwd) < CLI). Every test injects a tmp product directory — the
 # real ~/.config/opencode is never read.
 # ---------------------------------------------------------------------------

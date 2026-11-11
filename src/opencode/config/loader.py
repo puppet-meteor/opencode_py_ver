@@ -2,7 +2,7 @@
 
 OP-R3-10 ruling (①, task T-C1-030 mandatory answer 1): the full §6 L283-285
 priority chain is implemented — builtin defaults < the TS product config
-bridge (T-C1-049: ``$XDG_CONFIG_HOME/opencode`` else ``~/.config/opencode``,
+bridge (T-C1-067: ``$XDG_CONFIG_HOME/opencode`` else ``~/.config/opencode``,
 the fifth tier carrying exactly the three existing keys endpoint/api_key/model
 from the ``provider`` block) < user global
 ``~/.config/opencode-py/opencode.json`` < per-layer ``opencode.json`` from the
@@ -514,7 +514,7 @@ class ConfigLoader:
         else:
             self._global_dir = Path.home() / ".config" / "opencode-py"
             self._global_path = self._global_dir / "opencode.json"
-        # T-C1-049 product tier: the TS opencode config directory. None = the
+        # T-C1-067 product tier: the TS opencode config directory. None = the
         # production default (XDG_CONFIG_HOME/opencode else ~/.config/opencode);
         # tests inject a tmp directory (never the real home). The local import
         # dodges the import cycle: product.py imports ConfigError from here.
@@ -543,7 +543,7 @@ class ConfigLoader:
     def load(self) -> LayeredConfig:
         """Discover + validate + merge the §6 L283 chain (CLI not included).
 
-        The builtin layer is always first; the product tier (T-C1-049: the TS
+        The builtin layer is always first; the product tier (T-C1-067: the TS
         opencode gateway config) sits between builtin and global — absent
         product files mean no product layer, silently; the global tier is
         always present (its directory may contribute an ``AGENTS.md`` even

@@ -1,4 +1,4 @@
-"""T-C1-049 integration tests: the product config bridge (the ConfigLoader fifth layer).
+"""T-C1-067 integration tests: the product config bridge (the ConfigLoader fifth layer).
 
 The bridge turns the machine's TS opencode gateway config (``$XDG_CONFIG_HOME/
 opencode`` else ``~/.config/opencode``; ``opencode.json``/``opencode.jsonc``;
@@ -19,7 +19,7 @@ order (builtin < product < global < project(root→cwd) < CLI). Covered faces:
   credentials, the v3 snapshot's canonical serialization carries no api_key
   value and ``endpoint_ref`` is the sanitized (userinfo/query-free) URL.
 
-Hermeticity (T-C1-049 §4): every test injects a tmp product directory and the
+Hermeticity (T-C1-067 §4): every test injects a tmp product directory and the
 ambient env is scrubbed — the real ``~/.config/opencode`` (live developer
 credentials) is never read by anything here.
 """

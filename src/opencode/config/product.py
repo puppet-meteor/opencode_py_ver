@@ -1,4 +1,4 @@
-"""Product config bridge (T-C1-049): the TS opencode gateway config as a ConfigLoader layer.
+"""Product config bridge (T-C1-067): the TS opencode gateway config as a ConfigLoader layer.
 
 The machine's TS opencode installation keeps its gateway provider config at
 ``$XDG_CONFIG_HOME/opencode`` (when set) else ``~/.config/opencode`` —

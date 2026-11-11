@@ -309,7 +309,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     args.api_key = args.api_key or os.environ.get("OPENCODE_PY_API_KEY")
     # §6 L283 layer-aware completeness (R3-S6): --model/--context-limit are no
     # longer argparse-required — a config layer may supply them; the CLI flag
-    # wins when both are present. T-C1-049: the credentials walk the SAME layer
+    # wins when both are present. T-C1-067: the credentials walk the SAME layer
     # fallback — 'endpoint'/'api_key' ride the product/global tiers (the
     # product bridge reads the TS opencode gateway config) and the model
     # arrives from the product tier's models first key, so none of
@@ -323,7 +323,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     except ConfigError as error:
         parser.error(f"config: {error}")
     values = layered.values
-    # T-C1-049 credential fallback: CLI flag > env > merged layers (the
+    # T-C1-067 credential fallback: CLI flag > env > merged layers (the
     # product/global tiers carry 'endpoint'/'api_key'). A layer value that is
     # not a non-empty string counts as absent — fail closed, never a blind
     # assign; nothing read is ever echoed back in the error below.
