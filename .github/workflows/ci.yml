@@ -50,4 +50,4 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
       - name: Type check
-        run: uv run mypy src tools/r0 tests/r0 tests/contract tests/integration
+        run: uv run mypy src tools/r0 tools/pty0 tests/r0 tests/contract tests/integration
