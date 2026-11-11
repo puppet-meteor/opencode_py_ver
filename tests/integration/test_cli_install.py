@@ -221,6 +221,12 @@ def test_installed_cli_missing_maas_config_is_an_argparse_exit_2(installed: _Ins
     env = {
         key: value for key, value in os.environ.items() if key not in ("OPENCODE_PY_BASE_URL", "OPENCODE_PY_API_KEY")
     }
+    # T-C1-067 fixup: pin XDG_CONFIG_HOME at a fresh empty dir so the product
+    # bridge tier stays silent even on machines with a real ~/.config/opencode
+    # (the product dir is always the empty tmp dir - machine-independent face).
+    xdg_config_home = tmp_path / "xdg"
+    xdg_config_home.mkdir()
+    env["XDG_CONFIG_HOME"] = str(xdg_config_home)
     result = subprocess.run(
         [str(installed.exe), "hello"],
         cwd=str(tmp_path),

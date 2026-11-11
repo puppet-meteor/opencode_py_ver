@@ -1,7 +1,10 @@
 """ConfigLoader (R3-S6; CORE-CONTRACTS §6 main anchor): layered discovery, merge, runtime resolution, recovery.
 
 OP-R3-10 ruling (①, task T-C1-030 mandatory answer 1): the full §6 L283-285
-priority chain is implemented — builtin defaults < user global
+priority chain is implemented — builtin defaults < the TS product config
+bridge (T-C1-067: ``$XDG_CONFIG_HOME/opencode`` else ``~/.config/opencode``,
+the fifth tier carrying exactly the three existing keys endpoint/api_key/model
+from the ``provider`` block) < user global
 ``~/.config/opencode-py/opencode.json`` < per-layer ``opencode.json`` from the
 project root down to the working directory < CLI — not TS ``discovery.ts``
 ``Sources/discover`` multi-source trust merging (r3-slices difference table 7:
@@ -65,7 +68,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import ValidationError
@@ -227,8 +230,8 @@ class ConfigLayer:
 class LayeredConfig:
     """The §6 L283 chain after discovery + merge (outermost layer first).
 
-    ``values`` is builtin < global < project(root→cwd) merged; CLI overrides
-    are applied later, at :meth:`ConfigLoader.resolve_runtime`.
+    ``values`` is builtin < product < global < project(root→cwd) merged; CLI
+    overrides are applied later, at :meth:`ConfigLoader.resolve_runtime`.
     """
 
     layers: tuple[ConfigLayer, ...]
@@ -476,8 +479,9 @@ class ConfigLoader:
     (``resolve_runtime``), and the recovery face (``recover``).
 
     All three faces share one discovery run configuration (working directory,
-    pinned project root, global config path), so the snapshot roots and the
-    adapter roots can never drift apart (one loader source, test-pinned).
+    pinned project root, global config path, product config directory), so
+    the snapshot roots and the adapter roots can never drift apart (one
+    loader source, test-pinned).
     """
 
     def __init__(
@@ -486,6 +490,7 @@ class ConfigLoader:
         working_dir: str | Path | None = None,
         project_root: str | Path | None = None,
         global_config: str | Path | None = None,
+        product_config_dir: str | Path | None = None,
     ) -> None:
         self._working_dir = Path(working_dir) if working_dir is not None else Path.cwd()
         self._working_dir = self._working_dir.resolve()
@@ -509,6 +514,16 @@ class ConfigLoader:
         else:
             self._global_dir = Path.home() / ".config" / "opencode-py"
             self._global_path = self._global_dir / "opencode.json"
+        # T-C1-067 product tier: the TS opencode config directory. None = the
+        # production default (XDG_CONFIG_HOME/opencode else ~/.config/opencode);
+        # tests inject a tmp directory (never the real home). The local import
+        # dodges the import cycle: product.py imports ConfigError from here.
+        if product_config_dir is not None:
+            self._product_config_dir = Path(product_config_dir)
+        else:
+            from opencode.config.product import product_config_dir as _default_product_dir
+
+            self._product_config_dir = _default_product_dir()
 
     # -- §6 L283-285: discovery + merge --------------------------------------
 
@@ -528,13 +543,40 @@ class ConfigLoader:
     def load(self) -> LayeredConfig:
         """Discover + validate + merge the §6 L283 chain (CLI not included).
 
-        The builtin layer is always first; the global tier is always present
-        (its directory may contribute an ``AGENTS.md`` even without a config
-        file); every project directory from the root down to the working
-        directory contributes its ``opencode.json`` when present and its
-        ``AGENTS.md`` when present.
+        The builtin layer is always first; the product tier (T-C1-067: the TS
+        opencode gateway config) sits between builtin and global — absent
+        product files mean no product layer, silently; the global tier is
+        always present (its directory may contribute an ``AGENTS.md`` even
+        without a config file); every project directory from the root down to
+        the working directory contributes its ``opencode.json`` when present
+        and its ``AGENTS.md`` when present. The product directory is NOT an
+        instruction source (``directory=None`` — its ``AGENTS.md`` never joins
+        the instruction chain; AGENTS.md semantics belong to the -py layers
+        only) and the tier is host-trusted: endpoint/api_key are host-only keys
+        and the product layer validates host_tier=True like the global tier.
         """
         layers: list[ConfigLayer] = [ConfigLayer(origin="builtin", values=dict(_BUILTIN_VALUES))]
+
+        # Local import (import cycle: product.py imports ConfigError from here).
+        from opencode.config.product import resolve_product_values
+
+        product_values = resolve_product_values(self._product_config_dir)
+        if product_values is not None:
+            json_path = self._product_config_dir / "opencode.json"
+            jsonc_path = self._product_config_dir / "opencode.jsonc"
+            # Provenance: the last file in the dual-read order (jsonc keys
+            # override json) — the file the merged values answer to.
+            contributing = jsonc_path if jsonc_path.is_file() else json_path
+            layer_values = cast("JsonObject", product_values)
+            _validate_layer_keys(contributing, layer_values, host_tier=True)
+            layers.append(
+                ConfigLayer(
+                    origin=f"product:{self._product_config_dir}",
+                    values=layer_values,
+                    path=contributing,
+                    directory=None,
+                )
+            )
 
         global_values: JsonObject = {}
         if self._global_path.is_file():

@@ -580,3 +580,106 @@ def test_sanitize_endpoint_rejects_non_absolute_and_non_http() -> None:
             _sanitize_endpoint(bad)
     assert _sanitize_endpoint("http://example.com/v1") == "http://example.com/v1"
     assert _sanitize_endpoint("https://user:secret@example.com/v1?q=1#f") == "https://example.com/v1"
+
+
+# ---------------------------------------------------------------------------
+# T-C1-067: the product bridge fifth layer (builtin < product < global <
+# project(root→cwd) < CLI). Every test injects a tmp product directory — the
+# real ~/.config/opencode is never read.
+# ---------------------------------------------------------------------------
+
+
+def _product_gateway(config_dir: Path, *, base_url: str, api_key: str, model: str, name: str = "opencode.json") -> Path:
+    """One product config file with a nested gateway provider block (the local shape)."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / name
+    path.write_text(
+        json.dumps(
+            {"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": {model: {}}}}}
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_global_overrides_product_on_the_same_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Layer order: the -py global tier beats the foreign product tier on every
+    overlapping key — the product bridge can never shadow -py configuration."""
+    monkeypatch.chdir(tmp_path)
+    product_dir = tmp_path / "product"
+    _product_gateway(
+        product_dir, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    global_path = _write_json(
+        tmp_path / "g.json",
+        {"model": "global-model", "endpoint": "https://global-endpoint.test/v1", "api_key": "r0-global-key"},
+    )
+    loader = ConfigLoader(global_config=global_path, product_config_dir=product_dir)
+    layered = loader.load()
+    assert layered.values["model"] == "global-model"
+    assert layered.values["endpoint"] == "https://global-endpoint.test/v1"
+    assert layered.values["api_key"] == "r0-global-key"
+    # CLI stays the top layer over both (L283).
+    runtime = loader.resolve_runtime(
+        cli=CliOverrides(model="cli-model", context_limit=100000), endpoint_url="https://api.example.test/v1"
+    )
+    assert runtime.settings.model.model == "cli-model"
+
+
+def test_product_layer_shape_origin_path_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The product layer's shape: origin names the config DIRECTORY, directory is
+    None (the product dir is NOT an instruction source), and path is the file the
+    merged values answer to — the last file in the dual-read order (jsonc
+    overrides json)."""
+    monkeypatch.chdir(tmp_path)
+    product_dir = tmp_path / "product"
+    _product_gateway(
+        product_dir, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    layered = ConfigLoader(product_config_dir=product_dir).load()
+    assert layered.layers[0].origin == "builtin"
+    product_layer = layered.layers[1]
+    assert product_layer.origin == f"product:{product_dir}"
+    assert product_layer.path == product_dir / "opencode.json"
+    assert product_layer.directory is None  # its AGENTS.md never joins the instruction chain
+    assert product_layer.values == {
+        "endpoint": "https://product-gw.test/v1",
+        "api_key": "r0-product-key",
+        "model": "product-model",
+    }
+    only_jsonc = tmp_path / "only-jsonc"
+    _product_gateway(only_jsonc, base_url="https://x.test/v1", api_key="r0-k", model="m", name="opencode.jsonc")
+    assert ConfigLoader(product_config_dir=only_jsonc).load().layers[1].path == only_jsonc / "opencode.jsonc"
+    both = tmp_path / "both"
+    _product_gateway(both, base_url="https://a.test/v1", api_key="r0-k", model="m", name="opencode.json")
+    _product_gateway(both, base_url="https://b.test/v1", api_key="r0-k2", model="m2", name="opencode.jsonc")
+    assert ConfigLoader(product_config_dir=both).load().layers[1].path == both / "opencode.jsonc"
+
+
+def test_no_product_config_keeps_the_original_three_tier_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no product config files, the layer chain is exactly the original
+    segments: builtin, global, project — no silent product tier insertion."""
+    monkeypatch.chdir(tmp_path)
+    layered = ConfigLoader(product_config_dir=tmp_path / "empty-product").load()
+    assert [layer.origin for layer in layered.layers] == [
+        "builtin",
+        f"global:{Path.home() / '.config' / 'opencode-py' / 'opencode.json'}",
+        f"project:{tmp_path}",
+    ]
+
+
+def test_project_layers_still_reject_host_only_keys_with_the_product_tier_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing-tier regression: the product tier is host-trusted, but a project
+    layer carrying endpoint/api_key stays a host-tier violation (L285) — the
+    product bridge never dilutes the project-tier trust boundary."""
+    monkeypatch.chdir(tmp_path)
+    product_dir = tmp_path / "product"
+    _product_gateway(
+        product_dir, base_url="https://product-gw.test/v1", api_key="r0-product-key", model="product-model"
+    )
+    for key, value in (("endpoint", "https://from-project.test/v1"), ("api_key", "r0-project-key")):
+        _write_json(tmp_path / "opencode.json", {key: value})
+        with pytest.raises(ConfigError, match="host-tier"):
+            ConfigLoader(product_config_dir=product_dir).load()

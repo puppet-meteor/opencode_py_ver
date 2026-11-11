@@ -1,3 +1,4 @@
+> 席位注记（T-C1-049 产品级配置桥席位 · p2-s19 · 2026-11-11）：本文件原路径为 `doc/orchestration/progress/T-C1-049.md`，系 R5-S6 席位（发布检查+Done 对账+exit-evidence+r5-slices 收口，2026-11-07 落盘）的完成件。票号跨纪元复用（R5 纪元 T-C1-049=本文件；P2 纪元 T-C1-049=产品级配置桥）致同路径冲突——P2 席位按票面「新建」口径落盘时覆盖本文件，发现后即刻将原内容**逐字节原样**恢复于本路径（仅前置本注记 banner，banner 以下零改动；字节同一性以 blob hash 亲证 `d23a4ef9`）。原历史版本亦可经 `git show eb24cdd:doc/orchestration/progress/T-C1-049.md` 直取。
 # T-C1-049 进度（席位C-1 · R5-S6 发布检查+Done 对账+exit-evidence+r5-slices 收口）
 
 - 会话起点（创建时刻首读时钟）：2026-11-07 05:36:28
