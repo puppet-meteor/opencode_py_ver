@@ -20,6 +20,19 @@ server = [
     "fastapi>=0.162.2,<1",
     "uvicorn>=0.54.0,<1",
 ]
+# T2 residue (OP-P2-4 path A, user-adjudicated 2026-11-11): optional watcher face,
+# forward-declared ahead of the W1 ticket (module lands with W1 dispatch). Core
+# starts and works without this extra; the watcher face without it reports
+# UnsupportedCapability.
+watcher = [
+    "watchfiles>=1.3,<2",
+]
+# T2 residue (OP-P2-4 path A, user-adjudicated 2026-11-11): optional PTY face,
+# forward-declared ahead of the T0 ticket (module lands with T0 dispatch).
+# Windows-only pin; POSIX uses stdlib pty/select with zero extra installs.
+pty = [
+    "pywinpty>=3.1,<4; sys_platform=='win32'",
+]
 
 [project.scripts]
 opencode = "opencode.cli:main"
