@@ -429,6 +429,284 @@ async def test_crash_sweeps_tree(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# T-C1-075 Form A: job-capture bounded retry + observability (R1/R2/R3/P1)
+# ---------------------------------------------------------------------------
+
+
+def _bare_transport() -> StdioTransport:
+    """A transport that never started: the unit seam for the capture/sweep faces."""
+    return StdioTransport(command=sys.executable, args=("-c", "pass"), env={})
+
+
+async def _sleep_proc() -> asyncio.subprocess.Process:
+    """A real live leader stand-in: python sleeping 30s, no pipes (nothing to hold open)."""
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """Test hygiene: never leak the stand-in leader (kill + reap, best effort)."""
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass  # raced with a natural/terminated exit between the check and the kill
+    await proc.wait()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_job_capture_retries_transient_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R1 (Form A 2): a transient capture OSError is absorbed by the bounded retry.
+
+    WDAC/AV-class refusals are exactly the transient category the retry
+    absorbs: capture fails twice, the third attempt succeeds -- the job comes
+    back, ``job_captured`` flips True, and exactly 3 attempts were spent
+    (today's face has zero retry: the first failure is final).
+    """
+    state = {"ctor": 0, "capture": 0, "closes": 0}
+
+    class _FlakyJobObject:
+        """Fake win32 JobObject: ctor fine, capture raises twice then succeeds."""
+
+        def __init__(self) -> None:
+            state["ctor"] += 1
+
+        def capture(self, pid: int) -> None:
+            state["capture"] += 1
+            if state["capture"] <= 2:
+                raise OSError(5, f"AssignProcessToJobObject({pid}) failed")
+
+        def terminate(self, exit_code: int = 1) -> None:
+            raise AssertionError("no sweep runs in this test")
+
+        def close(self) -> None:
+            state["closes"] += 1
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _FlakyJobObject)
+    transport = _bare_transport()
+    proc = await _sleep_proc()
+    try:
+        transport._proc = proc
+        job = await transport._capture_in_job()
+        assert job is not None
+        assert transport.job_captured is True
+        assert transport.job_capture_error is None
+        assert state["capture"] == 3  # exactly JOB_CAPTURE_ATTEMPTS tries
+        assert state["closes"] == 2  # both failed attempts closed their remnant job
+    finally:
+        await _reap(proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_job_capture_ctor_failure_is_observable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2a (Form A 1): ctor always failing -> None + job_capture_error with face + try count."""
+    state = {"ctor": 0}
+
+    class _CtorFailsJobObject:
+        """Fake win32 JobObject whose CreateJobObjectW-equivalent ctor always fails."""
+
+        def __init__(self) -> None:
+            state["ctor"] += 1
+            raise OSError(5, "CreateJobObjectW failed")
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _CtorFailsJobObject)
+    transport = _bare_transport()
+    proc = await _sleep_proc()
+    try:
+        transport._proc = proc
+        assert await transport._capture_in_job() is None
+        assert transport.job_captured is False
+        error = transport.job_capture_error
+        assert error is not None
+        assert "CreateJobObjectW" in error
+        assert "3 attempts" in error
+        assert state["ctor"] == 3  # the ctor face retried too, then gave up observably
+    finally:
+        await _reap(proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_job_capture_failure_after_retries_is_observable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2b (Form A 1+2): capture failing on every try (live leader) -> None + terminal text."""
+    state = {"capture": 0, "closes": 0}
+
+    class _CaptureFailsJobObject:
+        """Fake win32 JobObject: ctor fine, capture always fails while the leader lives."""
+
+        def capture(self, pid: int) -> None:
+            state["capture"] += 1
+            raise OSError(5, f"OpenProcess({pid}) failed")
+
+        def terminate(self, exit_code: int = 1) -> None:
+            raise AssertionError("no sweep runs in this test")
+
+        def close(self) -> None:
+            state["closes"] += 1
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _CaptureFailsJobObject)
+    transport = _bare_transport()
+    proc = await _sleep_proc()
+    try:
+        transport._proc = proc
+        assert await transport._capture_in_job() is None
+        assert transport.job_captured is False
+        error = transport.job_capture_error
+        assert error is not None
+        assert "3 attempts" in error
+        assert "OpenProcess" in error  # the last OSError rides the text
+        assert state["capture"] == 3
+        assert state["closes"] == 3  # every failed attempt closed its remnant job (no handle leak)
+    finally:
+        await _reap(proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_job_capture_already_exited_keeps_empty_shell_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2c (Form A 1, secondary gap): capture OSError + already-exited leader -> the
+    empty-shell job is kept (KILL_ON_JOB_CLOSE backstop), job_captured False, exited note."""
+    state = {"capture": 0, "closes": 0}
+
+    class _ShellJobObject:
+        """Fake win32 JobObject: ctor fine, capture fails against the exited leader."""
+
+        def capture(self, pid: int) -> None:
+            state["capture"] += 1
+            raise OSError(5, f"AssignProcessToJobObject({pid}) failed")
+
+        def terminate(self, exit_code: int = 1) -> None:
+            raise AssertionError("no sweep runs in this test")
+
+        def close(self) -> None:
+            state["closes"] += 1
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _ShellJobObject)
+    transport = _bare_transport()
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "pass",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()  # the leader exited before the capture (the crash-path race)
+    transport._proc = proc
+    job = await transport._capture_in_job()
+    assert job is not None  # the empty shell is kept, not discarded
+    assert transport.job_captured is False
+    error = transport.job_capture_error
+    assert error is not None
+    assert "already-exited" in error
+    assert state["capture"] == 1  # terminal condition: zero retry
+    assert state["closes"] == 0  # the shell handle is kept for the backstop, not closed
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_terminate_tree_reports_degraded_sweep_after_capture_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3a (Form A 3): _job=None + job_capture_error set -> the sweep note records the
+    degradation while the main-process terminate still runs exactly as today."""
+    state = {"ctor": 0}
+
+    class _CtorFailsJobObject:
+        """Fake win32 JobObject whose ctor always fails (the genuine capture failure)."""
+
+        def __init__(self) -> None:
+            state["ctor"] += 1
+            raise OSError(5, "CreateJobObjectW failed")
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _CtorFailsJobObject)
+    transport = _bare_transport()
+    proc = await _sleep_proc()
+    try:
+        transport._proc = proc
+        assert await transport._capture_in_job() is None
+        assert transport._job is None
+        assert transport.job_capture_error is not None
+        transport._terminate_tree()  # today's behavior: the main-process kill still fires
+        sweep_error = transport.job_sweep_error
+        assert sweep_error is not None
+        assert "degraded" in sweep_error
+        assert "never captured" in sweep_error
+        await asyncio.wait_for(proc.wait(), 5.0)  # the leader really got terminated
+    finally:
+        await _reap(proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_terminate_tree_reports_job_terminate_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R3b (Form A 5): a live job whose TerminateJobObject fails -> the sweep note records
+    it while the fall-through to proc.terminate() runs exactly as today."""
+    state = {"terminated": 0}
+
+    class _TerminateFailsJobObject:
+        """Fake win32 JobObject: capture succeeds, terminate always raises."""
+
+        def capture(self, pid: int) -> None:
+            pass
+
+        def terminate(self, exit_code: int = 1) -> None:
+            state["terminated"] += 1
+            raise OSError(5, "TerminateJobObject failed")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("opencode.mcp.stdio.JobObject", _TerminateFailsJobObject)
+    transport = _bare_transport()
+    proc = await _sleep_proc()
+    try:
+        transport._proc = proc
+        transport._job = await transport._capture_in_job()  # the live job enters type-clean
+        assert transport._job is not None
+        assert transport.job_captured is True
+        transport._terminate_tree()
+        sweep_error = transport.job_sweep_error
+        assert sweep_error is not None
+        assert "TerminateJobObject failed" in sweep_error
+        assert state["terminated"] == 1
+        await asyncio.wait_for(proc.wait(), 5.0)  # the fall-through really fired
+    finally:
+        await _reap(proc)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object capture face (R3-S5 winjob)")
+async def test_connect_time_job_capture_is_pinned(tmp_path: Path) -> None:
+    """P1 (Form A 4; a pin, not a red): a real connect must capture the job.
+
+    A runner-side transient capture failure now reds HERE -- immediately and
+    attributably -- instead of surfacing as a vague survivor red two
+    escalation windows later (the CI-179/CI-181 attribution cost).
+    """
+    definition, log = _fixture_definition("fixture", "ok", tmp_path)
+    transport = StdioTransport(
+        command=definition.command,
+        args=definition.args,
+        env=definition.env,
+        server="fixture",
+    )
+    await transport.start()
+    try:
+        result = await transport.request("initialize", {}, timeout_s=10.0)
+        assert isinstance(result, dict)  # sanity: the handshake really worked
+        assert transport._job is not None
+        assert transport.job_captured is True
+        assert transport.job_capture_error is None
+    finally:
+        await transport.close()
+    assert transport.closed
+    start = (await _wait_for_events(log, "start"))[0]
+    await _wait_pids_gone([_event_pid(start)])
+
+
+# ---------------------------------------------------------------------------
 # (e) frame cap
 # ---------------------------------------------------------------------------
 

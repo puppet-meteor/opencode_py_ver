@@ -22,7 +22,12 @@ Process-tree discipline reuses the R3-S5 machinery read-only: Windows
 assigns the fresh server to a :class:`~opencode.process.winjob.JobObject`
 (``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` backstop; ``runner.py`` itself is
 untouched), POSIX starts the server as a new session so ``killpg`` reaps
-the whole tree.
+the whole tree. T-C1-075 Form A hardens the Windows capture against the
+silent degradation adjudicated in #182: the ctor + capture pair is retried
+(:data:`JOB_CAPTURE_ATTEMPTS` / :data:`JOB_CAPTURE_BACKOFF_S`) and every
+degraded capture or sweep is exposed on the transport attributes
+(:attr:`StdioTransport.job_capture_error`,
+:attr:`StdioTransport.job_sweep_error`) instead of failing silently.
 """
 
 from __future__ import annotations
@@ -67,6 +72,19 @@ STDERR_TAIL_CHARS = 1000
 
 #: How many stdout bytes one pipe read may return (framing granularity).
 READ_CHUNK_BYTES = 65536
+
+#: T-C1-075 (prescription Form A, T-C1-061a section 2): how many times the
+#: JobObject ctor + capture pair is attempted before the Windows job capture
+#: is declared failed. The WDAC/AV-class transient ACCESS_DENIED
+#: (OpenProcess / AssignProcessToJobObject) is exactly the category a short
+#: bounded retry absorbs; a persistent failure still degrades -- observably
+#: (see :attr:`StdioTransport.job_capture_error`) -- after this many tries.
+JOB_CAPTURE_ATTEMPTS = 3
+
+#: T-C1-075: the backoff between job-capture attempts, one entry per retry
+#: (prescription band 50-100 ms). Consumed via plain ``await asyncio.sleep``
+#: so the retry never blocks the event loop.
+JOB_CAPTURE_BACKOFF_S: tuple[float, ...] = (0.05, 0.10)
 
 
 class McpTransportError(Exception):
@@ -141,6 +159,9 @@ class StdioTransport:
         self._exit_wait_s = exit_wait_s
         self._proc: asyncio.subprocess.Process | None = None
         self._job: JobObject | None = None
+        self._job_captured = False
+        self._job_capture_error: str | None = None
+        self._job_sweep_error: str | None = None
         self._stdout_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._buffer = bytearray()
@@ -173,7 +194,7 @@ class StdioTransport:
             stderr=asyncio.subprocess.PIPE,
             **popen_kwargs,
         )
-        self._job = self._capture_in_job()
+        self._job = await self._capture_in_job()
         self._started = True
         self._stdout_task = asyncio.create_task(self._read_stdout(), name=f"mcp-stdio-{self._server}-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name=f"mcp-stdio-{self._server}-stderr")
@@ -298,6 +319,38 @@ class StdioTransport:
     def closed(self) -> bool:
         """True once :meth:`close` finished."""
         return self._closed
+
+    @property
+    def job_captured(self) -> bool:
+        """True once the Windows job capture succeeded.
+
+        False before start, on POSIX (the platform-legal form: no job exists
+        there) and after any degraded capture -- a degraded capture is told
+        apart by :attr:`job_capture_error` being set.
+        """
+        return self._job_captured
+
+    @property
+    def job_capture_error(self) -> str | None:
+        """The job-capture degradation note (None = success, POSIX, or not yet attempted).
+
+        T-C1-075 Form A: the silent ``return None`` fallbacks of the
+        adjudicated #182 degradation are gone -- every failed capture (ctor,
+        retries exhausted, or the already-exited empty shell) leaves its
+        reason here for CI attribution.
+        """
+        return self._job_capture_error
+
+    @property
+    def job_sweep_error(self) -> str | None:
+        """The tree-sweep degradation note (None = no sweep degraded).
+
+        Set when a Windows sweep runs without its job (the capture had
+        genuinely failed, so only the main process is killed) or when
+        TerminateJobObject itself fails and the sweep falls back to the
+        main-process kill/terminate.
+        """
+        return self._job_sweep_error
 
     @property
     def _open(self) -> bool:
@@ -479,30 +532,67 @@ class StdioTransport:
 
     # -- process-tree discipline (R3-S5 winjob/killpg reuse) ---------------
 
-    def _capture_in_job(self) -> JobObject | None:
-        """Windows: assign the fresh server to a Job Object; None = defensive fallback.
+    async def _capture_in_job(self) -> JobObject | None:
+        """Windows: assign the fresh server to a Job Object; None = observable fallback.
 
         Mirrors ``opencode/process/runner.py``'s capture (the winjob module is
         reused read-only; ``runner.py`` itself is untouched): a process that
         exited between spawn and capture is not an error, any other failure
         degrades to the main-process-only kill instead of failing the spawn.
+        T-C1-075 Form A hardened the degradation: the ctor + capture pair is
+        retried (:data:`JOB_CAPTURE_ATTEMPTS` tries with
+        :data:`JOB_CAPTURE_BACKOFF_S` backoff -- a WDAC/AV-class transient
+        refusal is the absorbable category) and every degraded form is
+        observable on the transport (:attr:`job_captured` /
+        :attr:`job_capture_error`) instead of silent: the already-exited
+        empty-shell job keeps the KILL_ON_JOB_CLOSE backstop handle while
+        its error text records that descendants spawned before the exit
+        never joined the job.
         """
         if sys.platform != "win32":
             return None
         proc = self._proc
         assert proc is not None
-        try:
-            job = JobObject()
-        except OSError:
-            return None
-        try:
-            job.capture(proc.pid)
-        except OSError:
-            if proc.returncode is not None:
-                return job  # already exited: nothing left to capture
-            job.close()
-            return None
-        return job
+        error: OSError | None = None
+        for attempt in range(1, JOB_CAPTURE_ATTEMPTS + 1):
+            try:
+                job = JobObject()
+            except OSError as exc:
+                error = exc
+            else:
+                try:
+                    job.capture(proc.pid)
+                except OSError as exc:
+                    error = exc
+                    if proc.returncode is not None:
+                        # Already exited (terminal, no retry): nothing is left
+                        # to capture, and the empty-shell job keeps the
+                        # KILL_ON_JOB_CLOSE backstop handle -- but descendants
+                        # spawned before the exit never joined the job.
+                        self._job_captured = False
+                        self._job_capture_error = (
+                            f"job capture of the already-exited server failed "
+                            f"(attempt {attempt}: {exc}); the empty-shell job is kept "
+                            "for the KILL_ON_JOB_CLOSE backstop, but descendants "
+                            "spawned before the exit never joined the job"
+                        )
+                        return job
+                    job.close()
+                else:
+                    self._job_captured = True
+                    self._job_capture_error = None
+                    return job
+            if attempt < JOB_CAPTURE_ATTEMPTS:
+                await asyncio.sleep(JOB_CAPTURE_BACKOFF_S[attempt - 1])
+        # Retries exhausted with the server still alive: the tree kill
+        # degrades to the main process only -- observably (Form A).
+        self._job_captured = False
+        assert error is not None
+        self._job_capture_error = (
+            f"job capture failed after {JOB_CAPTURE_ATTEMPTS} attempts "
+            f"(last error: {error}); the tree kill degrades to the main process only"
+        )
+        return None
 
     def _terminate_tree(self) -> None:
         """Terminate the whole tree: TerminateJobObject / SIGTERM the process group."""
@@ -513,8 +603,20 @@ class StdioTransport:
                 try:
                     self._job.terminate(1)
                     return
-                except OSError:
-                    pass  # defensive: fall through to the main-process kill
+                except OSError as error:
+                    # T-C1-075 5: the fall-through below is unchanged, but the
+                    # degraded sweep is no longer silent.
+                    self._job_sweep_error = (
+                        f"TerminateJobObject failed ({error}); the sweep falls back to the main-process terminate"
+                    )
+            elif self._job_capture_error is not None:
+                # T-C1-075 3 (worst-case signal): the capture genuinely failed
+                # (a clean or POSIX capture never sets the attribute), so this
+                # tree sweep degrades to the main process only.
+                self._job_sweep_error = (
+                    "degraded tree sweep: the job was never captured "
+                    f"({self._job_capture_error}); only the main process is terminated"
+                )
             proc.terminate()  # Windows TerminateProcess (no SIGTERM analog)
             return
         try:
@@ -534,8 +636,17 @@ class StdioTransport:
                 try:
                     self._job.terminate(1)
                     return
-                except OSError:
-                    pass
+                except OSError as error:
+                    # T-C1-075 5: same fall-through as before, no longer silent.
+                    self._job_sweep_error = (
+                        f"TerminateJobObject failed ({error}); the hard kill falls back to the main-process kill"
+                    )
+            elif self._job_capture_error is not None:
+                # T-C1-075 3: same worst-case signal as the terminate stage.
+                self._job_sweep_error = (
+                    "degraded tree sweep: the job was never captured "
+                    f"({self._job_capture_error}); only the main process is hard-killed"
+                )
             proc.kill()
             return
         try:
