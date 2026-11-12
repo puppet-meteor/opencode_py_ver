@@ -12,6 +12,7 @@
 
 - 2026-11-11 [T-A-016]：增补 M2-watcher 规划契约——§6.4 watcher 文件变更监视与显式 reload（裁定①只提示通知不走 py.* durable/ephemeral 事件注册面——§3.1 零增补、events.py 零新事件模型、schema-lock 裁定面零解锁；裁定②宿主显式 reload 命令→新快照=§6.1 版本路径+§6.2 canonical hash 重验，旧快照含义不静默改写；裁定③ idle 判定三条件口径（无在飞 run+无在飞审批+静默窗，阈值归实现切片）；裁定④ boot_id 不变+saved 决定跨快照保留审计不自动激活；「不改变运行中审批」红线明文）+§6 L338「Phase 1 无热重载」句翻面承接（显式 capability 非静默热重载——原句语义不变）。语义逐句承载 PHASE2-MODULES L61/L65/L70 与 p2-slices watcher 卡/W1/W2 原文，增补面全部标注「规划契约，未实现」（watcher 全线未实现——本票无既有标注翻牌面）；W1/W2 实现切片派发前置（沿 T-A-013/014 两步走先例第一步——B 席评审与 merge 归调度器后续）。
 - 2026-11-12 [T-C1-076]：增补 P3 jobs 编排契约并落地 S1——§3.1 增 `py.job.*` 七事件行（created/spec_bound/started/stalled/redispatched/gated/finished；jobs 为编排域实体非 §7 run，metadata 非 run-scoped）+§5.4 jobs 工件与生命周期（状态闭集与 fold 迁移表/终态吸收、trace 四字段嵌套相关性集、`ses_job_{job_id}` 合成流键与 M-7 双写入域裁决——jobs 自有 writer 复用 §3.2 最小提交序；jobs 表无 sessions 外键、无 §3.2.1 隔离面两偏差；A fork-3 提交序；§8 五分支恢复矩阵含稳定 id 幂等回写）。S1 实现随票落地：七类型+数据模型注册、纯 fold/投影器/JobService、0003_jobs 迁移、/jobs 五路由+SSE 透传、FakeJobExecutor（started→finished(done)）、21 个事件 fixture；S2（params JSON-Schema 校验/真实 spec 哈希）、S3（预算强制）、S5a（门回复链）余量在 §5.4 标注。
+- 2026-11-12 [T-C1-077]：落地 P3-S2 引擎最小环——§5.4 增 pipeline spec 契约段（`PipelineSpec/PipelineNode/PipelineEdge` wire 形状；节点类型封闭集五名 `llm_call/tool/opencode_agent/human_gate/subworkflow`，S2 仅实现前两名执行体、其余三类语义门显式拒绝并标注 S3/S5a 交付；注册门三层=结构[pydantic]→语义[版本门 v1+拓扑闭包+类型约束+depth≤3 硬帽]→彩排[编译干跑]；spec 哈希锁定——载入即按 §6.2 口径算 SHA-256，运行中图永不热重绑；checkpointer=独立 SQLite 文件咨询性游标，M-7 双库边界下无 job 状态通道）。实现随票落地：contracts/pipelines.py、orchestrator/engine.py（注入式 `llm_call`/`tool` 执行面，测试全用诚实 fake）、schema 工件 pipelines.json+三元组 fixture、App 装配（`pipeline_engine=` 注入+close 顺序）；真实 LLM 档位归 S4；params 按管道 JSON Schema 校验未随本环承接（余量标注见 §5.4）。
 
 ## 1. 共同规则
 
@@ -324,7 +325,7 @@ Phase 1 不做通用 before_execute hook。M3 若变更输入，必须发生在�
 - 参数流每个调用上限 64 KiB、每次生成最多 16 个工具调用、文本流上限 1 MiB；超过即停止本次生成并报错，不执行超限调用计划。structured_output 和 metadata 各限制为 64 KiB，超限明确标记并保留 bounded 文本说明，不无限写入数据库/提示。
 - 命令输出、模型内容可能有任意终端控制字符，CLI 展示必须转义危险 escape。日志不记录认证头/环境凭据；任意文件输出无法保证识别所有秘密，保存和发送模型前受同一工作区信任范围约束。
 
-### 5.4 jobs 工件与生命周期（P3 编排域；S1 已实现——T-C1-076）
+### 5.4 jobs 工件与生命周期（P3 编排域；S1 已实现——T-C1-076；S2 引擎最小环已实现——T-C1-077）
 
 **工件与状态闭集**：jobs 是编排域实体，不是 §7 run——七类 durable 事件（§3.1 `py.job.*` 行）折叠出状态闭集 `created/running/stalled/gated/done/failed/cancelled`。迁移规则的单一来源是纯 fold：`created→(spec_bound|started)`；`running→(stalled|gated|finished)`；`stalled→redispatched`（恰一次：事件 retry_count==1 且状态 retry_count==0；m-4 节点级重派，非整图重跑）；`finished(done)` 仅自 running，`finished(failed/cancelled)` 可自任何非终态；终态吸收——终态后任何 py.job.* 再提交拒绝；非 py.job.* 类型不属于该 fold，拒绝。提交路径上的违例是 StoreValidationError（拒绝+回滚），重放已存坏日志时是 StorageCorrupt。
 
@@ -336,7 +337,9 @@ Phase 1 不做通用 before_execute hook。M3 若变更输入，必须发生在�
 
 **§8 重启恢复矩阵**：恢复扫描非终态集合，按检查点裁决——created→重派；检查点带终态 outcome→以稳定 batch_id/event_id/created_at_ms 幂等回写（重复恢复=writer 整批幂等重放，无新事件、H 不变；span 自 event_id 确定派生，不新铸）；检查点无 outcome→恢复续跑（resume 形态：仅补终态事件）；无 reader/无检查点/spec 哈希不符→分支④ fail-closed：`finished(failed)` 携带 `ExecutionUnknown`（副作用无法证明）。检查点 reader 为注入面，S1 的 App 默认 None。
 
-**实现状态**：S1 已落地——七类型注册、纯 fold/投影器/JobService、0003_jobs 迁移、/jobs 五路由（提交/状态/事件流 SSE 透传/取消/门回复 409 壳）、FakeJobExecutor（started→finished(done)）。S2 余量：params 按管道 JSON Schema 校验（S1 仅结构校验）、真实 spec 哈希（S1 为 params_hash）；S3：预算强制；S5a：门回复链（approve/reject/revise）与 gated→running 生产者——S1 中 gated 仅经终态转换收敛，/jobs 门回复路由为 409 壳。
+**实现状态**：S1 已落地——七类型注册、纯 fold/投影器/JobService、0003_jobs 迁移、/jobs 五路由（提交/状态/事件流 SSE 透传/取消/门回复 409 壳）、FakeJobExecutor（started→finished(done)）。S2 引擎最小环已落地（T-C1-077，契约段见下）；余量：params 按管道 JSON Schema 校验（S1 仅结构校验；未随 S2 最小环承接，归属调度器后续定）。S3：预算强制；S5a：门回复链（approve/reject/revise）与 gated→running 生产者——S1 中 gated 仅经终态转换收敛，/jobs 门回复路由为 409 壳。
+
+**S2 引擎最小环（T-C1-077）**：pipeline spec（`graph.json`）是智能层→执行层的唯一交接工件，独立 wire 契约 `contracts/pipelines.py`（非 py.* 事件、不入事件注册表）：`PipelineSpec={schema_version, pipeline_id, entry, nodes[], edges[]}`（schema_version 为 ≥1 整数、bool 先拒[§1]；nodes 至少一条，edges 工厂默认空表）；`PipelineNode={node_id, node_type, model?, prompt_template?, command?, tool_ref?, workflow_ref?, depth?}`；`PipelineEdge={from_node, to_node}`（v1 只承载两端点，条件路由后到——§8 不走同版本可选字段生长）。node_type 封闭集五名——`llm_call/tool/opencode_agent/human_gate/subworkflow`：未知名=结构层拒绝；认识但未实现的三类（opencode_agent→S3、human_gate/subworkflow→S5a）在语义层显式拒绝（`UnsupportedCapability`，错误信息标注交付切片），绝不静默跳过。per-type 约束字段 wire 层可选、语义层强制：`llm_call` 必带 model 档位+prompt 模板；`tool` 必带 command 或 tool_ref 恰其一（皆带/皆缺都拒）；`subworkflow` 受 depth≤3 硬帽（网关侧 lineage 第一道防线之外的第二道）。注册门三层：结构（pydantic 解析）→语义（确定性顺序：版本门——仅装载 v1，旧读者遇新版本明确失败[§8]→深度硬帽→未实现类型面→per-type 约束→节点 id 唯一→边引用闭包→entry 已声明且无入边→无孤儿节点）→彩排（编译为真实 LangGraph 状态机干跑，不执行副作用）。拒绝统一为 §8 结构化错误，经引擎异常 `PipelineSpecRejected` 交付：拓扑/约束=ValidationError、未实现类型/新版本=UnsupportedCapability——`contracts/errors.py` 注册面零触碰。spec 哈希锁定（§5.1）：载入即按 §6.2 canonical JSON 口径算 SHA-256，作为 `pipeline_spec_hash` 随图状态通道携带，resume 时核对——不符即 fail-closed `ExecutionUnknown`（分支④语义：运行中的图永不热重绑新 spec，改 spec 走取消→修订→重提）。执行面=注入式 Protocol callable（`llm_call`/`tool`；S2 测试全用诚实 fake，真实 LLM 档位归 S4，tool 节点真实原语可后补）。检查点=独立 SQLite 文件上的 langgraph `AsyncSqliteSaver`（同步 `SqliteSaver` 的 async face 抛 NotImplementedError，故取 async 形态；主库 alembic/census 零触碰）：只存图游标/图状态通道（params/params_hash/pipeline_id/pipeline_spec_hash/attempt_id/node_results/outcome/result），无 job 状态通道——job 状态唯一来源是主库 py.job.* fold，engine 不得从 checkpointer 推导 job 状态（M-7 双库边界；§8 恢复矩阵的 reader 即该检查点读取面，五分支不变）。
 
 ## 6. S5：配置、指令和 MCP 信任
 

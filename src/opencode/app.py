@@ -42,6 +42,7 @@ from opencode.bus.eventlog import EventLog
 from opencode.contracts.events import DurableEvent, McpServerRef
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
 from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdapter
+from opencode.orchestrator.engine import PipelineEngine
 from opencode.orchestrator.jobs import FakeJobExecutor, JobService, JobsProjector
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
@@ -162,6 +163,7 @@ class App:
         mcp_manager: McpManager | None = None,
         mcp_refs: Sequence[McpServerRef] | None = None,
         sweep_roots: Sequence[str | Path] | None = None,
+        pipeline_engine: PipelineEngine | None = None,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -271,15 +273,20 @@ class App:
         # P3-S1 (T-C1-076): the jobs domain rides the same engine + bus over
         # its own writer (PHASE3 M-7 "two writer domains" -- the session fold
         # is fail-closed on py.job.* and frozen, so jobs commit through
-        # JobsStore on ses_job_* stream keys, not SessionStore). The executor
-        # is the S1 fake (started -> finished(done)); workers land in S3/S4.
-        # Recovery is deliberately NOT wired into the lifespan (a semantics
-        # change beyond this slice's edit list): callers drive
-        # ``jobs.recover()`` explicitly -- progress ④ open item.
+        # JobsStore on ses_job_* stream keys, not SessionStore). P3-S2
+        # (T-C1-077): the executor is the injected pipeline engine when one is
+        # wired (real LangGraph execution over its own checkpointer file);
+        # None keeps the S1 fake (started -> finished(done)) -- workers land
+        # in S3/S4. Recovery is deliberately NOT wired into the lifespan (a
+        # semantics change beyond this slice's edit list): callers drive
+        # ``jobs.recover()`` explicitly -- progress ④ open item, now with the
+        # engine itself injectable as the ``JobCheckpointReader`` (its
+        # advisory-cursor read face).
+        self._pipeline_engine = pipeline_engine
         self._jobs = JobService(
             store=JobsStore(engine, projector=JobsProjector()),
             repos=JobsReadRepository(engine),
-            executor=FakeJobExecutor(),
+            executor=pipeline_engine if pipeline_engine is not None else FakeJobExecutor(),
             bus=self._bus,
             ids=shared_ids,
             clock=clock,
@@ -314,6 +321,11 @@ class App:
     def jobs(self) -> JobService:
         """The P3-S1 jobs service (submit/run/cancel + the §8 recovery scan)."""
         return self._jobs
+
+    @property
+    def pipeline_engine(self) -> PipelineEngine | None:
+        """The P3-S2 pipeline engine when wired (None keeps the S1 fake executor)."""
+        return self._pipeline_engine
 
     async def start_mcp_servers(self) -> tuple[tuple[str, Exception], ...]:
         """P2-S0 (§6 L304): spawn, catalog and bind every configured stdio server.
@@ -369,8 +381,12 @@ class App:
         return tuple(failures)
 
     async def close(self) -> None:
-        """Release in order: the jobs tasks first, then the service lifecycle, then the engine/lock."""
+        """Release in order: the jobs tasks first (which cancels every engine
+        drive), then the engine's own advisory-cursor store, then the service
+        lifecycle, then the engine/lock."""
         await self._jobs.close()
+        if self._pipeline_engine is not None:
+            await self._pipeline_engine.close()
         await self._service.close()
         await self._database.close()
 

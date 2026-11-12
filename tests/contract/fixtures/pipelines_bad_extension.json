@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "pipeline_id": "digest",
+  "entry": "collect",
+  "nodes": [
+    {
+      "node_id": "collect",
+      "node_type": "tool",
+      "tool_ref": "fs.read_text",
+      "weight": 3
+    },
+    {
+      "node_id": "summarize",
+      "node_type": "llm_call",
+      "model": "small",
+      "prompt_template": "Summarize the collected input."
+    }
+  ],
+  "edges": [
+    {
+      "from_node": "collect",
+      "to_node": "summarize"
+    }
+  ]
+}

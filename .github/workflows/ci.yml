@@ -50,4 +50,8 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
       - name: Type check
-        run: uv run mypy src tools/r0 tools/pty0 tests/r0 tests/contract tests/integration
+        # S-1 disposition (T-C1-077): tools/r5 joins the checked shape
+        # (generate_schema_artifacts.py gained the pipelines module import);
+        # three-source consistency = ci.yml + the T-C1-077 progress file + the
+        # gate command form. Existing pytest/ruff routes untouched.
+        run: uv run mypy src tools/r0 tools/pty0 tools/r5 tests/r0 tests/contract tests/integration

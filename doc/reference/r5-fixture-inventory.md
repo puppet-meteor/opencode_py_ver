@@ -6,10 +6,11 @@
 - 范围声明：本清单只陈述 Python 侧可核事实（模型枚举、工件结构、fixture 分类、测试锚）。按 parity §3 L41 口径，全文不含 TS wire 同构/兼容宣称；冻结模型类 docstring 经 `model_json_schema()` 的 `description` 字段原样进入工件——**现行模型类 docstring 实测零 TS 注记、工件零 TS 文本**（TS 历史注记均在模块 docstring/注释/函数 docstring，结构上不进入工件；若未来引入则原样透传，为差异对照非等价宣称）——实测与透传语义见进度文件 ③ 注记 b（T-B-049 一般-2 处方 3 修正，#160）。
 - 修订：T-C1-060（P2-S8 M6 压缩 slice one）落 `py.context.compacted`——模型 64→65、durable 键 22→23、fixture 92→95（26 正例 / 49 schema 级 / 20 行为级），§1–§8 计数与 events.py 行锚随版更新。
 - 修订：T-C1-076（P3-S1 job 注册表首切片）落 `py.job.*` 七事件 + `JobCard`——模型 65→76（events 36→46 + 新 cards 模块 1）、durable 键 23→30、fixture 95→116（33 正例 / 63 schema 级 / 20 行为级；S4 49→70），§1–§8 计数与 events.py / CORE-CONTRACTS（§1/§6.3）行锚随版更新。
+- 修订：T-C1-077（P3-S2 引擎最小环）落 pipeline spec 契约——模型 76→79（+新 pipelines 模块 3：`PipelineEdge` `PipelineNode` `PipelineSpec`）、fixture 116→119（34 正例 / 65 schema 级 / 20 行为级）、工件表增 `pipelines.json`（`models`×3，9189 字节）行，§1–§8 计数与 CORE-CONTRACTS（§5.4）行锚随版更新。
 
 ## 1. 统一 JSON Schema 工件
 
-生成器 `tools/r5/generate_schema_artifacts.py`（导入六模块公开定义面——五模块 + cards，T-C1-076；`build_artifacts()` 即漂移测试的编程 API）；守卫 `tests/contract/test_schema_lock.py`。
+生成器 `tools/r5/generate_schema_artifacts.py`（导入七模块公开定义面——五模块 + cards，T-C1-076 + pipelines，T-C1-077；`build_artifacts()` 即漂移测试的编程 API）；守卫 `tests/contract/test_schema_lock.py`。
 
 | 工件 | 顶层结构 | 覆盖 | 字节 |
 |---|---|---|---|
@@ -20,10 +21,11 @@
 | `doc/reference/schema/events.json` | `models`×46 | events 模块全模型（含 3 泛型信封；+`ContextCompactedData` T-C1-060；+job 域 ×10：`JobCreatedData` 等 7 data + `JobBudget` `JobLineage` `JobTrace`——T-C1-076） | 134505 |
 | `doc/reference/schema/event-envelopes.json` | `durable`×30 + `ephemeral`×4 + `generic`×3 | 注册表参数化信封（+`py.context.compacted.1` T-C1-060；+`py.job.*` durable 键 ×7——T-C1-076） | 161980 |
 | `doc/reference/schema/cards.json` | `models`×1 | `JobCard`（jobs 卡片渲染 wire 契约）——T-C1-076 | 3469 |
+| `doc/reference/schema/pipelines.json` | `models`×3 | pipelines 模块全模型（`PipelineEdge` / `PipelineNode` / `PipelineSpec`——pipeline spec wire 契约，CORE-CONTRACTS §5.4 S2）——T-C1-077 | 9189 |
 
 - **粒度**：模块边界 = 机械稳定枚举单元（`vars(module)` + `issubclass(BaseModel)` + `__module__` 归属过滤，重导出零重复）；信封单独按注册表定义参数化；六接缝是语义维度，不在工件内分文件，由本清单显式承载（任务书 1a）。
 - **durable 键** = `versioned_type` 形如 `py.session.created.1`，共 30 键（R1 2：`py.session.created.1`、`py.prompt.accepted.1`；R2 durable 11；R3 permission 6；session_created v2/v3 各 1；skills 1：`py.skill.activated.1`——T-C1-052a 增；compaction 1：`py.context.compacted.1`——T-C1-060 增；job 7：`py.job.created.1` /`py.job.spec_bound.1` /`py.job.started.1` /`py.job.stalled.1` /`py.job.gated.1` /`py.job.redispatched.1` /`py.job.finished.1`——T-C1-076 增）；**ephemeral 键** = `py.<type>`，4 键（`py.text.delta` 等）；**generic** = `EventDraft` / `DurableEvent` / `EphemeralEvent` 未参数化泛型，其 `data` 面为任意对象——即 unknown_type / unknown_version 探针的 schema 靶。
-- **序列化**：`json.dumps(indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)` + 尾换行、`newline="\n"`（dump_fixtures.py 先例 + 键排序消除 dict 插入序依赖）。字节确定性双证：进程内 `build_artifacts()` 连调相等（测试钉）+ 跨进程重跑 7 文件 SHA256 全等（T-C1-045 会话内两轮实测立 6 文件；T-C1-076 增 cards.json 同配方）。
+- **序列化**：`json.dumps(indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)` + 尾换行、`newline="\n"`（dump_fixtures.py 先例 + 键排序消除 dict 插入序依赖）。字节确定性双证：进程内 `build_artifacts()` 连调相等（测试钉）+ 跨进程重跑 8 文件 SHA256 全等（T-C1-045 会话内两轮实测立 6 文件；T-C1-076 增 cards.json、T-C1-077 增 pipelines.json 同配方）。
 
 ## 2. 六接缝 × 证据矩阵（契约模型 / fixture / 行为锚 / 适配器）
 
@@ -32,13 +34,13 @@
 | S1 §2 历史、模型输入和流式输出 | messages 8 + llm 17 + events 1（`ContextCompactedData`，§2.4，T-C1-060）= 26 | 3（context_compacted 三元组，T-C1-060；见注） | `tests/contract/test_messages.py`、`test_llm.py`、`test_ai_adapter.py`、`test_compaction_engine.py` | `tests/r0/fake_openai_server.py`（fake OpenAI 兼容 HTTP 服务） |
 | S2 §4 live 与 durable feed | events 4（ephemeral data） | 16 | `tests/contract/test_events.py`（R2 正/负例与 run 元数据组） | `tests/integration/test_eventlog.py`、`test_bus_commit.py`（真实 SQLite 事件日志/总线提交）+ `tests/contract/test_bus.py` |
 | S3 §5 工具、权限与生命周期 | tools 3 + events permission 6 = 9 | 18 | `tests/contract/test_permission_events.py`、`test_tools.py`、`test_tool_listing.py` | `tests/integration/test_tool_bash.py`、`test_tool_read.py`、`test_tool_static_trio.py`、`test_tool_write_edit.py`（真实 fs/bash 工具）；`tests/integration/mcp_stdio_server.py`（fake stdio MCP 服务端） |
-| S4 §3（S6+S4）唯一事件写入、投影与数据库 | events 25（3 信封 + 12 durable data + job 域 10：`JobCreatedData` 等 7 data + `JobBudget` `JobLineage` `JobTrace`——T-C1-076）+ cards 1（`JobCard`——T-C1-076） | 70 | `tests/contract/test_events.py`（R1/R2 正负例、注册表探针组）、`test_job_events.py`（py.job.* 正负例与 trace 四字段——T-C1-076） | `tests/integration/test_store_commit.py`、`test_projector.py`、`test_rebuild.py`、`test_recovery.py`、`test_migrations.py`（真实 SQLite + alembic）、`test_jobs_store.py`、`test_jobs_api.py`、`test_jobs_recovery.py`（jobs 写入/读模型/重启恢复矩阵——T-C1-076） |
+| S4 §3（S6+S4）唯一事件写入、投影与数据库 | events 25（3 信封 + 12 durable data + job 域 10：`JobCreatedData` 等 7 data + `JobBudget` `JobLineage` `JobTrace`——T-C1-076）+ cards 1（`JobCard`——T-C1-076）+ pipelines 3（`PipelineEdge`/`PipelineNode`/`PipelineSpec`——T-C1-077） | 73 | `tests/contract/test_events.py`（R1/R2 正负例、注册表探针组）、`test_job_events.py`（py.job.* 正负例与 trace 四字段——T-C1-076）、`test_pipelines.py`（pipeline spec 正反例与三层门拒绝——T-C1-077） | `tests/integration/test_store_commit.py`、`test_projector.py`、`test_rebuild.py`、`test_recovery.py`、`test_migrations.py`（真实 SQLite + alembic）、`test_jobs_store.py`、`test_jobs_api.py`、`test_jobs_recovery.py`（jobs 写入/读模型/重启恢复矩阵——T-C1-076）、`test_engine.py`（真实 LangGraph 引擎最小环：顺序执行/断点续跑/双库边界/恢复矩阵——T-C1-077） |
 | S5 §6 配置、指令和 MCP 信任 | events 10（snapshot / session_created 家族 + skills 激活记录，T-C1-052a） | 9 | `tests/contract/test_config.py`（TestSessionCreatedV2Wire）、`test_mcp_naming.py`（TestSessionCreatedV3Wire） | `tests/integration/test_config_loader.py`（真实 fs 配置加载） |
 | S6 §7 应用命令接口和任务所有权 | 0（运行时资源，非 wire 模型） | 0（见注） | `tests/integration/test_service.py`、`test_service_run.py`、`test_cli.py`、`test_cli_r3.py`、`test_cli_r4.py`、`test_e2e*.py` | 真实 service/CLI 进程面（无 fake） |
 
-注（S6 零 fixture 属预期，非缺口；S1 自 T-C1-060 起非零）：116 个落盘 fixture 全部是事件 wire 面（`events_*.json`），接缝归属按语义定而非文件前缀——S1 承载 §2.4 压缩事件三元组（正例 / schema 级 / 行为级各 1，T-C1-060）；S4 承载 py.job.* 七类三元组（正例 / schema 级 ×2 各 7，T-C1-076）。S1 的消息/生成 wire 形状仍由模型 + 单测内联构造锁定（R1 起即此口径，CORE-CONTRACTS §1 L22），其统一 schema 面由本任务工件补齐；S6 命令面是运行时行为（无 wire 模型），由集成测试承载。两接缝的模型/行为锚/适配器证据列均非空。
+注（S6 零 fixture 属预期，非缺口；S1 自 T-C1-060 起非零）：119 个落盘 fixture 中 116 个是事件 wire 面（`events_*.json`）、3 个是 pipeline spec wire 面（`pipelines_*.json`——锁 CORE-CONTRACTS §5.4 S2 spec 形状，T-C1-077），接缝归属按语义定而非文件前缀——S1 承载 §2.4 压缩事件三元组（正例 / schema 级 / 行为级各 1，T-C1-060）；S4 承载 py.job.* 七类三元组（正例 / schema 级 ×2 各 7，T-C1-076）与 pipeline spec 三元组（正例 / schema 级 ×2 各 1，T-C1-077）。S1 的消息/生成 wire 形状仍由模型 + 单测内联构造锁定（R1 起即此口径，CORE-CONTRACTS §1 L22），其统一 schema 面由本任务工件补齐；S6 命令面是运行时行为（无 wire 模型），由集成测试承载。两接缝的模型/行为锚/适配器证据列均非空。
 
-## 3. 模型→接缝映射（76 = errors 1 + messages 8 + events 46 + llm 17 + tools 3 + cards 1）
+## 3. 模型→接缝映射（79 = errors 1 + messages 8 + events 46 + llm 17 + tools 3 + cards 1 + pipelines 3）
 
 | 模块 | 接缝 | 模型 |
 |---|---|---|
@@ -52,11 +54,12 @@
 | `contracts/events.py` | S4 | 信封：`EventDraft` `DurableEvent` `EphemeralEvent`；durable data：`PromptAcceptedData` `ReasoningFinalizedData` `RunCancelRequestedData` `RunFinishedData` `RunStartedData` `StepFinishedData` `StepGeneratedData` `StepStartedData` `TextFinalizedData` `ToolFinishedData` `ToolRequestedData` `ToolStartedData` |
 | `contracts/events.py` | S4 | job 域（T-C1-076）：`JobBudget` `JobLineage` `JobTrace` + data `JobCreatedData` `JobSpecBoundData` `JobStartedData` `JobStalledData` `JobGatedData` `JobRedispatchedData` `JobFinishedData` |
 | `contracts/cards.py` | S4 | `JobCard`（T-C1-076） |
+| `contracts/pipelines.py` | S4 | `PipelineEdge` `PipelineNode` `PipelineSpec`（pipeline spec wire 契约，T-C1-077） |
 | `contracts/events.py` | S5 | `ConfigSnapshot` `ConfigSnapshotV2` `ConfigSnapshotV3` `InstructionSource` `McpServerRef` `SessionCreatedData` `SessionCreatedDataV2` `SessionCreatedDataV3` `SkillActivatedData` `SnapshotLimits` |
 
-计数：S1 26 + S2 4 + S3 9 + S4 26（15 + job 10 + cards 1） + S5 10 + S6 0 + 跨接缝 1 = 76。
+计数：S1 26 + S2 4 + S3 9 + S4 29（15 + job 10 + cards 1 + pipelines 3） + S5 10 + S6 0 + 跨接缝 1 = 79。
 
-## 4. fixture 枚举（116；接缝分布 S1:3 / S2:16 / S3:18 / S4:70 / S5:9）
+## 4. fixture 枚举（119；接缝分布 S1:3 / S2:16 / S3:18 / S4:73 / S5:9）
 
 | # | 文件 | 接缝 | 类别 | 行为锚 |
 |---|---|---|---|---|
@@ -176,14 +179,19 @@
 | 114 | `events_job_started_bad_extension.json` | S4 | 反例·schema 级（additionalProperties:false，T-C1-076） | test_schema_lock.py::TestSchemaLevelLockDiff::test_schema_level_negative_fails_schema_and_decode |
 | 115 | `events_job_started_missing_field.json` | S4 | 反例·schema 级（required，T-C1-076） | test_schema_lock.py::TestSchemaLevelLockDiff::test_schema_level_negative_fails_schema_and_decode |
 | 116 | `events_job_started_valid.json` | S4 | 正例（T-C1-076） | test_schema_lock.py::TestPositiveLockDiff::test_positive_fixture_passes_schema_and_decodes |
+| 117 | `pipelines_bad_extension.json` | S4 | 反例·schema 级（additionalProperties:false，T-C1-077） | test_schema_lock.py::TestPipelineSpecLockDiff::test_pipeline_spec_fixture_locks_the_wire_shape |
+| 118 | `pipelines_missing_field.json` | S4 | 反例·schema 级（required，T-C1-077） | test_schema_lock.py::TestPipelineSpecLockDiff::test_pipeline_spec_fixture_locks_the_wire_shape |
+| 119 | `pipelines_valid.json` | S4 | 正例（T-C1-077） | test_pipelines.py::TestStructuralLayer::test_valid_fixture_loads_and_passes_the_semantic_gate + test_schema_lock.py::TestPipelineSpecLockDiff::test_pipeline_spec_fixture_locks_the_wire_shape |
 
 ## 5. 反例分类与拒绝语义
 
 | 类别 | 数量 | 拒绝面（锚） |
 |---|---|---|
-| 正例 | 33 | 注册表 34 条定义（R1 2 + R2 15 + R3 permission 6 + R3 config v2 1 + R4 config v3 1 + skills 1——T-C1-052a + compaction 1——T-C1-060 + job 7——T-C1-076）；正例与其中 33 条一一对应（compaction / job 缺口即时闭合——T-C1-060 / T-C1-076），skills 定义 fixture 归 P2-S2 实现切片（§6.3 L366），为在册待闭合缺口；events.py L1033/L1041/L1065/L1082/L1094/L1106/L1119 + JOB L1348，`default_event_registry` L1359 |
-| 反例·schema 级 | 63 | bad_extension 32（envelope/typed data `extra="forbid"`，CORE-CONTRACTS §1 L20；+7 job，T-C1-076）+ missing_field 31（`required` 缺失拒绝；+1 context_compacted，T-C1-060；+7 job，T-C1-076） |
+| 正例 | 34 | 注册表 34 条定义（R1 2 + R2 15 + R3 permission 6 + R3 config v2 1 + R4 config v3 1 + skills 1——T-C1-052a + compaction 1——T-C1-060 + job 7——T-C1-076）；正例与其中 33 条一一对应（compaction / job 缺口即时闭合——T-C1-060 / T-C1-076）；+1 pipeline spec 正例（T-C1-077）非注册表事件面——锁 CORE-CONTRACTS §5.4 S2 spec wire 形状，不入 34 条定义对应账；skills 定义 fixture 归 P2-S2 实现切片（§6.3 L366），为在册待闭合缺口；events.py L1033/L1041/L1065/L1082/L1094/L1106/L1119 + JOB L1348，`default_event_registry` L1359 |
+| 反例·schema 级 | 65 | bad_extension 33（envelope/typed data `extra="forbid"`，CORE-CONTRACTS §1 L20；+7 job，T-C1-076；+1 pipeline，T-C1-077）+ missing_field 32（`required` 缺失拒绝；+1 context_compacted，T-C1-060；+7 job，T-C1-076；+1 pipeline，T-C1-077） |
 | 反例·行为级 | 20 | missing_run_id 15（`_require_run_metadata`，events.py L826）+ bad_run_id 1（同校验器 whenever-present 规则，T-C1-060：run-scoped 之外类型带非字符串 `metadata.run_id` 也拒）+ bad_hash 2（`_snapshot_hash_verified`，events.py L349）+ 注册表探针 2（`UnknownEventTypeError` L902 / `UnknownEventVersionError` L906；raise 于 L1001/L1002/L1011） |
+
+注（口径，T-B-092 MINOR-1）：本表与 §8 为**折叠口径**（34/65/20——pipeline spec 三元组按语义折入正例/schema 级）；消费面测试 `PINNED_COUNTS`（test_schema_lock.py）为**四桶口径**（events 33/63/20 + pipeline 3 = 119）。两口径总数一致，逐桶差恰为 pipeline 三件——对账勿以 34-vs-33 误读为漂移。
 
 ## 6. UNSUPPORTED_CAPABILITY 三面对账
 
@@ -211,9 +219,9 @@
 
 ## 8. 对账结论（零差异）
 
-1. **76 vs 65**：前版机械枚举 65 = grep 口径 55（53 R5-S4 时点 + T-C1-052a `SkillActivatedData` + T-C1-060 `ContextCompactedData`，class 行含 `BaseModel` 字样）+ 10 条子类声明行（`SessionCreatedDataV2` / `SessionCreatedDataV3` 与 8 个 `(*Chunk)` chunk 子类声明行无 `BaseModel` 字样）；T-C1-076 增量 +11 = events job 域 10 模型（`JobBudget` `JobLineage` `JobTrace` + 7 data）+ cards `JobCard` 1，65 + 11 = 76（新模块/新模型机械枚举导出）。两口径皆真、非契约缺陷；工件覆盖全 76。
-2. **116 fixture lock-diff**：工件 + 测试内置最小 JSON Schema 校验器（draft 2020-12 pydantic 发射子集）重放全部 116 个 fixture，分类 33 正例 / 63 schema 级 / 20 行为级与消费面测试语义一致，零差异（+21 = py.job.* 七类三元组随参数化位自然扩容，T-C1-076）。
-3. **33 正例 ↔ 34 注册表定义**：33 条已注册定义与正例一一对应（含 T-C1-060 compaction、T-C1-076 job 七定义，缺口即时闭合）；+1 skills 定义（T-C1-052a）fixture 归 P2-S2（§6.3 L366），缺口在册（§5）。
-4. **接缝分布闭合**：3 + 16 + 18 + 70 + 9 = 116；S6 零 fixture 属预期，S1 三件即 §2.4 压缩三元组、S4 增 21 件即 py.job.* 七类三元组（T-C1-076）（§2 注）。
+1. **76 vs 65**：前版机械枚举 65 = grep 口径 55（53 R5-S4 时点 + T-C1-052a `SkillActivatedData` + T-C1-060 `ContextCompactedData`，class 行含 `BaseModel` 字样）+ 10 条子类声明行（`SessionCreatedDataV2` / `SessionCreatedDataV3` 与 8 个 `(*Chunk)` chunk 子类声明行无 `BaseModel` 字样）；T-C1-076 增量 +11 = events job 域 10 模型（`JobBudget` `JobLineage` `JobTrace` + 7 data）+ cards `JobCard` 1，65 + 11 = 76（新模块/新模型机械枚举导出）。两口径皆真、非契约缺陷；T-C1-077 增量 +3 = 新 pipelines 模块（`PipelineEdge` `PipelineNode` `PipelineSpec`），76 + 3 = 79；工件覆盖全 79。
+2. **119 fixture lock-diff**：工件 + 测试内置最小 JSON Schema 校验器（draft 2020-12 pydantic 发射子集）重放全部 119 个 fixture，分类 34 正例 / 65 schema 级 / 20 行为级与消费面测试语义一致，零差异（+21 = py.job.* 七类三元组随参数化位自然扩容，T-C1-076；+3 = pipeline spec 三元组，`TestPipelineSpecLockDiff` 承载，T-C1-077）。口径注（T-B-092 MINOR-1）：本条与 §5 为折叠口径（34/65/20），消费面 `PINNED_COUNTS` 为四桶（events 33/63/20 + pipeline 3 = 119），逐桶差恰为 pipeline 三件。
+3. **33 正例 ↔ 34 注册表定义**：33 条已注册定义与正例一一对应（含 T-C1-060 compaction、T-C1-076 job 七定义，缺口即时闭合）；+1 skills 定义（T-C1-052a）fixture 归 P2-S2（§6.3 L366），缺口在册（§5）；+1 pipeline spec 正例（T-C1-077）非注册表事件面，不入本对应账（CORE-CONTRACTS §5.4 S2 spec wire）。
+4. **接缝分布闭合**：3 + 16 + 18 + 73 + 9 = 119；S6 零 fixture 属预期，S1 三件即 §2.4 压缩三元组、S4 增 21 件即 py.job.* 七类三元组（T-C1-076）、再增 3 件即 pipeline spec 三元组（T-C1-077）（§2 注）。
 
 ——生成/锁定/测试执行细节与门禁数字见 `doc/orchestration/progress/T-C1-045.md`。

@@ -46,25 +46,31 @@ from opencode.contracts.events import (
     default_event_registry,
     versioned_type,
 )
+from opencode.contracts.pipelines import PipelineSpec
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ENVELOPE_ARTIFACT = SCHEMA_DIR / "event-envelopes.json"
+PIPELINES_ARTIFACT = SCHEMA_DIR / "pipelines.json"
 
 #: Pinned census (doc/reference/r5-fixture-inventory.md closes the same counts):
 #: 33 positive, 63 schema-level negatives, 20 behavior-level negatives
 #: (15 missing run_id + 1 bad run_id + 2 bad snapshot hash + 2 registry probes;
 #: the compaction trio lands the py.context.compacted faces at T-C1-060; the
 #: py.job.* septet lands the jobs family at T-C1-076: +7 valid +7 missing_field
-#: +7 bad_extension).
-PINNED_TOTAL = 116
-PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20}
+#: +7 bad_extension), plus the pipeline-spec trio at T-C1-077 (+1 valid
+#: +1 missing_field +1 bad_extension, classified "pipeline-spec" -- pipeline
+#: specs lock against pipelines.json, not the event-envelope face).
+PINNED_TOTAL = 119
+PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20, "pipeline-spec": 3}
 
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
 #: misses 10 subclass-only declarations -- both counts are reconciled in the
 #: inventory, the artifact covers all 65 actual pydantic models, +1
 #: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060, +10
-#: jobs-family models at T-C1-076; cards.json opens with its 1 model).
+#: jobs-family models at T-C1-076; cards.json opens with its 1 model; the
+#: pipelines trio (+PipelineNode/PipelineEdge/PipelineSpec) at T-C1-077 opens
+#: pipelines.json with its 3 models).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
     "events.json": 46,
@@ -72,6 +78,7 @@ PINNED_MODEL_COUNTS = {
     "messages.json": 8,
     "tools.json": 3,
     "cards.json": 1,
+    "pipelines.json": 3,
 }
 PINNED_DURABLE_KEYS = 30
 PINNED_EPHEMERAL_KEYS = 4
@@ -89,7 +96,15 @@ def _load_fixture(name: str) -> dict[str, Any]:
 
 
 def _classify(name: str) -> str:
-    """The pinned negative-classification map (T-C1-045 task 2b): suffix families."""
+    """The pinned negative-classification map (T-C1-045 task 2b): suffix families.
+
+    The pipeline-spec trio (T-C1-077) is its own bucket: those fixtures lock the
+    pipeline ``graph.json`` wire shape against the pipelines.json artifact and
+    the ``PipelineSpec`` model, not the event-envelope face (so they must not
+    enter the envelope lock-diff classes despite their familiar suffixes).
+    """
+    if name.startswith("pipelines_"):
+        return "pipeline-spec"
     if name.endswith("_valid.json"):
         return "positive"
     if name.endswith("_bad_extension.json") or name.endswith("_missing_field.json"):
@@ -104,6 +119,11 @@ def _classify(name: str) -> str:
 @functools.cache
 def _envelope_document() -> dict[str, Any]:
     return json.loads(ENVELOPE_ARTIFACT.read_text(encoding="utf-8"))
+
+
+@functools.cache
+def _pipeline_document() -> dict[str, Any]:
+    return json.loads(PIPELINES_ARTIFACT.read_text(encoding="utf-8"))
 
 
 @functools.cache
@@ -293,7 +313,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (76 models; see the inventory)."""
+    """The artifacts enumerate the full model face (79 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
@@ -313,7 +333,8 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 116-file closure (Done L16 + the T-C1-076 jobs septet) and the pinned classification mix."""
+    """The 119-file closure (116 event-face fixtures + the T-C1-077 pipeline trio)
+    and the pinned classification mix."""
 
     def test_fixture_directory_is_exactly_the_pinned_files(self) -> None:
         assert len(FIXTURE_FILES) == PINNED_TOTAL
@@ -363,6 +384,43 @@ class TestBehaviorLevelLockDiff:
         _validate(schema, raw, schema, "$")
         with pytest.raises(_expected_rejection(fixture_name)):
             _decode(raw)
+
+
+class TestPipelineSpecLockDiff:
+    """The pipeline-spec trio (T-C1-077) locks against the committed pipelines.json
+    artifact: the valid spec passes the ``PipelineSpec`` JSON Schema and decodes
+    through the model; both negatives (a missing required field, an unknown node
+    field) are rejected by the JSON Schema itself and by the model decode path
+    -- the schema/behavior split for the engine-input face. Semantic-layer
+    rejections (the llm_call tier/template rule, topology, the unimplemented
+    node types) live in test_pipelines.py: they parse structurally by design."""
+
+    @pytest.mark.parametrize("fixture_name", [n for n in FIXTURE_FILES if _classify(n) == "pipeline-spec"])
+    def test_pipeline_spec_fixture_locks_the_wire_shape(self, fixture_name: str) -> None:
+        raw = _load_fixture(fixture_name)
+        document = _pipeline_document()
+        schema = document["models"]["PipelineSpec"]
+        if fixture_name.endswith("_valid.json"):
+            _validate(schema, raw, schema, "$")
+            spec = PipelineSpec.model_validate(raw)
+            assert spec.pipeline_id == raw["pipeline_id"]
+            assert [node.node_id for node in spec.nodes] == [node["node_id"] for node in raw["nodes"]]
+        else:
+            with pytest.raises(_SchemaRejected):
+                _validate(schema, raw, schema, "$")
+            with pytest.raises(ValidationError):
+                PipelineSpec.model_validate(raw)
+
+    def test_pipelines_artifact_covers_the_node_type_closed_set(self) -> None:
+        document = _pipeline_document()
+        enum = document["models"]["PipelineNode"]["properties"]["node_type"]["enum"]
+        assert tuple(enum) == (
+            "llm_call",
+            "opencode_agent",
+            "tool",
+            "human_gate",
+            "subworkflow",
+        )
 
 
 class TestRegistryRejections:

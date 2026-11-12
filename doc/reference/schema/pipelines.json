@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "models": {
+    "PipelineEdge": {
+      "additionalProperties": false,
+      "description": "One spec edge: a plain sequential/conditional topology edge (v1: from -> to).\n\nConditions land with conditional routing; v1's wire face carries the two\nendpoints only (CORE-CONTRACTS §8: no same-version optional-field growth).",
+      "properties": {
+        "from_node": {
+          "minLength": 1,
+          "title": "From Node",
+          "type": "string"
+        },
+        "to_node": {
+          "minLength": 1,
+          "title": "To Node",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_node",
+        "to_node"
+      ],
+      "title": "PipelineEdge",
+      "type": "object"
+    },
+    "PipelineNode": {
+      "additionalProperties": false,
+      "description": "One spec node: identity + closed-set type + the per-type constraint fields.\n\nThe per-type fields (``model``/``prompt_template`` for ``llm_call``,\n``command``/``tool_ref`` for ``tool``, ``depth`` for ``subworkflow``) are\n*optional on the wire*: whether a node of a given type carries the right\nones is a semantic-layer rule, so a spec with an ``llm_call`` node missing\nits model tier parses here and is rejected by the engine's semantic gate\nwith a structured error (CORE-CONTRACTS §8 shape) -- the layered-gate\ncontract tests pin that split.",
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "depth": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Depth"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "node_id": {
+          "minLength": 1,
+          "title": "Node Id",
+          "type": "string"
+        },
+        "node_type": {
+          "enum": [
+            "llm_call",
+            "opencode_agent",
+            "tool",
+            "human_gate",
+            "subworkflow"
+          ],
+          "title": "Node Type",
+          "type": "string"
+        },
+        "prompt_template": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Template"
+        },
+        "tool_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Ref"
+        },
+        "workflow_ref": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workflow Ref"
+        }
+      },
+      "required": [
+        "node_id",
+        "node_type"
+      ],
+      "title": "PipelineNode",
+      "type": "object"
+    },
+    "PipelineSpec": {
+      "$defs": {
+        "PipelineEdge": {
+          "additionalProperties": false,
+          "description": "One spec edge: a plain sequential/conditional topology edge (v1: from -> to).\n\nConditions land with conditional routing; v1's wire face carries the two\nendpoints only (CORE-CONTRACTS §8: no same-version optional-field growth).",
+          "properties": {
+            "from_node": {
+              "minLength": 1,
+              "title": "From Node",
+              "type": "string"
+            },
+            "to_node": {
+              "minLength": 1,
+              "title": "To Node",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_node",
+            "to_node"
+          ],
+          "title": "PipelineEdge",
+          "type": "object"
+        },
+        "PipelineNode": {
+          "additionalProperties": false,
+          "description": "One spec node: identity + closed-set type + the per-type constraint fields.\n\nThe per-type fields (``model``/``prompt_template`` for ``llm_call``,\n``command``/``tool_ref`` for ``tool``, ``depth`` for ``subworkflow``) are\n*optional on the wire*: whether a node of a given type carries the right\nones is a semantic-layer rule, so a spec with an ``llm_call`` node missing\nits model tier parses here and is rejected by the engine's semantic gate\nwith a structured error (CORE-CONTRACTS §8 shape) -- the layered-gate\ncontract tests pin that split.",
+          "properties": {
+            "command": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Command"
+            },
+            "depth": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Depth"
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Model"
+            },
+            "node_id": {
+              "minLength": 1,
+              "title": "Node Id",
+              "type": "string"
+            },
+            "node_type": {
+              "enum": [
+                "llm_call",
+                "opencode_agent",
+                "tool",
+                "human_gate",
+                "subworkflow"
+              ],
+              "title": "Node Type",
+              "type": "string"
+            },
+            "prompt_template": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Prompt Template"
+            },
+            "tool_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool Ref"
+            },
+            "workflow_ref": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Workflow Ref"
+            }
+          },
+          "required": [
+            "node_id",
+            "node_type"
+          ],
+          "title": "PipelineNode",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One registered pipeline (the ``graph.json`` wire shape, PHASE3 §5.2).\n\n``schema_version`` is the registered-pipeline validation field (§5.1):\nthe engine loads specs at v1 only. ``entry`` is the single entry node id;\nthe semantic gate enforces that it exists, is unique (no incoming edges)\nand that no node is orphaned from it.",
+      "properties": {
+        "edges": {
+          "items": {
+            "$ref": "#/$defs/PipelineEdge"
+          },
+          "title": "Edges",
+          "type": "array"
+        },
+        "entry": {
+          "minLength": 1,
+          "title": "Entry",
+          "type": "string"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/PipelineNode"
+          },
+          "minItems": 1,
+          "title": "Nodes",
+          "type": "array"
+        },
+        "pipeline_id": {
+          "minLength": 1,
+          "title": "Pipeline Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version",
+        "pipeline_id",
+        "entry",
+        "nodes"
+      ],
+      "title": "PipelineSpec",
+      "type": "object"
+    }
+  },
+  "module": "opencode.contracts.pipelines",
+  "title": "opencode.contracts.pipelines: unified JSON Schema (R5-S4, CORE-CONTRACTS section 1 L17)"
+}
