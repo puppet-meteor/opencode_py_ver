@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -89,11 +90,13 @@ from opencode.contracts.events import (
     JobTrace,
 )
 from opencode.contracts.messages import JsonObject, JsonValue
+from opencode.contracts.pipelines import MAX_SUBWORKFLOW_DEPTH, PipelineSpec
 from opencode.session.service import AscendingIds, Clock, IdFactory
 from opencode.storage.jobs_store import JobRecord, JobsReadRepository, JobsStore, job_stream_key
 from opencode.storage.repos import NotFoundError
 from opencode.storage.store import EventBatch
 from opencode.storage.txn import StoreValidationError, epoch_ms, from_epoch_ms
+from opencode.tools.invoker import validate_input_strict, validate_schema_supported
 
 #: The §8 restart-recovery scan set (non-terminal statuses).
 NON_TERMINAL_STATUSES: frozenset[str] = frozenset({"created", "running", "stalled", "gated"})
@@ -109,6 +112,74 @@ def compute_params_hash(params: JsonObject) -> str:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+# -- P3-S4 (T-C1-079): the submit-face params gate ----------------------------
+
+#: The strict default params schema when a pipeline declares none: the empty
+#: object only. Fail-closed reading of "unknown fields are rejected"
+#: (PHASE3 §1 condition 4): an undeclared params face accepts no fields at
+#: all, so a params-less pipeline still validates zero-model and strictly.
+_EMPTY_PARAMS_SCHEMA: JsonObject = {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": False,
+}
+
+
+class ParamsValidator(Protocol):
+    """The gateway params gate every wired submit passes through (T-C1-079 ⑥).
+
+    Zero-model strict JSON-Schema validation of ``params`` against the
+    pipeline's declared schema: a missing field, a type error or an unknown
+    field is a structured 4xx rejection (``StoreValidationError``), an
+    unregistered pipeline a ``NotFoundError``. One shared instance serves the
+    brain submit (``workflow__run``) and the future S5b router; it is injected
+    into :class:`JobService` as a seam so S1/S2 direct-submit callers (no
+    validator wired) keep their structural-only face unchanged.
+    """
+
+    def __call__(self, pipeline_id: str, params: JsonObject) -> None: ...
+
+
+class SpecParamsValidator:
+    """The concrete gate over a registered-pipeline lookup seam.
+
+    ``lookup`` resolves a pipeline id to its registered :class:`PipelineSpec`
+    (None = never registered -> NotFound). The declared ``params_schema`` must
+    stay inside the strict validator's supported subset
+    (:func:`opencode.tools.invoker.validate_schema_supported` -- the same
+    subset the tool registry enforces at registration): a spec outside the
+    subset is surfaced here fail-closed as a ValidationError rather than an
+    invoke-time surprise. A spec without ``params_schema`` validates against
+    the empty-object default above (only ``{}`` is legal).
+    """
+
+    def __init__(self, lookup: Callable[[str], PipelineSpec | None]) -> None:
+        self._lookup = lookup
+
+    def __call__(self, pipeline_id: str, params: JsonObject) -> None:
+        spec = self._lookup(pipeline_id)
+        if spec is None:
+            raise NotFoundError(
+                f"pipeline {pipeline_id!r} is not registered",
+                details={"pipeline_id": pipeline_id},
+            )
+        schema = spec.params_schema if spec.params_schema is not None else _EMPTY_PARAMS_SCHEMA
+        try:
+            validate_schema_supported(schema, root=True)
+        except ValueError as error:
+            raise StoreValidationError(
+                f"pipeline {pipeline_id!r} declares a params schema outside the strict subset: {error}",
+                details={"pipeline_id": pipeline_id},
+            ) from error
+        issues = validate_input_strict(schema, params)
+        if issues:
+            raise StoreValidationError(
+                f"params for pipeline {pipeline_id!r} failed strict validation: {'; '.join(issues)}",
+                details={"pipeline_id": pipeline_id, "issues": list(issues)},
+            )
 
 
 class JobStatus(enum.Enum):
@@ -552,6 +623,7 @@ class JobService:
         bus: VolatileBus | None = None,
         ids: IdFactory | None = None,
         clock: Clock | None = None,
+        params_validator: ParamsValidator | None = None,
     ) -> None:
         self._store = store
         self._repos = repos
@@ -559,6 +631,7 @@ class JobService:
         self._bus = bus
         self._ids = ids if ids is not None else AscendingIds(clock)
         self._clock = clock if clock is not None else _utc_now
+        self._params_validator = params_validator
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -619,12 +692,19 @@ class JobService:
         *,
         depth: int = 0,
         budget: JobBudget | None = None,
+        lineage: JobLineage | None = None,
     ) -> JobHandle:
         """Submit one job: ``created`` + ``spec_bound`` atomically, before any execution.
 
         Structural validation only in S1 (non-empty pipeline_id, JSON-object
         params, anchor ``"api"`` or ``^ses_``); validating params against the
         pipeline's JSON Schema needs spec loading and lands in S2 (progress ①).
+        P3-S4 (T-C1-079) adds the two gateway faces: the injected params
+        validator (zero-model strict JSON-Schema validation over the
+        registered spec, PHASE3 §1 condition 4 -- shared by the brain submit
+        and the future S5b router) and the M-9 lineage/depth recursion guard
+        (``lineage`` declares the submission's parent/origin explicitly; None
+        keeps the S1 derived face).
         """
         if not isinstance(pipeline_id, str) or not pipeline_id:
             raise StoreValidationError("pipeline_id must be a non-empty string")
@@ -632,11 +712,21 @@ class JobService:
             raise StoreValidationError("params must be a JSON object")
         if not isinstance(session_anchor, str) or (session_anchor != "api" and not session_anchor.startswith("ses_")):
             raise StoreValidationError("session_anchor must be 'api' or a ses_-prefixed session id")
+        if self._params_validator is not None:
+            self._params_validator(pipeline_id, params)
+        if lineage is None:
+            resolved: JobLineage = JobLineage(
+                parent_job_id=None,
+                session_id=None if session_anchor == "api" else session_anchor,
+                origin="api" if session_anchor == "api" else "session",
+            )
+        else:
+            await self._check_lineage(lineage, depth, session_anchor)
+            resolved = lineage
         job_id = self._mint("job")
         stream_key = job_stream_key(job_id)
         trace_id = self._mint("trc")
         now = self._clock()
-        origin: Literal["api", "session"] = "api" if session_anchor == "api" else "session"
         created = self._draft(
             stream_key,
             PY_JOB_CREATED,
@@ -644,11 +734,7 @@ class JobService:
                 job_id=job_id,
                 pipeline_id=pipeline_id,
                 depth=depth,
-                lineage=JobLineage(
-                    parent_job_id=None,
-                    session_id=None if session_anchor == "api" else session_anchor,
-                    origin=origin,
-                ),
+                lineage=resolved,
                 budget=budget if budget is not None else JobBudget(),
                 trace=JobTrace(trace_id=trace_id, span_id=self._mint("spn"), parent_id=None, depth=0),
             ),
@@ -668,6 +754,73 @@ class JobService:
         )
         await self._commit(job_id, [created, spec_bound])
         return JobHandle(service=self, job_id=job_id)
+
+    # -- P3-S4 (T-C1-079): the M-9 lineage/depth recursion guard ----------------
+
+    async def _check_lineage(self, lineage: JobLineage, depth: int, session_anchor: str) -> None:
+        """Reject recursive/illegal submissions before any event is drafted (M-9).
+
+        The gateway's first line (PHASE3 §5.2): a worker identity never
+        submits (``origin == "worker"`` is the workers' reserved channel), the
+        declared lineage must agree with the anchor, the ancestor chain must
+        exist and stay within the cap, and ``depth <= 3`` is the second line
+        behind the spec-side hard cap. Every rejection is a structured 4xx
+        (``StoreValidationError``; a missing ancestor surfaces the read
+        repository's ``NotFoundError``).
+        """
+        if lineage.origin == "worker":
+            raise StoreValidationError(
+                "worker-identity job submission is rejected (M-9 recursion guard)",
+                details={"origin": "worker"},
+            )
+        if lineage.origin == "api" and session_anchor != "api":
+            raise StoreValidationError(
+                "lineage origin 'api' requires session_anchor 'api'",
+                details={"origin": "api", "session_anchor": session_anchor},
+            )
+        if lineage.origin == "session" and (
+            session_anchor == "api" or (lineage.session_id is not None and lineage.session_id != session_anchor)
+        ):
+            raise StoreValidationError(
+                "lineage origin 'session' requires a matching ses_-prefixed session_anchor",
+                details={"origin": "session", "session_anchor": session_anchor},
+            )
+        if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
+            raise StoreValidationError("depth must be a non-negative integer")
+        if depth > MAX_SUBWORKFLOW_DEPTH:
+            raise StoreValidationError(
+                f"workflow nesting depth {depth} exceeds the hard cap {MAX_SUBWORKFLOW_DEPTH} (M-9 second line)",
+                details={"depth": depth, "max_depth": MAX_SUBWORKFLOW_DEPTH},
+            )
+        if lineage.parent_job_id is None:
+            if depth != 0:
+                raise StoreValidationError(
+                    "a root submission (no parent job) must carry depth 0",
+                    details={"depth": depth},
+                )
+            return
+        # The ancestor walk: every ancestor must exist (NotFoundError on a
+        # dangling parent_job_id) and the chain must stay within the cap.
+        chain: list[str] = []
+        parent_id: str | None = lineage.parent_job_id
+        parent_depth: int | None = None
+        while parent_id is not None:
+            record = await self.get_job(parent_id)
+            chain.append(record.job_id)
+            if parent_depth is None:
+                parent_depth = record.depth
+            raw_parent = (record.lineage or {}).get("parent_job_id")
+            parent_id = raw_parent if isinstance(raw_parent, str) else None
+        if len(chain) > MAX_SUBWORKFLOW_DEPTH:
+            raise StoreValidationError(
+                f"the ancestor chain length {len(chain)} exceeds the cap {MAX_SUBWORKFLOW_DEPTH} (M-9)",
+                details={"chain_length": len(chain), "max_depth": MAX_SUBWORKFLOW_DEPTH},
+            )
+        if parent_depth is None or depth != parent_depth + 1:
+            raise StoreValidationError(
+                "lineage depth must equal the parent job's depth + 1",
+                details={"depth": depth, "parent_depth": parent_depth},
+            )
 
     # -- reads ----------------------------------------------------------------
 

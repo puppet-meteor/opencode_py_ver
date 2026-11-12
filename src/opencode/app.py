@@ -41,9 +41,11 @@ from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
 from opencode.contracts.events import DurableEvent, McpServerRef
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
+from opencode.contracts.pipelines import PipelineSpec
 from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdapter
+from opencode.orchestrator.brain_driver import BrainDriver
 from opencode.orchestrator.engine import PipelineEngine
-from opencode.orchestrator.jobs import FakeJobExecutor, JobService, JobsProjector
+from opencode.orchestrator.jobs import FakeJobExecutor, JobService, JobsProjector, SpecParamsValidator
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
 from opencode.session.llm_summarizer import ProviderSummarizer
@@ -69,6 +71,7 @@ from opencode.tools.policy import (
     PermissionRule,
 )
 from opencode.tools.registry import ToolAdapter, mcp_tool_spec
+from opencode.tools.workflow import WorkflowRunAdapter, WorkflowStatusAdapter
 
 
 class _ProviderHandle(Protocol):
@@ -164,9 +167,17 @@ class App:
         mcp_refs: Sequence[McpServerRef] | None = None,
         sweep_roots: Sequence[str | Path] | None = None,
         pipeline_engine: PipelineEngine | None = None,
+        workflow_tools: bool = False,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
+        # P3-S4 (T-C1-079): the workflow tools and the brain driver are the
+        # provider composition's faces -- they register into the brain's
+        # single ToolRegistry and drive its session runner. Wiring them
+        # without a provider is a composition defect (fail closed, never a
+        # silent no-op registry).
+        if workflow_tools and provider is None:
+            raise StoreValidationError("workflow_tools=True requires the provider composition (provider + settings)")
         self._database = open_database(db_path, mode=mode)
         self._bus = bus if bus is not None else VolatileBus()
         engine = self._database.engine
@@ -283,6 +294,21 @@ class App:
         # engine itself injectable as the ``JobCheckpointReader`` (its
         # advisory-cursor read face).
         self._pipeline_engine = pipeline_engine
+
+        # P3-S4 (T-C1-079): the shared gateway params validator over the
+        # engine's registered specs -- zero-model strict JSON-Schema
+        # validation (PHASE3 §1 condition 4) that the brain's workflow__run
+        # submit and the future S5b router consume as ONE instance. Without
+        # an engine the lookup is the empty face (every pipeline id is
+        # "not registered" -- fail closed, same verdict the engine-bound
+        # lookup gives an unknown id).
+        def _spec_of(pipeline_id: str) -> PipelineSpec | None:
+            bound = pipeline_engine.bound(pipeline_id) if pipeline_engine is not None else None
+            return bound.spec if bound is not None else None
+
+        params_validator: SpecParamsValidator | None = None
+        if workflow_tools:
+            params_validator = SpecParamsValidator(lookup=_spec_of)
         self._jobs = JobService(
             store=JobsStore(engine, projector=JobsProjector()),
             repos=JobsReadRepository(engine),
@@ -290,7 +316,22 @@ class App:
             bus=self._bus,
             ids=shared_ids,
             clock=clock,
+            params_validator=params_validator,
         )
+        # The registration-isolation face (C#5): the workflow tools are
+        # injected ONLY into the main brain's ToolRegistry (this single
+        # registry); worker catalogs (S3) build their own builtin-only
+        # registries and never see workflow__run. The brain driver shares
+        # the same service + engine + bus.
+        self._brain: BrainDriver | None = None
+        if workflow_tools:
+            assert registry is not None  # the provider check above guarantees it
+            registry.register(WorkflowRunAdapter(jobs=self._jobs))
+            registry.register(WorkflowStatusAdapter(jobs=self._jobs))
+            self._brain = BrainDriver(
+                service=self._service,
+                log=EventLog(engine, repos=repos, bus=self._bus),
+            )
 
     @property
     def database(self) -> Database:
@@ -326,6 +367,21 @@ class App:
     def pipeline_engine(self) -> PipelineEngine | None:
         """The P3-S2 pipeline engine when wired (None keeps the S1 fake executor)."""
         return self._pipeline_engine
+
+    @property
+    def registry(self) -> ToolRegistry | None:
+        """The provider composition's single tool registry (None without a provider).
+
+        P3-S4 (T-C1-079) registers the workflow tools into exactly this
+        instance -- the main brain's registry; worker catalogs are separate
+        builtin-only registries and never see them.
+        """
+        return self._registry
+
+    @property
+    def brain(self) -> BrainDriver | None:
+        """The P3-S4 main-brain driver (None unless ``workflow_tools=True``)."""
+        return self._brain
 
     async def start_mcp_servers(self) -> tuple[tuple[str, Exception], ...]:
         """P2-S0 (§6 L304): spawn, catalog and bind every configured stdio server.

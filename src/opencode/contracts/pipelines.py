@@ -31,6 +31,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from opencode.contracts.events import canonical_json
+from opencode.contracts.messages import JsonObject
 
 #: The closed v1 node-type set (PHASE3 §5.2). The wire contract recognizes all
 #: five names; S2 implements executors for the first two only -- the engine's
@@ -121,6 +122,15 @@ class PipelineSpec(BaseModel):
     entry: str = Field(min_length=1)
     nodes: list[PipelineNode] = Field(min_length=1)
     edges: list[PipelineEdge] = Field(default_factory=list)
+    #: The declared params face (P3-S4, T-C1-079): a JSON Schema (draft
+    #: 2020-12 subset) the gateway validates submitted params against with
+    #: zero model involvement (missing/type-error/unknown fields -> structured
+    #: 4xx, PHASE3 §1 condition 4). Optional on the wire: a spec without it
+    #: accepts the empty object only (fail-closed default, CORE-CONTRACTS
+    #: §5.4 S4). Whether a declared schema stays inside the strict subset the
+    #: gateway validator supports is a registration-time/submit-time gate,
+    #: not wire shape.
+    params_schema: JsonObject | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod

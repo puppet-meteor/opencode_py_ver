@@ -59,9 +59,13 @@ PIPELINES_ARTIFACT = SCHEMA_DIR / "pipelines.json"
 #: py.job.* septet lands the jobs family at T-C1-076: +7 valid +7 missing_field
 #: +7 bad_extension), plus the pipeline-spec trio at T-C1-077 (+1 valid
 #: +1 missing_field +1 bad_extension, classified "pipeline-spec" -- pipeline
-#: specs lock against pipelines.json, not the event-envelope face).
-PINNED_TOTAL = 119
-PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20, "pipeline-spec": 3}
+#: specs lock against pipelines.json, not the event-envelope face), plus the
+#: params-schema pair at T-C1-079 (+1 valid with a declared params_schema
+#: +1 bad_schema where the JSON Schema itself rejects a non-object
+#: params_schema; the PipelineSpec wire face gained the params_schema field,
+#: so the pipelines.json artifact regenerated with it).
+PINNED_TOTAL = 121
+PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20, "pipeline-spec": 5}
 
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
@@ -333,8 +337,9 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 119-file closure (116 event-face fixtures + the T-C1-077 pipeline trio)
-    and the pinned classification mix."""
+    """The 121-file closure (116 event-face fixtures + the pipeline-spec five:
+    the T-C1-077 trio + the T-C1-079 params-schema pair) and the pinned
+    classification mix."""
 
     def test_fixture_directory_is_exactly_the_pinned_files(self) -> None:
         assert len(FIXTURE_FILES) == PINNED_TOTAL
@@ -387,13 +392,15 @@ class TestBehaviorLevelLockDiff:
 
 
 class TestPipelineSpecLockDiff:
-    """The pipeline-spec trio (T-C1-077) locks against the committed pipelines.json
-    artifact: the valid spec passes the ``PipelineSpec`` JSON Schema and decodes
-    through the model; both negatives (a missing required field, an unknown node
-    field) are rejected by the JSON Schema itself and by the model decode path
-    -- the schema/behavior split for the engine-input face. Semantic-layer
-    rejections (the llm_call tier/template rule, topology, the unimplemented
-    node types) live in test_pipelines.py: they parse structurally by design."""
+    """The pipeline-spec fixtures lock against the committed pipelines.json
+    artifact: the valid specs pass the ``PipelineSpec`` JSON Schema and decode
+    through the model; the negatives (a missing required field, an unknown node
+    field, a non-object params_schema) are rejected by the JSON Schema itself
+    and by the model decode path -- the schema/behavior split for the
+    engine-input face. Semantic-layer rejections (the llm_call tier/template
+    rule, topology, the unimplemented node types, a params_schema outside the
+    strict validator subset) live in test_pipelines.py / the gateway validator:
+    they parse structurally by design."""
 
     @pytest.mark.parametrize("fixture_name", [n for n in FIXTURE_FILES if _classify(n) == "pipeline-spec"])
     def test_pipeline_spec_fixture_locks_the_wire_shape(self, fixture_name: str) -> None:

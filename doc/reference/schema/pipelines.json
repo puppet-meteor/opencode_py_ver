@@ -133,6 +133,13 @@
     },
     "PipelineSpec": {
       "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
         "PipelineEdge": {
           "additionalProperties": false,
           "description": "One spec edge: a plain sequential/conditional topology edge (v1: from -> to).\n\nConditions land with conditional routing; v1's wire face carries the two\nendpoints only (CORE-CONTRACTS §8: no same-version optional-field growth).",
@@ -286,6 +293,17 @@
           "minItems": 1,
           "title": "Nodes",
           "type": "array"
+        },
+        "params_schema": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "pipeline_id": {
           "minLength": 1,
