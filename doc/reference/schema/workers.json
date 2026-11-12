@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "models": {
+    "WorkerReturn": {
+      "additionalProperties": false,
+      "description": "The structured return a worker must emit as its final stdout marker.\n\nThe manager parses the *last* ``[final] `` line on worker stdout, strips\nthe display-escaping the CLI applies, ``json.loads`` the single line, and\nvalidates it here. Any failure on that chain is a ``WorkerError`` -- the\nnode fails closed; there is no best-effort fallback to raw text.",
+      "properties": {
+        "artifacts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "files_changed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files Changed",
+          "type": "array"
+        },
+        "schema_version": {
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "summary": {
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "tests_passed": {
+          "title": "Tests Passed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_version",
+        "summary",
+        "tests_passed"
+      ],
+      "title": "WorkerReturn",
+      "type": "object"
+    }
+  },
+  "module": "opencode.contracts.workers",
+  "title": "opencode.contracts.workers: unified JSON Schema (R5-S4, CORE-CONTRACTS section 1 L17)"
+}

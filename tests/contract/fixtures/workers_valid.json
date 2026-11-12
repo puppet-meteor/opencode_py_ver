@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "summary": "Implemented the task brief; the acceptance checks pass.",
+  "files_changed": [
+    "src/feature.py"
+  ],
+  "artifacts": [
+    "reports/feature.md"
+  ],
+  "tests_passed": true
+}

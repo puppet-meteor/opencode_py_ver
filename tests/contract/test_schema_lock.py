@@ -47,10 +47,12 @@ from opencode.contracts.events import (
     versioned_type,
 )
 from opencode.contracts.pipelines import PipelineSpec
+from opencode.contracts.workers import WorkerReturn
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ENVELOPE_ARTIFACT = SCHEMA_DIR / "event-envelopes.json"
 PIPELINES_ARTIFACT = SCHEMA_DIR / "pipelines.json"
+WORKERS_ARTIFACT = SCHEMA_DIR / "workers.json"
 
 #: Pinned census (doc/reference/r5-fixture-inventory.md closes the same counts):
 #: 33 positive, 63 schema-level negatives, 20 behavior-level negatives
@@ -63,9 +65,18 @@ PIPELINES_ARTIFACT = SCHEMA_DIR / "pipelines.json"
 #: params-schema pair at T-C1-079 (+1 valid with a declared params_schema
 #: +1 bad_schema where the JSON Schema itself rejects a non-object
 #: params_schema; the PipelineSpec wire face gained the params_schema field,
-#: so the pipelines.json artifact regenerated with it).
-PINNED_TOTAL = 121
-PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20, "pipeline-spec": 5}
+#: so the pipelines.json artifact regenerated with it). The worker-return
+#: trio at T-C1-078 is its own bucket too (+1 valid +1 missing_field
+#: +1 bad_extension, classified "worker-return" -- worker returns lock
+#: against workers.json).
+PINNED_TOTAL = 124
+PINNED_COUNTS = {
+    "positive": 33,
+    "schema-level": 63,
+    "behavior-level": 20,
+    "pipeline-spec": 5,
+    "worker-return": 3,
+}
 
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
@@ -73,8 +84,8 @@ PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20, "pipe
 #: inventory, the artifact covers all 65 actual pydantic models, +1
 #: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060, +10
 #: jobs-family models at T-C1-076; cards.json opens with its 1 model; the
-#: pipelines trio (+PipelineNode/PipelineEdge/PipelineSpec) at T-C1-077 opens
-#: pipelines.json with its 3 models).
+#: pipelines.json with its 3 models; the worker trio (+WorkerReturn) at
+#: T-C1-078 opens workers.json with its 1 model).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
     "events.json": 46,
@@ -83,6 +94,7 @@ PINNED_MODEL_COUNTS = {
     "tools.json": 3,
     "cards.json": 1,
     "pipelines.json": 3,
+    "workers.json": 1,
 }
 PINNED_DURABLE_KEYS = 30
 PINNED_EPHEMERAL_KEYS = 4
@@ -105,10 +117,15 @@ def _classify(name: str) -> str:
     The pipeline-spec trio (T-C1-077) is its own bucket: those fixtures lock the
     pipeline ``graph.json`` wire shape against the pipelines.json artifact and
     the ``PipelineSpec`` model, not the event-envelope face (so they must not
-    enter the envelope lock-diff classes despite their familiar suffixes).
+    enter the envelope lock-diff classes despite their familiar suffixes). The
+    worker-return trio (T-C1-078) is its own bucket for the same reason: it
+    locks the worker structured-return shape against workers.json and the
+    ``WorkerReturn`` model.
     """
     if name.startswith("pipelines_"):
         return "pipeline-spec"
+    if name.startswith("workers_"):
+        return "worker-return"
     if name.endswith("_valid.json"):
         return "positive"
     if name.endswith("_bad_extension.json") or name.endswith("_missing_field.json"):
@@ -128,6 +145,11 @@ def _envelope_document() -> dict[str, Any]:
 @functools.cache
 def _pipeline_document() -> dict[str, Any]:
     return json.loads(PIPELINES_ARTIFACT.read_text(encoding="utf-8"))
+
+
+@functools.cache
+def _worker_document() -> dict[str, Any]:
+    return json.loads(WORKERS_ARTIFACT.read_text(encoding="utf-8"))
 
 
 @functools.cache
@@ -317,7 +339,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (79 models; see the inventory)."""
+    """The artifacts enumerate the full model face (80 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
@@ -337,9 +359,9 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 121-file closure (116 event-face fixtures + the pipeline-spec five:
-    the T-C1-077 trio + the T-C1-079 params-schema pair) and the pinned
-    classification mix."""
+    """The 124-file closure (116 event-face fixtures + the pipeline-spec five:
+    the T-C1-077 trio + the T-C1-079 params-schema pair, plus the T-C1-078
+    worker-return trio) and the pinned classification mix."""
 
     def test_fixture_directory_is_exactly_the_pinned_files(self) -> None:
         assert len(FIXTURE_FILES) == PINNED_TOTAL
@@ -428,6 +450,33 @@ class TestPipelineSpecLockDiff:
             "human_gate",
             "subworkflow",
         )
+
+
+class TestWorkerReturnLockDiff:
+    """The worker-return trio (T-C1-078) locks against the committed workers.json
+    artifact: the valid return passes the ``WorkerReturn`` JSON Schema and decodes
+    through the model; both negatives (a missing required field, an unknown
+    field) are rejected by the JSON Schema itself and by the model decode path.
+    Path-shape rejections (absolute/backslash/``..``/empty entries) and the
+    bool-before-int schema_version rule are behavior-level validators -- pydantic
+    field validators, not JSON Schema keywords -- pinned in test_workers.py (the
+    schema/behavior split for the worker output face)."""
+
+    @pytest.mark.parametrize("fixture_name", [n for n in FIXTURE_FILES if _classify(n) == "worker-return"])
+    def test_worker_return_fixture_locks_the_wire_shape(self, fixture_name: str) -> None:
+        raw = _load_fixture(fixture_name)
+        schema = _worker_document()["models"]["WorkerReturn"]
+        if fixture_name.endswith("_valid.json"):
+            _validate(schema, raw, schema, "$")
+            returned = WorkerReturn.model_validate(raw)
+            assert returned.summary == raw["summary"]
+            assert returned.files_changed == raw["files_changed"]
+            assert returned.artifacts == raw["artifacts"]
+        else:
+            with pytest.raises(_SchemaRejected):
+                _validate(schema, raw, schema, "$")
+            with pytest.raises(ValidationError):
+                WorkerReturn.model_validate(raw)
 
 
 class TestRegistryRejections:

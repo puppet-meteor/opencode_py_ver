@@ -25,7 +25,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from opencode.contracts import cards, errors, events, llm, messages, pipelines, tools
+from opencode.contracts import cards, errors, events, llm, messages, pipelines, tools, workers
 from opencode.contracts.events import (
     COMPACTION_EVENT_DEFINITIONS,
     JOB_EVENT_DEFINITIONS,
@@ -48,8 +48,9 @@ SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema"
 
 #: The wire modules whose pydantic models make up the unified schema face
 #: (P3-S1 adds ``opencode.contracts.cards``, the job-card rendering contract;
-#: P3-S2 adds ``opencode.contracts.pipelines``, the pipeline-spec wire contract).
-MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools, cards, pipelines)
+#: P3-S2 adds ``opencode.contracts.pipelines``, the pipeline-spec wire contract;
+#: P3-S3 adds ``opencode.contracts.workers``, the worker structured-return contract).
+MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools, cards, pipelines, workers)
 
 #: The public definition tuples ``default_event_registry()`` composes
 #: (events.py, re-anchored per family addition). Importing the tuples --

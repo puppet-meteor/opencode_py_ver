@@ -12,6 +12,7 @@ data preserved.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -20,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncConnection
 
-from opencode.contracts import EventDraft
+from opencode.contracts import DurableEvent, EventDraft
 from opencode.contracts.events import (
     PY_JOB_CREATED,
     PY_JOB_FINISHED,
@@ -41,7 +43,16 @@ from opencode.contracts.events import (
 from opencode.contracts.messages import JsonObject
 from opencode.orchestrator.jobs import JobsProjector, compute_params_hash
 from opencode.storage import open_database
-from opencode.storage.jobs_store import JobsReadRepository, JobsStore, job_stream_key
+from opencode.storage.jobs_store import (
+    REASON_JOBS_DUPLICATE_SEQ,
+    REASON_JOBS_ILLEGAL_SEQ,
+    REASON_JOBS_PROJECTION_INVARIANT,
+    REASON_JOBS_REPLAY_ILLEGAL_TRANSITION,
+    REASON_JOBS_SEQ_GAP,
+    JobsReadRepository,
+    JobsStore,
+    job_stream_key,
+)
 from opencode.storage.store import EventBatch
 from opencode.storage.txn import (
     ConflictError,
@@ -384,6 +395,150 @@ class TestCorruptionDetections:
         )
         with pytest.raises(StorageCorruptError):
             await store.commit(job_stream_key("job_l"), EventBatch(id="bat_l2", events=(started,)), 1)
+
+
+class TestDeepDefenseBranches:
+    """The S1-leftover fail-closed branches, directly driven (T-B-091 S-2; T-C1-078 ⑧).
+
+    The S1 suite covered the read-model-mismatch / missing-row / gap shapes at
+    commit time; these drive the remaining stored-log and rebuild defenses:
+    an illegal seq below 1 and a duplicate seq (a constraint-less damaged
+    schema -- unreachable under the live UNIQUE(session_id, seq)) at commit
+    time, the A=H+n projection invariant (a projector that folds nothing
+    must fail the commit and roll it back), and the rebuild-time trio -- a
+    replayed illegal transition, an undecodable log row, and a seq-run
+    violation.
+    """
+
+    async def test_stored_seq_below_one_fails_closed_at_commit(
+        self, jobs_stack: tuple[JobsStore, JobsReadRepository], tmp_path: Path
+    ) -> None:
+        store, _repos = jobs_stack
+        db_path = tmp_path / "jobs.db"
+        created, spec_bound = _submit_drafts("job_p1")
+        await store.commit(job_stream_key("job_p1"), EventBatch(id="bat_p1", events=(created, spec_bound)), 0)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE events SET seq = 0 WHERE seq = 1 AND session_id = ?", (job_stream_key("job_p1"),)
+            )
+        started = _draft(
+            job_stream_key("job_p1"),
+            PY_JOB_STARTED,
+            JobStartedData(job_id="job_p1", attempt_id="att_1", trace=JobTrace(trace_id="t", span_id="s", depth=0)),
+        )
+        with pytest.raises(StorageCorruptError, match=REASON_JOBS_ILLEGAL_SEQ):
+            await store.commit(job_stream_key("job_p1"), EventBatch(id="bat_p1b", events=(started,)), 2)
+
+    async def test_stored_duplicate_seq_fails_closed_at_commit(
+        self, jobs_stack: tuple[JobsStore, JobsReadRepository], tmp_path: Path
+    ) -> None:
+        """The duplicate-seq classification: unreachable in a healthy schema
+        (UNIQUE(session_id, seq)), so the probe rebuilds the events table
+        without constraints -- the damaged-schema shape the defense exists for."""
+        store, _repos = jobs_stack
+        db_path = tmp_path / "jobs.db"
+        created, spec_bound = _submit_drafts("job_p2")
+        await store.commit(job_stream_key("job_p2"), EventBatch(id="bat_p2", events=(created, spec_bound)), 0)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("ALTER TABLE events RENAME TO events_orig")
+            connection.execute("CREATE TABLE events AS SELECT * FROM events_orig")
+            connection.execute("DROP TABLE events_orig")
+            connection.execute(
+                "INSERT INTO events (id, session_id, seq, type, version, created, data, metadata, "
+                "batch_id, batch_ordinal) "
+                "VALUES ('evt_dup_seq', ?, 1, 'py.job.started', 1, 1770000000000, '{}', '{}', 'bat_p2x', 0)",
+                (job_stream_key("job_p2"),),
+            )
+        started = _draft(
+            job_stream_key("job_p2"),
+            PY_JOB_STARTED,
+            JobStartedData(job_id="job_p2", attempt_id="att_1", trace=JobTrace(trace_id="t", span_id="s", depth=0)),
+        )
+        with pytest.raises(StorageCorruptError, match=REASON_JOBS_DUPLICATE_SEQ) as raised:
+            await store.commit(job_stream_key("job_p2"), EventBatch(id="bat_p2b", events=(started,)), 2)
+        assert raised.value.core.details["reason"] == REASON_JOBS_DUPLICATE_SEQ
+
+    async def test_noop_projection_fails_the_commit_and_rolls_it_back(self, tmp_path: Path) -> None:
+        """The A=H+n invariant: a projector that folds nothing leaves the read
+        model behind the log, so the commit fails and nothing half-applies."""
+
+        class _NoopProjector:
+            """A projector that applies nothing (the invariant probe)."""
+
+            async def apply(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+                return None
+
+        db_path = tmp_path / "noop.db"
+        _require_success(_upgrade_head(db_path))
+        database = open_database(db_path, mode="create")
+        try:
+            store = JobsStore(database.engine, projector=_NoopProjector())
+            created, spec_bound = _submit_drafts("job_p3")
+            with pytest.raises(StorageCorruptError, match="projection did not advance") as raised:
+                await store.commit(job_stream_key("job_p3"), EventBatch(id="bat_p3", events=(created, spec_bound)), 0)
+            assert raised.value.core.details["reason"] == REASON_JOBS_PROJECTION_INVARIANT
+            with sqlite3.connect(db_path) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM events WHERE session_id = ?", (job_stream_key("job_p3"),)
+                ).fetchone()[0]
+            assert count == 0
+        finally:
+            await database.close()
+
+    async def test_rebuild_replay_of_an_illegal_transition_fails_closed(
+        self, jobs_stack: tuple[JobsStore, JobsReadRepository], tmp_path: Path
+    ) -> None:
+        store, _repos = jobs_stack
+        db_path = tmp_path / "jobs.db"
+        created, spec_bound = _submit_drafts("job_p4")
+        await store.commit(job_stream_key("job_p4"), EventBatch(id="bat_p4", events=(created, spec_bound)), 0)
+        # Surgery: append two extra started rows with valid payloads, so the
+        # replay folds created -> spec_bound -> started -> started.
+        started_data = json.dumps(
+            JobStartedData(
+                job_id="job_p4", attempt_id="att_x", trace=JobTrace(trace_id="trc_x", span_id="spn_x", depth=0)
+            ).model_dump(mode="json")
+        )
+        with sqlite3.connect(db_path) as connection:
+            connection.executemany(
+                "INSERT INTO events (id, session_id, seq, type, version, created, data, metadata, "
+                "batch_id, batch_ordinal) VALUES (?, ?, ?, ?, 1, 1770000000000, ?, '{}', ?, 0)",
+                [
+                    ("evt_twice_a", job_stream_key("job_p4"), 3, PY_JOB_STARTED, started_data, "bat_p4x"),
+                    ("evt_twice_b", job_stream_key("job_p4"), 4, PY_JOB_STARTED, started_data, "bat_p4y"),
+                ],
+            )
+        with pytest.raises(StorageCorruptError, match=REASON_JOBS_REPLAY_ILLEGAL_TRANSITION) as raised:
+            await store.rebuild(job_stream_key("job_p4"))
+        assert raised.value.core.details["reason"] == REASON_JOBS_REPLAY_ILLEGAL_TRANSITION
+
+    async def test_rebuild_of_an_undecodable_log_row_fails_closed(
+        self, jobs_stack: tuple[JobsStore, JobsReadRepository], tmp_path: Path
+    ) -> None:
+        store, _repos = jobs_stack
+        db_path = tmp_path / "jobs.db"
+        created, spec_bound = _submit_drafts("job_p5")
+        await store.commit(job_stream_key("job_p5"), EventBatch(id="bat_p5", events=(created, spec_bound)), 0)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "UPDATE events SET type = 'py.nope.nope' WHERE seq = 1 AND session_id = ?",
+                (job_stream_key("job_p5"),),
+            )
+        with pytest.raises(StorageCorruptError, match="jobs log row failed to decode"):
+            await store.rebuild(job_stream_key("job_p5"))
+
+    async def test_rebuild_of_a_gapped_seq_run_fails_closed(
+        self, jobs_stack: tuple[JobsStore, JobsReadRepository], tmp_path: Path
+    ) -> None:
+        store, _repos = jobs_stack
+        db_path = tmp_path / "jobs.db"
+        created, spec_bound = _submit_drafts("job_p6")
+        await store.commit(job_stream_key("job_p6"), EventBatch(id="bat_p6", events=(created, spec_bound)), 0)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("DELETE FROM events WHERE seq = 1 AND session_id = ?", (job_stream_key("job_p6"),))
+        with pytest.raises(StorageCorruptError, match="jobs log seq run violation") as raised:
+            await store.rebuild(job_stream_key("job_p6"))
+        assert raised.value.core.details["reason"] == REASON_JOBS_SEQ_GAP
 
 
 class TestRebuild:

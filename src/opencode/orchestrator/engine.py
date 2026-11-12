@@ -1,4 +1,4 @@
-"""The P3-S2 LangGraph engine minimal loop (PHASE3 §11 S2, T-C1-077).
+"""The P3-S2 LangGraph engine minimal loop (PHASE3 §11 S2, T-C1-077; S3 agent wiring T-C1-078).
 
 ``PipelineEngine`` turns a registered pipeline spec into a real compiled
 LangGraph state machine and drives jobs through it as the jobs domain's
@@ -15,9 +15,11 @@ registration pipeline re-anchored for the gateway):
   edge-reference closure, unique entry (exists, no incoming edges), no orphan
   nodes, per-type constraints (``llm_call`` carries a model tier + prompt
   template; ``tool`` carries exactly one of command / static tool ref; the
-  subworkflow nesting depth cap), and the S2 node-type execution face: the
-  closed set's other three names are recognized-but-unimplemented -- rejected
-  with an explicit error naming the S3/S5a delivery;
+  subworkflow nesting depth cap), and the node-type execution face: the
+  closed set's other names are recognized-but-unimplemented -- rejected with
+  an explicit error naming the S3/S5a delivery (the default face stays
+  byte-identical to the S2 message; a worker-wired engine names its executed
+  set instead);
 * **rehearsal** -- ``_compile``: the graph is actually compiled (a dry run
   with no side effects; the injected executors are never invoked).
 
@@ -27,9 +29,11 @@ shape/topology, ``UnsupportedCapability`` for the unimplemented node types);
 no new ``CoreErrorCode`` value was added for this slice (T-C1-077 decision).
 
 Executor injection (PHASE3 §3 discipline, the S1 fake-executor precedent):
-``llm_call`` and ``tool`` bodies are injectable async callables. The default
-constructors take none, so every S2 test injects a fake (honestly labeled);
-the real LLM-tier wiring lands with S4 and the worker face with S3.
+``llm_call`` and ``tool`` bodies are injectable async callables, and since S3
+so is ``opencode_agent`` (:class:`~opencode.orchestrator.workers.WorkerManager`
+-- a real CLI subprocess in a per-node worktree). The default constructors take
+no bodies, so tests inject fakes (honestly labeled); the real LLM-tier wiring
+lands with S4.
 
 The dual-database boundary (PHASE3 §14 / M-7, CC §5.4): the ``jobs`` table is
 the single source of truth for job status and is written only through
@@ -47,15 +51,16 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Protocol, TypedDict, cast
+from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.errors import EmptyInputError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import ValidationError
 
 from opencode.contracts.errors import CoreError, CoreErrorCode
+from opencode.contracts.events import JobBudget
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.contracts.pipelines import (
     MAX_SUBWORKFLOW_DEPTH,
@@ -70,10 +75,17 @@ from opencode.orchestrator.jobs import (
     JobService,
     JobTransitionError,
 )
+from opencode.orchestrator.workers import (
+    AGENT_JOB_CONTEXT,
+    AgentJobContext,
+    WorkerError,
+    WorkerSuspended,
+)
 
-#: The node types whose execution lands with a later slice (S3/S5a), named in
-#: every rejection message so the wire contract stays closed but honest.
-_UNIMPLEMENTED_NODE_TYPES: tuple[str, ...] = ("opencode_agent", "human_gate", "subworkflow")
+#: The node types this engine executes when no worker manager is wired (the
+#: S2 face, the default constructor). A worker-wired engine registers its
+#: ``opencode_agent`` executor into this set at ``register`` time.
+DEFAULT_IMPLEMENTED: frozenset[str] = frozenset({"llm_call", "tool"})
 
 
 class PipelineSpecRejected(ValueError):
@@ -174,13 +186,39 @@ class ToolFn(Protocol):
     async def __call__(self, node: PipelineNode, state: EngineState) -> JsonValue: ...
 
 
-def validate_pipeline_spec(spec: PipelineSpec) -> None:
+class AgentFn(Protocol):
+    """The injectable ``opencode_agent`` node body (the S3 worker face, T-C1-078).
+
+    The real body is :class:`opencode.orchestrator.workers.WorkerManager`:
+    a real CLI subprocess in a per-node git worktree with the proactive
+    interception trio, the three-line budget enforcement and the
+    structured-return acceptance gate. It reads the drive's job context (the
+    ``ContextVar`` the engine sets around ``ainvoke``) for the job id and
+    budget; the job params carry the worker's ``context`` /
+    ``authorized_files`` / ``acceptance`` face. A raised
+    :class:`~opencode.orchestrator.workers.WorkerError` carries its own §8
+    code; a ``WorkerSuspended`` ends the drive non-terminated (the fold owns
+    the outcome).
+    """
+
+    async def __call__(self, node: PipelineNode, state: EngineState) -> JsonValue: ...
+
+
+def validate_pipeline_spec(
+    spec: PipelineSpec,
+    *,
+    implemented: frozenset[str] = DEFAULT_IMPLEMENTED,
+) -> None:
     """The semantic-gate layer (PHASE3 §3 discipline 2): topology + type constraints.
 
     Raises :class:`PipelineSpecRejected` with the first violation found
     (deterministic order: the version gate, the nesting-depth cap, the
     unimplemented node-type face, per-type field constraints, node-id
     uniqueness, edge-reference closure, the entry rules, orphan reachability).
+    ``implemented`` is the executed node-type set: the default is the S2 face
+    (``llm_call``/``tool``) whose rejection message is pinned byte-identical
+    by the S2 tests; a worker-wired engine passes its executed set so
+    ``opencode_agent`` passes the face and the message names the set.
     """
     ids = spec.node_ids()
     id_set = set(ids)
@@ -208,16 +246,30 @@ def validate_pipeline_spec(spec: PipelineSpec) -> None:
                 details={"node_id": node.node_id, "node_type": node.node_type, "depth": node.depth},
             )
 
-    # -- the S2 execution face: closed-set names, three of them unimplemented.
+    # -- the execution face: closed-set names, the non-executed ones rejected
+    # with an explicit message naming the delivery slice. The default-face
+    # message is pinned byte-identical to the S2 wording by test_pipelines.py;
+    # a worker-wired engine names its executed set instead.
     for node in spec.nodes:
-        if node.node_type in _UNIMPLEMENTED_NODE_TYPES:
-            raise PipelineSpecRejected(
+        if node.node_type in implemented:
+            continue
+        if "opencode_agent" in implemented:
+            message = (
+                f"unimplemented node type '{node.node_type}' on node '{node.node_id}': "
+                "this engine executes llm_call/tool/opencode_agent nodes only "
+                "(human_gate and subworkflow land with S5a)"
+            )
+        else:
+            message = (
                 f"unimplemented node type '{node.node_type}' on node '{node.node_id}': "
                 "S2 executes llm_call/tool nodes only "
-                "(opencode_agent lands with S3 workers; human_gate and subworkflow with S5a)",
-                code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
-                details={"node_id": node.node_id, "node_type": node.node_type},
+                "(opencode_agent lands with S3 workers; human_gate and subworkflow with S5a)"
             )
+        raise PipelineSpecRejected(
+            message,
+            code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+            details={"node_id": node.node_id, "node_type": node.node_type},
+        )
 
     # -- per-type field constraints (semantic layer by design: see pipelines.py).
     for node in spec.nodes:
@@ -225,6 +277,13 @@ def validate_pipeline_spec(spec: PipelineSpec) -> None:
             raise PipelineSpecRejected(
                 f"llm_call node '{node.node_id}' must carry both a model tier ('model') "
                 "and a prompt template ('prompt_template')",
+                code=CoreErrorCode.VALIDATION_ERROR,
+                details={"node_id": node.node_id, "node_type": node.node_type},
+            )
+        if node.node_type == "opencode_agent" and node.prompt_template is None:
+            raise PipelineSpecRejected(
+                f"{node.node_type} node '{node.node_id}' must carry a prompt template "
+                "('prompt_template') as its goal for the worker brief",
                 code=CoreErrorCode.VALIDATION_ERROR,
                 details={"node_id": node.node_id, "node_type": node.node_type},
             )
@@ -380,11 +439,19 @@ class PipelineEngine:
         checkpointer: EngineCheckpointer,
         llm_call: LlmCallFn,
         tool: ToolFn,
+        opencode_agent: AgentFn | None = None,
     ) -> None:
         self._checkpointer = checkpointer
         self._llm_call = llm_call
         self._tool = tool
+        self._opencode_agent = opencode_agent
         self._pipelines: dict[str, BoundPipeline] = {}
+
+    def _implemented(self) -> frozenset[str]:
+        """The executed node-type set: the S2 two, plus the agent when wired."""
+        if self._opencode_agent is None:
+            return DEFAULT_IMPLEMENTED
+        return DEFAULT_IMPLEMENTED | frozenset({"opencode_agent"})
 
     # -- the registration gate (structure -> semantic -> rehearsal) -----------
 
@@ -400,7 +467,7 @@ class PipelineEngine:
         they were started with or fail closed (PHASE3 §5.2 no hot rebind).
         """
         spec = PipelineSpec.model_validate(raw)
-        validate_pipeline_spec(spec)
+        validate_pipeline_spec(spec, implemented=self._implemented())
         saver = await self._checkpointer.saver()
         graph = self._compile(spec, saver)
         bound = BoundPipeline(spec=spec, spec_hash=compute_spec_hash(spec), graph=graph)
@@ -410,6 +477,15 @@ class PipelineEngine:
     def bound(self, pipeline_id: str) -> BoundPipeline | None:
         """The registered binding for ``pipeline_id`` (None = never registered)."""
         return self._pipelines.get(pipeline_id)
+
+    @property
+    def opencode_agent(self) -> AgentFn | None:
+        """The wired ``opencode_agent`` node body (None = the S2-only face).
+
+        The App wiring face reads this to derive the jobs cancel hook: a
+        worker manager instance doubles as the ``RunCanceller``.
+        """
+        return self._opencode_agent
 
     def _compile(self, spec: PipelineSpec, saver: AsyncSqliteSaver) -> CompiledStateGraph:
         """The rehearsal layer + the actual graph: build, wire topology, compile.
@@ -434,10 +510,25 @@ class PipelineEngine:
                 try:
                     if node.node_type == "llm_call":
                         value = await self._llm_call(node, state)
-                    else:
+                    elif node.node_type == "tool":
                         value = await self._tool(node, state)
+                    else:
+                        # The registration gate proved this type executed; the
+                        # only remaining closed-set name is the agent (the old
+                        # two-way else->tool dispatch would have misrouted it).
+                        if self._opencode_agent is None:
+                            raise _NodeFailure(
+                                node,
+                                WorkerError(
+                                    "opencode_agent executor is not wired (the gate should have rejected this spec)",
+                                    code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+                                ),
+                            )
+                        value = await self._opencode_agent(node, state)
                 except EnginePause:
                     raise  # the suspend seam passes through untouched
+                except WorkerSuspended:
+                    raise  # the S3 cancel seam: the drive returns, the fold owns the outcome
                 except Exception as cause:
                     raise _NodeFailure(node, cause) from cause
                 update: dict[str, Any] = {"node_results": {node.node_id: value}}
@@ -460,6 +551,26 @@ class PipelineEngine:
 
     # -- the JobExecutor face --------------------------------------------------
 
+    async def _finish(
+        self,
+        handle: JobHandle,
+        outcome: Literal["done", "failed", "cancelled"],
+        *,
+        result: JsonValue | None = None,
+        error: CoreError | None = None,
+    ) -> None:
+        """Finish the job with the FakeJobExecutor discipline: a lost race is silent.
+
+        A ``JobTransitionError`` from the emit means a concurrent resolution
+        (a cancel race, or a recovery write-back) already made the job
+        terminal -- the read model's fold is the authority, never the drive's
+        local view, so the drive swallows it and returns.
+        """
+        try:
+            await handle.finished(outcome, result=result, error=error)
+        except JobTransitionError:
+            return
+
     async def drive(self, handle: JobHandle, *, resume: bool = False) -> None:
         """Drive one job through its bound pipeline graph (the executor seam).
 
@@ -475,7 +586,8 @@ class PipelineEngine:
             return
         bound = self._pipelines.get(record.pipeline_id)
         if bound is None:
-            await handle.finished(
+            await self._finish(
+                handle,
                 "failed",
                 error=CoreError(
                     code=CoreErrorCode.NOT_FOUND,
@@ -513,49 +625,113 @@ class PipelineEngine:
 
         if resume_mode:
             tuple_ = await saver.aget_tuple(cast(Any, config))
-            if tuple_ is not None:
-                values = tuple_.checkpoint.get("channel_values", {})
-                # PHASE3 §5.2: a running graph never hot-rebinds to a re-registered
-                # spec. A hash mismatch means the spec changed after this graph
-                # started: side effects cannot be proven against the new binding.
-                if values.get("pipeline_spec_hash") not in (None, bound.spec_hash):
-                    await handle.finished(
-                        "failed",
-                        error=CoreError(
-                            code=CoreErrorCode.EXECUTION_UNKNOWN,
-                            message=(
-                                "pipeline spec hash changed after the graph started; "
-                                "running graphs are never rebound (cancel, revise, resubmit)"
-                            ),
-                            retryable=False,
-                            details={
-                                "job_id": handle.job_id,
-                                "pipeline_id": record.pipeline_id,
-                                "registered_spec_hash": bound.spec_hash,
-                                "graph_spec_hash": values.get("pipeline_spec_hash"),
-                            },
+            if tuple_ is None:
+                # Defense ① (T-B-092 ①, landed with S3): a resume drive with
+                # no advisory cursor cannot prove the side-effect frontier.
+                # The S2 fallback re-ran the whole graph under EmptyInputError
+                # -- acceptable while node bodies were fakes; with real worker
+                # side effects a re-run would duplicate work, so it fails
+                # closed instead (the recovery matrix routes here only after
+                # losing the checkpoint).
+                await self._finish(
+                    handle,
+                    "failed",
+                    error=CoreError(
+                        code=CoreErrorCode.EXECUTION_UNKNOWN,
+                        message=(
+                            "resume drive found no advisory cursor for a running job; the side-effect frontier "
+                            "cannot be proven, so the graph is not re-run (fail closed)"
                         ),
-                    )
-                    return
+                        retryable=False,
+                        details={"job_id": handle.job_id, "pipeline_id": record.pipeline_id},
+                    ),
+                )
+                return
+            values = tuple_.checkpoint.get("channel_values", {})
+            # Defense ② (T-B-092 ②, landed with S3): a cursor without a spec
+            # hash cannot prove its binding. S2 let None pass (skip the
+            # check); S3 fails closed with a message distinct from the
+            # re-registration mismatch below.
+            graph_spec_hash = values.get("pipeline_spec_hash")
+            if graph_spec_hash is None:
+                await self._finish(
+                    handle,
+                    "failed",
+                    error=CoreError(
+                        code=CoreErrorCode.EXECUTION_UNKNOWN,
+                        message=(
+                            "advisory cursor carries no pipeline spec hash; the graph's pipeline binding "
+                            "cannot be proven, so the graph is not resumed (fail closed)"
+                        ),
+                        retryable=False,
+                        details={"job_id": handle.job_id, "pipeline_id": record.pipeline_id},
+                    ),
+                )
+                return
+            # PHASE3 §5.2: a running graph never hot-rebinds to a re-registered
+            # spec. A hash mismatch means the spec changed after this graph
+            # started: side effects cannot be proven against the new binding.
+            if graph_spec_hash != bound.spec_hash:
+                await self._finish(
+                    handle,
+                    "failed",
+                    error=CoreError(
+                        code=CoreErrorCode.EXECUTION_UNKNOWN,
+                        message=(
+                            "pipeline spec hash changed after the graph started; "
+                            "running graphs are never rebound (cancel, revise, resubmit)"
+                        ),
+                        retryable=False,
+                        details={
+                            "job_id": handle.job_id,
+                            "pipeline_id": record.pipeline_id,
+                            "registered_spec_hash": bound.spec_hash,
+                            "graph_spec_hash": values.get("pipeline_spec_hash"),
+                        },
+                    ),
+                )
+                return
+
+        # The S3 context seam: the job id + decoded budget ride a ContextVar
+        # (the graph-state channel set is pinned by the S2 tests, so no new
+        # channels); the opencode_agent node body reads it. The committed
+        # budget row was validated at emit time -- the decode here is the
+        # defensive second line and degrades to "no budget" on garbage.
+        try:
+            job_budget = JobBudget.model_validate(record.budget if isinstance(record.budget, dict) else {})
+        except ValidationError:
+            job_budget = JobBudget()
 
         try:
-            if resume_mode:
-                try:
+            context_token = AGENT_JOB_CONTEXT.set(AgentJobContext(job_id=handle.job_id, budget=job_budget))
+            try:
+                if resume_mode:
                     final = await bound.graph.ainvoke(None, cast(Any, config))
-                except EmptyInputError:
+                else:
                     final = await bound.graph.ainvoke(state0, cast(Any, config))
-            else:
-                final = await bound.graph.ainvoke(state0, cast(Any, config))
+            finally:
+                AGENT_JOB_CONTEXT.reset(context_token)
         except EnginePause:
             # Leave the job running: the advisory cursor holds the position; the
             # recovery scan (or a plain re-drive) resumes from it.
             return
+        except WorkerSuspended:
+            # The S3 cancel face: the fold already committed the terminal
+            # outcome (cancel beats the drive); leave it untouched.
+            return
         except _NodeFailure as failure:
             # The injected body raised: attribute to the node and map the §8
-            # code by type (llm_call -> ProviderUnavailable, tool -> ToolFailed).
+            # code by type (llm_call -> ProviderUnavailable; a WorkerError
+            # carries its own code; the rest default to ToolFailed).
             node = failure.node
-            code = CoreErrorCode.PROVIDER_UNAVAILABLE if node.node_type == "llm_call" else CoreErrorCode.TOOL_FAILED
-            await handle.finished(
+            if node.node_type == "llm_call":
+                code = CoreErrorCode.PROVIDER_UNAVAILABLE
+            elif isinstance(failure.__cause__, WorkerError):
+                code = failure.__cause__.code
+            else:
+                code = CoreErrorCode.TOOL_FAILED
+            await self._finish(
+                handle,
                 "failed",
                 error=CoreError(
                     code=code,
@@ -568,9 +744,10 @@ class PipelineEngine:
 
         outcome = final.get("outcome") if final else None
         if outcome == "done":
-            await handle.finished("done", result=final.get("result") if final else None)
+            await self._finish(handle, "done", result=final.get("result") if final else None)
         else:
-            await handle.finished(
+            await self._finish(
+                handle,
                 "failed",
                 error=CoreError(
                     code=CoreErrorCode.VALIDATION_ERROR,

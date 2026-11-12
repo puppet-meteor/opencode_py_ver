@@ -534,6 +534,21 @@ class JobExecutor(Protocol):
     async def drive(self, handle: JobHandle, *, resume: bool = False) -> None: ...
 
 
+class RunCanceller(Protocol):
+    """The cancel hook (§7; S3 T-C1-078): stop the live execution of one job.
+
+    :meth:`JobService.cancel` calls it *before* committing the terminal
+    ``py.job.finished(cancelled)`` event, so the in-flight execution (an
+    ``opencode_agent`` worker subprocess tree) is signalled while the job is
+    still non-terminal and the fold stays the single status authority. The
+    face is sync and best-effort by contract: it must never await, and a
+    signal for an already-finished job is the idempotent no-op the service's
+    terminal guard already provides.
+    """
+
+    def cancel(self, job_id: str) -> None: ...
+
+
 class FakeJobExecutor:
     """The S1 fake execution body: ``started -> finished(done)`` (no budget face).
 
@@ -563,8 +578,11 @@ class FakeJobExecutor:
 class JobCheckpoint:
     """One job's executor checkpoint (§8): the restart-resume/write-back envelope.
 
-    ``spec_hash`` is ``params_hash`` in S1 (the true pipeline spec hash lands
-    with spec loading, S2; progress ①). A terminal ``outcome`` plus
+    ``spec_hash`` carries the job's ``params_hash`` binding (the S2 engine
+    writes the pipeline spec hash as its own ``pipeline_spec_hash`` graph
+    channel and compares it on resume; the recovery scan keeps comparing the
+    params binding, T-C1-077). The S3 worker face leaves this envelope
+    unchanged (T-C1-078). A terminal ``outcome`` plus
     ``batch_id``/``event_id``/``created_at_ms`` is the branch-⑤ write-back
     envelope: the service re-commits the exact original ``py.job.finished``
     draft under the checkpoint's stable batch id, so a repeated recovery is
@@ -624,6 +642,7 @@ class JobService:
         ids: IdFactory | None = None,
         clock: Clock | None = None,
         params_validator: ParamsValidator | None = None,
+        canceller: RunCanceller | None = None,
     ) -> None:
         self._store = store
         self._repos = repos
@@ -632,6 +651,7 @@ class JobService:
         self._ids = ids if ids is not None else AscendingIds(clock)
         self._clock = clock if clock is not None else _utc_now
         self._params_validator = params_validator
+        self._canceller = canceller
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -970,10 +990,18 @@ class JobService:
         return task
 
     async def cancel(self, job_id: str) -> JobRecord:
-        """Cancel the job; idempotent (a terminal job returns unchanged)."""
+        """Cancel the job; idempotent (a terminal job returns unchanged).
+
+        The canceller hook (S3) runs *before* the terminal emit, so a live
+        worker subprocess tree is signalled to die while the job is still
+        non-terminal (PHASE3 §7: the fold stays the single status authority;
+        the drive's swallow-JobTransitionError discipline handles the race).
+        """
         record = await self.get_job(job_id)
         if record.status in TERMINAL_STATUSES:
             return record
+        if self._canceller is not None:
+            self._canceller.cancel(job_id)
         await self.emit_finished(job_id, "cancelled")
         return await self.get_job(job_id)
 

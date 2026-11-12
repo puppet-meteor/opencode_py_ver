@@ -46,6 +46,7 @@ from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdap
 from opencode.orchestrator.brain_driver import BrainDriver
 from opencode.orchestrator.engine import PipelineEngine
 from opencode.orchestrator.jobs import FakeJobExecutor, JobService, JobsProjector, SpecParamsValidator
+from opencode.orchestrator.workers import WorkerManager
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
 from opencode.session.llm_summarizer import ProviderSummarizer
@@ -287,12 +288,17 @@ class App:
         # JobsStore on ses_job_* stream keys, not SessionStore). P3-S2
         # (T-C1-077): the executor is the injected pipeline engine when one is
         # wired (real LangGraph execution over its own checkpointer file);
-        # None keeps the S1 fake (started -> finished(done)) -- workers land
-        # in S3/S4. Recovery is deliberately NOT wired into the lifespan (a
-        # semantics change beyond this slice's edit list): callers drive
-        # ``jobs.recover()`` explicitly -- progress ④ open item, now with the
-        # engine itself injectable as the ``JobCheckpointReader`` (its
-        # advisory-cursor read face).
+        # None keeps the S1 fake (started -> finished(done)). Recovery is
+        # deliberately NOT wired into the lifespan (a semantics change beyond
+        # this slice's edit list): callers drive ``jobs.recover()`` explicitly
+        # -- progress ④ open item, now with the engine itself injectable as
+        # the ``JobCheckpointReader`` (its advisory-cursor read face).
+        # P3-S3 (T-C1-078): when the wired engine carries a real worker
+        # manager, it doubles as the jobs ``RunCanceller`` (a cancel kills
+        # the worker's subprocess tree before the terminal fold commits).
+        # The full production wiring (credentials, model, runs root) is
+        # composed by the caller that builds the manager -- the App face
+        # only derives the hook.
         self._pipeline_engine = pipeline_engine
 
         # P3-S4 (T-C1-079): the shared gateway params validator over the
@@ -309,6 +315,8 @@ class App:
         params_validator: SpecParamsValidator | None = None
         if workflow_tools:
             params_validator = SpecParamsValidator(lookup=_spec_of)
+
+        wired_agent = pipeline_engine.opencode_agent if pipeline_engine is not None else None
         self._jobs = JobService(
             store=JobsStore(engine, projector=JobsProjector()),
             repos=JobsReadRepository(engine),
@@ -317,6 +325,7 @@ class App:
             ids=shared_ids,
             clock=clock,
             params_validator=params_validator,
+            canceller=wired_agent if isinstance(wired_agent, WorkerManager) else None,
         )
         # The registration-isolation face (C#5): the workflow tools are
         # injected ONLY into the main brain's ToolRegistry (this single

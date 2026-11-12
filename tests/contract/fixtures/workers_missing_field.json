@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "files_changed": [
+    "src/feature.py"
+  ],
+  "artifacts": [
+    "reports/feature.md"
+  ],
+  "tests_passed": true
+}
