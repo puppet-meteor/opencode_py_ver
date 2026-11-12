@@ -1,0 +1,20 @@
+{
+  "id": "evt_0000000000000000000000003",
+  "type": "py.job.started",
+  "version": 1,
+  "session_id": "ses_job_0000000000000000000000000001",
+  "created_at": "2026-11-12T08:00:13Z",
+  "data": {
+    "job_id": "job_0000000000000000000000000001",
+    "attempt_id": "att_0000000000000000000000001",
+    "trace": {
+      "trace_id": "trc_0000000000000000000000000001",
+      "span_id": "spn_0000000000000000000000000002",
+      "parent_id": null,
+      "depth": 0
+    },
+    "unexpected_extension_key": true
+  },
+  "metadata": {},
+  "seq": 3
+}

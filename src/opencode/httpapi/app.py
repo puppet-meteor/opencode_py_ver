@@ -14,10 +14,24 @@ requests and responses:
 * ``POST /permission/{permission_id}/reply`` -> DecisionReceipt wire
 * ``GET  /session/{session_id}/events``      -> durable SSE stream (§7 L105)
 
+P3-S1 (T-C1-076) adds the five /jobs routes over
+:meth:`~opencode.app.App.jobs` (PHASE3-ORCHESTRATOR §5.4/§7):
+
+* ``POST /jobs``                             -> ``{id}`` (structural validation; params JSON-Schema lands in S2)
+* ``GET  /jobs/{job_id}``                    -> JobStatus wire (the folded row)
+* ``GET  /jobs/{job_id}/events``             -> durable SSE over ``ses_job_{job_id}`` (the trace pass-through)
+* ``POST /jobs/{job_id}/cancel``             -> JobStatus wire (idempotent)
+* ``POST /jobs/{job_id}/gate/{gate_id}/reply`` -> the S5a shell: 409 on an existing job (body enum validated first)
+
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
 assembled here over ``app.database.engine`` + ``app.bus`` (the core
-composition is untouched). ``Last-Event-ID`` carries the
+composition is untouched). ``GET /jobs/{job_id}/events`` (P3-S1) is the same
+machinery over the synthesized ``ses_job_{job_id}`` stream key: the job's
+existence is pre-checked (404) before the follow context is entered, the
+frame ids generalize to ``{stream_key}:{seq}``, and the four trace fields ride
+each ``py.job.*`` envelope's data (PHASE3 §4 M-6 double-stream correlation).
+``Last-Event-ID`` carries the
 ``"{session_id}:{seq}"`` cursor: a malformed or cross-session header is
 rejected at the transport (400 InvalidCursor), while a well-formed cursor of
 an unknown session (404) or beyond the committed high watermark H (400, never
@@ -90,6 +104,7 @@ from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.session.service import DecisionReceipt, RunRef, RunStatus, SessionRef
 from opencode.storage import StoreError
+from opencode.storage.jobs_store import JobRecord, job_stream_key
 from opencode.storage.repos import MessagePage
 
 #: §7 L106 "限制请求/并发/输出大小" — the transport-level caps (module-level,
@@ -237,6 +252,30 @@ def _messages_wire(page: MessagePage) -> JsonObject:
     }
 
 
+def _job_wire(record: JobRecord) -> JsonObject:
+    """The P3-S1 job status wire: the folded ``jobs`` row (PHASE3 §5.4 field set).
+
+    ``id``/``status``/``pipeline_id``/``session_anchor``/``params_hash``/
+    ``depth``/``retry_count``/``trace_id`` carry the §5.4 identity and fold
+    faces; ``result``/``error`` ride the terminal event (None before it);
+    ``created_at_ms``/``updated_at_ms`` are the storage epoch-ms stamps.
+    """
+    return {
+        "id": record.job_id,
+        "status": record.status,
+        "pipeline_id": record.pipeline_id,
+        "session_anchor": record.session_anchor,
+        "params_hash": record.params_hash,
+        "depth": record.depth,
+        "retry_count": record.retry_count,
+        "trace_id": record.trace_id,
+        "result": record.result,
+        "error": record.error,
+        "created_at_ms": record.created_epoch_ms,
+        "updated_at_ms": record.updated_epoch_ms,
+    }
+
+
 # -- §7 L105: the durable SSE stream (CORE-CONTRACTS §4) --------------------
 
 
@@ -283,16 +322,25 @@ def _last_event_id_cursor(request: Request, session_id: str) -> EventCursor | No
 
 
 def _is_sse_request(scope: Scope) -> bool:
-    """``GET /session/{session_id}/events``: the route that holds a stream slot.
+    """``GET /session/{id}/events`` and ``GET /jobs/{id}/events``: the stream-slot routes.
 
-    Matched structurally (three path segments: ``session``/id/``events``) so
-    the stream budget only ever counts requests the router itself would
-    accept as the stream route; anything else stays on the request budget.
+    Matched structurally (three path segments: ``session``/``jobs`` + id +
+    ``events``) so the stream budget only ever counts requests the router
+    itself would accept as a stream route; anything else stays on the request
+    budget. The P3-S1 generalization keeps the two stream families on the
+    same ``MAX_CONCURRENT_SSE_STREAMS`` budget (disjoint causes are not
+    split per family in v1).
     """
     if scope.get("method") != "GET":
         return False
     parts = (scope.get("path") or "").split("/")
-    return len(parts) == 4 and parts[0] == "" and parts[1] == "session" and bool(parts[2]) and parts[3] == "events"
+    return (
+        len(parts) == 4
+        and parts[0] == ""
+        and parts[1] in ("session", "jobs")
+        and bool(parts[2])
+        and parts[3] == "events"
+    )
 
 
 def _frame_for(item: LogItem) -> bytes:
@@ -507,6 +555,7 @@ def create_app(app: App, *, token: str) -> FastAPI:
     the seven routes — nothing on this app answers anonymously.
     """
     service = app.service
+    jobs = app.jobs
     api = FastAPI(
         title="opencode",
         version="0.0.1",
@@ -591,6 +640,99 @@ def create_app(app: App, *, token: str) -> FastAPI:
                 "decision": receipt.decision,
                 "execution_id": receipt.execution_id,
             }
+        )
+
+    # -- P3-S1 (T-C1-076): the five /jobs routes over app.jobs ---------------
+
+    @api.post("/jobs")
+    async def create_job(request: Request) -> Response:
+        """Submit one job (PHASE3 §7 A fork-3): created + spec_bound atomically.
+
+        Structural validation only in S1: ``pipeline_id`` non-empty string,
+        ``params`` JSON object, ``session_anchor`` ``"api"`` (default) or a
+        ``ses_``-prefixed session id, unknown fields rejected. Validating
+        params against the pipeline's JSON Schema lands with spec loading
+        (S2). The fake executor is spawned after the submit commits, so the
+        response returns while the run drives the lifecycle events.
+        """
+        payload = await _read_json_object(request)
+        unknown = sorted(set(payload) - {"pipeline_id", "params", "session_anchor"})
+        if unknown:
+            raise _TransportError(422, _validation(f"request body has unknown fields: {', '.join(unknown)}"))
+        pipeline_id = payload.get("pipeline_id")
+        if not isinstance(pipeline_id, str) or not pipeline_id:
+            raise _TransportError(422, _validation("request body field 'pipeline_id' must be a non-empty string"))
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            raise _TransportError(422, _validation("request body field 'params' must be a JSON object"))
+        session_anchor = payload.get("session_anchor", "api")
+        if not isinstance(session_anchor, str) or (session_anchor != "api" and not session_anchor.startswith("ses_")):
+            raise _TransportError(
+                422, _validation("request body field 'session_anchor' must be 'api' or a ses_-prefixed session id")
+            )
+        handle = await jobs.submit(pipeline_id, params, session_anchor)
+        jobs.spawn(handle.job_id)
+        return _json_response({"id": handle.job_id})
+
+    @api.get("/jobs/{job_id}")
+    async def job_status(job_id: str) -> Response:
+        return _json_response(_job_wire(await jobs.get_job(job_id)))
+
+    @api.get("/jobs/{job_id}/events")
+    async def job_events(job_id: str, request: Request) -> Response:
+        """The jobs SSE stream (PHASE3 §5.4): the same follow machinery over ``ses_job_{job_id}``.
+
+        The job's existence is pre-checked (404 with a job-flavored body)
+        before the follow context is entered; the frame ids are the
+        generalized ``{stream_key}:{seq}`` resume cursors and each
+        ``py.job.*`` envelope's data carries the four trace fields, so a
+        client correlates this stream with the session stream on
+        ``trace_id`` (PHASE3 §4 M-6 double-stream envelope).
+        """
+        await jobs.get_job(job_id)
+        stream_key = job_stream_key(job_id)
+        cursor = _last_event_id_cursor(request, stream_key)
+        log = EventLog(app.database.engine, bus=app.bus)
+        follow = log.follow(stream_key, cursor)
+        items = await follow.__aenter__()
+        return StreamingResponse(
+            _sse_frames(follow, items),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @api.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> Response:
+        return _json_response(_job_wire(await jobs.cancel(job_id)))
+
+    @api.post("/jobs/{job_id}/gate/{gate_id}/reply")
+    async def gate_reply(job_id: str, gate_id: str, request: Request) -> Response:
+        """The S5a gate-chain shell: validate the reply shape, then answer 409.
+
+        The body enum (approve/reject/revise) is validated first (the wire
+        contract is real), the job's existence second (404); an existing job
+        then answers 409 Conflict -- the human-gate full chain (gate waiting,
+        expiry, reply resolution) lands in S5a, and this route never
+        silently pretends a reply was applied.
+        """
+        payload = await _read_json_object(request)
+        unknown = sorted(set(payload) - {"reply"})
+        if unknown:
+            raise _TransportError(422, _validation(f"request body has unknown fields: {', '.join(unknown)}"))
+        reply = payload.get("reply")
+        if not isinstance(reply, str) or reply not in ("approve", "reject", "revise"):
+            raise _TransportError(
+                422, _validation("request body field 'reply' must be one of: approve, reject, revise")
+            )
+        await jobs.get_job(job_id)
+        raise _TransportError(
+            409,
+            CoreError(
+                code=CoreErrorCode.CONFLICT,
+                message="job gate replies land with the human-gate chain (S5a); no reply is applied in this version",
+                retryable=False,
+                details={"job_id": job_id, "gate_id": gate_id},
+            ),
         )
 
     api.add_exception_handler(_TransportError, _transport_error_handler)

@@ -1121,8 +1121,243 @@ COMPACTION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Jobs family (§3.1 py.job.* rows; PHASE3-ORCHESTRATOR §5.4/§7 A fork-3):
+# the orchestrator's job lifecycle events, committed to the synthesized
+# ``ses_job_*`` stream keys. NOT run-scoped: a job is an orchestrator-domain
+# entity, not a §7 run, so no envelope metadata.run_id is required (the
+# whenever-present ^run_ guard below still applies to any metadata.run_id).
+# The four trace fields (PHASE3 §4 M-6/§5.4) ride every data model as the
+# nested ``trace`` object -- flat fields would collide with the §5.4 job
+# field ``depth`` (workflow nesting depth), which py.job.created carries
+# separately. Producers/fold/projection land in P3-S1 (T-C1-076,
+# opencode.orchestrator.jobs); the registration below is contract face only,
+# the skills/compaction precedent. Job ids follow the plain non-empty string
+# convention (OP-3: no pattern for new internal conventions; the service
+# mints ``job_<hex>``); the synthesized stream key is ``ses_job_{job_id}``
+# (the ^ses_ envelope pattern holds with zero contract change).
+# ---------------------------------------------------------------------------
+
+PY_JOB_CREATED = "py.job.created"
+PY_JOB_SPEC_BOUND = "py.job.spec_bound"
+PY_JOB_STARTED = "py.job.started"
+PY_JOB_STALLED = "py.job.stalled"
+PY_JOB_REDISPATCHED = "py.job.redispatched"
+PY_JOB_GATED = "py.job.gated"
+PY_JOB_FINISHED = "py.job.finished"
+
+_JOB_ID = r"job_"
+
+
+class JobTrace(BaseModel):
+    """The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).
+
+    ``trace_id`` correlates the job stream with the session stream (the SSE
+    double-stream envelope); ``span_id`` is this event's span; ``parent_id``
+    is the parent span (None at the job's root span); ``depth`` is the trace
+    tree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in
+    gateway policy) is a separate py.job.created field -- the name collision
+    is why the trace set rides as one nested object.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    trace_id: str = Field(min_length=1)
+    span_id: str = Field(min_length=1)
+    parent_id: str | None = None
+    depth: int = Field(ge=0)
+
+    @field_validator("depth", mode="before")
+    @classmethod
+    def _depth_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("depth", value)
+
+
+class JobLineage(BaseModel):
+    """The §5.2/M-9 lineage block: parent job, initiating session, origin.
+
+    ``origin`` marks the submission channel (PHASE3 §1: a session-less API
+    submission is explicitly ``api``); the worker-identity submission guard
+    (reject lineage.origin == "worker") is gateway policy land with the
+    workers slice (S3/S4), not wire shape.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_job_id: str | None = None
+    session_id: str | None = None
+    origin: Literal["api", "session", "worker"]
+
+    @model_validator(mode="after")
+    def _session_id_prefixed(self) -> JobLineage:
+        if self.session_id is not None and not self.session_id.startswith("ses_"):
+            raise ValueError("lineage.session_id, when present, must start with 'ses_'")
+        return self
+
+
+class JobBudget(BaseModel):
+    """The §5.3 brief budget block (max tool calls / max tokens / timeout).
+
+    All three are optional on the wire: S1's fake executor declares no budget
+    face; the enforcement trio lands with workers (S3, T-C1-076 disclosed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_tool_calls: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    timeout_s: float | None = Field(default=None, gt=0)
+
+    @field_validator("max_tool_calls", "max_tokens", mode="before")
+    @classmethod
+    def _integer_fields_not_bool(cls, value: Any, info: ValidationInfo) -> Any:
+        return _reject_bool(info.field_name or "", value)
+
+
+class JobCreatedData(BaseModel):
+    """``py.job.created`` v1 data (§3.1/PHASE3 §5.4): job identity first.
+
+    The A fork-3 submit order: identity (created) and the spec binding
+    (``py.job.spec_bound``) commit before the job starts; ``depth`` is the
+    workflow nesting depth (subworkflow <= 3 is gateway policy, §5.2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    pipeline_id: str = Field(min_length=1)
+    depth: int = Field(ge=0)
+    lineage: JobLineage
+    budget: JobBudget
+    trace: JobTrace
+
+    @field_validator("depth", mode="before")
+    @classmethod
+    def _depth_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("depth", value)
+
+
+class JobSpecBoundData(BaseModel):
+    """``py.job.spec_bound`` v1 data: the spec/params/hash/session-anchor set.
+
+    ``params_hash`` is the sha256 of the canonical params JSON (§6.2 pipeline);
+    ``session_anchor`` is the conversation anchor -- ``"api"`` for a
+    session-less API submission, or the ``ses_``-prefixed session id the job
+    is bound to (PHASE3 §1).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    params: JsonObject
+    params_hash: str = Field(pattern=_SHA256_HEX)
+    session_anchor: str = Field(min_length=1)
+    trace: JobTrace
+
+    @model_validator(mode="after")
+    def _anchor_form(self) -> JobSpecBoundData:
+        if self.session_anchor != "api" and not self.session_anchor.startswith("ses_"):
+            raise ValueError("session_anchor must be 'api' or a ses_-prefixed session id")
+        return self
+
+
+class JobStartedData(BaseModel):
+    """``py.job.started`` v1 data: the (fake) execution start; attempt identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    trace: JobTrace
+
+
+class JobStalledData(BaseModel):
+    """``py.job.stalled`` v1 data: the watchdog hook (``running -> stalled``).
+
+    ``stalled_reason`` is recorded for the retry decision; ``attempt_id``
+    identifies the stalled attempt (PHASE3 §8).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    stalled_reason: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    trace: JobTrace
+
+
+class JobRedispatchedData(BaseModel):
+    """``py.job.redispatched`` v1 data: the single ``stalled -> running`` re-dispatch.
+
+    Node-level retry, not a whole-graph rerun (m-4); ``retry_count`` is 1 on
+    the one legal re-dispatch (the fold rejects a second).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    attempt_id: str = Field(min_length=1)
+    retry_count: int = Field(ge=1)
+    trace: JobTrace
+
+    @field_validator("retry_count", mode="before")
+    @classmethod
+    def _retry_count_not_bool(cls, value: Any) -> Any:
+        return _reject_bool("retry_count", value)
+
+
+class JobGatedData(BaseModel):
+    """``py.job.gated`` v1 data: the human gate interrupt (``running -> gated``).
+
+    ``gate_id`` is unique within the job; ``expires_at`` follows the 300 s
+    permission precedent (m-3). The gate reply chain (approve/reject/revise)
+    lands in S5a; the fold keeps ``gated`` resolvable only by terminal
+    transitions in this slice (disclosed).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    gate_id: str = Field(min_length=1)
+    expires_at: UtcDateTime
+    trace: JobTrace
+
+
+class JobFinishedData(BaseModel):
+    """``py.job.finished`` v1 data: the terminal state/result event.
+
+    ``outcome`` uses the §5.4 status vocabulary directly
+    (done/failed/cancelled); ``result`` carries the structured result the
+    gateway submits after verifying the executor's structured return
+    (A fork-3); ``error`` is the §8 CoreError shape on failed/cancelled.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1)
+    outcome: Literal["done", "failed", "cancelled"]
+    error: CoreError | None = None
+    result: JsonValue | None = None
+    trace: JobTrace
+
+
+#: Jobs family (§3.1 py.job.* rows; PHASE3 §5.4/§7 A fork-3): seven durable
+#: types. Kept in a separate tuple so the frozen R2 boundary pins hold while
+#: ``default_event_registry`` resolves the full §3.1 table (T-C1-076; the
+#: fold/projection/service land in opencode.orchestrator.jobs).
+JOB_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_JOB_CREATED, durability="durable", data_model=JobCreatedData),
+    EventDefinition(event_type=PY_JOB_SPEC_BOUND, durability="durable", data_model=JobSpecBoundData),
+    EventDefinition(event_type=PY_JOB_STARTED, durability="durable", data_model=JobStartedData),
+    EventDefinition(event_type=PY_JOB_STALLED, durability="durable", data_model=JobStalledData),
+    EventDefinition(event_type=PY_JOB_REDISPATCHED, durability="durable", data_model=JobRedispatchedData),
+    EventDefinition(event_type=PY_JOB_GATED, durability="durable", data_model=JobGatedData),
+    EventDefinition(event_type=PY_JOB_FINISHED, durability="durable", data_model=JobFinishedData),
+)
+
+
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4+skills+compaction event subsets (§3.1; skills §6.3, compaction §2.4)."""
+    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1132,5 +1367,6 @@ def default_event_registry() -> EventRegistry:
             *R4_CONFIG_EVENT_DEFINITIONS,
             *SKILL_EVENT_DEFINITIONS,
             *COMPACTION_EVENT_DEFINITIONS,
+            *JOB_EVENT_DEFINITIONS,
         )
     )

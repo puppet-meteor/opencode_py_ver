@@ -11,6 +11,7 @@
 - 2026-11-10 [T-A-014]：增补 M6-compaction 规划契约——§2.4 自动 compaction（`py.context.compacted` 七字段 payload 表、锁内捕获 settled 边界/hash→释放锁生成摘要→短提交锁 expected_seq/CAS 校验→边界变化即丢弃摘要的执行序、阈值/锁/CAS/边界变化丢弃/失败不替换的 fixture 行为要求、「失败/取消/崩溃不替换原上下文」与「永远不拆 call/result」红线、物理删除原日志另走 M1 归档设计）+§3.1 增 `py.context.compacted` 事件行；§7 零增补（卡片无宿主命令面）。语义逐句承载 PHASE2-MODULES L123/L130/L138/L159 原文，增补面标注「规划契约，未实现」，compaction 实现切片派发前置（OP-P2-1 用户裁决定序：M6 线先于 M2 余量→自动 compaction 卡）。同票随载 rider：§6.3 skills 六处「规划契约，未实现」标注随 #171 实现落地（90f0073）翻牌为已实现态——上限值以 src 现读 `SKILL_BODY_MAX_BYTES`（64 KiB）填入，生产注册面以 src 现读核证（`src/opencode/skills/catalog.py`+`__init__.py` 在库、`SessionService` 构造参数 `catalog`、events.py `PY_SKILL_ACTIVATED`/`SkillActivatedData`+registry 注册线）。
 
 - 2026-11-11 [T-A-016]：增补 M2-watcher 规划契约——§6.4 watcher 文件变更监视与显式 reload（裁定①只提示通知不走 py.* durable/ephemeral 事件注册面——§3.1 零增补、events.py 零新事件模型、schema-lock 裁定面零解锁；裁定②宿主显式 reload 命令→新快照=§6.1 版本路径+§6.2 canonical hash 重验，旧快照含义不静默改写；裁定③ idle 判定三条件口径（无在飞 run+无在飞审批+静默窗，阈值归实现切片）；裁定④ boot_id 不变+saved 决定跨快照保留审计不自动激活；「不改变运行中审批」红线明文）+§6 L338「Phase 1 无热重载」句翻面承接（显式 capability 非静默热重载——原句语义不变）。语义逐句承载 PHASE2-MODULES L61/L65/L70 与 p2-slices watcher 卡/W1/W2 原文，增补面全部标注「规划契约，未实现」（watcher 全线未实现——本票无既有标注翻牌面）；W1/W2 实现切片派发前置（沿 T-A-013/014 两步走先例第一步——B 席评审与 merge 归调度器后续）。
+- 2026-11-12 [T-C1-076]：增补 P3 jobs 编排契约并落地 S1——§3.1 增 `py.job.*` 七事件行（created/spec_bound/started/stalled/redispatched/gated/finished；jobs 为编排域实体非 §7 run，metadata 非 run-scoped）+§5.4 jobs 工件与生命周期（状态闭集与 fold 迁移表/终态吸收、trace 四字段嵌套相关性集、`ses_job_{job_id}` 合成流键与 M-7 双写入域裁决——jobs 自有 writer 复用 §3.2 最小提交序；jobs 表无 sessions 外键、无 §3.2.1 隔离面两偏差；A fork-3 提交序；§8 五分支恢复矩阵含稳定 id 幂等回写）。S1 实现随票落地：七类型+数据模型注册、纯 fold/投影器/JobService、0003_jobs 迁移、/jobs 五路由+SSE 透传、FakeJobExecutor（started→finished(done)）、21 个事件 fixture；S2（params JSON-Schema 校验/真实 spec 哈希）、S3（预算强制）、S5a（门回复链）余量在 §5.4 标注。
 
 ## 1. 共同规则
 
@@ -176,6 +177,13 @@ durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配
 | py.run.finished | `run_id, outcome, error?`；投影 idle 消息并释放 active run |
 | py.skill.activated | `skill_id, source, path, hash, size, body`；M6-skills 已实现（§6.3——P2-S1/P2-S2 落地并回 #171 [90f0073]）——durable activation 记录（bounded 正文，上限值=src 现读 `SKILL_BODY_MAX_BYTES` 64 KiB）；恢复使用已保存内容，不悄悄重读磁盘 |
 | py.context.compacted | `covered_seq, retained_from, summary_text, summary_hash, model, usage, message_count`；M6-compaction 规划契约未实现（§2.4）——有效上下文替换记录：保留原始事件和工具结果，永远不拆 call/result；失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage |
+| py.job.created | `job_id, pipeline_id, depth, lineage, budget, trace`；jobs 身份先行（A fork-3 提交序，§5.4）——`depth` 为工作流嵌套深度（子工作流 ≤3 为网关策略），`lineage` 记录 parent_job_id/session_id/origin，`budget` 为执行预算，`trace` 四字段相关性集见 §5.4 |
+| py.job.spec_bound | `job_id, params, params_hash, session_anchor, trace`；spec 绑定——`params_hash` 为 canonical params JSON 的 SHA-256，`session_anchor` 为 `"api"`（无会话 API 提交）或 `ses_` 前缀会话 id；created 后恰一次，与 created 同批原子提交后才允许执行（§5.4） |
+| py.job.started | `job_id, attempt_id, trace`；执行启动（created→running），attempt 身份 |
+| py.job.stalled | `job_id, stalled_reason, attempt_id, trace`；watchdog 钩子（running→stalled），stalled_reason 供重派决策 |
+| py.job.redispatched | `job_id, attempt_id, retry_count, trace`；节点级单次重派（stalled→running；retry_count==1 恰一次，m-4 非整图重跑） |
+| py.job.gated | `job_id, gate_id, expires_at, trace`；人工门中断（running→gated；expiry 沿 §5.2 300 秒先例 m-3）；回复链 approve/reject/revise 为 S5a 面 |
+| py.job.finished | `job_id, outcome: done/failed/cancelled, result?, error?, trace`；终态事件——done 仅自 running，failed/cancelled 可自任何非终态；`result` 为网关校验执行器结构化返回后提交的结果，`error` 为 §8 CoreError 形状 |
 
 ephemeral 类型为 `py.text.delta/py.reasoning.delta`（message_id, part_id, delta）、`py.tool.input.delta`（call_index, delta）、`py.tool.progress`（execution_id, metadata）。delta 不落库；finalized/finished 必须含恢复所需的完整值。生产类型注册留 R2 随流式生产者落地；R1 生产注册表仅含 py.session.created/py.prompt.accepted 两个 durable 类型，ephemeral 只保留 envelope/注册机制和测试局部定义。
 
@@ -315,6 +323,20 @@ Phase 1 不做通用 before_execute hook。M3 若变更输入，必须发生在�
 - 子进程用受控环境、超时默认 120 秒、输出截断后仍排空管道；取消/超时必须终止并回收进程树（Windows Job Object、Unix process group 或已验证等价方案）。无法确认清理完成时标 effect_status=unknown。
 - 参数流每个调用上限 64 KiB、每次生成最多 16 个工具调用、文本流上限 1 MiB；超过即停止本次生成并报错，不执行超限调用计划。structured_output 和 metadata 各限制为 64 KiB，超限明确标记并保留 bounded 文本说明，不无限写入数据库/提示。
 - 命令输出、模型内容可能有任意终端控制字符，CLI 展示必须转义危险 escape。日志不记录认证头/环境凭据；任意文件输出无法保证识别所有秘密，保存和发送模型前受同一工作区信任范围约束。
+
+### 5.4 jobs 工件与生命周期（P3 编排域；S1 已实现——T-C1-076）
+
+**工件与状态闭集**：jobs 是编排域实体，不是 §7 run——七类 durable 事件（§3.1 `py.job.*` 行）折叠出状态闭集 `created/running/stalled/gated/done/failed/cancelled`。迁移规则的单一来源是纯 fold：`created→(spec_bound|started)`；`running→(stalled|gated|finished)`；`stalled→redispatched`（恰一次：事件 retry_count==1 且状态 retry_count==0；m-4 节点级重派，非整图重跑）；`finished(done)` 仅自 running，`finished(failed/cancelled)` 可自任何非终态；终态吸收——终态后任何 py.job.* 再提交拒绝；非 py.job.* 类型不属于该 fold，拒绝。提交路径上的违例是 StoreValidationError（拒绝+回滚），重放已存坏日志时是 StorageCorrupt。
+
+**trace 四字段相关性集**（PHASE3 §4 M-6）：`trace_id` 关联 job 流与会话流，`span_id/parent_id/depth` 构成 span 树；四个字段作为嵌套 `trace` 对象随每个 data 模型携带（嵌套而非扁平：`py.job.created` 的工件字段 `depth` 是工作流嵌套深度——子工作流 ≤3 为网关策略——与 trace 的 depth 同名冲突）。
+
+**流键与双写入域**（M-7 裁决）：jobs 事件用合成流键 `ses_job_{job_id}`——`^ses_` envelope 约束零契约变更成立，jobs 事件 metadata 非 run-scoped。py.job.* 永不经过 SessionStore（session fold 对其子集外类型 fail-closed 且该模块冻结）：jobs 自有 writer 复用同一 events 表与 §3.2 最小提交序（整批幂等重放先于 expected_seq 等值检查、H/A 不变量、连续 seq 分配、插入+同事务投影、A=H+n 校验）。偏差两条：`jobs` 表无 sessions 外键（合成流无 sessions 行，0002_runs 先例反转）；无 §3.2.1 隔离面——读模型损坏检测以 StorageCorruptError fail-closed，无可标记行。§3.3 式 rebuild 复用同一投影器。
+
+**提交序（A fork-3）**：`py.job.created`+`py.job.spec_bound` 同批原子提交，先于任何执行；网关校验执行器结构化返回后才提交 `finished` 的 result。
+
+**§8 重启恢复矩阵**：恢复扫描非终态集合，按检查点裁决——created→重派；检查点带终态 outcome→以稳定 batch_id/event_id/created_at_ms 幂等回写（重复恢复=writer 整批幂等重放，无新事件、H 不变；span 自 event_id 确定派生，不新铸）；检查点无 outcome→恢复续跑（resume 形态：仅补终态事件）；无 reader/无检查点/spec 哈希不符→分支④ fail-closed：`finished(failed)` 携带 `ExecutionUnknown`（副作用无法证明）。检查点 reader 为注入面，S1 的 App 默认 None。
+
+**实现状态**：S1 已落地——七类型注册、纯 fold/投影器/JobService、0003_jobs 迁移、/jobs 五路由（提交/状态/事件流 SSE 透传/取消/门回复 409 壳）、FakeJobExecutor（started→finished(done)）。S2 余量：params 按管道 JSON Schema 校验（S1 仅结构校验）、真实 spec 哈希（S1 为 params_hash）；S3：预算强制；S5a：门回复链（approve/reject/revise）与 gated→running 生产者——S1 中 gated 仅经终态转换收敛，/jobs 门回复路由为 409 壳。
 
 ## 6. S5：配置、指令和 MCP 信任
 

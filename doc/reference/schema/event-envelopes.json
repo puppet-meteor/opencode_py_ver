@@ -207,6 +207,1125 @@
       "title": "DurableEvent[ContextCompactedData]",
       "type": "object"
     },
+    "py.job.created.1": {
+      "$defs": {
+        "JobBudget": {
+          "additionalProperties": false,
+          "description": "The §5.3 brief budget block (max tool calls / max tokens / timeout).\n\nAll three are optional on the wire: S1's fake executor declares no budget\nface; the enforcement trio lands with workers (S3, T-C1-076 disclosed).",
+          "properties": {
+            "max_tokens": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Tokens"
+            },
+            "max_tool_calls": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Tool Calls"
+            },
+            "timeout_s": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Timeout S"
+            }
+          },
+          "title": "JobBudget",
+          "type": "object"
+        },
+        "JobCreatedData": {
+          "additionalProperties": false,
+          "description": "``py.job.created`` v1 data (§3.1/PHASE3 §5.4): job identity first.\n\nThe A fork-3 submit order: identity (created) and the spec binding\n(``py.job.spec_bound``) commit before the job starts; ``depth`` is the\nworkflow nesting depth (subworkflow <= 3 is gateway policy, §5.2).",
+          "properties": {
+            "budget": {
+              "$ref": "#/$defs/JobBudget"
+            },
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "lineage": {
+              "$ref": "#/$defs/JobLineage"
+            },
+            "pipeline_id": {
+              "minLength": 1,
+              "title": "Pipeline Id",
+              "type": "string"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "pipeline_id",
+            "depth",
+            "lineage",
+            "budget",
+            "trace"
+          ],
+          "title": "JobCreatedData",
+          "type": "object"
+        },
+        "JobLineage": {
+          "additionalProperties": false,
+          "description": "The §5.2/M-9 lineage block: parent job, initiating session, origin.\n\n``origin`` marks the submission channel (PHASE3 §1: a session-less API\nsubmission is explicitly ``api``); the worker-identity submission guard\n(reject lineage.origin == \"worker\") is gateway policy land with the\nworkers slice (S3/S4), not wire shape.",
+          "properties": {
+            "origin": {
+              "enum": [
+                "api",
+                "session",
+                "worker"
+              ],
+              "title": "Origin",
+              "type": "string"
+            },
+            "parent_job_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Job Id"
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Session Id"
+            }
+          },
+          "required": [
+            "origin"
+          ],
+          "title": "JobLineage",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobCreatedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobCreatedData]",
+      "type": "object"
+    },
+    "py.job.finished.1": {
+      "$defs": {
+        "CoreError": {
+          "additionalProperties": false,
+          "description": "Stable wire shape for every error crossing a seam (§8).",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/CoreErrorCode"
+            },
+            "details": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "message": {
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "retryable": {
+              "title": "Retryable",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "title": "CoreError",
+          "type": "object"
+        },
+        "CoreErrorCode": {
+          "description": "Closed code registry from §8; R1 slices surface a subset of it.\n\nLater slices may need more codes, but codes are never removed or\nrenumbered: they are part of the wire contract.",
+          "enum": [
+            "ValidationError",
+            "UnsupportedCapability",
+            "NotFound",
+            "SessionBusy",
+            "Conflict",
+            "IdempotencyConflict",
+            "InvalidCursor",
+            "PermissionDenied",
+            "ApprovalUnavailable",
+            "ApprovalExpired",
+            "ToolTimeout",
+            "ToolFailed",
+            "ExecutionUnknown",
+            "ProviderUnavailable",
+            "ProviderStreamInterrupted",
+            "ContextLimitExceeded",
+            "SlowConsumer",
+            "StorageCorrupt",
+            "MigrationRequired",
+            "SessionReadOnly",
+            "SessionClosed",
+            "LifecycleCleanupFailed"
+          ],
+          "title": "CoreErrorCode",
+          "type": "string"
+        },
+        "JobFinishedData": {
+          "additionalProperties": false,
+          "description": "``py.job.finished`` v1 data: the terminal state/result event.\n\n``outcome`` uses the §5.4 status vocabulary directly\n(done/failed/cancelled); ``result`` carries the structured result the\ngateway submits after verifying the executor's structured return\n(A fork-3); ``error`` is the §8 CoreError shape on failed/cancelled.",
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CoreError"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "done",
+                "failed",
+                "cancelled"
+              ],
+              "title": "Outcome",
+              "type": "string"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "outcome",
+            "trace"
+          ],
+          "title": "JobFinishedData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobFinishedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobFinishedData]",
+      "type": "object"
+    },
+    "py.job.gated.1": {
+      "$defs": {
+        "JobGatedData": {
+          "additionalProperties": false,
+          "description": "``py.job.gated`` v1 data: the human gate interrupt (``running -> gated``).\n\n``gate_id`` is unique within the job; ``expires_at`` follows the 300 s\npermission precedent (m-3). The gate reply chain (approve/reject/revise)\nlands in S5a; the fold keeps ``gated`` resolvable only by terminal\ntransitions in this slice (disclosed).",
+          "properties": {
+            "expires_at": {
+              "format": "date-time",
+              "title": "Expires At",
+              "type": "string"
+            },
+            "gate_id": {
+              "minLength": 1,
+              "title": "Gate Id",
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "gate_id",
+            "expires_at",
+            "trace"
+          ],
+          "title": "JobGatedData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobGatedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobGatedData]",
+      "type": "object"
+    },
+    "py.job.redispatched.1": {
+      "$defs": {
+        "JobRedispatchedData": {
+          "additionalProperties": false,
+          "description": "``py.job.redispatched`` v1 data: the single ``stalled -> running`` re-dispatch.\n\nNode-level retry, not a whole-graph rerun (m-4); ``retry_count`` is 1 on\nthe one legal re-dispatch (the fold rejects a second).",
+          "properties": {
+            "attempt_id": {
+              "minLength": 1,
+              "title": "Attempt Id",
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "retry_count": {
+              "minimum": 1,
+              "title": "Retry Count",
+              "type": "integer"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "attempt_id",
+            "retry_count",
+            "trace"
+          ],
+          "title": "JobRedispatchedData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobRedispatchedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobRedispatchedData]",
+      "type": "object"
+    },
+    "py.job.spec_bound.1": {
+      "$defs": {
+        "JobSpecBoundData": {
+          "additionalProperties": false,
+          "description": "``py.job.spec_bound`` v1 data: the spec/params/hash/session-anchor set.\n\n``params_hash`` is the sha256 of the canonical params JSON (§6.2 pipeline);\n``session_anchor`` is the conversation anchor -- ``\"api\"`` for a\nsession-less API submission, or the ``ses_``-prefixed session id the job\nis bound to (PHASE3 §1).",
+          "properties": {
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "params_hash": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Params Hash",
+              "type": "string"
+            },
+            "session_anchor": {
+              "minLength": 1,
+              "title": "Session Anchor",
+              "type": "string"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "params",
+            "params_hash",
+            "session_anchor",
+            "trace"
+          ],
+          "title": "JobSpecBoundData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobSpecBoundData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobSpecBoundData]",
+      "type": "object"
+    },
+    "py.job.stalled.1": {
+      "$defs": {
+        "JobStalledData": {
+          "additionalProperties": false,
+          "description": "``py.job.stalled`` v1 data: the watchdog hook (``running -> stalled``).\n\n``stalled_reason`` is recorded for the retry decision; ``attempt_id``\nidentifies the stalled attempt (PHASE3 §8).",
+          "properties": {
+            "attempt_id": {
+              "minLength": 1,
+              "title": "Attempt Id",
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "stalled_reason": {
+              "minLength": 1,
+              "title": "Stalled Reason",
+              "type": "string"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "stalled_reason",
+            "attempt_id",
+            "trace"
+          ],
+          "title": "JobStalledData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobStalledData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobStalledData]",
+      "type": "object"
+    },
+    "py.job.started.1": {
+      "$defs": {
+        "JobStartedData": {
+          "additionalProperties": false,
+          "description": "``py.job.started`` v1 data: the (fake) execution start; attempt identity.",
+          "properties": {
+            "attempt_id": {
+              "minLength": 1,
+              "title": "Attempt Id",
+              "type": "string"
+            },
+            "job_id": {
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            },
+            "trace": {
+              "$ref": "#/$defs/JobTrace"
+            }
+          },
+          "required": [
+            "job_id",
+            "attempt_id",
+            "trace"
+          ],
+          "title": "JobStartedData",
+          "type": "object"
+        },
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        },
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "data": {
+          "$ref": "#/$defs/JobStartedData"
+        },
+        "id": {
+          "minLength": 1,
+          "pattern": "^evt_",
+          "title": "Id",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "seq": {
+          "minimum": 1,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "type": {
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "session_id",
+        "created_at",
+        "data",
+        "seq"
+      ],
+      "title": "DurableEvent[JobStartedData]",
+      "type": "object"
+    },
     "py.permission.closed.1": {
       "$defs": {
         "JsonObject": {

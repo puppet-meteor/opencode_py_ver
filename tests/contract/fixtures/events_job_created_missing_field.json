@@ -1,0 +1,25 @@
+{
+  "id": "evt_0000000000000000000000001",
+  "type": "py.job.created",
+  "version": 1,
+  "session_id": "ses_job_0000000000000000000000000001",
+  "created_at": "2026-11-12T08:00:11Z",
+  "data": {
+    "job_id": "job_0000000000000000000000000001",
+    "pipeline_id": "research",
+    "depth": 0,
+    "lineage": {
+      "parent_job_id": null,
+      "session_id": null,
+      "origin": "api"
+    },
+    "trace": {
+      "trace_id": "trc_0000000000000000000000000001",
+      "span_id": "spn_0000000000000000000000000002",
+      "parent_id": null,
+      "depth": 0
+    }
+  },
+  "metadata": {},
+  "seq": 1
+}

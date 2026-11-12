@@ -51,19 +51,29 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 ENVELOPE_ARTIFACT = SCHEMA_DIR / "event-envelopes.json"
 
 #: Pinned census (doc/reference/r5-fixture-inventory.md closes the same counts):
-#: 26 positive, 49 schema-level negatives, 20 behavior-level negatives
+#: 33 positive, 63 schema-level negatives, 20 behavior-level negatives
 #: (15 missing run_id + 1 bad run_id + 2 bad snapshot hash + 2 registry probes;
-#: the compaction trio lands the py.context.compacted faces at T-C1-060).
-PINNED_TOTAL = 95
-PINNED_COUNTS = {"positive": 26, "schema-level": 49, "behavior-level": 20}
+#: the compaction trio lands the py.context.compacted faces at T-C1-060; the
+#: py.job.* septet lands the jobs family at T-C1-076: +7 valid +7 missing_field
+#: +7 bad_extension).
+PINNED_TOTAL = 116
+PINNED_COUNTS = {"positive": 33, "schema-level": 63, "behavior-level": 20}
 
 #: Pinned model counts per module artifact (seat full recount at R5-S4; the
 #: scheduler's grep pre-check of 53 counts class lines mentioning BaseModel and
 #: misses 10 subclass-only declarations -- both counts are reconciled in the
 #: inventory, the artifact covers all 65 actual pydantic models, +1
-#: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060).
-PINNED_MODEL_COUNTS = {"errors.json": 1, "events.json": 36, "llm.json": 17, "messages.json": 8, "tools.json": 3}
-PINNED_DURABLE_KEYS = 23
+#: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060, +10
+#: jobs-family models at T-C1-076; cards.json opens with its 1 model).
+PINNED_MODEL_COUNTS = {
+    "errors.json": 1,
+    "events.json": 46,
+    "llm.json": 17,
+    "messages.json": 8,
+    "tools.json": 3,
+    "cards.json": 1,
+}
+PINNED_DURABLE_KEYS = 30
 PINNED_EPHEMERAL_KEYS = 4
 
 
@@ -283,7 +293,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (65 models; see the inventory)."""
+    """The artifacts enumerate the full model face (76 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
@@ -303,7 +313,7 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 95-file closure (Done L16) and the pinned classification mix."""
+    """The 116-file closure (Done L16 + the T-C1-076 jobs septet) and the pinned classification mix."""
 
     def test_fixture_directory_is_exactly_the_pinned_files(self) -> None:
         assert len(FIXTURE_FILES) == PINNED_TOTAL

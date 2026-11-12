@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "models": {
+    "JobCard": {
+      "$defs": {
+        "JobTrace": {
+          "additionalProperties": false,
+          "description": "The unified-trace four-field set every ``py.job.*`` event carries (PHASE3 §4/§5.4).\n\n``trace_id`` correlates the job stream with the session stream (the SSE\ndouble-stream envelope); ``span_id`` is this event's span; ``parent_id``\nis the parent span (None at the job's root span); ``depth`` is the trace\ntree depth. The §5.4 job field ``depth`` (workflow nesting, hard cap 3 in\ngateway policy) is a separate py.job.created field -- the name collision\nis why the trace set rides as one nested object.",
+          "properties": {
+            "depth": {
+              "minimum": 0,
+              "title": "Depth",
+              "type": "integer"
+            },
+            "parent_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Parent Id"
+            },
+            "span_id": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            },
+            "trace_id": {
+              "minLength": 1,
+              "title": "Trace Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "trace_id",
+            "span_id",
+            "depth"
+          ],
+          "title": "JobTrace",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One renderable job card: the frontend wire shape for a ``py.job.*`` event.\n\n``kind`` selects the renderer; ``status`` is the folded job status after\nthe event; ``detail`` carries the event-specific payload (``None`` when\nthe kind renders from the fixed fields alone); ``title`` is the heading\ntext. Unknown fields are rejected (the §1 repo-wide closed-shape rule).",
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "job_id": {
+          "minLength": 1,
+          "title": "Job Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "job_created",
+            "job_spec_bound",
+            "job_started",
+            "job_stalled",
+            "job_redispatched",
+            "job_gated",
+            "job_finished"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "created",
+            "running",
+            "stalled",
+            "gated",
+            "done",
+            "failed",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "trace": {
+          "$ref": "#/$defs/JobTrace"
+        }
+      },
+      "required": [
+        "kind",
+        "job_id",
+        "status",
+        "title",
+        "trace"
+      ],
+      "title": "JobCard",
+      "type": "object"
+    }
+  },
+  "module": "opencode.contracts.cards",
+  "title": "opencode.contracts.cards: unified JSON Schema (R5-S4, CORE-CONTRACTS section 1 L17)"
+}

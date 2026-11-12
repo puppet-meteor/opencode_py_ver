@@ -42,6 +42,7 @@ from opencode.bus.eventlog import EventLog
 from opencode.contracts.events import DurableEvent, McpServerRef
 from opencode.contracts.llm import GenerationRequest, ProviderChunk
 from opencode.mcp import McpConnectError, McpManager, MCPRemoteTool, MCPToolAdapter
+from opencode.orchestrator.jobs import FakeJobExecutor, JobService, JobsProjector
 from opencode.session import SessionProjector, SessionService
 from opencode.session.context import ContextBuilder, RuntimeSettings
 from opencode.session.llm_summarizer import ProviderSummarizer
@@ -56,6 +57,7 @@ from opencode.storage import (
     StoreValidationError,
     open_database,
 )
+from opencode.storage.jobs_store import JobsReadRepository, JobsStore
 from opencode.storage.store import EventBatch
 from opencode.tools import ToolLimits, ToolRegistry
 from opencode.tools.policy import (
@@ -266,6 +268,22 @@ class App:
         self._mcp_refs = tuple(mcp_refs) if mcp_refs is not None else ()
         self._registry = registry
         self._policy = policy
+        # P3-S1 (T-C1-076): the jobs domain rides the same engine + bus over
+        # its own writer (PHASE3 M-7 "two writer domains" -- the session fold
+        # is fail-closed on py.job.* and frozen, so jobs commit through
+        # JobsStore on ses_job_* stream keys, not SessionStore). The executor
+        # is the S1 fake (started -> finished(done)); workers land in S3/S4.
+        # Recovery is deliberately NOT wired into the lifespan (a semantics
+        # change beyond this slice's edit list): callers drive
+        # ``jobs.recover()`` explicitly -- progress ④ open item.
+        self._jobs = JobService(
+            store=JobsStore(engine, projector=JobsProjector()),
+            repos=JobsReadRepository(engine),
+            executor=FakeJobExecutor(),
+            bus=self._bus,
+            ids=shared_ids,
+            clock=clock,
+        )
 
     @property
     def database(self) -> Database:
@@ -291,6 +309,11 @@ class App:
     def mcp_manager(self) -> McpManager | None:
         """The owned MCP server manager (None = no MCP servers in this composition)."""
         return self._mcp_manager
+
+    @property
+    def jobs(self) -> JobService:
+        """The P3-S1 jobs service (submit/run/cancel + the §8 recovery scan)."""
+        return self._jobs
 
     async def start_mcp_servers(self) -> tuple[tuple[str, Exception], ...]:
         """P2-S0 (§6 L304): spawn, catalog and bind every configured stdio server.
@@ -346,7 +369,8 @@ class App:
         return tuple(failures)
 
     async def close(self) -> None:
-        """Release in order: the service lifecycle first, then the engine/lock."""
+        """Release in order: the jobs tasks first, then the service lifecycle, then the engine/lock."""
+        await self._jobs.close()
         await self._service.close()
         await self._database.close()
 

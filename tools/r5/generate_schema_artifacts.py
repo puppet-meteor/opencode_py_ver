@@ -1,7 +1,7 @@
 """Generate the R5 unified JSON Schema artifacts (CORE-CONTRACTS §1 L17; r5-slices §2.4).
 
 Explicit tool (NOT part of pytest or CI): regenerates ``doc/reference/schema/``
-from the five frozen ``opencode.contracts`` wire modules by calling
+from the six frozen ``opencode.contracts`` wire modules by calling
 ``model_json_schema()`` on every pydantic model defined in them (read-only
 consumption -- the contracts source is never modified), plus one
 registry-parametrized event-envelope file derived from the public definition
@@ -25,9 +25,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from opencode.contracts import errors, events, llm, messages, tools
+from opencode.contracts import cards, errors, events, llm, messages, tools
 from opencode.contracts.events import (
     COMPACTION_EVENT_DEFINITIONS,
+    JOB_EVENT_DEFINITIONS,
     R1_EVENT_DEFINITIONS,
     R2_EVENT_DEFINITIONS,
     R3_CONFIG_EVENT_DEFINITIONS,
@@ -45,16 +46,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = REPO_ROOT / "doc" / "reference" / "schema"
 SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema"
 
-#: The five wire modules whose pydantic models make up the unified schema face.
-MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools)
+#: The six wire modules whose pydantic models make up the unified schema face
+#: (P3-S1 adds ``opencode.contracts.cards``, the job-card rendering contract).
+MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools, cards)
 
 #: The public definition tuples ``default_event_registry()`` composes
-#: (events.py L1119-1131, re-anchored at T-C1-060). Importing the tuples --
+#: (events.py, re-anchored per family addition). Importing the tuples --
 #: not the registry's private dicts -- keeps the generator on public surface
 #: only. The sixth tuple (SKILL_EVENT_DEFINITIONS, py.skill.activated) was
 #: added here by T-C1-052a, fulfilling the T-C1-045 disclosure; the seventh
 #: (COMPACTION_EVENT_DEFINITIONS, py.context.compacted) by T-C1-060; the
-#: registry still exposes no enumeration API.
+#: eighth (JOB_EVENT_DEFINITIONS, the seven py.job.* types) by T-C1-076;
+#: the registry still exposes no enumeration API.
 ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R1_EVENT_DEFINITIONS,
     *R2_EVENT_DEFINITIONS,
@@ -63,6 +66,7 @@ ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R4_CONFIG_EVENT_DEFINITIONS,
     *SKILL_EVENT_DEFINITIONS,
     *COMPACTION_EVENT_DEFINITIONS,
+    *JOB_EVENT_DEFINITIONS,
 )
 
 

@@ -889,7 +889,7 @@ def test_malformed_sse_lines_and_frames_fail_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_runtime_openapi_document_answers_the_seven_paths(running: _Running) -> None:
+def test_the_runtime_openapi_document_answers_the_twelve_paths(running: _Running) -> None:
     request = urllib.request.Request(
         running.base + "/openapi.json", headers={"Authorization": f"Bearer {_TOKEN}"}, method="GET"
     )
@@ -907,6 +907,11 @@ def test_the_runtime_openapi_document_answers_the_seven_paths(running: _Running)
         "/run/{run_id}/cancel",
         "/run/{run_id}/status",
         "/permission/{permission_id}/reply",
+        "/jobs",
+        "/jobs/{job_id}",
+        "/jobs/{job_id}/cancel",
+        "/jobs/{job_id}/events",
+        "/jobs/{job_id}/gate/{gate_id}/reply",
     }
     for path, method in (
         ("/session", "post"),
