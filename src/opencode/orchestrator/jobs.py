@@ -28,7 +28,8 @@ event                  legal from             notes
 =====================  =====================  =========================================
 py.job.created         (no row)               identity first; second create rejected
 py.job.spec_bound      created                once; params/params_hash/anchor bind
-py.job.started         created                attempt identity; -> running
+py.job.started         created/gated          attempt identity; -> running (the gated
+                                              leg is the S5a gate-reply resume)
 py.job.stalled         running                watchdog reason + attempt
 py.job.redispatched    stalled                exactly once (event retry_count == 1 and
                                               state retry_count == 0); -> running
@@ -40,10 +41,14 @@ failed/cancelled                              created/running/stalled/gated
 (non py.job.* type)    --                     not part of the fold: rejected
 =====================  =====================  =========================================
 
-``gated -> running`` has NO producer event in v1 -- the gate reply chain
-(approve/reject/revise) lands in S5a; until then a gated job resolves only
-through terminal transitions (disclosed, progress ①). The S1 transport's
-gate-reply route is the 409 shell of that later chain.
+``gated -> running`` is produced by the S5a gate reply chain (T-C1-080):
+``reply_gate`` emits ``py.job.started`` on approve/revise (then re-drives
+the job from the advisory cursor through the injected broker), and a reject
+resolves terminally through ``py.job.finished(failed)`` with
+``PermissionDenied`` naming the gate. The reply is validated against the
+active gate (id match, 300 s expiry per the m-3 precedent); every
+rejection is a structured conflict carrying the job id and gate id, and an
+expired or dangling gate never re-enters the graph.
 
 The four trace fields ride every data model as the nested ``trace`` object
 (PHASE3 §4 M-6: ``trace_id`` correlates the job stream with the session
@@ -60,7 +65,7 @@ import enum
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any, Literal, Protocol
 
@@ -91,6 +96,7 @@ from opencode.contracts.events import (
 )
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.contracts.pipelines import MAX_SUBWORKFLOW_DEPTH, PipelineSpec
+from opencode.orchestrator.gates import GATE_EXPIRY_S, GateBroker, GateResolution
 from opencode.session.service import AscendingIds, Clock, IdFactory
 from opencode.storage.jobs_store import JobRecord, JobsReadRepository, JobsStore, job_stream_key
 from opencode.storage.repos import NotFoundError
@@ -103,6 +109,13 @@ NON_TERMINAL_STATUSES: frozenset[str] = frozenset({"created", "running", "stalle
 
 #: The terminal, absorbing statuses.
 TERMINAL_STATUSES: frozenset[str] = frozenset({"done", "failed", "cancelled"})
+
+#: The dispatch self-check horizon (PHASE3 §6 discipline 5, the S3 leftover
+#: landed with S5a): an advisory probe that runs this many seconds after a
+#: spawn and confirms the job is actually being driven (drive task alive /
+#: event heartbeat / row readable). Results are in-memory and advisory only
+#: -- no consumer gates on them in v1 (disclosed, CORE-CONTRACTS §5.4 S5a).
+SELFCHECK_DELAY_S = 30.0
 
 
 def compute_params_hash(params: JsonObject) -> str:
@@ -284,9 +297,9 @@ def fold_job_event(state: JobState | None, event: DurableEvent[Any]) -> JobState
             applied_seq=event.seq,
         )
     if isinstance(data, JobStartedData):
-        if state.status is not JobStatus.CREATED:
+        if state.status not in (JobStatus.CREATED, JobStatus.GATED):
             raise JobTransitionError(
-                f"py.job.started is legal only from created (status {state.status.value})",
+                f"py.job.started is legal only from created or gated (status {state.status.value})",
                 details={"job_id": data.job_id, "status": state.status.value},
             )
         return replace(state, status=JobStatus.RUNNING, attempt_id=data.attempt_id, applied_seq=event.seq)
@@ -620,6 +633,14 @@ class JobRecoveryAction:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _ActiveGate:
+    """The in-memory active-gate entry (S5a): the gate id plus its expiry horizon."""
+
+    gate_id: str
+    expires_at: datetime
+
+
 class JobService:
     """The jobs service: submit, run, cancel, status, and the §8 recovery scan.
 
@@ -628,8 +649,19 @@ class JobService:
     commit. IDs are minted through the shared composition ``IdFactory``
     (event/batch ids share the process-wide ascending counter, so
     ``evt_``/``bat_`` ids never collide with the session domain); the
-    ``job_``/``att_``/``trc_``/``spn_`` conventions are built on the same
-    counter's bare hex (OP-3: new internal prefixes carry no §3.1 pattern).
+    ``job_``/``att_``/``trc_``/``spn_``/``gat_`` conventions are built on the
+    same counter's bare hex (OP-3: new internal prefixes carry no §3.1
+    pattern).
+
+    S5a (T-C1-080) adds three in-memory registries alongside the durable
+    ``py.job.*`` spine: the active-gate registry (one live gate per job,
+    populated by ``emit_gated`` and consumed/cleared by the reply face and
+    ``emit_finished``), the per-job spawn-task registry (the cancel face
+    interrupts the live drive tasks), and the advisory self-check reports.
+    All three are process-local by design -- a restart rebuilds none of
+    them, and recovery answers through the durable fold (an active gate
+    lost to a restart is re-minted fresh by the re-driven ``human_gate``
+    node; CORE-CONTRACTS §5.4 S5a).
     """
 
     def __init__(
@@ -643,6 +675,8 @@ class JobService:
         clock: Clock | None = None,
         params_validator: ParamsValidator | None = None,
         canceller: RunCanceller | None = None,
+        gate_broker: GateBroker | None = None,
+        selfcheck_delay_s: float = SELFCHECK_DELAY_S,
     ) -> None:
         self._store = store
         self._repos = repos
@@ -652,8 +686,18 @@ class JobService:
         self._clock = clock if clock is not None else _utc_now
         self._params_validator = params_validator
         self._canceller = canceller
+        self._gate_broker = gate_broker
+        self._selfcheck_delay_s = selfcheck_delay_s
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._gates: dict[str, _ActiveGate] = {}
+        self._job_tasks: dict[str, set[asyncio.Task[None]]] = {}
+        # The S5a deliberate-interrupt marker: the cancel face marks the job
+        # BEFORE cancelling its live drives, so jobs.run can tell its quiet
+        # exit (the fold owns the terminal) from a genuine task cancellation
+        # (close-time teardown keeps the task cancelled).
+        self._interrupted: set[str] = set()
+        self._selfchecks: dict[str, JsonObject] = {}
 
     # -- identity -----------------------------------------------------------
 
@@ -691,7 +735,14 @@ class JobService:
             depth=0,
         )
 
-    def _draft(self, stream_key: str, event_type: str, data: Any, created_at: datetime) -> EventDraft[Any]:
+    def _draft(
+        self,
+        stream_key: str,
+        event_type: str,
+        data: Any,
+        created_at: datetime,
+        metadata: JsonObject | None = None,
+    ) -> EventDraft[Any]:
         return EventDraft(
             id=self._ids.event_id(),
             type=event_type,
@@ -699,7 +750,7 @@ class JobService:
             session_id=stream_key,
             created_at=created_at,
             data=data,
-            metadata={},
+            metadata=metadata if metadata is not None else {},
         )
 
     # -- §7 A fork-3: submit --------------------------------------------------
@@ -854,11 +905,16 @@ class JobService:
     # -- the lifecycle emits (the executor's commit faces) ---------------------
 
     async def emit_started(self, job_id: str, *, attempt_id: str | None = None) -> DurableEvent[Any]:
-        """Emit ``py.job.started`` (created -> running)."""
+        """Emit ``py.job.started`` (created -> running; gated -> running is the S5a resume).
+
+        The gated leg is the gate-reply chain: ``reply_gate`` starts a gated
+        job (approve/revise) before re-driving it from the advisory cursor,
+        and the engine's gate body does the same on a reply-less resume.
+        """
         record = await self.get_job(job_id)
-        if record.status != JobStatus.CREATED.value:
+        if record.status not in (JobStatus.CREATED.value, JobStatus.GATED.value):
             raise JobTransitionError(
-                f"py.job.started is legal only from created (status {record.status})",
+                f"py.job.started is legal only from created or gated (status {record.status})",
                 details={"job_id": job_id, "status": record.status},
             )
         stream_key = job_stream_key(job_id)
@@ -928,22 +984,45 @@ class JobService:
         events = await self._commit(job_id, [draft])
         return events[0]
 
-    async def emit_gated(self, job_id: str, gate_id: str, expires_at: datetime) -> DurableEvent[Any]:
-        """Emit ``py.job.gated`` (running -> gated; the human-gate interrupt)."""
+    async def emit_gated(
+        self,
+        job_id: str,
+        gate_id: str | None = None,
+        expires_at: datetime | None = None,
+        *,
+        conversation_ref: str | None = None,
+    ) -> DurableEvent[Any]:
+        """Emit ``py.job.gated`` (running -> gated; the human-gate interrupt, S5a).
+
+        With no explicit gate id/expiry (the engine's gate body), the gate
+        is minted here (``gat_`` prefix, unique within the job) and the
+        expiry defaults to the 300 s m-3 precedent. The event itself is the
+        gate card over the job's control channel: ``conversation_ref``
+        (the engine passes the job's session anchor) rides the envelope
+        metadata so the frontend routes the card to its conversation without
+        the brain ever seeing it. The active-gate registry records the mint
+        (in-memory; ``reply_gate`` validates against it and
+        ``emit_finished`` clears it).
+        """
         record = await self.get_job(job_id)
         if record.status != JobStatus.RUNNING.value:
             raise JobTransitionError(
                 f"py.job.gated is legal only from running (status {record.status})",
                 details={"job_id": job_id, "status": record.status},
             )
+        resolved_gate = gate_id if gate_id is not None else self._mint("gat")
+        resolved_expiry = expires_at if expires_at is not None else self._clock() + timedelta(seconds=GATE_EXPIRY_S)
         stream_key = job_stream_key(job_id)
+        metadata: JsonObject | None = {"conversation_ref": conversation_ref} if conversation_ref is not None else None
         draft = self._draft(
             stream_key,
             PY_JOB_GATED,
-            JobGatedData(job_id=job_id, gate_id=gate_id, expires_at=expires_at, trace=self._trace(record)),
+            JobGatedData(job_id=job_id, gate_id=resolved_gate, expires_at=resolved_expiry, trace=self._trace(record)),
             self._clock(),
+            metadata,
         )
         events = await self._commit(job_id, [draft])
+        self._gates[job_id] = _ActiveGate(gate_id=resolved_gate, expires_at=resolved_expiry)
         return events[0]
 
     async def emit_finished(
@@ -954,7 +1033,12 @@ class JobService:
         result: JsonValue | None = None,
         error: CoreError | None = None,
     ) -> DurableEvent[Any]:
-        """Emit ``py.job.finished`` (terminal; done only from running)."""
+        """Emit ``py.job.finished`` (terminal; done only from running).
+
+        A terminal emit also clears the job's active-gate registry entry
+        (S5a): a cancelled or failed gated job takes its gate with it --
+        the card is invalidated by the same event that resolves the job.
+        """
         record = await self.get_job(job_id)
         if record.status in TERMINAL_STATUSES:
             raise JobTransitionError(
@@ -974,36 +1058,232 @@ class JobService:
             self._clock(),
         )
         events = await self._commit(job_id, [draft])
+        self._gates.pop(job_id, None)
         return events[0]
 
-    # -- run / cancel ----------------------------------------------------------
+    # -- the S5a gate-reply chain (T-C1-080) --------------------------------------
+
+    def active_gate(self, job_id: str) -> str | None:
+        """The job's one active gate id (None = no live gate; the pure read face)."""
+        gate = self._gates.get(job_id)
+        return gate.gate_id if gate is not None else None
+
+    async def reply_gate(
+        self,
+        job_id: str,
+        gate_id: str,
+        reply: Literal["approve", "reject", "revise"],
+        *,
+        params: JsonObject | None = None,
+    ) -> JobRecord:
+        """Resolve one human-gate reply (approve/reject/revise; PHASE3 §4).
+
+        Validation order -- every rejection is a structured conflict carrying
+        the job id and gate id, so the transport answers 409 with the same
+        body shape the S1 shell pinned: the chain must be wired (a broker
+        exists); the job must be ``gated``; the gate must be the job's one
+        active gate; the expiry must not have passed. An approve/revise then
+        starts the job (``gated -> running``), stores the resolution on the
+        broker and spawns the resume drive: the engine's gate node takes the
+        reply and the graph continues from the advisory cursor (a revise
+        carries the revised params into the node result for downstream
+        nodes; the job's ``params_hash`` binding is never re-bound). A
+        reject resolves the job terminally -- ``finished(failed)`` with
+        ``PermissionDenied`` naming the gate, the card invalidated by the
+        same event. A concurrent terminal resolution (a cancel race)
+        surfaces as the fold's ``JobTransitionError``, unchanged for the
+        caller.
+        """
+        details: JsonObject = {"job_id": job_id, "gate_id": gate_id}
+        if self._gate_broker is None:
+            raise JobTransitionError(
+                "the human-gate reply chain is not wired in this composition (no gate broker)",
+                details=details,
+            )
+        record = await self.get_job(job_id)
+        if record.status != JobStatus.GATED.value:
+            raise JobTransitionError(
+                f"job {job_id} is not gated (status {record.status}); no reply is applied",
+                details=details,
+            )
+        gate = self._gates.get(job_id)
+        if gate is None or gate.gate_id != gate_id:
+            raise JobTransitionError(
+                f"gate {gate_id!r} is not the active gate of job {job_id}"
+                + ("" if gate is None else f" (active gate {gate.gate_id!r})"),
+                details=details,
+            )
+        if self._clock() >= gate.expires_at:
+            self._gates.pop(job_id, None)
+            raise JobTransitionError(
+                f"gate {gate_id!r} of job {job_id} has expired; no reply is applied",
+                details=details,
+            )
+        self._gates.pop(job_id, None)
+        if reply == "reject":
+            await self.emit_finished(
+                job_id,
+                "failed",
+                error=CoreError(
+                    code=CoreErrorCode.PERMISSION_DENIED,
+                    message=f"the human gate {gate_id!r} rejected the job",
+                    retryable=False,
+                    details=details,
+                ),
+            )
+            return await self.get_job(job_id)
+        await self.emit_started(job_id)
+        self._gate_broker.resolve(
+            GateResolution(
+                job_id=job_id,
+                gate_id=gate_id,
+                reply=reply,
+                params=params if reply == "revise" else None,
+            )
+        )
+        self.spawn(job_id, resume=True)
+        return await self.get_job(job_id)
+
+    # -- run / cancel --------------------------------------------------------------
 
     async def run(self, job_id: str, *, resume: bool = False) -> None:
-        """Drive the job through the executor (deterministic, inline)."""
-        await self._executor.drive(JobHandle(service=self, job_id=job_id), resume=resume)
+        """Drive the job through the executor (deterministic, inline).
+
+        The S5a cancel face interrupts a live drive with ``task.cancel()``
+        (CORE-CONTRACTS §5.4 S5a) -- and only that deliberate interrupt is
+        absorbed here, at the spawn wrapper (the cancel face marks the job
+        first): the interrupted drive exits quietly, never touches job
+        state on the way out, and the fold stays the sole terminal
+        authority, the same discipline as the S3 ``WorkerSuspended``
+        swallow one frame down. Any other cancellation (close-time
+        teardown) is a genuine task cancellation and re-raises untouched.
+        """
+        try:
+            await self._executor.drive(JobHandle(service=self, job_id=job_id), resume=resume)
+        except asyncio.CancelledError:
+            if job_id not in self._interrupted:
+                raise
+            return
 
     def spawn(self, job_id: str, *, resume: bool = False) -> asyncio.Task[None]:
-        """Schedule ``run`` as a tracked background task (the API submit shape)."""
+        """Schedule ``run`` as a tracked background task (the API submit shape).
+
+        The task also registers under the job's id -- the S5a cancel face
+        interrupts exactly the drives of the cancelled job -- and an
+        advisory self-check probe is scheduled alongside (§6 discipline 5:
+        ``selfcheck_delay_s`` after dispatch, swallowing everything; the
+        report is in-memory and no consumer gates on it in v1 -- disclosed,
+        CORE-CONTRACTS §5.4 S5a).
+        """
         task = asyncio.create_task(self.run(job_id, resume=resume))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        self._job_tasks.setdefault(job_id, set()).add(task)
+
+        def _release(finished: asyncio.Task[None]) -> None:
+            tasks = self._job_tasks.get(job_id)
+            if tasks is not None:
+                tasks.discard(finished)
+                if not tasks:
+                    self._job_tasks.pop(job_id, None)
+
+        task.add_done_callback(_release)
+        if self._selfcheck_delay_s >= 0:
+            self._tasks.add(asyncio.create_task(self._advisory_selfcheck(job_id)))
         return task
 
-    async def cancel(self, job_id: str) -> JobRecord:
-        """Cancel the job; idempotent (a terminal job returns unchanged).
+    async def _advisory_selfcheck(self, job_id: str) -> None:
+        """The deferred probe body: sleep the horizon, then record the report (never raise)."""
+        await asyncio.sleep(self._selfcheck_delay_s)
+        try:
+            await self.selfcheck(job_id)
+        except Exception:
+            return  # advisory only: a failing probe never surfaces anywhere
 
-        The canceller hook (S3) runs *before* the terminal emit, so a live
-        worker subprocess tree is signalled to die while the job is still
-        non-terminal (PHASE3 §7: the fold stays the single status authority;
-        the drive's swallow-JobTransitionError discipline handles the race).
+    async def selfcheck(self, job_id: str) -> JsonObject:
+        """The §6 discipline-5 three-check probe: is the dispatch actually being driven?
+
+        Pure reads, honestly answered: (1) ``row`` -- the job's read-model
+        row is readable; (2) ``heartbeat`` -- the committed event high
+        watermark advanced past the submit batch (the A fork-3 pair);
+        (3) ``drive_task`` -- the job has a live drive task, or is
+        legitimately self-settled (terminal: nothing left to drive; gated:
+        parked on a human reply). ``ok`` is the conjunction. The report is
+        recorded for the ``last_selfcheck`` read face (in-memory).
+        """
+        try:
+            record = await self.get_job(job_id)
+        except NotFoundError:
+            self._selfchecks[job_id] = {
+                "job_id": job_id,
+                "row": False,
+                "heartbeat": False,
+                "drive_task": False,
+                "ok": False,
+            }
+            return self._selfchecks[job_id]
+        high = await self._repos.log_high(job_stream_key(job_id))
+        heartbeat = high >= 2  # py.job.created + py.job.spec_bound committed
+        drive_task = record.status in TERMINAL_STATUSES or record.status == "gated" or bool(self._job_tasks.get(job_id))
+        report: JsonObject = {
+            "job_id": job_id,
+            "row": True,
+            "heartbeat": heartbeat,
+            "drive_task": drive_task,
+            "ok": heartbeat and drive_task,
+        }
+        self._selfchecks[job_id] = report
+        return report
+
+    def last_selfcheck(self, job_id: str) -> JsonObject | None:
+        """The most recent advisory self-check report (None = not yet run)."""
+        return self._selfchecks.get(job_id)
+
+    async def cancel(self, job_id: str) -> JobRecord:
+        """Cancel the job -- and its non-terminal descendants -- idempotently.
+
+        The S5a full chain (PHASE3 §7): descendants first (leaves before the
+        parent, each through this same face -- a subworkflow's nested job is
+        an independent job record whose lineage parent is the cancelled
+        job), then the job itself: the canceller hook (S3) kills a live
+        worker subprocess tree *before* the terminal emit, the job's live
+        drive tasks are interrupted (``task.cancel`` -- the interrupted
+        node's side effects are bounded by the checkpointer's last
+        committed node boundary, the same frontier a restart would see),
+        and ``py.job.finished(cancelled)`` commits the outcome with the
+        fold as the single status authority. A concurrent resolution that
+        already made the job terminal is swallowed (idempotent over the
+        closed terminal set: the pinned second cancel is the no-op). A
+        gated job cancelled here takes its active gate with it (the
+        registry clear inside ``emit_finished``): the card is invalidated
+        by the same event.
         """
         record = await self.get_job(job_id)
         if record.status in TERMINAL_STATUSES:
             return record
+        for child_id in await self._non_terminal_children(job_id):
+            await self.cancel(child_id)
         if self._canceller is not None:
             self._canceller.cancel(job_id)
-        await self.emit_finished(job_id, "cancelled")
+        # Mark before the interrupt so the drive can never observe its own
+        # cancellation without the marker (the quiet-exit contract, jobs.run).
+        self._interrupted.add(job_id)
+        for task in list(self._job_tasks.get(job_id, ())):
+            task.cancel()
+        try:
+            await self.emit_finished(job_id, "cancelled")
+        except JobTransitionError:
+            pass  # a concurrent resolution won the race; the fold is the authority
         return await self.get_job(job_id)
+
+    async def _non_terminal_children(self, job_id: str) -> list[str]:
+        """The job's non-terminal children by lineage (the subworkflow descent walk)."""
+        children: list[str] = []
+        for record in await self._repos.non_terminal_jobs():
+            lineage = record.lineage if record.lineage is not None else {}
+            if lineage.get("parent_job_id") == job_id:
+                children.append(record.job_id)
+        return children
 
     # -- §8: the restart-recovery scan -----------------------------------------
 
@@ -1126,3 +1406,4 @@ class JobService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._job_tasks.clear()

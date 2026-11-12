@@ -49,6 +49,12 @@ VALID_DIGEST = "70152fa897ce94831325a87efae0039c6af197ef1e70527e5551e14da3731ef8
 EMPTY_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 POSITIVE_FIXTURE = "skills_manifest_valid.json"
+#: The S5a manifest-extension positive fixture (T-C1-080, CORE-CONTRACTS
+#: §6.3): a langgraph entry carrying the legal execution/pipeline pair.
+#: Its four-path behavior tests live in test_skills_manifest_langgraph.py;
+#: it joins the directory-exactness set here so the fixture face stays one
+#: declared set.
+LANGGRAPH_POSITIVE_FIXTURE = "skills_manifest_entry_langgraph_valid.json"
 NEGATIVE_FIXTURES = [
     "skills_manifest_invalid_json.json",
     "skills_manifest_top_level_array.json",
@@ -60,6 +66,8 @@ NEGATIVE_FIXTURES = [
     "skills_manifest_entry_bad_hash.json",
     "skills_manifest_entry_duplicate_id.json",
     "skills_manifest_duplicate_key.json",
+    "skills_manifest_entry_langgraph_missing_pipeline.json",
+    "skills_manifest_entry_execution_unknown.json",
 ]
 
 
@@ -366,7 +374,7 @@ class TestWireShapeFixtures:
 
     def test_the_fixture_directory_is_exactly_the_declared_set(self) -> None:
         assert sorted(path.name for path in SKILLS_FIXTURES_DIR.glob("*.json")) == sorted(
-            [POSITIVE_FIXTURE, *NEGATIVE_FIXTURES]
+            [POSITIVE_FIXTURE, LANGGRAPH_POSITIVE_FIXTURE, *NEGATIVE_FIXTURES]
         )
 
     def test_positive_fixture_round_trips_field_by_field(self, tmp_path: Path) -> None:

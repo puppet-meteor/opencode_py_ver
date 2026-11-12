@@ -20,8 +20,9 @@ P3-S1 (T-C1-076) adds the five /jobs routes over
 * ``POST /jobs``                             -> ``{id}`` (structural validation; params JSON-Schema lands in S2)
 * ``GET  /jobs/{job_id}``                    -> JobStatus wire (the folded row)
 * ``GET  /jobs/{job_id}/events``             -> durable SSE over ``ses_job_{job_id}`` (the trace pass-through)
-* ``POST /jobs/{job_id}/cancel``             -> JobStatus wire (idempotent)
-* ``POST /jobs/{job_id}/gate/{gate_id}/reply`` -> the S5a shell: 409 on an existing job (body enum validated first)
+* ``POST /jobs/{job_id}/cancel``             -> JobStatus wire (idempotent, propagates to descendants)
+* ``POST /jobs/{job_id}/gate/{gate_id}/reply`` -> the gate-reply receipt (approve/reject/revise;
+  body enum validated first; 409 Conflict on every service-side rejection)
 
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
@@ -92,7 +93,7 @@ import secrets
 import sys
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
-from typing import Any
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
@@ -102,6 +103,7 @@ from opencode.app import App
 from opencode.bus.eventlog import EventCursor, EventLog, LogItem, Synced
 from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue
+from opencode.orchestrator.jobs import JobTransitionError
 from opencode.session.service import DecisionReceipt, RunRef, RunStatus, SessionRef
 from opencode.storage import StoreError
 from opencode.storage.jobs_store import JobRecord, job_stream_key
@@ -707,16 +709,22 @@ def create_app(app: App, *, token: str) -> FastAPI:
 
     @api.post("/jobs/{job_id}/gate/{gate_id}/reply")
     async def gate_reply(job_id: str, gate_id: str, request: Request) -> Response:
-        """The S5a gate-chain shell: validate the reply shape, then answer 409.
+        """The S5a gate-reply face: validate the shape, then resolve through the service.
 
         The body enum (approve/reject/revise) is validated first (the wire
-        contract is real), the job's existence second (404); an existing job
-        then answers 409 Conflict -- the human-gate full chain (gate waiting,
-        expiry, reply resolution) lands in S5a, and this route never
-        silently pretends a reply was applied.
+        contract is real), the job's existence second (404), then the reply
+        resolves through the jobs service's gate chain: an approve/revise
+        resumes the job from its advisory cursor (the re-drive runs in the
+        background -- the M-5 non-blocking discipline), a reject resolves
+        it terminally with ``PermissionDenied`` naming the gate. A revise may
+        carry revised ``params`` (a JSON object, legal only on the revise
+        enum -- any other pairing is a 422). Every service-side rejection
+        (job not gated, gate mismatch, expired gate, chain not wired in
+        this composition) answers 409 Conflict with the job id and gate id
+        in ``details`` -- the exact body shape the S1 shell pinned.
         """
         payload = await _read_json_object(request)
-        unknown = sorted(set(payload) - {"reply"})
+        unknown = sorted(set(payload) - {"reply", "params"})
         if unknown:
             raise _TransportError(422, _validation(f"request body has unknown fields: {', '.join(unknown)}"))
         reply = payload.get("reply")
@@ -724,16 +732,31 @@ def create_app(app: App, *, token: str) -> FastAPI:
             raise _TransportError(
                 422, _validation("request body field 'reply' must be one of: approve, reject, revise")
             )
+        params = payload.get("params")
+        if "params" in payload:
+            if reply != "revise":
+                raise _TransportError(422, _validation("request body field 'params' is legal only on a revise reply"))
+            if not isinstance(params, dict):
+                raise _TransportError(422, _validation("request body field 'params' must be a JSON object"))
         await jobs.get_job(job_id)
-        raise _TransportError(
-            409,
-            CoreError(
-                code=CoreErrorCode.CONFLICT,
-                message="job gate replies land with the human-gate chain (S5a); no reply is applied in this version",
-                retryable=False,
-                details={"job_id": job_id, "gate_id": gate_id},
-            ),
-        )
+        try:
+            record = await jobs.reply_gate(
+                job_id,
+                gate_id,
+                cast(Literal["approve", "reject", "revise"], reply),
+                params=params if isinstance(params, dict) else None,
+            )
+        except JobTransitionError as error:
+            raise _TransportError(
+                409,
+                CoreError(
+                    code=CoreErrorCode.CONFLICT,
+                    message=f"job gate reply was rejected: {error}",
+                    retryable=False,
+                    details={"job_id": job_id, "gate_id": gate_id, **error.details},
+                ),
+            ) from error
+        return _json_response({"job_id": job_id, "gate_id": gate_id, "reply": reply, "status": record.status})
 
     api.add_exception_handler(_TransportError, _transport_error_handler)
     api.add_exception_handler(StoreError, _store_error_handler)

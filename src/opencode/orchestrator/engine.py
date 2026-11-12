@@ -19,7 +19,10 @@ registration pipeline re-anchored for the gateway):
   closed set's other names are recognized-but-unimplemented -- rejected with
   an explicit error naming the S3/S5a delivery (the default face stays
   byte-identical to the S2 message; a worker-wired engine names its executed
-  set instead);
+  set instead). S5a (T-C1-080) wires the ``human_gate`` and ``subworkflow``
+  bodies behind optional constructor flags (``gate_broker`` /
+  ``subworkflow``), so the rejection fires only for compositions that
+  genuinely lack the executor;
 * **rehearsal** -- ``_compile``: the graph is actually compiled (a dry run
   with no side effects; the injected executors are never invoked).
 
@@ -48,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,7 +64,7 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from opencode.contracts.errors import CoreError, CoreErrorCode
-from opencode.contracts.events import JobBudget
+from opencode.contracts.events import JobBudget, JobLineage
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.contracts.pipelines import (
     MAX_SUBWORKFLOW_DEPTH,
@@ -68,6 +72,7 @@ from opencode.contracts.pipelines import (
     PipelineSpec,
     compute_spec_hash,
 )
+from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.jobs import (
     TERMINAL_STATUSES,
     JobCheckpoint,
@@ -86,6 +91,36 @@ from opencode.orchestrator.workers import (
 #: S2 face, the default constructor). A worker-wired engine registers its
 #: ``opencode_agent`` executor into this set at ``register`` time.
 DEFAULT_IMPLEMENTED: frozenset[str] = frozenset({"llm_call", "tool"})
+
+#: The S5a subworkflow poll interval: a nested job parked on a human gate
+#: legitimately leaves the parent node waiting, so the node body polls the
+#: nested job's read model until it turns terminal (the interval paces the
+#: read only -- the semantics are the fold's, never the poll's).
+_SUBWORKFLOW_POLL_S = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class DriveContext:
+    """One drive's service face for the engine-internal node bodies (S5a).
+
+    The ``human_gate`` and ``subworkflow`` bodies need the jobs service (the
+    gate emits / the nested submit) plus the job's identity facts; the
+    constructor cannot take the service (the engine is built *before* the
+    JobService -- the executor seam), so ``drive`` sets this ContextVar
+    around ``ainvoke`` (the S3 ``AGENT_JOB_CONTEXT`` precedent: the
+    graph-state channel set is pinned by the S2 tests, so no new channels).
+    ``depth`` is the §5.4 workflow-nesting depth and ``session_anchor`` the
+    job's conversation ref -- the nested submission inherits both.
+    """
+
+    service: JobService
+    job_id: str
+    depth: int
+    session_anchor: str
+
+
+#: The per-drive context (set/reset around ``ainvoke`` in ``drive``).
+DRIVE_CONTEXT: ContextVar[DriveContext | None] = ContextVar("opencode_pipeline_drive_context", default=None)
 
 
 class PipelineSpecRejected(ValueError):
@@ -247,23 +282,32 @@ def validate_pipeline_spec(
             )
 
     # -- the execution face: closed-set names, the non-executed ones rejected
-    # with an explicit message naming the delivery slice. The default-face
-    # message is pinned byte-identical to the S2 wording by test_pipelines.py;
-    # a worker-wired engine names its executed set instead.
+    # with an explicit message naming the delivery slice. The two pinned
+    # variants (the S2 default face and the S3 worker-wired face) stay
+    # byte-identical -- test_pipelines.py locks both; any other wiring
+    # combination (an S5a partial face: gate-broker or subworkflow wired
+    # without the full set) names its executed set dynamically.
     for node in spec.nodes:
         if node.node_type in implemented:
             continue
-        if "opencode_agent" in implemented:
+        if implemented == DEFAULT_IMPLEMENTED | frozenset({"opencode_agent"}):
             message = (
                 f"unimplemented node type '{node.node_type}' on node '{node.node_id}': "
                 "this engine executes llm_call/tool/opencode_agent nodes only "
                 "(human_gate and subworkflow land with S5a)"
             )
-        else:
+        elif implemented == DEFAULT_IMPLEMENTED:
             message = (
                 f"unimplemented node type '{node.node_type}' on node '{node.node_id}': "
                 "S2 executes llm_call/tool nodes only "
                 "(opencode_agent lands with S3 workers; human_gate and subworkflow with S5a)"
+            )
+        else:
+            executed = "/".join(sorted(implemented))
+            message = (
+                f"unimplemented node type '{node.node_type}' on node '{node.node_id}': "
+                f"this composition executes {executed} nodes only "
+                "(the closed set's other node types are not wired into this engine)"
             )
         raise PipelineSpecRejected(
             message,
@@ -284,6 +328,17 @@ def validate_pipeline_spec(
             raise PipelineSpecRejected(
                 f"{node.node_type} node '{node.node_id}' must carry a prompt template "
                 "('prompt_template') as its goal for the worker brief",
+                code=CoreErrorCode.VALIDATION_ERROR,
+                details={"node_id": node.node_id, "node_type": node.node_type},
+            )
+        if node.node_type == "subworkflow" and node.workflow_ref is None:
+            # The S5a constraint: a subworkflow node that reached the
+            # per-type checks (only an executed-subworkflow engine gets here)
+            # must name its nested pipeline -- otherwise the node body has
+            # nothing to submit and would fail at drive time instead of at
+            # the registration gate.
+            raise PipelineSpecRejected(
+                f"subworkflow node '{node.node_id}' must carry a nested pipeline reference ('workflow_ref')",
                 code=CoreErrorCode.VALIDATION_ERROR,
                 details={"node_id": node.node_id, "node_type": node.node_type},
             )
@@ -440,18 +495,33 @@ class PipelineEngine:
         llm_call: LlmCallFn,
         tool: ToolFn,
         opencode_agent: AgentFn | None = None,
+        gate_broker: GateBroker | None = None,
+        subworkflow: bool = False,
     ) -> None:
         self._checkpointer = checkpointer
         self._llm_call = llm_call
         self._tool = tool
         self._opencode_agent = opencode_agent
+        self._gate_broker = gate_broker
+        self._subworkflow_enabled = subworkflow
         self._pipelines: dict[str, BoundPipeline] = {}
 
     def _implemented(self) -> frozenset[str]:
-        """The executed node-type set: the S2 two, plus the agent when wired."""
-        if self._opencode_agent is None:
-            return DEFAULT_IMPLEMENTED
-        return DEFAULT_IMPLEMENTED | frozenset({"opencode_agent"})
+        """The executed node-type set: the S2 two plus each wired executor.
+
+        The S5a flags are injection-gated so the S2/S3 default faces stay
+        byte-identical: an engine with no broker executes no ``human_gate``
+        (the spec rejects it at the gate), and an engine without the
+        ``subworkflow`` flag executes no nested pipelines.
+        """
+        implemented = DEFAULT_IMPLEMENTED
+        if self._opencode_agent is not None:
+            implemented = implemented | frozenset({"opencode_agent"})
+        if self._gate_broker is not None:
+            implemented = implemented | frozenset({"human_gate"})
+        if self._subworkflow_enabled:
+            implemented = implemented | frozenset({"subworkflow"})
+        return implemented
 
     # -- the registration gate (structure -> semantic -> rehearsal) -----------
 
@@ -487,6 +557,17 @@ class PipelineEngine:
         """
         return self._opencode_agent
 
+    @property
+    def gate_broker(self) -> GateBroker | None:
+        """The wired gate-reply broker (None = the engine executes no ``human_gate``).
+
+        The App wiring face derives the JobService's gate hand-off from this
+        instance (the same derivation pattern as the ``opencode_agent``
+        canceller): the reply face resolves onto it and the ``human_gate``
+        node body takes from it -- one broker, both ends.
+        """
+        return self._gate_broker
+
     def _compile(self, spec: PipelineSpec, saver: AsyncSqliteSaver) -> CompiledStateGraph:
         """The rehearsal layer + the actual graph: build, wire topology, compile.
 
@@ -512,6 +593,29 @@ class PipelineEngine:
                         value = await self._llm_call(node, state)
                     elif node.node_type == "tool":
                         value = await self._tool(node, state)
+                    elif node.node_type == "human_gate":
+                        # The S5a gate body: the registration gate proved this
+                        # type executed, so the broker is wired (the guard is
+                        # the same defense-in-depth the agent branch carries).
+                        if self._gate_broker is None:
+                            raise _NodeFailure(
+                                node,
+                                WorkerError(
+                                    "human_gate executor is not wired (the gate should have rejected this spec)",
+                                    code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+                                ),
+                            )
+                        value = await self._human_gate(node, state)
+                    elif node.node_type == "subworkflow":
+                        if not self._subworkflow_enabled:
+                            raise _NodeFailure(
+                                node,
+                                WorkerError(
+                                    "subworkflow executor is not wired (the gate should have rejected this spec)",
+                                    code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+                                ),
+                            )
+                        value = await self._subworkflow(node, state)
                     else:
                         # The registration gate proved this type executed; the
                         # only remaining closed-set name is the agent (the old
@@ -548,6 +652,100 @@ class PipelineEngine:
         for node_id in terminal_ids:
             builder.add_edge(node_id, END)
         return builder.compile(checkpointer=saver)
+
+    # -- the S5a node bodies (engine-internal executors; T-C1-080) --------------
+
+    async def _human_gate(self, node: PipelineNode, state: EngineState) -> JsonValue:
+        """The real ``human_gate`` body: pause for a human reply, resume on it.
+
+        First look for an already-resolved reply (the resume drive after an
+        approve/revise): a resolution present means the human already
+        answered, and the reply becomes the node's result -- the graph
+        continues. Otherwise the node gates: a job entering this body as
+        ``gated`` (a resume without a reply -- a recovery drive, or a plain
+        re-drive) first re-enters ``running`` so the fresh gate below is a
+        legal transition, then the service mints the gate (id unique within
+        the job, 300 s expiry, the conversation ref on the envelope for the
+        card's routing -- the card rides the existing ``py.job.gated``
+        event over the job's control channel, never the brain) and the body
+        raises :class:`EnginePause`: the drive returns, the job stays
+        ``gated`` with the cursor holding the node position.
+        """
+        broker = self._gate_broker
+        assert broker is not None  # the node_fn dispatch guarded this
+        context = DRIVE_CONTEXT.get()
+        if context is None:
+            raise WorkerError(
+                "the human_gate node body runs outside a drive context",
+                code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+            )
+        resolution = broker.take(context.job_id)
+        if resolution is not None:
+            return resolution.node_result()
+        record = await context.service.get_job(context.job_id)
+        if record.status == "gated":
+            # A resume drive entered without a reply: re-enter running so
+            # the fresh gate below is the legal running -> gated transition.
+            await context.service.emit_started(context.job_id)
+        await context.service.emit_gated(context.job_id, conversation_ref=context.session_anchor)
+        raise EnginePause(
+            f"job {context.job_id} gated on node '{node.node_id}': waiting for a human reply (approve/reject/revise)"
+        )
+
+    async def _subworkflow(self, node: PipelineNode, state: EngineState) -> JsonValue:
+        """The real ``subworkflow`` body: drive a nested job in-process.
+
+        The nested spec must be registered with this same engine (the S2
+        three-layer gate + §5.1 hash already ran at its registration). The
+        nested job is an independent job record: lineage parent = this
+        job's id, depth = this job's depth + 1 -- the M-9 lineage guard
+        enforces the ancestor chain and the ≤3 cap on the nested submit, so
+        a too-deep recursion surfaces here as the guard's structured 4xx
+        wrapped into the node failure. Execution is in-process engine
+        recursion (PHASE3 §12: never a subprocess): ``service.run`` drives
+        the nested graph over the same checkpointer file under its own
+        thread id. A nested job parked on its own human gate legitimately
+        parks this body too (the poll loop below) until the reply resolves
+        it. The node's result carries the nested job's identity, terminal
+        status and result, so downstream nodes and tests can walk the
+        chain. Restart mid-node is NOT idempotent in v1 (the nested job id
+        cannot ride the graph state before the node completes -- disclosed
+        leftover, CORE-CONTRACTS §5.4 S5a).
+        """
+        context = DRIVE_CONTEXT.get()
+        if context is None:
+            raise WorkerError(
+                "the subworkflow node body runs outside a drive context",
+                code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+            )
+        assert node.workflow_ref is not None  # the semantic gate proved it
+        anchor = context.session_anchor
+        lineage = JobLineage(
+            parent_job_id=context.job_id,
+            session_id=None if anchor == "api" else anchor,
+            origin="api" if anchor == "api" else "session",
+        )
+        handle = await context.service.submit(node.workflow_ref, {}, anchor, depth=context.depth + 1, lineage=lineage)
+        await context.service.run(handle.job_id)
+        while True:
+            record = await context.service.get_job(handle.job_id)
+            if record.status in TERMINAL_STATUSES:
+                break
+            await asyncio.sleep(_SUBWORKFLOW_POLL_S)
+        if record.status == "cancelled":
+            # The cancel seam: the fold already committed the terminal
+            # outcome (a parent cancel propagated here) -- end the drive
+            # like the S3 WorkerSuspended face, never touching the status.
+            raise WorkerSuspended(f"nested job {handle.job_id} was cancelled")
+        if record.status == "failed":
+            error = record.error if record.error is not None else {}
+            message = str(error.get("message") or f"nested job {handle.job_id} failed")
+            try:
+                code = CoreErrorCode(str(error.get("code")))
+            except ValueError:
+                code = CoreErrorCode.TOOL_FAILED
+            raise WorkerError(f"subworkflow node '{node.node_id}' failed: {message}", code=code)
+        return {"job_id": handle.job_id, "status": record.status, "result": record.result}
 
     # -- the JobExecutor face --------------------------------------------------
 
@@ -600,18 +798,27 @@ class PipelineEngine:
 
         resume_mode = resume
         if not resume:
+            prior_status = record.status
             try:
                 await handle.started()
             except JobTransitionError:
-                # started is legal only from created: an already-running job is
-                # idempotent re-entry (continue from the cursor); a terminal
-                # job is a lost race (silent no-op); anything else re-raises.
+                # started is legal only from created or gated (the S5a gate
+                # reply chain): an already-running job is idempotent re-entry
+                # (continue from the cursor); a terminal job is a lost race
+                # (silent no-op); anything else re-raises.
                 record = await service.get_job(handle.job_id)
                 if record.status in TERMINAL_STATUSES:
                     return
                 if record.status != "running":
                     raise
                 resume_mode = True
+            else:
+                # A started-over-gated drive (S5a) is a re-entry, not a fresh
+                # start: the gate cycle left the advisory cursor at the gate
+                # node, so the drive resumes from it instead of restarting
+                # the graph channels from the submitted state.
+                if prior_status == "gated":
+                    resume_mode = True
 
         saver = await self._checkpointer.saver()
         config: dict[str, Any] = {"configurable": {"thread_id": handle.job_id}}
@@ -704,6 +911,19 @@ class PipelineEngine:
 
         try:
             context_token = AGENT_JOB_CONTEXT.set(AgentJobContext(job_id=handle.job_id, budget=job_budget))
+            # The S5a drive context: the engine-internal node bodies (the
+            # human_gate emits, the subworkflow nested submit) read the
+            # service and the job's identity facts from this ContextVar --
+            # set around the ainvoke so a nested drive's context restores
+            # the parent's on exit (token discipline).
+            drive_token = DRIVE_CONTEXT.set(
+                DriveContext(
+                    service=service,
+                    job_id=handle.job_id,
+                    depth=record.depth,
+                    session_anchor=record.session_anchor if record.session_anchor is not None else "api",
+                )
+            )
             try:
                 if resume_mode:
                     final = await bound.graph.ainvoke(None, cast(Any, config))
@@ -711,6 +931,7 @@ class PipelineEngine:
                     final = await bound.graph.ainvoke(state0, cast(Any, config))
             finally:
                 AGENT_JOB_CONTEXT.reset(context_token)
+                DRIVE_CONTEXT.reset(drive_token)
         except EnginePause:
             # Leave the job running: the advisory cursor holds the position; the
             # recovery scan (or a plain re-drive) resumes from it.

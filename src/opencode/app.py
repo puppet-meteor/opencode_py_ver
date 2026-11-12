@@ -298,7 +298,12 @@ class App:
         # the worker's subprocess tree before the terminal fold commits).
         # The full production wiring (credentials, model, runs root) is
         # composed by the caller that builds the manager -- the App face
-        # only derives the hook.
+        # only derives the hook. P3-S5a (T-C1-080): the engine's gate
+        # broker derives the same way -- one broker instance serves both
+        # ends of the gate-reply chain (the reply face resolves onto it,
+        # the engine's human_gate node body takes from it), and its
+        # presence is what makes the engine execute ``human_gate`` nodes
+        # at all (None keeps the S2/S3 unwired face byte-identical).
         self._pipeline_engine = pipeline_engine
 
         # P3-S4 (T-C1-079): the shared gateway params validator over the
@@ -326,6 +331,7 @@ class App:
             clock=clock,
             params_validator=params_validator,
             canceller=wired_agent if isinstance(wired_agent, WorkerManager) else None,
+            gate_broker=pipeline_engine.gate_broker if pipeline_engine is not None else None,
         )
         # The registration-isolation face (C#5): the workflow tools are
         # injected ONLY into the main brain's ToolRegistry (this single

@@ -23,11 +23,17 @@ implied):
   :meth:`opencode.config.loader.ConfigLoader.skills_directory`.
 * manifest: exactly one ``skills.json`` inside that directory -- a JSON
   object whose single key ``skills`` holds a list of entry objects.
-* entry: exactly the six §6.3 SkillEntry fields -- ``id``, ``name``,
-  ``path``, ``size``, ``hash``, ``source`` -- all required, no extras. The
-  entry maps onto :class:`SkillEntry` field by field, carried verbatim
-  (``path`` is the declared string; resolution and the path check belong to
-  activation, §6.3 "激活前须通过路径检查").
+* entry: the §6.3 SkillEntry fields -- ``id``, ``name``, ``path``,
+  ``size``, ``hash``, ``source``, all six required -- plus the optional
+  S5a execution pair (``execution`` ∈ {default, langgraph}; ``pipeline``
+  required with ``langgraph``, rejected without it -- CORE-CONTRACTS
+  §6.3 manifest extension, T-C1-080); no other extras. The entry maps onto
+  :class:`SkillEntry` field by field, carried verbatim (``path`` is the
+  declared string; resolution and the path check belong to activation,
+  §6.3 "激活前须通过路径检查"). Discovery reads exactly the manifest -- a
+  declared ``pipeline`` file is *not* opened here; the graph.json
+  registration-time validation and hash lock are the engine's
+  ``register`` face (the manifest -> engine glue is S5b).
 
 Failure is explicit, never repaired (p2-slices §2.1 L96): a missing
 directory, a missing manifest, corrupt JSON, a wrong manifest shape, or any
@@ -44,7 +50,7 @@ import re
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -66,8 +72,17 @@ SKILL_INSTRUCTION_TOTAL_BUDGET = 256 * 1024
 #: hex characters, no ``sha256:`` prefix.
 _SKILL_HASH = re.compile(r"[0-9a-f]{64}")
 
-#: The closed field set of one manifest entry (the §6.3 six-field table).
-_ENTRY_KEYS: frozenset[str] = frozenset({"id", "name", "path", "size", "hash", "source"})
+#: The closed field set of one manifest entry: the §6.3 six-field table plus
+#: the optional S5a execution pair (CORE-CONTRACTS §6.3 manifest extension,
+#: T-C1-080). ``execution``/``pipeline`` are legal only as the conditional
+#: langgraph pair -- the required/optional split and the pair's rules are
+#: enforced in :func:`_validate_entry`.
+_ENTRY_KEYS: frozenset[str] = frozenset({"id", "name", "path", "size", "hash", "source", "execution", "pipeline"})
+
+#: The six unconditionally required §6.3 fields (the execution pair is
+#: optional by CORE-CONTRACTS §6.3; a missing pair member is only a
+#: violation under the conditional rules below).
+_REQUIRED_ENTRY_KEYS: frozenset[str] = frozenset({"id", "name", "path", "size", "hash", "source"})
 
 
 class SkillDiscoveryError(Exception):
@@ -96,13 +111,15 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 class SkillEntry(BaseModel):
-    """One discovered skill entry -- the §6.3 six-field table, field for field.
+    """One discovered skill entry -- the §6.3 field table, field for field.
 
-    A strict carrier with no defaults and no extra fields: the manifest
-    validation in :class:`SkillCatalog` is the single discovery gate, and the
-    model restates the same constraints (strict types, so the §1 bool rule
-    holds and no string ever coerces into ``size``) so a directly constructed
-    entry cannot bypass them either.
+    A strict carrier with no extra fields: the six §6.3 fields are required
+    (strict types, so the §1 bool rule holds and no string ever coerces into
+    ``size``), and the S5a execution pair is optional (``execution`` None =
+    the implicit "default" reading; ``pipeline`` legal only on langgraph
+    entries). The manifest validation in :class:`SkillCatalog` is the single
+    discovery gate, and the model restates the same constraints so a
+    directly constructed entry cannot bypass them either.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -113,6 +130,14 @@ class SkillEntry(BaseModel):
     size: int = Field(ge=0)
     hash: str = Field(min_length=1)
     source: str = Field(min_length=1)
+    #: The execution declaration (CORE-CONTRACTS §6.3 S5a): None (the
+    #: implicit "default") or "langgraph"; any other value is rejected at
+    #: discovery, and "langgraph" makes ``pipeline`` required.
+    execution: Literal["default", "langgraph"] | None = None
+    #: The langgraph pipeline path (skill-directory-relative, declared
+    #: verbatim like ``path`` -- never opened by discovery). Legal only with
+    #: execution "langgraph"; rejected on a default entry.
+    pipeline: str | None = Field(default=None, min_length=1)
 
     @field_validator("hash")
     @classmethod
@@ -139,15 +164,43 @@ def _validate_entry(manifest: Path, index: int, raw: Any, seen_ids: set[str]) ->
         if key not in _ENTRY_KEYS:
             raise SkillDiscoveryError(
                 f"unknown field {key!r} in {where} of {manifest} "
-                "(CORE-CONTRACTS §6.3: exactly the six SkillEntry fields)"
+                "(CORE-CONTRACTS §6.3: exactly the SkillEntry fields -- six required "
+                "plus the optional execution/pipeline pair)"
             )
-    missing = sorted(_ENTRY_KEYS - entry.keys())
+    missing = sorted(_REQUIRED_ENTRY_KEYS - entry.keys())
     if missing:
         raise SkillDiscoveryError(f"{where} in {manifest} is missing required field(s): {', '.join(missing)}")
     for field in ("id", "name", "path", "source"):
         value = entry[field]
         if not isinstance(value, str) or not value:
             raise SkillDiscoveryError(f"{where}.{field} in {manifest} must be a non-empty string")
+    # -- the S5a execution pair (CORE-CONTRACTS §6.3 manifest extension):
+    # execution ∈ {default, langgraph} when present; pipeline is a
+    # non-empty string legal ONLY on langgraph entries, and required there.
+    # A pipeline on a default entry (explicit or implicit) is rejected --
+    # the pair is conditional, never a free-form extension.
+    execution = entry.get("execution")
+    if execution is not None and (not isinstance(execution, str) or execution not in ("default", "langgraph")):
+        raise SkillDiscoveryError(
+            f"{where}.execution in {manifest} must be one of: default, langgraph "
+            "(CORE-CONTRACTS §6.3 manifest extension)"
+        )
+    pipeline = entry.get("pipeline")
+    if pipeline is not None and (not isinstance(pipeline, str) or not pipeline):
+        raise SkillDiscoveryError(f"{where}.pipeline in {manifest} must be a non-empty string")
+    if execution == "langgraph" and pipeline is None:
+        raise SkillDiscoveryError(
+            f"{where} in {manifest} declares execution 'langgraph' without the required 'pipeline' field "
+            "(CORE-CONTRACTS §6.3: a langgraph skill must name its pipeline path)"
+        )
+    if pipeline is not None and execution != "langgraph":
+        raise SkillDiscoveryError(
+            f"{where} in {manifest} carries 'pipeline' without execution 'langgraph' "
+            "(CORE-CONTRACTS §6.3: the pipeline field is legal only on langgraph skills)"
+        )
+    # the pair is validated above -- execution is exactly the enum literal or
+    # None; ``in``-membership does not narrow, so cast for the frozen field.
+    execution = cast(Literal["default", "langgraph"] | None, execution)
     size = entry["size"]
     if isinstance(size, bool) or not isinstance(size, int):
         raise SkillDiscoveryError(f"{where}.size in {manifest} must be an integer, got {size!r}")
@@ -172,6 +225,8 @@ def _validate_entry(manifest: Path, index: int, raw: Any, seen_ids: set[str]) ->
             size=size,
             hash=digest,
             source=entry["source"],
+            execution=execution,
+            pipeline=pipeline,
         )
     except ValidationError as error:
         raise SkillDiscoveryError(f"{where} in {manifest} is not a legal skill entry: {error}") from error

@@ -280,6 +280,10 @@ async def test_the_brain_submits_polls_and_summarizes_one_workflow(tmp_path: Pat
             # The two-channel discipline (PHASE3 §4): job events never ride the
             # brain's session stream -- the brain saw only its own tool round.
             assert not [event for event in turn_one.events if event.type.startswith("py.job.")]
+            # The symmetric turn-2 zero (T-B-094 R5 addendum, the S5a rider):
+            # the status-poll round stays on the tool channel too -- no py.job.*
+            # event ever rode the brain's session stream in either turn.
+            assert not [event for event in turn_two.events if event.type.startswith("py.job.")]
 
             # The brain-direction registry pin (C#5): the resident brain's own
             # registry resolves the workflow pair for its session.
