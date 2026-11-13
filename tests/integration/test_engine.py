@@ -257,6 +257,25 @@ class TestRegistrationGate:
         finally:
             await engine_stack.close()
 
+    async def test_a_dialect_shaped_wire_object_is_the_structural_rejection(self, tmp_path: Path) -> None:
+        """T-C1-087 (ruling-18): the loading router is retired -- the structural
+        layer is the native single path. A dialect ``pydag-editable-graph-v1``
+        body reaching the engine is the plain pydantic rejection (no sniffing,
+        no conversion), exactly the registration face's ValueError-family row.
+        """
+        engine_stack = _Stack(tmp_path, llm=_FakeLlm(), tool=_FakeTool())
+        try:
+            dialect: dict[str, object] = {
+                "schema_version": "pydag-editable-graph-v1",
+                "skill_name": "demo",
+                "nodes": [],
+                "edges": [],
+            }
+            with pytest.raises(ValidationError, match="schema_version"):
+                await engine_stack.register_digest(dialect)  # type: ignore[arg-type]
+        finally:
+            await engine_stack.close()
+
     async def test_unregistered_pipeline_fails_the_job_not_found(self, stack: _Stack) -> None:
         job_id = await stack.submit("ghost-run", pipeline_id="ghost")
         await stack.service.run(job_id)

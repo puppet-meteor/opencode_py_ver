@@ -5,10 +5,13 @@ boot. The skills manifest is the single routing source (PHASE3 §5.1 m-1 /
 §13 L240): the real :class:`~opencode.skills.catalog.SkillCatalog` is the
 only discovery gate (zero second parsing -- no drift), and every entry
 declaring ``execution == "langgraph"`` names a skill-directory-relative
-graph.json that is opened, parsed and handed to the real engine's
-three-layer registration gate (structure -> semantic -> rehearsal).
-Default/None entries are counted and skipped -- their pipeline face is
-never opened (the catalog.py pinned discipline).
+graph.json whose same-directory sibling ``pipeline.opencode.json`` -- the
+native spec the framework repo's emitter publishes, the only consumption
+form (ruling-18/19) -- is opened, parsed and handed to the real engine's
+three-layer registration gate (structure -> semantic -> rehearsal). The
+declared graph.json string itself stays routing metadata and is never
+opened. Default/None entries are counted and skipped -- their pipeline
+face is never opened (the catalog.py pinned discipline).
 
 The report face (host-only; this module writes no stdout -- the CLI's
 stdout is the answer stream -- and no stderr either: the hosts own the
@@ -24,12 +27,13 @@ disclosure, the report carries everything):
 * ``rejected``: one row per failed entry -- skill id, the declared
   pipeline string, the exception class name and the message's first line
   (the single-line disclosure discipline). The rejection face is
-  ``OSError`` (the graph read) plus the ``ValueError`` family -- exactly
-  the ticket's five classes (``json.JSONDecodeError``, pydantic
-  ``ValidationError``, ``PydagImportError``, ``PipelineSpecRejected``)
-  plus the read/decode face (``UnicodeDecodeError``) and this module's
-  containment rejection (:class:`PipelinePathEscape`) -- and one entry's
-  rejection never interrupts the remaining entries;
+  ``OSError`` (the spec read) plus the ``ValueError`` family -- exactly
+  the ticket's classes (``json.JSONDecodeError``, pydantic
+  ``ValidationError``, ``PipelineSpecRejected``) plus the read/decode
+  face (``UnicodeDecodeError``) and this module's own named rejections
+  (containment :class:`PipelinePathEscape`, the missing-native-spec face
+  :class:`NativeSpecMissing`) -- and one entry's rejection never
+  interrupts the remaining entries;
 * ``manifest_error``: a broken manifest (the catalog's one named
   :class:`~opencode.skills.catalog.SkillDiscoveryError`) is reported,
   never raised -- while a missing skills directory or manifest is the
@@ -64,6 +68,13 @@ from typing import Any, Protocol, cast
 from opencode.contracts.messages import JsonObject
 from opencode.skills.catalog import SKILLS_MANIFEST_NAME, SkillCatalog, SkillDiscoveryError
 
+#: The native pipeline spec file the registration face consumes (ruling-18):
+#: the sibling of the entry's declared ``pipeline`` file -- the framework
+#: repo's emitter publishes it next to the dialect graph.json (the publish
+#: convention) and it is the ONLY consumption form; a missing sibling is a
+#: structured per-entry rejection, never a fallback to any conversion face.
+NATIVE_SPEC_NAME = "pipeline.opencode.json"
+
 
 class PipelinePathEscape(ValueError):
     """A declared pipeline path resolves outside the skills root (the §5.3 face).
@@ -71,6 +82,19 @@ class PipelinePathEscape(ValueError):
     Named, not a bare ``ValueError``: the escape is the glue's own
     rejection, discovered before any read, and the report's error rows
     carry class names the host discloses as-is.
+    """
+
+
+class NativeSpecMissing(ValueError):
+    """A langgraph entry's native pipeline spec sibling is absent (ruling-19).
+
+    Named, not a bare ``ValueError``: the missing ``pipeline.opencode.json``
+    is the glue's own structured rejection -- a rejected row, never a
+    silent skip and never a fallback to a converter (retired, ruling-18).
+    The single-line message carries the skill id, the missing-native-spec
+    fact (with the declared pipeline string as the dialect reference) and
+    the migration pointer: the framework repo's emitter publish face is
+    what writes the sibling.
     """
 
 
@@ -128,29 +152,42 @@ def _manifest_present(root: Path) -> bool:
     return root.is_dir() and (root / SKILLS_MANIFEST_NAME).is_file()
 
 
-def _load_graph(skills_root: Path, pipeline: str) -> Any:
-    """Containment + open + parse for one declared pipeline file (the sync read face).
+def _load_graph(skills_root: Path, pipeline: str, skill_id: str) -> Any:
+    """Derive, contain, open and parse one entry's native spec (the sync read face).
 
-    The path base is the skill-directory-relative string (PHASE3 §5.1
-    m-1); both sides resolve (lexical -> realpath) and an escape --
+    The declared string (``entry.pipeline``) is routing metadata only: the
+    consumed file is its same-directory sibling ``pipeline.opencode.json``
+    (the framework publish convention, ruling-18/19) -- the declared
+    graph.json is never opened here. The derived sibling path resolves
+    (lexical -> realpath) against the skills root, and an escape --
     traversal, an absolute path, or an unresolvable path treated
-    conservatively as an escape -- rejects before any read (the §5.3
-    face, the ``_escaping_resource`` precedent). The parse hands back the
-    raw JSON value untyped: the engine's structural layer owns what a
-    graph.json must be. Raises ``PipelinePathEscape`` (containment),
-    ``OSError`` (the read) and the ValueError family (UTF-8/JSON decode)
-    -- together with the engine's gate exceptions, exactly the per-entry
-    rejection face ``register_pipelines`` records.
+    conservatively as an escape -- rejects before any read (the §5.3 face,
+    the ``_escaping_resource`` precedent). A sibling that is not a file is
+    the structured :class:`NativeSpecMissing` rejection. The parse hands
+    back the raw JSON value untyped: the engine's structural layer owns
+    what a native spec must be. Raises ``PipelinePathEscape`` (containment
+    on the derived path), :class:`NativeSpecMissing`, ``OSError`` (the
+    read) and the ValueError family (UTF-8/JSON decode) -- together with
+    the engine's gate exceptions, exactly the per-entry rejection face
+    ``register_pipelines`` records.
     """
     resolved_root = skills_root.resolve()
+    native = (skills_root / pipeline).parent / NATIVE_SPEC_NAME
     try:
-        resolved = (skills_root / pipeline).resolve()
+        resolved = native.resolve()
     except OSError as error:
         raise PipelinePathEscape(f"pipeline path {pipeline!r} under {skills_root} is unresolvable: {error}") from error
     if not resolved.is_relative_to(resolved_root):
         raise PipelinePathEscape(
             f"pipeline path {pipeline!r} escapes the skills root {skills_root} "
             "(CORE-CONTRACTS §5.3: traversal and out-of-root symlinks/junctions are rejected)"
+        )
+    if not resolved.is_file():
+        raise NativeSpecMissing(
+            f"skill {skill_id!r}: the native pipeline spec {NATIVE_SPEC_NAME} is missing next to the declared "
+            f"pipeline {pipeline!r} (the dialect graph.json stays routing metadata; the native spec is the "
+            f"only consumption form) -- re-publish the skill with the agent_dsl_flow_framework emitter, "
+            f"whose publish face writes {NATIVE_SPEC_NAME} next to the graph"
         )
     return json.loads(resolved.read_text(encoding="utf-8"))
 
@@ -185,7 +222,7 @@ async def register_pipelines(engine: RegistrationEngine, skills_dir: str | Path)
         # so cast for the declared string (the catalog.py precedent).
         pipeline = cast(str, entry.pipeline)
         try:
-            bound = await engine.register(_load_graph(root, pipeline))
+            bound = await engine.register(_load_graph(root, pipeline, entry.id))
             registered.append(
                 RegisteredPipeline(
                     skill_id=entry.id,
@@ -195,10 +232,10 @@ async def register_pipelines(engine: RegistrationEngine, skills_dir: str | Path)
             )
         except (OSError, ValueError) as error:
             # The per-entry rejection face: the read's OSError plus the
-            # ValueError family -- PipelinePathEscape / json.JSONDecodeError /
-            # UnicodeDecodeError from the sync read face, pydantic
-            # ValidationError / PydagImportError / PipelineSpecRejected from
-            # the engine's three-layer gate. Recorded by class name with the
+            # ValueError family -- PipelinePathEscape / NativeSpecMissing /
+            # json.JSONDecodeError / UnicodeDecodeError from the sync read
+            # face, pydantic ValidationError / PipelineSpecRejected from the
+            # engine's three-layer gate. Recorded by class name with the
             # message's first line; the remaining entries continue.
             message_lines = str(error).splitlines()
             rejected.append(

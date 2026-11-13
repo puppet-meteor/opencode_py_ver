@@ -9,16 +9,24 @@ second face is exercised or built here). The real-engine cases live in
 tests/integration/test_registration_engine.py; the two host composition
 cases in tests/integration/test_registration_hosts.py.
 
-Coverage (the T-C1-085 acceptance judges):
+Coverage (the T-C1-085 acceptance judges; the T-C1-087 native-spec faces):
 
-* filtering: only ``execution == "langgraph"`` entries open their pipeline
-  file -- default/None entries are counted and skipped, never opened
+* filtering: only ``execution == "langgraph"`` entries open their native
+  spec file -- default/None entries are counted and skipped, never opened
   (proven by nonexistent declared files: any open would surface as a
   rejection row, and none does);
-* containment: a pipeline path escaping the skills root (traversal or
-  absolute) is rejected per-entry without touching the outside file;
+* the native-spec consumption (T-C1-087, ruling-18): the consumed file is
+  the declared pipeline's ``pipeline.opencode.json`` sibling -- the
+  declared graph.json is routing metadata and is never opened (a garbage
+  declared file proves it); a missing sibling is the named
+  ``NativeSpecMissing`` rejection row carrying the skill id, the missing
+  fact and the framework-emitter migration pointer (the legacy 2 SPEC + 6
+  missing batch is the mirror);
+* containment: the derived sibling path escaping the skills root
+  (traversal or absolute) is rejected per-entry without touching the
+  outside file;
 * the per-entry rejection face: ``OSError`` / ``json.JSONDecodeError`` /
-  pydantic ``ValidationError`` / ``PydagImportError`` /
+  pydantic ``ValidationError`` / ``NativeSpecMissing`` /
   ``PipelineSpecRejected`` each land in the report by class name without
   interrupting the remaining entries;
 * manifest_error: a corrupt manifest is reported, never raised; a missing
@@ -41,9 +49,12 @@ from pydantic import ValidationError
 
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.pipelines import PipelineSpec
-from opencode.contracts.pydag_import import PYDAG_STRUCTURAL, PydagDiagnostic, PydagImportError
 from opencode.orchestrator.engine import PipelineSpecRejected
-from opencode.orchestrator.registration import RegistrationReport, register_pipelines
+from opencode.orchestrator.registration import (
+    NATIVE_SPEC_NAME,
+    RegistrationReport,
+    register_pipelines,
+)
 from tests.contract.test_pipelines import _spec_raw
 
 #: The §6.2 digest form carried verbatim from the locked skills fixtures.
@@ -81,6 +92,13 @@ def _write_skills(skills: Path, entries: Sequence[dict[str, Any]]) -> Path:
 def _write_graph(skills: Path, relative: str, payload: object) -> None:
     """Write one file under the skills root (str payloads land verbatim)."""
     target = skills / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+
+
+def _write_native(skills: Path, declared: str, payload: object) -> None:
+    """Write the native-spec sibling for one declared pipeline (the glue's own derivation)."""
+    target = (skills / declared).parent / NATIVE_SPEC_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
 
@@ -138,10 +156,6 @@ def _make_validation_error() -> ValidationError:
     return excinfo.value
 
 
-def _make_pydag_error() -> PydagImportError:
-    return PydagImportError([PydagDiagnostic(PYDAG_STRUCTURAL, "nodes", "unit-test diagnostic")])
-
-
 def _make_spec_rejection() -> PipelineSpecRejected:
     return PipelineSpecRejected("entry node 'ghost' is not declared", code=CoreErrorCode.VALIDATION_ERROR)
 
@@ -179,8 +193,8 @@ class TestFiltering:
                 _entry("beta", execution="langgraph", pipeline="beta/graph.json"),
             ],
         )
-        _write_graph(skills, "alpha/graph.json", _spec_raw(pipeline_id="alpha-pipeline"))
-        _write_graph(skills, "beta/graph.json", _spec_raw(pipeline_id="beta-pipeline"))
+        _write_native(skills, "alpha/graph.json", _spec_raw(pipeline_id="alpha-pipeline"))
+        _write_native(skills, "beta/graph.json", _spec_raw(pipeline_id="beta-pipeline"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert report.manifest_error is None
@@ -199,9 +213,10 @@ class TestContainment:
             tmp_path / "skills",
             [_entry("escape", execution="langgraph", pipeline="../outside/graph.json")],
         )
-        # The outside file EXISTS with a registrable spec -- the rejection must
-        # come from containment, not from a read or gate failure.
-        _write_graph(tmp_path / "outside", "graph.json", _spec_raw(pipeline_id="escapee"))
+        # The OUTSIDE native spec EXISTS with a registrable payload -- the
+        # rejection must come from containment on the derived sibling path,
+        # not from a read or gate failure.
+        _write_graph(tmp_path / "outside", "pipeline.opencode.json", _spec_raw(pipeline_id="escapee"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert engine.raws == []
@@ -217,7 +232,7 @@ class TestContainment:
             tmp_path / "skills",
             [_entry("abs", execution="langgraph", pipeline=str(elsewhere / "graph.json"))],
         )
-        _write_graph(elsewhere, "graph.json", _spec_raw(pipeline_id="absolute"))
+        _write_graph(elsewhere, "pipeline.opencode.json", _spec_raw(pipeline_id="absolute"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert engine.raws == []
@@ -227,25 +242,53 @@ class TestContainment:
 
 
 class TestPerEntryRejection:
-    async def test_missing_pipeline_file_is_an_oserror_rejection(self, tmp_path: Path) -> None:
+    async def test_a_missing_native_spec_is_a_structured_rejection(self, tmp_path: Path) -> None:
+        """The missing face (ruling-19): no ``pipeline.opencode.json`` sibling -> the named row.
+
+        The declared graph.json EXISTS with dialect-shaped content and is
+        never opened: the rejection is the glue's own missing-native-spec
+        face, not a read or parse failure of the declared file.
+        """
         skills = _write_skills(
             tmp_path / "skills",
-            [_entry("ghost-file", execution="langgraph", pipeline="ghost/graph.json")],
-        )  # the declared pipeline file is never written
+            [_entry("legacy-skill", execution="langgraph", pipeline="legacy/graph.json")],
+        )
+        _write_graph(
+            skills,
+            "legacy/graph.json",
+            {"schema_version": "pydag-editable-graph-v1", "skill_name": "demo", "nodes": [], "edges": []},
+        )
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert engine.raws == []
+        assert report.registered == ()
         (rejection,) = report.rejected
-        assert rejection.skill_id == "ghost-file"
-        assert rejection.error_type == "FileNotFoundError"
+        assert rejection.skill_id == "legacy-skill"
+        assert rejection.pipeline == "legacy/graph.json"
+        assert rejection.error_type == "NativeSpecMissing"
+        assert "legacy-skill" in rejection.message
+        assert "pipeline.opencode.json" in rejection.message
+        assert "agent_dsl_flow_framework" in rejection.message
+
+    async def test_a_directory_at_the_native_spec_path_is_the_missing_rejection(self, tmp_path: Path) -> None:
+        """Conservative face: anything that is not a file is the missing spec."""
+        skills = _write_skills(
+            tmp_path / "skills",
+            [_entry("dir-skill", execution="langgraph", pipeline="dir/graph.json")],
+        )
+        (skills / "dir" / "pipeline.opencode.json").mkdir(parents=True)
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        (rejection,) = report.rejected
+        assert rejection.error_type == "NativeSpecMissing"
         assert report.registered == ()
 
-    async def test_invalid_graph_json_is_a_jsondecodeerror_rejection(self, tmp_path: Path) -> None:
+    async def test_invalid_native_spec_json_is_a_jsondecodeerror_rejection(self, tmp_path: Path) -> None:
         skills = _write_skills(
             tmp_path / "skills",
             [_entry("bad-json", execution="langgraph", pipeline="bad/graph.json")],
         )
-        _write_graph(skills, "bad/graph.json", "{not json")
+        _write_native(skills, "bad/graph.json", "{not json")
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         (rejection,) = report.rejected
@@ -256,7 +299,6 @@ class TestPerEntryRejection:
         ("make_failure", "error_name"),
         [
             pytest.param(_make_validation_error, "ValidationError", id="pydantic-structural"),
-            pytest.param(_make_pydag_error, "PydagImportError", id="pydag-import"),
             pytest.param(_make_spec_rejection, "PipelineSpecRejected", id="semantic-gate"),
         ],
     )
@@ -267,7 +309,7 @@ class TestPerEntryRejection:
             tmp_path / "skills",
             [_entry("rejected-skill", execution="langgraph", pipeline="one/graph.json")],
         )
-        _write_graph(skills, "one/graph.json", _spec_raw(pipeline_id="one"))
+        _write_native(skills, "one/graph.json", _spec_raw(pipeline_id="one"))
         engine = _RecordingEngine(failures=[make_failure()])
         report = await register_pipelines(engine, skills)
         assert report.registered == ()
@@ -285,8 +327,8 @@ class TestPerEntryRejection:
                 _entry("healthy", execution="langgraph", pipeline="healthy/graph.json"),
             ],
         )
-        _write_graph(skills, "broken/graph.json", "{still not json")
-        _write_graph(skills, "healthy/graph.json", _spec_raw(pipeline_id="healthy-pipeline"))
+        _write_native(skills, "broken/graph.json", "{still not json")
+        _write_native(skills, "healthy/graph.json", _spec_raw(pipeline_id="healthy-pipeline"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert [r.pipeline_id for r in report.registered] == ["healthy-pipeline"]
@@ -327,7 +369,7 @@ class TestIdentitySemantics:
             tmp_path / "skills",
             [_entry("code-review", execution="langgraph", pipeline="code-review/graph.json")],
         )
-        _write_graph(skills, "code-review/graph.json", _spec_raw(pipeline_id="digest"))
+        _write_native(skills, "code-review/graph.json", _spec_raw(pipeline_id="digest"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         (registered,) = report.registered
@@ -344,8 +386,8 @@ class TestIdentitySemantics:
                 _entry("second", execution="langgraph", pipeline="second/graph.json"),
             ],
         )
-        _write_graph(skills, "first/graph.json", _spec_raw(pipeline_id="digest"))
-        _write_graph(skills, "second/graph.json", _spec_raw(pipeline_id="digest"))
+        _write_native(skills, "first/graph.json", _spec_raw(pipeline_id="digest"))
+        _write_native(skills, "second/graph.json", _spec_raw(pipeline_id="digest"))
         engine = _RecordingEngine()
         report = await register_pipelines(engine, skills)
         assert [(r.skill_id, r.pipeline_id) for r in report.registered] == [
@@ -358,3 +400,61 @@ class TestIdentitySemantics:
         bound = engine.bound("digest")
         assert bound is not None
         assert bound.spec_hash == report.registered[1].spec_hash
+
+
+class TestNativeSpecPriority:
+    """The native spec is the ONLY consumption form (ruling-18): the declared
+    graph.json is routing metadata, never opened -- the sibling registers."""
+
+    async def test_the_declared_graph_is_never_opened_the_native_sibling_registers(self, tmp_path: Path) -> None:
+        skills = _write_skills(
+            tmp_path / "skills",
+            [_entry("code-review", execution="langgraph", pipeline="code-review/graph.json")],
+        )
+        # The declared graph.json is garbage: any read of it would be a
+        # JSONDecodeError rejection; the registered row proves only the
+        # native sibling was consumed (no fallback to any conversion face).
+        _write_graph(skills, "code-review/graph.json", "{never opened")
+        native = _spec_raw(pipeline_id="native-pipeline")
+        _write_native(skills, "code-review/graph.json", native)
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert report.rejected == ()
+        (registered,) = report.registered
+        assert registered.skill_id == "code-review"
+        assert registered.pipeline_id == "native-pipeline"
+        assert engine.raws == [native]  # the native spec, verbatim -- never the declared body
+
+    async def test_the_legacy_batch_mirror_two_specs_six_missing(self, tmp_path: Path) -> None:
+        """The 裁决-19 mirror: the migrated legacy batch (2 SPEC + 6 missing) lands
+        as 2 registered rows + 6 structured missing rows, in manifest order."""
+        legacy = (
+            "gocm-sop",
+            "dws-disk-diagnosis",
+            "efs-diagnosis",
+            "dia-dlf-job",
+            "lingqu-general-rca",
+            "modelarts-general-rca",
+            "pipeline-author",
+            "resource-fault-query-capability",
+        )
+        entries = [_entry(skill_id, execution="langgraph", pipeline=f"{skill_id}/graph.json") for skill_id in legacy]
+        skills = _write_skills(tmp_path / "skills", entries)
+        for skill_id in ("gocm-sop", "pipeline-author"):  # the two the emitter batch published
+            _write_native(skills, f"{skill_id}/graph.json", _spec_raw(pipeline_id=f"{skill_id}-pipeline"))
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert report.manifest_error is None
+        assert report.non_langgraph == 0
+        assert [r.pipeline_id for r in report.registered] == ["gocm-sop-pipeline", "pipeline-author-pipeline"]
+        assert [r.skill_id for r in report.rejected] == [
+            "dws-disk-diagnosis",
+            "efs-diagnosis",
+            "dia-dlf-job",
+            "lingqu-general-rca",
+            "modelarts-general-rca",
+            "resource-fault-query-capability",
+        ]
+        assert {r.error_type for r in report.rejected} == {"NativeSpecMissing"}
+        assert all(NATIVE_SPEC_NAME in r.message for r in report.rejected)
+        assert all("agent_dsl_flow_framework" in r.message for r in report.rejected)

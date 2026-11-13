@@ -75,7 +75,6 @@ from opencode.contracts.pipelines import (
     PipelineSpec,
     compute_spec_hash,
 )
-from opencode.contracts.pydag_import import parse_pipeline_spec
 from opencode.orchestrator.conditions import (
     ConditionSyntaxError,
     evaluate_step_condition,
@@ -1353,19 +1352,18 @@ class PipelineEngine:
 
         ``raw`` is the ``graph.json`` wire object. The structural layer is the
         pydantic contract; the semantic layer is :func:`validate_pipeline_spec`;
-        the rehearsal layer is the real ``compile`` (no node body runs). A
-        ``schema_version`` of ``pydag-editable-graph-v1`` (the
-        agent_dsl_flow_framework dialect, T-C1-083) routes through the pydag
-        converter at this loading seam before the structural layer --
-        everything after the routing is the unchanged v1 path (semantic gate,
-        rehearsal, hash lock; rejections surface as
-        :class:`~opencode.contracts.pydag_import.PydagImportError`). The
+        the rehearsal layer is the real ``compile`` (no node body runs). The
         compiled graph is bound to this engine's checkpointer, so a later
         re-registration under the same ``pipeline_id`` with a changed spec is
         a *new* binding (new hash): running graphs resume against the hash
         they were started with or fail closed (PHASE3 §5.2 no hot rebind).
+
+        T-C1-087 (ruling-18/19): the T-C1-083 loading router is retired --
+        the native spec is the only consumption form, so a dialect
+        ``pydag-editable-graph-v1`` wire object reaching this seam is the
+        plain pydantic structural rejection (no sniffing, no conversion).
         """
-        spec = parse_pipeline_spec(raw)
+        spec = PipelineSpec.model_validate(raw)
         validate_pipeline_spec(spec, implemented=self._implemented())
         saver = await self._checkpointer.saver()
         graph = self._compile(spec, saver)
