@@ -318,15 +318,19 @@ class TestContainment:
     ) -> None:
         """The unresolvable form, honest shape (T-C1-088 rider 1).
 
-        The TDD-era probe finding (progress log): Python's non-strict
-        ``Path.resolve()`` raises NO OSError for any probed construct
-        (invalid chars, reserved names, trailing dots, junction and symlink
-        loops all return best-effort paths), so the glue's conservative
-        escape-on-OSError branch stays defensive. This pins the reachable
-        face of the ELOOP construct: the self-symlink keeps the derived
-        path inside the root, nothing is ever read or registered, and the
-        entry lands as exactly one structured rejection row -- never a
-        silent registration, never a boot crash."""
+        The platform-divergent resolve face (the CI-ubuntu red evidence,
+        run 43478819498): CPython's non-strict ``Path.resolve()`` never
+        raises ``OSError`` on win32 (the probe finding -- best-effort
+        paths for every construct), but on POSIX the symlink loop raises
+        ``RuntimeError: Symlink loop from ...``, which the conservative
+        escape branch catches (an unresolvable derived path is treated as
+        an escape). Both platforms pin the same safety invariant: the loop
+        is never opened or registered, and the entry lands as exactly one
+        structured rejection row -- never a silent registration, never a
+        boot crash. The row class is the reachable face per platform:
+        win32 resolves best-effort to an in-root non-file
+        (``NativeSpecMissing``); POSIX refuses to resolve the loop and the
+        conservative escape fires (``PipelinePathEscape``)."""
         skills = _write_skills(
             tmp_path / "skills",
             [_entry("loop-skill", execution="langgraph", pipeline="loop/graph.json")],
@@ -343,7 +347,12 @@ class TestContainment:
         (rejection,) = report.rejected
         assert rejection.skill_id == "loop-skill"
         assert rejection.pipeline == "loop/graph.json"
-        assert rejection.error_type == "NativeSpecMissing"
+        # The row class is the platform's reachable face: win32 resolves
+        # best-effort to an in-root non-file (NativeSpecMissing); POSIX
+        # raises RuntimeError on the loop and the conservative escape fires
+        # (PipelinePathEscape) -- the CI-ubuntu red evidence, run 43478819498.
+        expected_error_type = "NativeSpecMissing" if sys.platform == "win32" else "PipelinePathEscape"
+        assert rejection.error_type == expected_error_type
 
 
 class TestPerEntryRejection:

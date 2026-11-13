@@ -175,7 +175,12 @@ def _load_graph(skills_root: Path, pipeline: str, skill_id: str) -> Any:
     native = (skills_root / pipeline).parent / NATIVE_SPEC_NAME
     try:
         resolved = native.resolve()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
+        # The RuntimeError face is the POSIX symlink loop: CPython's
+        # non-strict realpath raises ``RuntimeError: Symlink loop from ...``
+        # where ntpath returns a best-effort path (the win32 probe finding)
+        # -- an unresolvable derived path stays the conservative escape
+        # (CI-ubuntu red evidence, T-C1-088 rider 1, run 43478819498).
         raise PipelinePathEscape(f"pipeline path {pipeline!r} under {skills_root} is unresolvable: {error}") from error
     if not resolved.is_relative_to(resolved_root):
         raise PipelinePathEscape(
