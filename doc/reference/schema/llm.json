@@ -520,6 +520,17 @@
           "title": "Request Id",
           "type": "string"
         },
+        "response_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "temperature": {
           "anyOf": [
             {

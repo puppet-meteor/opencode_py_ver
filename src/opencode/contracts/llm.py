@@ -146,6 +146,12 @@ class GenerationRequest(BaseModel):
     max_output_tokens: int = Field(ge=1)
     temperature: float | None = None
     timeout_s: float = Field(gt=0)
+    #: The v2 structured-output face (T-C1-084): an OpenAI-compatible
+    #: ``response_format`` object (``{"type": "json_schema", ...}``) passed
+    #: through to the provider verbatim; None (the default and every §2.2
+    #: caller) is free-form text generation. The pipeline llm_call body is
+    #: the only producer; the adapter is transport, not policy.
+    response_format: JsonObject | None = None
 
     @field_validator("max_output_tokens", mode="before")
     @classmethod

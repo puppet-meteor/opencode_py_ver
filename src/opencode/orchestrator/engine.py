@@ -73,6 +73,12 @@ from opencode.contracts.pipelines import (
     compute_spec_hash,
 )
 from opencode.contracts.pydag_import import parse_pipeline_spec
+from opencode.orchestrator.conditions import (
+    ConditionSyntaxError,
+    evaluate_step_condition,
+    resolve_ref,
+    validate_condition_syntax,
+)
 from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.jobs import (
     TERMINAL_STATUSES,
@@ -87,6 +93,7 @@ from opencode.orchestrator.workers import (
     WorkerError,
     WorkerSuspended,
 )
+from opencode.tools.invoker import validate_input_strict, validate_schema_supported
 
 #: The node types this engine executes when no worker manager is wired (the
 #: S2 face, the default constructor). A worker-wired engine registers its
@@ -201,6 +208,198 @@ class EngineState(TypedDict, total=False):
     result: JsonValue
 
 
+#: The closed key set of the v2 condition-skip record (T-C1-084): the one
+#: explicit marker a skipped node leaves in ``node_results``.
+_SKIP_RECORD_KEYS = frozenset({"skipped", "condition", "reason"})
+
+
+def is_skip_record(value: JsonValue) -> bool:
+    """True when *value* is a v2 condition-skip record (the explicit skip face).
+
+    Closed key-set check: ``{"skipped": true, "condition": <expr>, "reason":
+    <why>}`` exactly -- a node body returning a same-shaped object by
+    accident would be indistinguishable on the wire, so the record is the
+    contract and this predicate is its single recognizer.
+    """
+    return (
+        isinstance(value, dict)
+        and set(value) == _SKIP_RECORD_KEYS
+        and value.get("skipped") is True
+        and isinstance(value.get("condition"), str)
+        and isinstance(value.get("reason"), str)
+    )
+
+
+class NodeBodyState(EngineState, total=False):
+    """The state view a node *body* sees: EngineState plus the v2 params view.
+
+    The engine's node wrapper resolves ``node.params`` at node entry and hands
+    the body this per-call view (``node_params``: the resolved values). It is
+    deliberately NOT a field of :class:`EngineState` -- a TypedDict key would
+    become a langgraph channel in the checkpointed graph state, and the S2
+    channel set is pinned by contract tests; the view is a plain dict cast,
+    never a channel update and never persisted. Bodies read it through
+    :func:`node_params_of`.
+    """
+
+    node_params: JsonObject
+
+
+def node_params_of(state: EngineState) -> JsonObject:
+    """The resolved v2 params the wrapper passed this body ({} when the node has none)."""
+    view = cast("dict[str, Any]", state)
+    value = view.get("node_params")
+    return value if isinstance(value, dict) else {}
+
+
+def _walk_strict(value: JsonValue, segments: list[str], ref: str, node_id: str) -> JsonValue:
+    """An exact dot-path walk (params refs): any miss is the honest failure.
+
+    No camel/snake tolerance here (the condition walk keeps the ported
+    tolerant face; params refs are strict -- a documented asymmetry). Lists
+    accept digit segments as indices.
+    """
+    current: Any = value
+    for segment in segments:
+        if isinstance(current, dict):
+            if segment not in current:
+                raise WorkerError(
+                    f"node '{node_id}' params ref '{ref}' cannot resolve segment '{segment}'",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                )
+            current = current[segment]
+        elif isinstance(current, list) and segment.isdigit() and int(segment) < len(current):
+            current = current[int(segment)]
+        else:
+            raise WorkerError(
+                f"node '{node_id}' params ref '{ref}' steps into a value that is not an "
+                f"object/array at segment '{segment}'",
+                code=CoreErrorCode.VALIDATION_ERROR,
+            )
+    return current
+
+
+def _resolve_node_params(
+    node: PipelineNode,
+    inputs: JsonObject,
+    node_results: dict[str, JsonValue],
+    node_ids: frozenset[str],
+) -> JsonObject:
+    """Resolve ``node.params`` at node entry: literals pass, refs bind strictly.
+
+    ``inputs.x`` binds the submitted param (a miss is a structured
+    ``ValidationError`` naming it); ``step_N...`` binds a completed step's
+    result -- a skipped or not-yet-completed step is the honest failure,
+    never a bare ``KeyError`` or a silent null (the T-C1-084 decision:
+    refs onto skipped steps error instead of nulling).
+    """
+    resolved: JsonObject = {}
+    for name, value in (node.params or {}).items():
+        if not (isinstance(value, dict) and set(value) == {"ref"}):
+            resolved[name] = value  # a literal: the pass-through case
+            continue
+        ref = str(value["ref"])
+        root, _, tail = ref.partition(".")
+        if root == "inputs":
+            head, _, rest = tail.partition(".")
+            if not tail:
+                raise WorkerError(
+                    f"node '{node.node_id}' params ref '{ref}' must name an input key",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                )
+            if head not in inputs:
+                raise WorkerError(
+                    f"node '{node.node_id}' params ref '{ref}' names input '{head}' the job did not submit",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                )
+            resolved[name] = _walk_strict(inputs[head], rest.split(".") if rest else [], ref, node.node_id)
+            continue
+        if root not in node_ids:
+            # The semantic gate proved root closure; reaching here means a
+            # body ran outside the registration gate -- fail honestly.
+            raise WorkerError(
+                f"node '{node.node_id}' params ref '{ref}' has unknown root '{root}'",
+                code=CoreErrorCode.VALIDATION_ERROR,
+            )
+        if root not in node_results:
+            raise WorkerError(
+                f"node '{node.node_id}' params ref '{ref}' references step '{root}' "
+                "which has not completed (declared upstream order broken or dangling)",
+                code=CoreErrorCode.VALIDATION_ERROR,
+            )
+        step_result = node_results[root]
+        if is_skip_record(step_result):
+            raise WorkerError(
+                f"node '{node.node_id}' params ref '{ref}' references skipped step '{root}' "
+                "(its condition evaluated false; a skipped result is not bindable)",
+                code=CoreErrorCode.VALIDATION_ERROR,
+            )
+        resolved[name] = _walk_strict(step_result, tail.split(".") if tail else [], ref, node.node_id)
+    return resolved
+
+
+def _make_condition_resolver(node_ids: frozenset[str], node_results: dict[str, JsonValue]) -> Any:
+    """The runtime condition resolver: the ported tolerant walk with skip guards.
+
+    Refs onto *known* steps guard first (skipped -> the honest WorkerError,
+    which propagates out of the ported evaluator because WorkerError is not
+    a KeyError/TypeError/ValueError; not-completed -> the same face), while
+    unknown roots and unknown fields keep the ported missing/empty
+    semantics (a typo'd condition reads as false, not as an error -- the
+    framework's own behavior, documented as the conditions/params asymmetry).
+    """
+
+    def resolver(path: str, context: dict[str, Any]) -> Any:
+        root = path.split(".", 1)[0]
+        if root in node_ids:
+            if root not in node_results:
+                raise WorkerError(
+                    f"condition ref '{path}' references step '{root}' which has not completed",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                )
+            if is_skip_record(node_results[root]):
+                raise WorkerError(
+                    f"condition ref '{path}' references skipped step '{root}' "
+                    "(its condition evaluated false; a skipped result is not bindable)",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                )
+        return resolve_ref(path, context)
+
+    return resolver
+
+
+def _project_extract(value: JsonValue, extract: dict[str, str | list[str]]) -> JsonObject:
+    """The v2 extract projection over the node's own executed result.
+
+    A plain exact dot-path walk (no camel/snake tolerance and none of the
+    framework's dynamic-field/content-0 heuristics -- a documented deviation),
+    ``first-hit-wins`` across an ordered fallback chain, unresolved chains
+    project ``null`` (the ported framework core semantics: extract is a
+    projection, not a validation). Only the executed path reaches here --
+    skip records are never projected.
+    """
+    projected: JsonObject = {}
+    for key, chain in extract.items():
+        paths = [chain] if isinstance(chain, str) else chain
+        resolved: JsonValue | None = None
+        for path in paths:
+            current: Any = value
+            ok = True
+            for segment in path.split("."):
+                if isinstance(current, dict) and segment in current:
+                    current = current[segment]
+                elif isinstance(current, list) and segment.isdigit() and int(segment) < len(current):
+                    current = current[int(segment)]
+                else:
+                    ok = False
+                    break
+            if ok:
+                resolved = current
+                break
+        projected[key] = resolved
+    return projected
+
+
 class LlmCallFn(Protocol):
     """The injectable ``llm_call`` node body (small-model critique/verify/summarize).
 
@@ -251,7 +450,10 @@ def validate_pipeline_spec(
     Raises :class:`PipelineSpecRejected` with the first violation found
     (deterministic order: the version gate, the nesting-depth cap, the
     unimplemented node-type face, per-type field constraints, node-id
-    uniqueness, edge-reference closure, the entry rules, orphan reachability).
+    uniqueness, edge-reference closure, the entry rules, orphan
+    reachability, then the v2 feature checks: the reserved ref root and
+    render-context collisions, condition syntax, params ref-root closure,
+    and the llm structured-output/fallback constraints).
     ``implemented`` is the executed node-type set: the default is the S2 face
     (``llm_call``/``tool``) whose rejection message is pinned byte-identical
     by the S2 tests; a worker-wired engine passes its executed set so
@@ -419,6 +621,128 @@ def validate_pipeline_spec(
             code=CoreErrorCode.VALIDATION_ERROR,
             details={"entry": spec.entry, "orphans": cast("list[JsonValue]", orphans)},
         )
+
+    # -- v2 (T-C1-084): the reserved ref root and the render-context collisions.
+    # The ref context is {"inputs": <submitted params>, **node_results} and the
+    # prompt render context is {**params, **node_results} -- a node id that is
+    # "inputs" or that names a declared param would shadow or be shadowed, so
+    # the ambiguity is rejected up front instead of silently resolving one way.
+    for node_id in sorted(id_set):
+        if node_id == "inputs":
+            raise PipelineSpecRejected(
+                "node id 'inputs' is reserved (the v2 ref root for submitted params)",
+                code=CoreErrorCode.VALIDATION_ERROR,
+                details={"node_id": node_id},
+            )
+    declared: frozenset[str] = frozenset()
+    if spec.params_schema is not None:
+        properties = spec.params_schema.get("properties")
+        if isinstance(properties, dict):
+            declared = frozenset(properties)
+    collisions = sorted(id_set & declared)
+    if collisions:
+        raise PipelineSpecRejected(
+            f"node ids collide with declared params (the v2 render context keys both): {collisions}",
+            code=CoreErrorCode.VALIDATION_ERROR,
+            details={"node_ids": cast("list[JsonValue]", collisions)},
+        )
+
+    # -- v2: condition syntax (the ported evaluator's grammar; refs stay
+    # runtime-tolerant -- unknown names are the ported missing semantics,
+    # only skipped/not-completed *known* steps error at evaluation time).
+    for node in spec.nodes:
+        if node.condition is None:
+            continue
+        try:
+            validate_condition_syntax(node.condition)
+        except ConditionSyntaxError as error:
+            raise PipelineSpecRejected(
+                f"node '{node.node_id}' condition is not a supported condition expression: {error}",
+                code=CoreErrorCode.VALIDATION_ERROR,
+                details={"node_id": node.node_id, "condition": node.condition},
+            ) from error
+
+    # -- v2: params ref-root closure (the strict face). Roots must be the
+    # reserved "inputs" (naming a declared property when a schema is
+    # declared; without a schema inputs are statically unbindable -- the
+    # spec accepts the empty object only) or a declared node id (the tail
+    # path is runtime-validated by the strict walk).
+    for node in spec.nodes:
+        if node.params is None:
+            continue
+        for name, value in node.params.items():
+            if not (isinstance(value, dict) and set(value) == {"ref"}):
+                continue  # a literal value: no closure to check
+            ref = str(value["ref"])
+            root, _, tail = ref.partition(".")
+            if root == "inputs":
+                head = tail.split(".", 1)[0]
+                if spec.params_schema is None:
+                    raise PipelineSpecRejected(
+                        f"node '{node.node_id}' params ref '{ref}' cannot bind: the spec declares no "
+                        "params schema, so inputs refs are statically unbindable",
+                        code=CoreErrorCode.VALIDATION_ERROR,
+                        details={"node_id": node.node_id, "param": name, "ref": ref},
+                    )
+                if not tail or head not in declared:
+                    raise PipelineSpecRejected(
+                        f"node '{node.node_id}' params ref '{ref}' does not name a declared params schema property",
+                        code=CoreErrorCode.VALIDATION_ERROR,
+                        details={"node_id": node.node_id, "param": name, "ref": ref},
+                    )
+            elif root not in id_set:
+                raise PipelineSpecRejected(
+                    f"node '{node.node_id}' params ref '{ref}' has unknown root '{root}' "
+                    "(expected 'inputs' or a declared node id)",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id, "param": name, "ref": ref},
+                )
+
+    # -- v2: the llm structured-output face. output_schema/fallback are
+    # llm_call features (no other body consumes them), the schema must sit
+    # inside the strict validator subset (a root object), fallback requires
+    # a schema and must satisfy it -- a degrade object that itself violates
+    # the schema would trade a validation failure for another one.
+    for node in spec.nodes:
+        if node.output_schema is not None and node.node_type != "llm_call":
+            raise PipelineSpecRejected(
+                f"node '{node.node_id}' carries 'output_schema' but is not an llm_call node "
+                "(structured output is an llm_call feature)",
+                code=CoreErrorCode.VALIDATION_ERROR,
+                details={"node_id": node.node_id, "node_type": node.node_type},
+            )
+        if node.fallback is not None:
+            if node.node_type != "llm_call":
+                raise PipelineSpecRejected(
+                    f"node '{node.node_id}' carries 'fallback' but is not an llm_call node "
+                    "(the degrade object is an llm_call feature)",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id, "node_type": node.node_type},
+                )
+            if node.output_schema is None:
+                raise PipelineSpecRejected(
+                    f"llm_call node '{node.node_id}' declares a fallback without an output_schema "
+                    "(the degrade object engages only on structured-output validation failure)",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id},
+                )
+        if node.output_schema is not None:
+            try:
+                validate_schema_supported(node.output_schema, root=True)
+            except ValueError as error:
+                raise PipelineSpecRejected(
+                    f"node '{node.node_id}' output_schema is outside the supported schema subset: {error}",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id},
+                ) from error
+            if node.fallback is not None:
+                issues = validate_input_strict(node.output_schema, node.fallback)
+                if issues:
+                    raise PipelineSpecRejected(
+                        f"node '{node.node_id}' fallback does not satisfy its output_schema: {'; '.join(issues)}",
+                        code=CoreErrorCode.VALIDATION_ERROR,
+                        details={"node_id": node.node_id},
+                    )
 
 
 class EngineCheckpointer:
@@ -595,14 +919,53 @@ class PipelineEngine:
 
         builder = StateGraph(EngineState)
         node_bodies: dict[str, PipelineNode] = {node.node_id: node for node in spec.nodes}
+        id_set = frozenset(node_bodies)
 
         def make_node_fn(node: PipelineNode) -> Any:
             async def node_fn(state: EngineState) -> dict[str, Any]:
                 try:
+                    inputs = state.get("params") or {}
+                    prior_results = state.get("node_results") or {}
+                    # -- v2 condition (T-C1-084): evaluated BEFORE execution via
+                    # the ported safe-subset evaluator. False -> the explicit
+                    # skip record (never a silent no-op); refs onto skipped /
+                    # not-completed steps raise the honest WorkerError through
+                    # the evaluator (it only degrades KeyError/TypeError/
+                    # ValueError to missing); a blank condition is "no
+                    # condition" (passes) per the ported semantics.
+                    if node.condition is not None:
+                        context: dict[str, Any] = {"inputs": inputs, **prior_results}
+                        resolver = _make_condition_resolver(id_set, prior_results)
+                        evaluation = evaluate_step_condition(node.condition, context, resolver)
+                        if not evaluation.passed:
+                            skip: JsonValue = {
+                                "skipped": True,
+                                "condition": node.condition,
+                                "reason": evaluation.reason,
+                            }
+                            update_skip: dict[str, Any] = {"node_results": {node.node_id: skip}}
+                            if node.node_id in terminal_ids:
+                                skip_results = {**prior_results, node.node_id: skip}
+                                update_skip["outcome"] = "done"
+                                update_skip["result"] = {
+                                    "pipeline_id": spec.pipeline_id,
+                                    "nodes": skip_results,
+                                }
+                            return update_skip
+                    # -- v2 params: resolved at node entry (strict refs; a miss
+                    # is the structured WorkerError) and handed to the body as
+                    # the ephemeral node_params view -- never a channel update,
+                    # never persisted (see NodeBodyState).
+                    body_state: EngineState = state
+                    if node.params is not None:
+                        resolved_params = _resolve_node_params(node, inputs, prior_results, id_set)
+                        view = dict(state)
+                        view["node_params"] = resolved_params
+                        body_state = cast("EngineState", view)
                     if node.node_type == "llm_call":
-                        value = await self._llm_call(node, state)
+                        value = await self._llm_call(node, body_state)
                     elif node.node_type == "tool":
-                        value = await self._tool(node, state)
+                        value = await self._tool(node, body_state)
                     elif node.node_type == "human_gate":
                         # The S5a gate body: the registration gate proved this
                         # type executed, so the broker is wired (the guard is
@@ -615,7 +978,7 @@ class PipelineEngine:
                                     code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
                                 ),
                             )
-                        value = await self._human_gate(node, state)
+                        value = await self._human_gate(node, body_state)
                     elif node.node_type == "subworkflow":
                         if not self._subworkflow_enabled:
                             raise _NodeFailure(
@@ -625,7 +988,7 @@ class PipelineEngine:
                                     code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
                                 ),
                             )
-                        value = await self._subworkflow(node, state)
+                        value = await self._subworkflow(node, body_state)
                     else:
                         # The registration gate proved this type executed; the
                         # only remaining closed-set name is the agent (the old
@@ -638,7 +1001,12 @@ class PipelineEngine:
                                     code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
                                 ),
                             )
-                        value = await self._opencode_agent(node, state)
+                        value = await self._opencode_agent(node, body_state)
+                    # -- v2 extract: the projection runs only on the executed
+                    # path (a skipped node never projects) and replaces the
+                    # node's downstream-visible result.
+                    if node.extract is not None:
+                        value = _project_extract(value, node.extract)
                 except EnginePause:
                     raise  # the suspend seam passes through untouched
                 except WorkerSuspended:

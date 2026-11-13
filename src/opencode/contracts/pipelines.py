@@ -15,6 +15,17 @@ settled by the artifact, not by negotiation). This module pins its wire shape:
   §6.2 canonical-JSON/SHA-256 recipe), computed at load time and carried into
   the job binding chain (PHASE3 §5.1 hash lock; running graphs never hot-rebind).
 
+**The v2 additive extension (T-C1-084)** stays on ``schema_version`` 1: the
+five new node fields (``params`` / ``condition`` / ``extract`` /
+``output_schema`` / ``fallback``) are optional additive faces inside the v1
+object, and an *old reader still fails closed on them* -- the node model is
+``extra="forbid"``, so a v1-only consumer rejects a spec carrying v2 fields as
+an unknown-field structural error rather than guessing (CORE-CONTRACTS §8: an
+old reader never silently drops data it does not understand). The hash recipe
+below strips the new fields whenever they are ``None`` so a pure-v1 spec's
+canonical bytes -- and therefore its hash -- are byte-identical before and
+after this extension (pinned by a contract test).
+
 Topology constraints (unique entry, edge-reference closure, no orphans,
 per-type field requirements, the subworkflow depth cap) are *semantic-layer*
 rules -- they live in the engine's gate (``opencode.orchestrator.engine``),
@@ -31,7 +42,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from opencode.contracts.events import canonical_json
-from opencode.contracts.messages import JsonObject
+from opencode.contracts.messages import JsonObject, JsonValue
 
 #: The closed v1 node-type set (PHASE3 §5.2). The wire contract recognizes all
 #: five names; S2 implements executors for the first two only -- the engine's
@@ -50,6 +61,19 @@ NodeType = Literal["llm_call", "opencode_agent", "tool", "human_gate", "subworkf
 #: The hard cap on workflow nesting (PHASE3 §5.2: subworkflow depth <= 3; the
 #: lineage guard is the gateway-side first line, this is the spec-side line).
 MAX_SUBWORKFLOW_DEPTH = 3
+
+#: The v2 additive node fields (T-C1-084). ``compute_spec_hash`` strips these
+#: from the serialized node whenever they are ``None`` so pure-v1 specs keep
+#: their exact pre-v2 canonical bytes (the hash-stability pin).
+_V2_NODE_FIELDS: tuple[str, ...] = ("params", "condition", "extract", "output_schema", "fallback")
+
+
+def _require_dot_path(field: str, path: Any) -> None:
+    """A ref/extract path must be a non-empty string of non-empty dot segments."""
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{field}: a dot path must be a non-empty string")
+    if any(not segment for segment in path.split(".")):
+        raise ValueError(f"{field}: {path!r} has an empty dot segment")
 
 
 def _reject_bool(field: str, value: Any) -> Any:
@@ -91,6 +115,62 @@ class PipelineNode(BaseModel):
     @classmethod
     def _depth_not_bool(cls, value: Any) -> Any:
         return _reject_bool("depth", value)
+
+    # -- the v2 additive fields (T-C1-084); all optional, None = not used ------
+
+    #: Per-node parameter values: JSON literals, or ``{"ref": "inputs.x"}`` /
+    #: ``{"ref": "step_N.field"}`` binding objects (an exact single-key shape
+    #: -- anything else that carries a ``ref`` key is malformed, never a
+    #: literal). Resolved strictly by the engine at node entry; whether a
+    #: root is bindable is the semantic gate's closure check, not wire shape.
+    params: JsonObject | None = None
+    #: A safe-subset condition expression evaluated *before* execution;
+    #: false -> the explicit skip record. Blank parses here (the ported
+    #: evaluator treats blank as "no condition"); the *syntax* is the
+    #: semantic gate's check (``orchestrator.conditions``).
+    condition: str | None = Field(default=None, min_length=1)
+    #: A projection of the node's own result: each output key maps to a dot
+    #: path into the result, or an ordered first-hit-wins fallback chain;
+    #: unresolved chains project ``null`` (ported framework core semantics).
+    extract: dict[str, str | list[str]] | None = None
+    #: The llm structured-output schema (the strict validator subset, root
+    #: object). Named ``output_schema`` -- a field named ``schema`` would
+    #: shadow ``BaseModel.schema`` (pydantic warns).
+    output_schema: JsonObject | None = None
+    #: The llm degrade object used when the structured completion fails
+    #: parsing/validation (the result then carries ``"fallback": true``);
+    #: requires ``output_schema`` and must satisfy it (semantic gate).
+    fallback: JsonValue | None = None
+
+    @field_validator("params")
+    @classmethod
+    def _params_refs_wellformed(cls, value: JsonObject | None) -> JsonObject | None:
+        if value is None:
+            return None
+        for name, entry in value.items():
+            if not isinstance(entry, dict) or "ref" not in entry:
+                continue  # a literal scalar/container value: the pass-through case
+            if set(entry) != {"ref"}:
+                raise ValueError(f"params.{name}: a ref binding must be exactly a single 'ref' key")
+            if not isinstance(entry["ref"], str):
+                raise ValueError(f"params.{name}: the ref path must be a string")
+            _require_dot_path(f"params.{name}", entry["ref"])
+        return value
+
+    @field_validator("extract")
+    @classmethod
+    def _extract_paths_wellformed(cls, value: dict[str, str | list[str]] | None) -> dict[str, str | list[str]] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("extract must carry at least one projection when present")
+        for key, chain in value.items():
+            paths = [chain] if isinstance(chain, str) else chain
+            if not isinstance(paths, list) or not paths:
+                raise ValueError(f"extract.{key}: the path (or fallback chain) must be non-empty")
+            for path in paths:
+                _require_dot_path(f"extract.{key}", path)
+        return value
 
 
 class PipelineEdge(BaseModel):
@@ -150,6 +230,18 @@ def compute_spec_hash(spec: PipelineSpec) -> str:
     and platforms. Computed at load time, before any execution, and pinned by
     contract tests; a re-registered spec with a different hash never rebinds a
     running graph (PHASE3 §5.2: cancel -> revise -> resubmit instead).
+
+    v2 stability (T-C1-084): the serialization *strips the five v2 node
+    fields whenever they are ``None*** before hashing, so a pure-v1 spec's
+    canonical bytes -- and its hash -- are byte-identical to the pre-v2
+    engine (a v1 spec never hashed a ``params: null`` it did not carry).
+    Fields that are set participate fully, so any v2 edit re-hashes the
+    spec and running graphs fail closed against it.
     """
-    canonical = canonical_json(spec.model_dump(mode="json"))
+    data = spec.model_dump(mode="json")
+    for node in data["nodes"]:
+        for field_name in _V2_NODE_FIELDS:
+            if node.get(field_name) is None:
+                node.pop(field_name, None)
+    canonical = canonical_json(data)
     return sha256(canonical.encode("utf-8")).hexdigest()

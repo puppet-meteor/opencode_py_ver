@@ -40,8 +40,11 @@ dual-database boundary, never a table in the main DB).
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 from opencode.ai.maas import MaasAdapter
@@ -60,8 +63,9 @@ from opencode.contracts.llm import (
 )
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.contracts.pipelines import PipelineNode
-from opencode.orchestrator.engine import EngineState
+from opencode.orchestrator.engine import EngineState, is_skip_record
 from opencode.orchestrator.workers import WorkerError
+from opencode.tools.invoker import validate_input_strict
 
 #: One pipeline node completion's output budget. The chat face sizes
 #: ``max_output_tokens`` from the session's context math; a pipeline's
@@ -95,30 +99,97 @@ def checkpointer_path_for(db_path: str | Path) -> Path:
     return resolved.with_name(f"{resolved.stem}-checkpointer.sqlite3")
 
 
-def render_prompt(template: str, params: JsonObject) -> str:
-    """Render ``prompt_template`` ``str.format`` style against the job params.
+class _FormatValue:
+    """A JSON value viewed through ``str.format`` (the v2 render context face).
 
-    ``{key}`` inserts the submitted param: strings verbatim, every other
-    JSON value as canonical JSON (``3``, ``true``, ``null``, compact
-    objects) so the rendering is deterministic. ``{{``/``}}`` keep their
+    A top-level ``{key}`` insertion keeps the S4-pinned rendering (strings
+    verbatim, every other JSON value canonical JSON); ``{key[field]}`` index
+    chains step into real objects/arrays -- the converted step refs
+    (``{step_2[sop_data]}``) resolve against the node's actual JSON result
+    instead of a pre-stringified scalar map, and a missing field surfaces as
+    the same pinned ``KeyError`` face ``{key}`` always had.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: JsonValue) -> None:
+        self._value = value
+
+    def _rendered(self) -> str:
+        return self._value if isinstance(self._value, str) else canonical_json(self._value)
+
+    def __format__(self, format_spec: str) -> str:
+        base = self._rendered()
+        return base if not format_spec else format(base, format_spec)
+
+    def __str__(self) -> str:
+        return self._rendered()
+
+    def __getitem__(self, key: Any) -> _FormatValue:
+        value = cast("Any", self._value)
+        if isinstance(value, (list, tuple)) and isinstance(key, str) and key.isdigit():
+            # ``str.format`` always feeds string element indices; a digit
+            # string into a sequence means the numeric position.
+            value = value[int(key)]
+        else:
+            value = value[key]
+        return _FormatValue(value)
+
+
+#: A ```json fenced completion (parse tolerance ported with the framework).
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+#: The OpenAI ``json_schema`` name alphabet: anything else becomes ``_``.
+_SCHEMA_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _parse_json_tolerant(text: str) -> JsonValue:
+    """Parse a completion as JSON, tolerating a ```json fence (framework parity)."""
+    candidate = text.strip()
+    fenced = _JSON_FENCE_RE.match(candidate)
+    if fenced is not None:
+        candidate = fenced.group(1).strip()
+    return json.loads(candidate)
+
+
+def _response_format_for(node: PipelineNode) -> JsonObject:
+    """The OpenAI ``response_format`` object for a schema-carrying llm node."""
+    assert node.output_schema is not None  # the semantic gate proved the schema
+    name = _SCHEMA_NAME_UNSAFE.sub("_", node.node_id).strip("_") or "schema"
+    if name[0].isdigit():
+        name = f"schema_{name}"
+    return {"type": "json_schema", "json_schema": {"name": name, "schema": node.output_schema}}
+
+
+def render_prompt(template: str, params: JsonObject) -> str:
+    """Render ``prompt_template`` ``str.format`` style against the render context.
+
+    The v2 render context (T-C1-084) is the submitted params merged with the
+    non-skipped node results (skip records never enter it -- a prompt ref to a
+    skipped step fails with the pinned missing-key face naming the step).
+    ``{key}`` inserts the value: strings verbatim, every other JSON value as
+    canonical JSON (``3``, ``true``, ``null``, compact objects) so the
+    rendering is deterministic; ``{step[field][...]}`` index chains step into
+    objects/arrays (the converted step-ref form). ``{{``/``}}`` keep their
     ``str.format`` escape meaning; format specs and conversions operate on
-    the inserted string. A template referencing a key the job did not
-    submit, or one the format machinery cannot render, is a structured
+    the rendered string. A template referencing a key the context does not
+    carry, or one the format machinery cannot render, is a structured
     ``ValidationError`` (CORE-CONTRACTS §8 face) -- the job fails with a
     message naming the key, never a bare ``KeyError`` traceback.
     """
-    scalars: dict[str, str] = {
-        key: value if isinstance(value, str) else canonical_json(value) for key, value in params.items()
-    }
+    context = {key: _FormatValue(value) for key, value in params.items()}
     try:
-        return template.format(**scalars)
+        return template.format(**context)
     except KeyError as error:
         key = str(error.args[0]) if error.args else ""
         raise WorkerError(
             f"prompt template references missing param key '{key}'",
             code=CoreErrorCode.VALIDATION_ERROR,
         ) from error
-    except (IndexError, AttributeError) as error:
+    except (IndexError, AttributeError, TypeError) as error:
+        # TypeError joins the catch with v2: an index chain stepping into a
+        # scalar (e.g. ``{step[field]}`` where the result is a string) is
+        # the same unsupported-access face as positional/attribute access.
         raise WorkerError(
             f"prompt template uses positional, attribute or index access this face does not support: {error}",
             code=CoreErrorCode.VALIDATION_ERROR,
@@ -227,11 +298,26 @@ class MaasLlmCall:
         message generation over the provider seam; the adapter's terminal
         ``error`` chunk becomes the node failure with its own §8 code, and a
         stream without any terminal chunk fails closed.
+
+        v2 (T-C1-084): the render context merges the submitted params with
+        the non-skipped node results (converted step refs resolve; a ref to
+        a skipped step fails with the pinned missing-key face). A node
+        carrying ``output_schema`` requests structured output (the provider
+        ``response_format`` face): a parseable, schema-valid completion adds
+        the ``"structured"`` key; a validation failure degrades onto
+        ``fallback`` (``"structured"`` + ``"fallback": true``) when one is
+        declared, and fails the node with ``ValidationError`` otherwise.
+        Provider failures keep their S4 faces unchanged.
         """
         assert node.model is not None  # the semantic gate proved the tier present
         assert node.prompt_template is not None  # ... and the template
         params = state.get("params") or {}
-        prompt = render_prompt(node.prompt_template, params)
+        node_results = state.get("node_results") or {}
+        context: JsonObject = {
+            **params,
+            **{key: value for key, value in node_results.items() if not is_skip_record(value)},
+        }
+        prompt = render_prompt(node.prompt_template, context)
         request = GenerationRequest(
             request_id=f"llm_{uuid4().hex}",
             model=self.resolve_model(node.model),
@@ -240,6 +326,7 @@ class MaasLlmCall:
             max_output_tokens=self._max_output_tokens,
             temperature=self._temperature,
             timeout_s=self._timeout_s,
+            response_format=None if node.output_schema is None else _response_format_for(node),
         )
         text_parts: list[str] = []
         finish_reason: FinishReason | None = None
@@ -272,4 +359,40 @@ class MaasLlmCall:
                 "the provider answered tool calls for a no-tools pipeline llm_call request",
                 code=CoreErrorCode.VALIDATION_ERROR,
             )
-        return {"text": "".join(text_parts), "model": node.model, "finish_reason": finish_reason.value}
+        text = "".join(text_parts)
+        if node.output_schema is None:
+            return {"text": text, "model": node.model, "finish_reason": finish_reason.value}
+
+        # -- v2 structured output: parse (fence-tolerant), validate, degrade.
+        try:
+            parsed: JsonValue = _parse_json_tolerant(text)
+        except ValueError as error:
+            return self._structured_degrade(node, text, finish_reason, f"the completion is not parseable JSON: {error}")
+        issues = validate_input_strict(node.output_schema, parsed)
+        if issues:
+            return self._structured_degrade(node, text, finish_reason, "; ".join(issues))
+        return {"text": text, "model": node.model, "finish_reason": finish_reason.value, "structured": parsed}
+
+    def _structured_degrade(
+        self, node: PipelineNode, text: str, finish_reason: FinishReason, problem: str
+    ) -> JsonValue:
+        """A schema-validation failure: the declared degrade object, or the honest failure.
+
+        The fallback engages *only* on JSON-parse/schema-validation failure
+        (a structured-output face); provider failures and stream faces keep
+        their own §8 codes above, and a node without a fallback fails closed
+        with ``ValidationError`` naming the problem -- never a silent
+        best-effort return.
+        """
+        if node.fallback is None:
+            raise WorkerError(
+                f"llm_call node '{node.node_id}' structured output failed validation: {problem}",
+                code=CoreErrorCode.VALIDATION_ERROR,
+            )
+        return {
+            "text": text,
+            "model": node.model,
+            "finish_reason": finish_reason.value,
+            "structured": node.fallback,
+            "fallback": True,
+        }

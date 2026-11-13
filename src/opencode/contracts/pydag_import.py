@@ -37,33 +37,49 @@ The mapping (grounded in the evidence graphs):
   se). ``builtin.compute`` *without* an llm prompt is a pure compute step:
   the ported closed node set (llm_call/tool) has no such node kind, so it
   is rejected with ``PYDAG_UNKNOWN_TOOL``.
-* llm prompts -- the dialect's ``{{ref}}`` template refs are restricted to
-  the declared input vars (the ``{{inputs.x}}`` form and the bare ``{{x}}``
-  form both convert to ``x``); any other ref (step outputs like
-  ``{{step_2.sop_data}}``) is beyond v1. The ported
-  ``prompt_template`` uses ``str.format`` keys, so the conversion also
-  escapes every residual literal brace (``{`` -> ``{{``) -- the rendered
-  template is format-safe by construction, and a literal brace in the
-  source prompt round-trips through ``str.format`` unchanged. The dialect
-  declares no model on llm steps; the import pins the ported small-model
-  tier (``small`` -- the ``LlmCallFn`` face is the small-model
-  critique/verify/summarize seam, PHASE3 §11 S2; per-tier selection lands
-  with the S4 wiring).
-* tool params -- literal values are the *pass-through* case: they never
-  block an import. The ported v1 node wire has no per-node parameter field
-  (``PipelineNode`` is a closed ``extra="forbid"`` shape; the params face
-  including literal carrying lands with v2, T-C1-084), so the converted
-  tool node is identified by ``tool_ref`` alone and the parameter surface
-  is the job's submitted params (declared via ``params_schema`` above).
-  Anything that *binds* a param -- every ``{"ref": ...}`` value, whether
-  ``inputs.x`` or ``step_N.field`` -- is rejected: a binding the converted
-  node cannot carry would be a silent semantic change, never a lossy
-  conversion.
+* llm prompts -- the dialect's ``{{ref}}`` template refs convert into the
+  ported ``str.format`` keys: the declared input vars (the ``{{inputs.x}}``
+  form and the bare ``{{x}}`` form both become ``{x}``) and, since v2
+  (T-C1-084), step refs (``{{step_2.sop_data}}`` becomes
+  ``{step_2[sop_data]}`` -- the engine's render context merges the
+  non-skipped node results, and ``str.format``'s index chains step into
+  them; a root-only ``{{step_2}}`` renders the whole result). Nested
+  input paths (``{{inputs.x.y}}``) and unknown names stay
+  ``PYDAG_REF_UNSUPPORTED``. The ported ``prompt_template`` uses
+  ``str.format`` keys, so the conversion also escapes every residual
+  literal brace (``{`` -> ``{{``) -- the rendered template is format-safe
+  by construction, and a literal brace in the source prompt round-trips
+  through ``str.format`` unchanged. The dialect declares no model on llm
+  steps; the import pins the ported small-model tier (``small`` -- the
+  ``LlmCallFn`` face is the small-model critique/verify/summarize seam,
+  PHASE3 §11 S2; per-tier selection lands with the S4 wiring).
+* tool params -- since v2 (T-C1-084) the converted node carries them on
+  ``params``: literals pass through verbatim, and ``{"ref": ...}`` values
+  convert when their root binds -- ``inputs.<declared var>`` or a known
+  step id of this graph (the engine resolves them strictly at node entry).
+  A ref with any other root is ``PYDAG_REF_UNSUPPORTED`` (the
+  lossy-conversion rule: what the converted node cannot bind is rejected,
+  never guessed). The ``context_bundle``/``template`` parameter modes
+  remain beyond the import surface, and the llm payload key itself never
+  lands on ``params``.
+* llm schema/fallback -- since v2 the llm payload's ``schema`` converts to
+  the node's ``output_schema`` (structured output) and ``fallback`` to the
+  node's degrade object; a fallback without a schema is still
+  ``PYDAG_UNSUPPORTED_FIELD`` (it only engages on schema-validation
+  failure). Whether the schema sits inside the strict validator subset
+  the engine's gate supports is the registration gate's check, not this
+  module's.
+* step condition/extract -- since v2 they convert: ``condition`` (a
+  non-blank string; the engine's ported safe-subset evaluator decides
+  skip/execute) and ``extract`` (output name -> dot path, or an ordered
+  fallback chain; unresolved paths project ``null``). Malformed shapes
+  are structural rejections.
 * edges -- only ``pydagDependency`` edges with ``data.kind ==
   "depends_on"`` are topology; they become spec edges verbatim
   (source/target). ``pydagReference`` edges (``kind: param_ref``) are the
-  canvas mirror of step-output parameter refs -- beyond v1, rejected with
-  ``PYDAG_REF_UNSUPPORTED`` like the refs they depict.
+  canvas mirror of step-output parameter refs -- ignored editor state
+  since v2 (the refs themselves are validated where they bind, on the
+  nodes' params/prompts), and any other edge shape is malformed.
 * entry -- the dialect declares no entry; the ported spec requires exactly
   one. The entry is computed as the unique node with no incoming
   dependency edges; zero or multiple roots is a structural rejection (the
@@ -84,17 +100,18 @@ then the depends_on consistency and entry checks). Codes:
   step shape violations, duplicate edges, unknown edge endpoints,
   depends_on/edge mismatches, no unique entry);
 * ``PYDAG_UNSUPPORTED_FIELD`` -- a recognized field carries a feature
-  beyond ported v1: ``condition`` / ``extract`` / ``transform`` /
+  beyond the ported v2 import surface: ``transform`` /
   ``output_format`` / ``instance_binding`` / ``fallback_tools``, a
-  non-default ``output_mode``, an unknown step key, the llm
-  ``schema``/``fallback`` objects, a non-string llm prompt (the
+  non-default ``output_mode``, an unknown step key, an llm ``fallback``
+  without a ``schema``, a non-string llm prompt (the
   structured template form), ``llm_call`` on a non-compute tool, and the
   ``context_bundle``/``template`` parameter modes;
 * ``PYDAG_UNKNOWN_TOOL`` -- a tool with no ported node kind (a
   ``builtin.compute`` step without an llm prompt);
-* ``PYDAG_REF_UNSUPPORTED`` -- a ``{"ref": ...}`` parameter value, a
-  prompt ref that does not name a declared input var, or a
-  ``pydagReference`` edge.
+* ``PYDAG_REF_UNSUPPORTED`` -- a ``{"ref": ...}`` parameter value whose
+  root binds neither to a declared input var nor to a step of this graph,
+  or a prompt ref that names neither a declared input var, nor a step of
+  this graph (nested input paths included).
 
 Seam grounding: :func:`parse_pipeline_spec` is the loading-seam router --
 ``PipelineEngine.register`` is the single place in ``src/`` where a
@@ -171,13 +188,13 @@ _STEP_KEYS: frozenset[str] = frozenset(
     }
 )
 
-#: The step fields that are recognized by the dialect but beyond ported v1
-#: whenever they carry a value (None/absent = not used; T-C1-084 legalizes
-#: them). ``output`` and ``description`` are ignored instead: they name and
+#: The step fields that are recognized by the dialect but beyond the ported
+#: v2 import surface whenever they carry a value (None/absent = not used).
+#: ``condition`` / ``extract`` / the tool-params face and the llm
+#: ``schema``/``fallback`` objects legalized with v2 (T-C1-084);
+#: ``output`` and ``description`` are ignored instead: they name and
 #: document the step's result, which the ported graph keys by node id.
 _STEP_UNSUPPORTED_WHEN_SET: tuple[str, ...] = (
-    "condition",
-    "extract",
     "transform",
     "output_format",
     "instance_binding",
@@ -267,7 +284,18 @@ def convert_pydag_graph(raw: dict[str, Any]) -> PipelineSpec:
     diagnostics: list[PydagDiagnostic] = []
     pipeline_id = _header(raw, diagnostics)
     input_vars = _input_vars(raw, diagnostics)
-    scans = [_convert_node(raw_node, frozenset(input_vars), diagnostics) for raw_node in _raw_nodes(raw, diagnostics)]
+    raw_nodes = _raw_nodes(raw, diagnostics)
+    # The v2 ref pre-pass: every ref (params values, prompt step refs) binds
+    # against the ids of THIS graph, so all node ids are collected before any
+    # node converts (a ref to a step declared later in the file is legal).
+    collected_ids: list[str] = []
+    for raw_node in raw_nodes:
+        if isinstance(raw_node, dict):
+            step_node_id = raw_node.get("id")
+            if isinstance(step_node_id, str) and step_node_id:
+                collected_ids.append(step_node_id)
+    node_ids = frozenset(collected_ids)
+    scans = [_convert_node(raw_node, frozenset(input_vars), node_ids, diagnostics) for raw_node in raw_nodes]
     edges, incoming = _edges(raw, [scan.node_id for scan in scans if scan.node_id is not None], diagnostics)
     _check_depends_on(scans, incoming, diagnostics)
     entry = _entry(
@@ -384,6 +412,7 @@ def _raw_nodes(raw: dict[str, Any], diagnostics: list[PydagDiagnostic]) -> list[
 def _convert_node(
     raw_node: Any,
     input_vars: frozenset[str],
+    node_ids: frozenset[str],
     diagnostics: list[PydagDiagnostic],
 ) -> _StepScan:
     """One ``pydagStep`` -> one ported node (or the diagnostics that reject it)."""
@@ -496,8 +525,10 @@ def _convert_node(
         )
         depends_on = None
 
-    # params: literals pass through (never a rejection ground); every
-    # binding form (ref) and the other ParamDef modes are diagnosed.
+    # params: the v2 carrying face. Literals pass through onto the node's
+    # ``params``; ``{"ref": ...}`` values convert when their root binds
+    # (inputs.<declared var> or a known step id of this graph); the other
+    # ParamDef modes and malformed refs are diagnosed.
     params = step.get("params", {})
     if params is None:
         params = {}
@@ -507,19 +538,46 @@ def _convert_node(
         )
         params = {}
     llm_key: str | None = None
+    carried: dict[str, Any] = {}
     for key, value in params.items():
         if not isinstance(value, dict):
-            continue  # a literal scalar/container: the pass-through case
+            carried[key] = value  # a literal scalar/container: the pass-through case
+            continue
+        if set(value) == {"ref"} and isinstance(value.get("ref"), str) and value["ref"]:
+            ref: str = value["ref"]
+            if _param_ref_binds(ref, input_vars, node_ids):
+                carried[key] = {"ref": ref}
+            else:
+                diagnostics.append(
+                    PydagDiagnostic(
+                        PYDAG_REF_UNSUPPORTED,
+                        f"data.step.params.{key}",
+                        f"parameter ref {ref!r} binds neither to a declared input var nor to a step of this graph",
+                        node_id=node_id,
+                    )
+                )
+            continue
         if "ref" in value:
             diagnostics.append(
                 PydagDiagnostic(
-                    PYDAG_REF_UNSUPPORTED,
+                    PYDAG_STRUCTURAL,
                     f"data.step.params.{key}",
-                    f"parameter ref {value.get('ref')!r} is beyond ported v1 (tool params convert as literals only)",
+                    "a parameter ref must be exactly a single 'ref' key with a non-empty string path",
                     node_id=node_id,
                 )
             )
-        elif "llm_call" in value:
+            continue
+        if "context_bundle" in value or "template" in value:
+            diagnostics.append(
+                PydagDiagnostic(
+                    PYDAG_UNSUPPORTED_FIELD,
+                    f"data.step.params.{key}",
+                    "the context_bundle/template parameter modes are beyond the ported v2 import surface",
+                    node_id=node_id,
+                )
+            )
+            continue
+        if "llm_call" in value:
             if llm_key is not None:
                 diagnostics.append(
                     PydagDiagnostic(
@@ -530,15 +588,32 @@ def _convert_node(
                     )
                 )
             llm_key = key
-        elif "context_bundle" in value or "template" in value:
+            continue
+        carried[key] = value  # a literal JSON object: the pass-through case
+
+    # The v2 step fields (T-C1-084): condition and extract convert with their
+    # shapes checked; the carried params land on the node when non-empty.
+    extra: dict[str, Any] = {}
+    condition = step.get("condition")
+    if condition is not None:
+        if not isinstance(condition, str) or not condition.strip():
             diagnostics.append(
                 PydagDiagnostic(
-                    PYDAG_UNSUPPORTED_FIELD,
-                    f"data.step.params.{key}",
-                    "the context_bundle/template parameter modes are beyond ported v1",
+                    PYDAG_STRUCTURAL,
+                    "data.step.condition",
+                    "step 'condition' must be a non-blank string",
                     node_id=node_id,
                 )
             )
+        else:
+            extra["condition"] = condition
+    extract = step.get("extract")
+    if extract is not None:
+        converted_extract = _convert_extract(extract, node_id, diagnostics)
+        if converted_extract is not None:
+            extra["extract"] = converted_extract
+    if carried:
+        extra["params"] = carried
 
     # The tool mapping: the closed ported node set has exactly one shape
     # per dialect tool face.
@@ -555,7 +630,7 @@ def _convert_node(
                 )
             )
         else:
-            node = _llm_node(node_id, params, llm_key, input_vars, diagnostics)
+            node = _llm_node(node_id, params, llm_key, input_vars, node_ids, extra, diagnostics)
     else:
         if llm_key is not None:
             diagnostics.append(
@@ -566,8 +641,77 @@ def _convert_node(
                     node_id=node_id,
                 )
             )
-        node = PipelineNode(node_id=node_id, node_type="tool", tool_ref=tool)
+        node = PipelineNode(node_id=node_id, node_type="tool", tool_ref=tool, **extra)
     return _StepScan(node_id, depends_on, node)
+
+
+def _param_ref_binds(ref: str, input_vars: frozenset[str], node_ids: frozenset[str]) -> bool:
+    """A params ref root closure check: ``inputs.<declared var>`` or a step id."""
+    root, _, tail = ref.partition(".")
+    if root == "inputs":
+        head = tail.split(".", 1)[0]
+        return bool(tail) and head in input_vars
+    return root in node_ids
+
+
+def _convert_extract(
+    raw: Any,
+    node_id: str,
+    diagnostics: list[PydagDiagnostic],
+) -> dict[str, str | list[str]] | None:
+    """The ``extract`` projection face: output name -> dot path (or fallback chain).
+
+    Malformed shapes (a non-object, non-string/empty paths, empty dot
+    segments, empty chains) are structural rejections; an empty object is the
+    editor's unused marker and converts as absent (None).
+    """
+    if not isinstance(raw, dict):
+        diagnostics.append(
+            PydagDiagnostic(
+                PYDAG_STRUCTURAL,
+                "data.step.extract",
+                "'extract' must be a JSON object of output name -> dot path",
+                node_id=node_id,
+            )
+        )
+        return None
+    if not raw:
+        return None  # the editor's unused marker: absent, not a rejection
+    converted: dict[str, str | list[str]] = {}
+    ok = True
+    for key, chain in raw.items():
+        paths = [chain] if isinstance(chain, str) else chain
+        if not isinstance(paths, list) or not paths:
+            diagnostics.append(
+                PydagDiagnostic(
+                    PYDAG_STRUCTURAL,
+                    f"data.step.extract.{key}",
+                    "each projection must be a non-empty dot path or a non-empty fallback chain of them",
+                    node_id=node_id,
+                )
+            )
+            ok = False
+            continue
+        good_paths: list[str] = []
+        for path in paths:
+            if not isinstance(path, str) or not path or any(not segment for segment in path.split(".")):
+                diagnostics.append(
+                    PydagDiagnostic(
+                        PYDAG_STRUCTURAL,
+                        f"data.step.extract.{key}",
+                        f"extract path {path!r} is not a non-empty dot path",
+                        node_id=node_id,
+                    )
+                )
+                ok = False
+                continue
+            good_paths.append(path)
+        if not good_paths:
+            # every path in the chain was malformed: the diagnostics
+            # already fired -- never index into the empty chain.
+            continue
+        converted[key] = good_paths[0] if isinstance(chain, str) else good_paths
+    return converted if ok else None
 
 
 def _llm_node(
@@ -575,6 +719,8 @@ def _llm_node(
     params: dict[str, Any],
     llm_key: str,
     input_vars: frozenset[str],
+    node_ids: frozenset[str],
+    extra: dict[str, Any],
     diagnostics: list[PydagDiagnostic],
 ) -> PipelineNode | None:
     """The ``builtin.compute`` + llm_call mapping -> one ``llm_call`` node."""
@@ -585,24 +731,32 @@ def _llm_node(
             PydagDiagnostic(PYDAG_STRUCTURAL, base, "the llm_call payload must be a JSON object", node_id=node_id)
         )
         return None
-    if payload.get("schema") is not None:
-        diagnostics.append(
-            PydagDiagnostic(
-                PYDAG_UNSUPPORTED_FIELD,
-                f"{base}.schema",
-                "llm structured-output schemas are beyond ported v1 (legalized with v2, T-C1-084)",
-                node_id=node_id,
+    schema = payload.get("schema")
+    if schema is not None:
+        # v2 (T-C1-084): the structured-output schema converts. Shape only --
+        # the strict-subset check is the engine's registration gate.
+        if not isinstance(schema, dict):
+            diagnostics.append(
+                PydagDiagnostic(
+                    PYDAG_STRUCTURAL, f"{base}.schema", "the llm schema must be a JSON object", node_id=node_id
+                )
             )
-        )
-    if payload.get("fallback") is not None:
-        diagnostics.append(
-            PydagDiagnostic(
-                PYDAG_UNSUPPORTED_FIELD,
-                f"{base}.fallback",
-                "llm fallback (degrade) objects are beyond ported v1 (legalized with v2, T-C1-084)",
-                node_id=node_id,
+        else:
+            extra["output_schema"] = schema
+    fallback = payload.get("fallback")
+    if fallback is not None:
+        if not isinstance(schema, dict):
+            diagnostics.append(
+                PydagDiagnostic(
+                    PYDAG_UNSUPPORTED_FIELD,
+                    f"{base}.fallback",
+                    "llm fallback without a structured-output schema is beyond the import surface "
+                    "(fallback converts only together with a schema)",
+                    node_id=node_id,
+                )
             )
-        )
+        else:
+            extra["fallback"] = fallback
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt:
         diagnostics.append(
@@ -624,7 +778,7 @@ def _llm_node(
             )
         )
         return None
-    template = _convert_prompt(prompt, input_vars, f"{base}.prompt", node_id, diagnostics)
+    template = _convert_prompt(prompt, input_vars, node_ids, f"{base}.prompt", node_id, diagnostics)
     if template is None:
         return None
     return PipelineNode(
@@ -632,22 +786,28 @@ def _llm_node(
         node_type="llm_call",
         model=PYDAG_LLM_MODEL_TIER,
         prompt_template=template,
+        **extra,
     )
 
 
 def _convert_prompt(
     prompt: str,
     input_vars: frozenset[str],
+    node_ids: frozenset[str],
     field: str,
     node_id: str,
     diagnostics: list[PydagDiagnostic],
 ) -> str | None:
     """``{{ref}}`` refs -> ``str.format`` keys; residual braces escaped.
 
-    Both input ref forms convert (``{{inputs.x}}`` and the bare ``{{x}}``
-    where ``x`` is a declared input var); anything else -- step-output
-    refs, unknown names, nested field paths -- collects a
-    ``PYDAG_REF_UNSUPPORTED`` diagnostic and the caller's import fails.
+    The input ref forms convert (``{{inputs.x}}`` and the bare ``{{x}}``
+    where ``x`` is a declared input var, both to ``{x}``); since v2 step
+    refs convert to index chains (``{{step_2.sop_data}}`` ->
+    ``{step_2[sop_data]}``, a root-only ``{{step_2}}`` to ``{step_2}`` --
+    the engine's render context carries the non-skipped node results).
+    Anything else -- unknown names, nested input paths (``{{inputs.x.y}}``),
+    malformed paths -- collects a ``PYDAG_REF_UNSUPPORTED`` diagnostic and
+    the caller's import fails.
     """
     failed = False
 
@@ -659,21 +819,34 @@ def _convert_prompt(
             name = ref
         elif ref.startswith(_INPUTS_PREFIX):
             tail = ref[len(_INPUTS_PREFIX) :]
-            if tail in input_vars:
+            if tail in input_vars and "." not in tail:
                 name = tail
-        if name is None:
-            diagnostics.append(
-                PydagDiagnostic(
-                    PYDAG_REF_UNSUPPORTED,
-                    field,
-                    f"prompt ref '{{{{{ref}}}}}' does not name a declared input var "
-                    "(step-output refs are beyond ported v1)",
-                    node_id=node_id,
-                )
+        if name is not None:
+            return _PROMPT_KEY_OPEN + name + _PROMPT_KEY_CLOSE
+        root, _, tail = ref.partition(".")
+        segments = tail.split(".") if tail else []
+        bad_segment = any(not segment or any(ch in segment for ch in "][{}") for segment in segments)
+        if (
+            root in node_ids
+            and root.isidentifier()
+            and not bad_segment
+            and not ref.startswith(".")
+            and not ref.endswith(".")
+        ):
+            # The v2 step-ref form: {step_2[sop_data]} index chains (the
+            # root-only form renders the node's whole result).
+            return _PROMPT_KEY_OPEN + root + "".join(f"[{segment}]" for segment in segments) + _PROMPT_KEY_CLOSE
+        diagnostics.append(
+            PydagDiagnostic(
+                PYDAG_REF_UNSUPPORTED,
+                field,
+                f"prompt ref '{{{{{ref}}}}}' names neither a declared input var, nor a step of "
+                "this graph (nested input paths are beyond the import surface)",
+                node_id=node_id,
             )
-            failed = True
-            return match.group(0)
-        return _PROMPT_KEY_OPEN + name + _PROMPT_KEY_CLOSE
+        )
+        failed = True
+        return match.group(0)
 
     keyed = _PROMPT_REF.sub(replace, prompt)
     if failed:
@@ -691,8 +864,8 @@ def _edges(
 
     Only ``pydagDependency``/``depends_on`` edges are topology;
     ``pydagReference`` edges (the canvas mirror of step-output parameter
-    refs) are rejected like the refs they depict, and any other edge shape
-    is malformed.
+    refs) are ignored editor state (the refs bind on the nodes), and any
+    other edge shape is malformed.
     """
     raw_edges = raw.get("edges", [])
     if raw_edges is None:
@@ -710,13 +883,10 @@ def _edges(
             continue
         edge_type = raw_edge.get("type")
         if edge_type == _REFERENCE_EDGE_TYPE:
-            diagnostics.append(
-                PydagDiagnostic(
-                    PYDAG_REF_UNSUPPORTED,
-                    f"edges[{index}].type",
-                    "pydagReference (param_ref) edges depict step-output parameter refs, beyond ported v1",
-                )
-            )
+            # v2 (T-C1-084): reference edges are the canvas mirror of the
+            # step-output refs the nodes themselves carry -- the refs are
+            # validated where they bind (params/prompts on the nodes), and
+            # the canvas mirror is ignored editor state like position/label.
             continue
         if edge_type != _DEPENDENCY_EDGE_TYPE:
             diagnostics.append(

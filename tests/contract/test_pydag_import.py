@@ -225,10 +225,15 @@ class TestNodeMapping:
             "tool_ref": "demo_fetch_ticket",
             "workflow_ref": None,
             "depth": None,
+            "params": {"ticket_id": "T-1", "verbose": True},
+            "condition": None,
+            "extract": None,
+            "output_schema": None,
+            "fallback": None,
         }
 
     def test_tool_literal_params_pass_through(self) -> None:
-        """Literal params never block the import (the pass-through rule)."""
+        """Literal params never block the import (the pass-through rule) and land on node.params."""
         raw = copy.deepcopy(_pydag_raw())
         raw["nodes"][0]["data"]["step"]["params"] = {
             "ticket_id": "T-1",
@@ -240,6 +245,14 @@ class TestNodeMapping:
         }
         spec = convert_pydag_graph(raw)
         assert spec.nodes[0].tool_ref == "demo_fetch_ticket"
+        assert spec.nodes[0].params == {
+            "ticket_id": "T-1",
+            "verbose": True,
+            "weight": 3,
+            "tags": ["a", "b"],
+            "nested": {"k": "v"},
+            "none": None,
+        }
 
     def test_llm_step_maps_to_an_llm_call_node(self) -> None:
         spec = convert_pydag_graph(_pydag_raw())
@@ -436,7 +449,7 @@ class TestStructuralDiagnostics:
 class TestUnsupportedFieldDiagnostics:
     @pytest.mark.parametrize(
         "field",
-        ["condition", "extract", "transform", "output_format", "instance_binding"],
+        ["transform", "output_format", "instance_binding"],
     )
     def test_step_feature_fields_are_rejected_when_set(self, field: str) -> None:
         raw = copy.deepcopy(_pydag_raw())
@@ -460,21 +473,35 @@ class TestUnsupportedFieldDiagnostics:
         raw["nodes"][0]["data"]["step"]["output_mode"] = mode
         _first_diagnostic(raw, code=PYDAG_UNSUPPORTED_FIELD, field="data.step.output_mode")
 
-    def test_llm_schema_is_rejected(self) -> None:
+    def test_llm_schema_converts_to_output_schema(self) -> None:
+        """v2 (T-C1-084): the structured-output schema lands on the llm node."""
         raw = copy.deepcopy(_pydag_raw())
-        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["schema"] = {
-            "type": "object",
-            "properties": {"pass": {"type": "boolean"}},
-        }
+        schema = {"type": "object", "properties": {"pass": {"type": "boolean"}}, "required": ["pass"]}
+        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["schema"] = schema
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].output_schema == schema
+        assert spec.nodes[1].fallback is None
+
+    def test_llm_fallback_converts_with_a_schema(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        payload = raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]
+        payload["schema"] = {"type": "object", "properties": {"pass": {"type": "boolean"}}, "required": ["pass"]}
+        payload["fallback"] = {"pass": True}
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].fallback == {"pass": True}
+
+    def test_llm_fallback_without_a_schema_is_rejected(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["fallback"] = {"pass": True}
         diagnostic = _first_diagnostic(
-            raw, code=PYDAG_UNSUPPORTED_FIELD, field="data.step.params.summary.llm_call.schema"
+            raw, code=PYDAG_UNSUPPORTED_FIELD, field="data.step.params.summary.llm_call.fallback"
         )
         assert diagnostic.node_id == "step_2"
 
-    def test_llm_fallback_is_rejected(self) -> None:
+    def test_a_non_object_llm_schema_is_a_structural_rejection(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
-        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["fallback"] = {"pass": True}
-        _first_diagnostic(raw, code=PYDAG_UNSUPPORTED_FIELD, field="data.step.params.summary.llm_call.fallback")
+        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["schema"] = ["not", "an", "object"]
+        _first_diagnostic(raw, code=PYDAG_STRUCTURAL, field="data.step.params.summary.llm_call.schema")
 
     @pytest.mark.parametrize("prompt", [{"template": {"format": "f", "bindings": {}}}, "", 42])
     def test_non_string_llm_prompt_is_rejected(self, prompt: Any) -> None:
@@ -499,23 +526,49 @@ class TestUnsupportedFieldDiagnostics:
 
 
 class TestRefDiagnostics:
-    def test_step_output_param_ref_is_rejected(self) -> None:
+    def test_step_output_param_ref_converts(self) -> None:
+        """v2 (T-C1-084): a step-rooted ref binds onto the node's params."""
         raw = copy.deepcopy(_pydag_raw())
         raw["nodes"][1]["data"]["step"]["params"]["ticket"] = {"ref": "step_1.ticket"}
-        diagnostic = _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="data.step.params.ticket")
-        assert diagnostic.node_id == "step_2"
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].params == {"ticket": {"ref": "step_1.ticket"}}
 
-    def test_inputs_param_ref_is_rejected(self) -> None:
-        """Tool params convert as literals only; every ref binding is rejected."""
+    def test_inputs_param_ref_converts_for_a_declared_var(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
         raw["nodes"][0]["data"]["step"]["params"]["ticket_id"] = {"ref": "inputs.ticket_id"}
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[0].params == {
+            "ticket_id": {"ref": "inputs.ticket_id"},
+            "verbose": True,
+        }
+
+    def test_params_ref_to_an_undeclared_input_var_is_rejected(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][0]["data"]["step"]["params"]["ticket_id"] = {"ref": "inputs.ghost"}
         diagnostic = _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="data.step.params.ticket_id")
         assert diagnostic.node_id == "step_1"
 
-    def test_prompt_step_output_ref_is_rejected(self) -> None:
+    def test_params_ref_with_an_unknown_root_is_rejected(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][0]["data"]["step"]["params"]["ticket_id"] = {"ref": "ghost.field"}
+        _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="data.step.params.ticket_id")
+
+    def test_a_malformed_ref_object_is_a_structural_rejection(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][0]["data"]["step"]["params"]["ticket_id"] = {"ref": "step_1.ticket", "mode": "x"}
+        _first_diagnostic(raw, code=PYDAG_STRUCTURAL, field="data.step.params.ticket_id")
+
+    def test_prompt_step_output_ref_converts_to_an_index_chain(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
         raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["prompt"] = "Summarize {{step_1.ticket}}."
-        _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="data.step.params.summary.llm_call.prompt")
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].prompt_template == "Summarize {step_1[ticket]}."
+
+    def test_prompt_root_only_step_ref_converts_to_the_whole_result(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["prompt"] = "All: {{step_1}}"
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].prompt_template == "All: {step_1}"
 
     def test_prompt_unknown_var_ref_is_rejected(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
@@ -534,9 +587,12 @@ class TestRefDiagnostics:
         )
         _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="data.step.params.summary.llm_call.prompt")
 
-    def test_param_ref_edge_is_rejected(self) -> None:
+    def test_param_ref_edges_are_ignored_canvas_metadata(self) -> None:
+        """v2: the pydagReference canvas mirror is ignored -- the refs bind on the nodes."""
         raw = copy.deepcopy(_pydag_raw())
-        raw["edges"].append(
+        raw["nodes"][1]["data"]["step"]["params"]["summary"]["llm_call"]["prompt"] = "Summarize {{step_1.ticket}}."
+        with_edge = copy.deepcopy(raw)
+        with_edge["edges"].append(
             {
                 "id": "step_1->step_2:param_ref:step_1.ticket",
                 "source": "step_1",
@@ -545,8 +601,75 @@ class TestRefDiagnostics:
                 "data": {"kind": "param_ref", "ref": "step_1.ticket"},
             }
         )
-        diagnostic = _first_diagnostic(raw, code=PYDAG_REF_UNSUPPORTED, field="edges[1].type")
-        assert diagnostic.node_id is None
+        assert convert_pydag_graph(with_edge) == convert_pydag_graph(raw)
+
+
+class TestV2StepConversions:
+    """The v2 step-field conversions (T-C1-084): condition, extract, params carrying."""
+
+    def test_a_valid_condition_converts(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["condition"] = "step_1.output is ticket"
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].condition == "step_1.output is ticket"
+        assert spec.nodes[0].condition is None
+
+    def test_a_blank_condition_is_a_structural_rejection(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["condition"] = "   "
+        _first_diagnostic(raw, code=PYDAG_STRUCTURAL, field="data.step.condition")
+
+    def test_a_non_string_condition_is_a_structural_rejection(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["condition"] = 7
+        _first_diagnostic(raw, code=PYDAG_STRUCTURAL, field="data.step.condition")
+
+    def test_extract_converts_paths_and_fallback_chains(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["extract"] = {
+            "sop_data": ["result.data", "result"],
+            "answer": "result.answer",
+        }
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].extract == {"sop_data": ["result.data", "result"], "answer": "result.answer"}
+
+    def test_an_empty_extract_object_converts_as_absent(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["extract"] = {}
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].extract is None
+
+    @pytest.mark.parametrize(
+        ("bad", "field"),
+        [
+            ("not-an-object", "data.step.extract"),
+            ({"a": ""}, "data.step.extract.a"),
+            ({"a": []}, "data.step.extract.a"),
+            ({"a": ["ok", ""]}, "data.step.extract.a"),
+            ({"a": 3}, "data.step.extract.a"),
+            ({"a": "x..y"}, "data.step.extract.a"),
+        ],
+    )
+    def test_malformed_extract_is_a_structural_rejection(self, bad: Any, field: str) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][1]["data"]["step"]["extract"] = bad
+        _first_diagnostic(raw, code=PYDAG_STRUCTURAL, field=field)
+
+    def test_the_llm_payload_key_never_lands_on_params(self) -> None:
+        raw = copy.deepcopy(_pydag_raw())
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[1].params is None  # the only param was the llm payload
+
+    def test_params_refs_bind_against_all_declared_steps(self) -> None:
+        """The ref pre-pass: a ref may name a step declared later in the file."""
+        raw = copy.deepcopy(_pydag_raw())
+        raw["nodes"][0]["data"]["step"]["params"]["next"] = {"ref": "step_2.summary"}
+        spec = convert_pydag_graph(raw)
+        assert spec.nodes[0].params == {
+            "ticket_id": "T-1",
+            "verbose": True,
+            "next": {"ref": "step_2.summary"},
+        }
 
 
 class TestUnknownTool:
@@ -560,22 +683,25 @@ class TestUnknownTool:
 class TestErrorFace:
     def test_the_error_carries_every_diagnostic(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
-        raw["nodes"][0]["data"]["step"]["condition"] = "step_1.ready is true"
-        raw["nodes"][1]["data"]["step"]["extract"] = {"ticket": "ticket.id"}
+        raw["nodes"][0]["data"]["step"]["transform"] = {"any": "value"}
+        raw["nodes"][1]["data"]["step"]["output_format"] = {"any": "value"}
         error = _rejected(raw)
         assert [diagnostic.code for diagnostic in error.diagnostics] == [
             PYDAG_UNSUPPORTED_FIELD,
             PYDAG_UNSUPPORTED_FIELD,
         ]
         assert [diagnostic.node_id for diagnostic in error.diagnostics] == ["step_1", "step_2"]
-        assert [diagnostic.field for diagnostic in error.diagnostics] == ["data.step.condition", "data.step.extract"]
+        assert [diagnostic.field for diagnostic in error.diagnostics] == [
+            "data.step.transform",
+            "data.step.output_format",
+        ]
 
     def test_the_error_message_names_the_first_diagnostic(self) -> None:
         raw = copy.deepcopy(_pydag_raw())
-        raw["nodes"][1]["data"]["step"]["params"]["summary"] = {"ref": "step_1.ticket"}
+        raw["nodes"][1]["data"]["step"]["params"]["summary"] = {"ref": "inputs.ghost"}
         error = _rejected(raw)
-        # Two findings: the ref itself and the now prompt-less compute step
-        # (the llm_call param was the ref); the message names the first.
+        # Two findings: the unbindable ref itself and the now prompt-less
+        # compute step (the llm_call param was the ref); the message names the first.
         assert "pydag graph rejected with 2 diagnostic(s)" in str(error)
         assert "[PYDAG_REF_UNSUPPORTED]" in str(error)
 

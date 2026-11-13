@@ -350,11 +350,352 @@ class TestSpecHash:
         assert len({base, changed_id, changed_tier}) == 3
 
     def test_hash_is_the_sha256_of_the_canonical_serialization(self) -> None:
+        """The recipe (T-C1-084): canonical JSON of the dump, None v2 fields stripped."""
         from hashlib import sha256
 
         from opencode.contracts.events import canonical_json
 
         spec = _validated()
-        expected = sha256(canonical_json(spec.model_dump(mode="json")).encode("utf-8")).hexdigest()
+        data = spec.model_dump(mode="json")
+        for node in data["nodes"]:
+            for field_name in ("params", "condition", "extract", "output_schema", "fallback"):
+                if node.get(field_name) is None:
+                    node.pop(field_name, None)
+        expected = sha256(canonical_json(data).encode("utf-8")).hexdigest()
         assert compute_spec_hash(spec) == expected
         assert len(compute_spec_hash(spec)) == 64
+
+    def test_the_v1_hash_is_pinned_byte_stable_across_the_v2_extension(self) -> None:
+        """The T-C1-084 stability pin: a pure-v1 spec hashes exactly what the
+        pre-v2 engine hashed -- the five new None-valued fields never enter
+        the canonical bytes, so v1 bindings survive the extension intact."""
+        pinned = "a881d3f4c06e24878ba25cbad28c1892a4222f54039603ee119db402c6928772"
+        assert compute_spec_hash(_validated()) == pinned
+        raw = json.loads((FIXTURES_DIR / "pipelines_valid.json").read_text(encoding="utf-8"))
+        assert compute_spec_hash(PipelineSpec.model_validate(raw)) == pinned
+
+    def test_set_v2_fields_participate_in_the_hash(self) -> None:
+        base = compute_spec_hash(_validated())
+        conditioned = compute_spec_hash(
+            _validated(
+                nodes=[
+                    {
+                        "node_id": "collect",
+                        "node_type": "tool",
+                        "tool_ref": "fs.read_text",
+                        "condition": "inputs.go is true",
+                    },
+                    {
+                        "node_id": "summarize",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "Summarize the collected input.",
+                    },
+                ]
+            )
+        )
+        assert conditioned != base
+        assert len(conditioned) == 64
+
+
+class TestV2NodeFields:
+    """Layer 1 (pydantic) for the v2 additive node fields (T-C1-084)."""
+
+    def test_params_literals_and_refs_parse(self) -> None:
+        node = PipelineNode.model_validate(
+            {
+                "node_id": "n",
+                "node_type": "tool",
+                "tool_ref": "t",
+                "params": {
+                    "literal": 3,
+                    "nested": {"k": "v"},
+                    "from_inputs": {"ref": "inputs.x"},
+                    "from_step": {"ref": "step_1.field.deep"},
+                },
+            }
+        )
+        assert node.params is not None
+        assert node.params["literal"] == 3
+        assert node.params["from_inputs"] == {"ref": "inputs.x"}
+        assert node.params["from_step"] == {"ref": "step_1.field.deep"}
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"ref": 3},
+            {"ref": ""},
+            {"ref": "a..b"},
+            {"ref": ".x"},
+            {"ref": "x."},
+            {"ref": "ok", "extra": 1},
+        ],
+    )
+    def test_malformed_ref_objects_are_rejected(self, bad: dict[str, Any]) -> None:
+        with pytest.raises(ValidationError):
+            PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "params": {"p": bad}})
+
+    def test_a_dict_with_a_ref_key_among_others_is_rejected_never_guessed(self) -> None:
+        with pytest.raises(ValidationError, match="single 'ref' key"):
+            PipelineNode.model_validate(
+                {
+                    "node_id": "n",
+                    "node_type": "tool",
+                    "tool_ref": "t",
+                    "params": {"p": {"ref": "inputs.x", "mode": "y"}},
+                }
+            )
+
+    def test_extract_paths_and_fallback_chains_parse(self) -> None:
+        node = PipelineNode.model_validate(
+            {
+                "node_id": "n",
+                "node_type": "tool",
+                "tool_ref": "t",
+                "extract": {"a": "result.x", "b": ["result.y", "fallback"]},
+            }
+        )
+        assert node.extract == {"a": "result.x", "b": ["result.y", "fallback"]}
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {},
+            {"a": ""},
+            {"a": []},
+            {"a": ["ok", ""]},
+            {"a": 3},
+            {"a": ["x", 3]},
+            {"a": "x..y"},
+        ],
+    )
+    def test_malformed_extract_is_rejected(self, bad: Any) -> None:
+        with pytest.raises(ValidationError):
+            PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "extract": bad})
+
+    def test_an_empty_condition_is_rejected_and_whitespace_parses(self) -> None:
+        with pytest.raises(ValidationError):
+            PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "condition": ""})
+        node = PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "condition": "  "})
+        # Whitespace parses; the ported evaluator reads it as "no condition".
+        assert node.condition == "  "
+
+    def test_output_schema_and_fallback_parse(self) -> None:
+        node = PipelineNode.model_validate(
+            {
+                "node_id": "n",
+                "node_type": "llm_call",
+                "model": "small",
+                "prompt_template": "p",
+                "output_schema": {"type": "object", "properties": {}},
+                "fallback": {"a": 1},
+            }
+        )
+        assert node.output_schema == {"type": "object", "properties": {}}
+        assert node.fallback == {"a": 1}
+
+
+def _v2_raw(**overrides: Any) -> dict[str, Any]:
+    """One minimal valid v2 carrier spec (a single llm node); overrides splice."""
+    raw: dict[str, Any] = {
+        "schema_version": 1,
+        "pipeline_id": "p",
+        "entry": "a",
+        "nodes": [{"node_id": "a", "node_type": "llm_call", "model": "small", "prompt_template": "p"}],
+    }
+    raw.update(overrides)
+    return raw
+
+
+class TestV2SemanticGate:
+    """Layer 2 for the v2 faces: reserved roots, condition syntax, ref closure, llm schema rules."""
+
+    def test_a_node_named_inputs_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(entry="inputs", nodes=[{"node_id": "inputs", "node_type": "tool", "tool_ref": "t"}])
+        )
+        with pytest.raises(PipelineSpecRejected, match="reserved"):
+            validate_pipeline_spec(spec)
+
+    def test_a_node_id_colliding_with_a_declared_param_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(params_schema={"type": "object", "properties": {"a": {"type": "string"}}})
+        )
+        with pytest.raises(PipelineSpecRejected, match="collide with declared params"):
+            validate_pipeline_spec(spec)
+
+    def test_bad_condition_syntax_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "condition": "a.ready === true",
+                    }
+                ]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="not a supported condition expression"):
+            validate_pipeline_spec(spec)
+
+    def test_valid_condition_syntax_passes_the_gate(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "condition": "inputs.go is true",
+                    }
+                ]
+            )
+        )
+        validate_pipeline_spec(spec)
+
+    def test_step_rooted_params_refs_pass_the_gate(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {"node_id": "a", "node_type": "tool", "tool_ref": "t", "params": {"x": {"ref": "b.field"}}},
+                    {"node_id": "b", "node_type": "llm_call", "model": "small", "prompt_template": "p"},
+                ],
+                edges=[{"from_node": "a", "to_node": "b"}],
+            )
+        )
+        validate_pipeline_spec(spec)
+
+    def test_unknown_params_ref_root_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(nodes=[{"node_id": "a", "node_type": "tool", "tool_ref": "t", "params": {"x": {"ref": "ghost.x"}}}])
+        )
+        with pytest.raises(PipelineSpecRejected, match="has unknown root 'ghost'"):
+            validate_pipeline_spec(spec)
+
+    def test_inputs_params_refs_without_a_schema_are_statically_unbindable(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[{"node_id": "a", "node_type": "tool", "tool_ref": "t", "params": {"x": {"ref": "inputs.x"}}}]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="statically unbindable"):
+            validate_pipeline_spec(spec)
+
+    def test_inputs_params_refs_must_name_a_declared_property(self) -> None:
+        schema: dict[str, Any] = {"type": "object", "properties": {"known": {"type": "string"}}}
+        bad = PipelineSpec.model_validate(
+            _v2_raw(
+                params_schema=schema,
+                nodes=[
+                    {"node_id": "a", "node_type": "tool", "tool_ref": "t", "params": {"x": {"ref": "inputs.unknown"}}}
+                ],
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="does not name a declared params schema property"):
+            validate_pipeline_spec(bad)
+        good = PipelineSpec.model_validate(
+            _v2_raw(
+                params_schema=schema,
+                nodes=[
+                    {"node_id": "a", "node_type": "tool", "tool_ref": "t", "params": {"x": {"ref": "inputs.known"}}}
+                ],
+            )
+        )
+        validate_pipeline_spec(good)
+
+    def test_output_schema_outside_the_subset_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "output_schema": {"type": "object", "pattern": "x"},
+                    }
+                ]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="outside the supported schema subset"):
+            validate_pipeline_spec(spec)
+
+    def test_non_object_output_schema_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "output_schema": {"type": "string"},
+                    }
+                ]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="outside the supported schema subset"):
+            validate_pipeline_spec(spec)
+
+    def test_output_schema_on_a_non_llm_node_is_rejected(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(nodes=[{"node_id": "a", "node_type": "tool", "tool_ref": "t", "output_schema": {"type": "object"}}])
+        )
+        with pytest.raises(PipelineSpecRejected, match="not an llm_call node"):
+            validate_pipeline_spec(spec)
+
+    def test_fallback_requires_an_output_schema(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "fallback": {"a": 1},
+                    }
+                ]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="without an output_schema"):
+            validate_pipeline_spec(spec)
+
+    def test_fallback_must_satisfy_the_schema(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "output_schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                        "fallback": {"a": 3},
+                    }
+                ]
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="fallback does not satisfy its output_schema"):
+            validate_pipeline_spec(spec)
+
+    def test_a_schema_fallback_pair_passes_the_gate(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "llm_call",
+                        "model": "small",
+                        "prompt_template": "p",
+                        "output_schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                        "fallback": {"a": "degraded"},
+                    }
+                ]
+            )
+        )
+        validate_pipeline_spec(spec)

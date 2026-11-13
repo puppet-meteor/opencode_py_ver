@@ -428,6 +428,11 @@ class MaasAdapter:
             params["tools"] = self._openai_tools(request)
         if request.temperature is not None:
             params["temperature"] = request.temperature
+        if request.response_format is not None:
+            # The v2 structured-output passthrough (T-C1-084): verbatim to the
+            # OpenAI-compatible create() -- the adapter is transport, not
+            # policy (the schema subset was validated at the pipeline gate).
+            params["response_format"] = request.response_format
 
         state = _AttemptState()
         # M-1 (R2-S3-review §2 M-1; pinned by T-C1-017a, 2026-11-03): a

@@ -24,6 +24,15 @@
       "type": "object"
     },
     "PipelineNode": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
       "additionalProperties": false,
       "description": "One spec node: identity + closed-set type + the per-type constraint fields.\n\nThe per-type fields (``model``/``prompt_template`` for ``llm_call``,\n``command``/``tool_ref`` for ``tool``, ``depth`` for ``subworkflow``) are\n*optional on the wire*: whether a node of a given type carries the right\nones is a semantic-layer rule, so a spec with an ``llm_call`` node missing\nits model tier parses here and is rejected by the engine's semantic gate\nwith a structured error (CORE-CONTRACTS §8 shape) -- the layered-gate\ncontract tests pin that split.",
       "properties": {
@@ -42,6 +51,19 @@
           "default": null,
           "title": "Command"
         },
+        "condition": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Condition"
+        },
         "depth": {
           "anyOf": [
             {
@@ -54,6 +76,42 @@
           ],
           "default": null,
           "title": "Depth"
+        },
+        "extract": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                ]
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Extract"
+        },
+        "fallback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "model": {
           "anyOf": [
@@ -83,6 +141,28 @@
           ],
           "title": "Node Type",
           "type": "string"
+        },
+        "output_schema": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "prompt_template": {
           "anyOf": [
@@ -181,6 +261,19 @@
               "default": null,
               "title": "Command"
             },
+            "condition": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Condition"
+            },
             "depth": {
               "anyOf": [
                 {
@@ -193,6 +286,42 @@
               ],
               "default": null,
               "title": "Depth"
+            },
+            "extract": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    ]
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Extract"
+            },
+            "fallback": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonValue"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "model": {
               "anyOf": [
@@ -222,6 +351,28 @@
               ],
               "title": "Node Type",
               "type": "string"
+            },
+            "output_schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonObject"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "params": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonObject"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "prompt_template": {
               "anyOf": [
