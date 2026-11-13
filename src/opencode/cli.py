@@ -108,6 +108,8 @@ from opencode.contracts.messages import (
     UserMessage,
 )
 from opencode.mcp import McpManager, StdioServerDefinition
+from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
+from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import (
     ApprovalExpiredError,
@@ -645,6 +647,20 @@ def main(
             host_mcp_refs = list(host_runtime.snapshot.mcp_servers)
         else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
             host_mcp_refs = []
+        # P4-S1 (T-C1-082): the production pipeline engine. The real llm_call
+        # body runs over this process's own MAAS provider (the tier fallback
+        # model is the HOST runtime's -- the --model source, never the
+        # possibly-recovered session's replayed snapshot), the tool body is
+        # the honest fail-closed refusal (the real one is a later slice), and
+        # the advisory-cursor store is its own sqlite file derived from the
+        # DB path (M-7: never a table in the main DB). Host-only discipline:
+        # base_url/api_key/model stay in this composition and never enter the
+        # config snapshot, an event payload, or the graph state.
+        pipeline_engine = PipelineEngine(
+            checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
+            llm_call=MaasLlmCall(provider=provider, default_model=host_runtime.settings.model),
+            tool=unsupported_tool_body,
+        )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
         # App exists — a refusal exits without ever triggering the startup
         # recovery scan (structural: recover must precede App, so other
@@ -674,6 +690,7 @@ def main(
                 working_dir=recovery.working_dir if recovery is not None else None,
                 mcp_manager=mcp_manager,
                 mcp_refs=host_mcp_refs,
+                pipeline_engine=pipeline_engine,
             )
         )
     except _SelectionError as error:
@@ -837,6 +854,7 @@ async def _drive(
     working_dir: str | None,
     mcp_manager: McpManager | None,
     mcp_refs: Sequence[McpServerRef],
+    pipeline_engine: PipelineEngine,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -893,6 +911,7 @@ async def _drive(
         working_dir=working_dir,
         mcp_manager=mcp_manager,
         mcp_refs=mcp_refs,
+        pipeline_engine=pipeline_engine,
     )
     # R4-S6: the driving act itself waits for the startup scan. The gated
     # store already orders every WRITE behind the scan, but prompt()'s

@@ -161,8 +161,9 @@ class _NodeFailure(Exception):
     """An injected node body raised; carries the node for the §8 error mapping.
 
     The engine's node wrapper raises this so the drive handler can attribute
-    the failure to the node and map the §8 code by node type
-    (``ProviderUnavailable`` for ``llm_call``, ``ToolFailed`` for ``tool``);
+    the failure to the node and map the §8 code: a ``WorkerError`` keeps its
+    own code, the unstructured rest defaults by node type
+    (``ProviderUnavailable`` for ``llm_call``, ``ToolFailed`` for the others);
     unexpected failures outside node bodies (graph machinery) propagate
     uncaught rather than being mislabeled with a node code.
     """
@@ -483,8 +484,10 @@ class PipelineEngine:
     * ``read`` is the ``JobCheckpointReader`` face for the §8 recovery scan:
       the advisory-cursor facts (attempt, the job's params hash binding, and
       the graph-completion outcome/result) with no job-status claims;
-    * node failures fail the job with the §8 ``CoreError`` face
-      (``ToolFailed``/``ProviderUnavailable`` by node type); ``EnginePause``
+    * node failures fail the job with the §8 ``CoreError`` face: a
+      ``WorkerError`` from the body keeps its own code, the rest defaults by
+      node type (``ProviderUnavailable`` for ``llm_call``,
+      ``ToolFailed`` otherwise); ``EnginePause``
       leaves the job ``running`` with the cursor holding the position.
     """
 
@@ -942,13 +945,15 @@ class PipelineEngine:
             return
         except _NodeFailure as failure:
             # The injected body raised: attribute to the node and map the §8
-            # code by type (llm_call -> ProviderUnavailable; a WorkerError
-            # carries its own code; the rest default to ToolFailed).
+            # code. A WorkerError carries its own code and wins first (S4's
+            # llm body raises structured ValidationError/ProviderUnavailable
+            # faces); the unstructured rest defaults by node type
+            # (llm_call -> ProviderUnavailable, everything else -> ToolFailed).
             node = failure.node
-            if node.node_type == "llm_call":
-                code = CoreErrorCode.PROVIDER_UNAVAILABLE
-            elif isinstance(failure.__cause__, WorkerError):
+            if isinstance(failure.__cause__, WorkerError):
                 code = failure.__cause__.code
+            elif node.node_type == "llm_call":
+                code = CoreErrorCode.PROVIDER_UNAVAILABLE
             else:
                 code = CoreErrorCode.TOOL_FAILED
             await self._finish(

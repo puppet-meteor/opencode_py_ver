@@ -40,6 +40,8 @@ from opencode.config import ConfigLoader
 from opencode.contracts.events import ConfigSnapshotV3
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
+from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
+from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
 from opencode.tools.builtin import (
     BashAdapter,
     FsEditAdapter,
@@ -242,15 +244,31 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         mcp_refs = list(runtime.snapshot.mcp_servers)
     else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
         mcp_refs = []
+    provider = MaasAdapter(base_url, api_key)
+    # P4-S1 (T-C1-082): the production pipeline engine, composed here
+    # isomorphically to the CLI's assembly (deliberately not a shared
+    # factory -- this host chain stays a frozen face): the real llm_call
+    # body over this process's own provider (tier fallback = the resolved
+    # runtime's model, the --model/config source), the honest fail-closed
+    # tool body (the real one is a later slice), and the advisory-cursor
+    # store at its own sqlite file derived from the DB path (M-7: never a
+    # table in the main DB). Host-only discipline: base_url/api_key/model
+    # stay in this composition -- never the snapshot, events or graph state.
+    pipeline_engine = PipelineEngine(
+        checkpointer=EngineCheckpointer(checkpointer_path_for(resolved_db)),
+        llm_call=MaasLlmCall(provider=provider, default_model=runtime.settings.model),
+        tool=unsupported_tool_body,
+    )
     app = App(
         resolved_db,
-        provider=MaasAdapter(base_url, api_key),
+        provider=provider,
         tools=_builtin_adapters(runtime.roots),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
         rules=permission_rules_from_snapshot(runtime.snapshot.permission_rules),
         mcp_manager=mcp_manager,
         mcp_refs=mcp_refs,
+        pipeline_engine=pipeline_engine,
     )
     api = create_app(app, token=token)
     server = uvicorn.Server(_server_config(api, port=port))
