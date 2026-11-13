@@ -259,6 +259,11 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         llm_call=MaasLlmCall(provider=provider, default_model=runtime.settings.model),
         tool=unsupported_tool_body,
     )
+    # P5-S1 (T-C1-085): the registration glue's input root -- the same
+    # loader face the CLI composition uses (one source, no drift). The
+    # registration itself runs in the ASGI lifespan startup (app.py, the
+    # startup twin of the shutdown reclaim face) on the serving loop.
+    skills_dir = loader.skills_directory()
     app = App(
         resolved_db,
         provider=provider,
@@ -269,6 +274,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         mcp_manager=mcp_manager,
         mcp_refs=mcp_refs,
         pipeline_engine=pipeline_engine,
+        skills_dir=skills_dir,
     )
     api = create_app(app, token=token)
     server = uvicorn.Server(_server_config(api, port=port))

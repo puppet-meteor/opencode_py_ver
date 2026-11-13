@@ -110,6 +110,7 @@ from opencode.contracts.messages import (
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
+from opencode.orchestrator.registration import register_pipelines
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import (
     ApprovalExpiredError,
@@ -691,6 +692,7 @@ def main(
                 mcp_manager=mcp_manager,
                 mcp_refs=host_mcp_refs,
                 pipeline_engine=pipeline_engine,
+                skills_dir=loader.skills_directory(),
             )
         )
     except _SelectionError as error:
@@ -855,6 +857,7 @@ async def _drive(
     mcp_manager: McpManager | None,
     mcp_refs: Sequence[McpServerRef],
     pipeline_engine: PipelineEngine,
+    skills_dir: Path,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -879,8 +882,30 @@ async def _drive(
     ``mcp_manager``/``mcp_refs`` are the host's current MCP composition —
     spawned and bound at session start (P2-S0, §6 L304) and closed by the
     App lifecycle (§7 L339).
+
+    P5-S1 (T-C1-085): the drive's first face registers the skills
+    manifest's langgraph pipelines into the engine (the manifest ->
+    engine glue, on this same loop -- the checkpointer's aiosqlite
+    connection is loop-bound; the report is disclosed on stderr only).
     """
     global _ACTIVE_INPUT
+    # P5-S1 (T-C1-085): the production registration face -- the skills
+    # manifest -> engine glue. It runs inside THIS loop's lifetime (the
+    # same loop that later drives the engine below: the checkpointer's
+    # aiosqlite connection is loop-bound). Disclosure policy (the MCP boot
+    # precedent, ADR-0002 L60): a missing skills directory/manifest is the
+    # silent fresh-project zero state; a broken manifest or a rejected
+    # entry is exactly one stderr line each and the boot continues. stdout
+    # stays the answer stream -- the registration face never writes it.
+    report = await register_pipelines(pipeline_engine, skills_dir)
+    if report.manifest_error is not None:
+        print(f"opencode: skills manifest discovery failed: {report.manifest_error}", file=sys.stderr)
+    for rejection in report.rejected:
+        print(
+            f"opencode: skill {rejection.skill_id!r} pipeline {rejection.pipeline!r} "
+            f"rejected: {rejection.error_type}: {rejection.message}",
+            file=sys.stderr,
+        )
     # R4-S6: idempotency keys on (session_id, request_id, text), and a
     # recovered session's log already carries ids minted by earlier boots —
     # a new boot reusing a plain ``req_cli_1`` with a different text would

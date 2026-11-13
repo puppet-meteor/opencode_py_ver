@@ -33,7 +33,8 @@ implied):
   §6.3 "激活前须通过路径检查"). Discovery reads exactly the manifest -- a
   declared ``pipeline`` file is *not* opened here; the graph.json
   registration-time validation and hash lock are the engine's
-  ``register`` face (the manifest -> engine glue is S5b).
+  ``register`` face (the manifest -> engine glue is the P5-S1
+  registration face, :mod:`opencode.orchestrator.registration`).
 
 Failure is explicit, never repaired (p2-slices §2.1 L96): a missing
 directory, a missing manifest, corrupt JSON, a wrong manifest shape, or any

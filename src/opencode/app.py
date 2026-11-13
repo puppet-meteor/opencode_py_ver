@@ -168,6 +168,7 @@ class App:
         mcp_refs: Sequence[McpServerRef] | None = None,
         sweep_roots: Sequence[str | Path] | None = None,
         pipeline_engine: PipelineEngine | None = None,
+        skills_dir: str | Path | None = None,
         workflow_tools: bool = False,
     ) -> None:
         if provider is not None and settings is None:
@@ -305,6 +306,11 @@ class App:
         # presence is what makes the engine execute ``human_gate`` nodes
         # at all (None keeps the S2/S3 unwired face byte-identical).
         self._pipeline_engine = pipeline_engine
+        # P5-S1 (T-C1-085): the skills discovery root the ASGI lifespan
+        # registers pipelines from (None = this composition declares no
+        # registration face; the CLI host registers inside its own drive
+        # loop instead, so its App carries no root).
+        self._skills_dir = Path(skills_dir) if skills_dir is not None else None
 
         # P3-S4 (T-C1-079): the shared gateway params validator over the
         # engine's registered specs -- zero-model strict JSON-Schema
@@ -382,6 +388,11 @@ class App:
     def pipeline_engine(self) -> PipelineEngine | None:
         """The P3-S2 pipeline engine when wired (None keeps the S1 fake executor)."""
         return self._pipeline_engine
+
+    @property
+    def skills_dir(self) -> Path | None:
+        """The §6.3 skills root the ASGI lifespan registers pipelines from (P5-S1; None = none)."""
+        return self._skills_dir
 
     @property
     def registry(self) -> ToolRegistry | None:

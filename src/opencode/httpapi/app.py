@@ -104,6 +104,7 @@ from opencode.bus.eventlog import EventCursor, EventLog, LogItem, Synced
 from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.jobs import JobTransitionError
+from opencode.orchestrator.registration import register_pipelines
 from opencode.session.service import DecisionReceipt, RunRef, RunStatus, SessionRef
 from opencode.storage import StoreError
 from opencode.storage.jobs_store import JobRecord, job_stream_key
@@ -520,7 +521,10 @@ def _lifespan_for(app: App) -> Any:
 
     Startup awaits the startup-recovery scan (fail closed: a failed scan
     aborts the ASGI startup) and then starts the MCP servers — a failed
-    server is one stderr line and the boot continues. Shutdown closes the
+    server is one stderr line and the boot continues. P5-S1 (T-C1-085):
+    an App carrying the pipeline engine and the skills root also registers
+    the manifest's pipelines here — the startup twin of the shutdown
+    reclaim below, on this same serving loop. Shutdown closes the
     App: the SessionService close lifecycle reclaims the scheduled runs
     (§7 L337/L108), then the database handle releases the writer lock.
     """
@@ -530,6 +534,23 @@ def _lifespan_for(app: App) -> Any:
         await app.recovery_gate.wait()
         for server, error in await app.start_mcp_servers():
             print(f"opencode-http: MCP server {server!r} failed to start: {error}", file=sys.stderr)
+        # P5-S1 (T-C1-085): the manifest -> engine registration face — the
+        # startup twin of the shutdown reclaim below, on this same serving
+        # loop (the checkpointer's aiosqlite connection is loop-bound). The
+        # disclosure policy is the MCP boot precedent (ADR-0002 L60): a
+        # missing skills directory/manifest is the silent fresh-project
+        # zero state; a broken manifest or a rejected entry is exactly one
+        # stderr line each and the boot continues.
+        if app.pipeline_engine is not None and app.skills_dir is not None:
+            report = await register_pipelines(app.pipeline_engine, app.skills_dir)
+            if report.manifest_error is not None:
+                print(f"opencode-http: skills manifest discovery failed: {report.manifest_error}", file=sys.stderr)
+            for rejection in report.rejected:
+                print(
+                    f"opencode-http: skill {rejection.skill_id!r} pipeline {rejection.pipeline!r} "
+                    f"rejected: {rejection.error_type}: {rejection.message}",
+                    file=sys.stderr,
+                )
         try:
             yield
         finally:
