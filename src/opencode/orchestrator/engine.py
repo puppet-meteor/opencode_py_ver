@@ -72,6 +72,7 @@ from opencode.contracts.pipelines import (
     PipelineSpec,
     compute_spec_hash,
 )
+from opencode.contracts.pydag_import import parse_pipeline_spec
 from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.jobs import (
     TERMINAL_STATUSES,
@@ -533,13 +534,19 @@ class PipelineEngine:
 
         ``raw`` is the ``graph.json`` wire object. The structural layer is the
         pydantic contract; the semantic layer is :func:`validate_pipeline_spec`;
-        the rehearsal layer is the real ``compile`` (no node body runs). The
+        the rehearsal layer is the real ``compile`` (no node body runs). A
+        ``schema_version`` of ``pydag-editable-graph-v1`` (the
+        agent_dsl_flow_framework dialect, T-C1-083) routes through the pydag
+        converter at this loading seam before the structural layer --
+        everything after the routing is the unchanged v1 path (semantic gate,
+        rehearsal, hash lock; rejections surface as
+        :class:`~opencode.contracts.pydag_import.PydagImportError`). The
         compiled graph is bound to this engine's checkpointer, so a later
         re-registration under the same ``pipeline_id`` with a changed spec is
         a *new* binding (new hash): running graphs resume against the hash
         they were started with or fail closed (PHASE3 §5.2 no hot rebind).
         """
-        spec = PipelineSpec.model_validate(raw)
+        spec = parse_pipeline_spec(raw)
         validate_pipeline_spec(spec, implemented=self._implemented())
         saver = await self._checkpointer.saver()
         graph = self._compile(spec, saver)
