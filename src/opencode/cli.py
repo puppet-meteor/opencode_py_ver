@@ -64,6 +64,7 @@ import argparse
 import asyncio
 import contextlib
 import ctypes
+import importlib.metadata
 import io
 import os
 import signal
@@ -232,6 +233,14 @@ def _positive_seconds(text: str) -> float:
     return value
 
 
+def _package_version() -> str:
+    """The installed distribution version (T-C1-081); '0.0.1' before any install metadata exists."""
+    try:
+        return importlib.metadata.version("opencode-py")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.1"
+
+
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="opencode",
@@ -287,6 +296,17 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         type=_int_at_least_one("--max-steps"),
         default=None,
         help=f"runner step budget (unset falls through to config, builtin default {DEFAULT_MAX_STEPS})",
+    )
+    # T-C1-081 (TS parity): '--version' prints 'opencode v{V}' on stdout and
+    # exits 0 — the exact TS CLI face. The argparse version action fires inside
+    # parse_args, before any config discovery, so it needs no MAAS configuration
+    # and leaves no database behind. The '-v' short flag is deliberately NOT
+    # aliased (a later ticket owns that face).
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"opencode v{_package_version()}",
+        help="print the CLI version and exit",
     )
     # R4-S6 (§6.2 L107): the session-selection face. Mutually exclusive —
     # one resume intent per process; both given is a usage error (exit 2).

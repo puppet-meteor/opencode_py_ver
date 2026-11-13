@@ -361,6 +361,26 @@ def test_argparse_missing_required_args_exit_2() -> None:
     assert excinfo.value.code == 2
 
 
+def test_version_flag_prints_ts_parity_line_and_exits_0(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """T-C1-081 (TS parity): ``--version`` prints 'opencode v{V}' on stdout and
+    exits 0 — the argparse version action fires during parse_args, before any
+    config discovery, so it needs no MAAS configuration and writes nothing."""
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "never-created.db"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version", "--db", str(db_path)])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert out.startswith("opencode v")
+    assert not db_path.exists()
+    assert not (tmp_path / "opencode.db").exists()
+
+
 # ---------------------------------------------------------------------------
 # T-C1-067: the product config bridge CLI face — no explicit
 # --base-url/--api-key/--model needed when the TS product config exists.

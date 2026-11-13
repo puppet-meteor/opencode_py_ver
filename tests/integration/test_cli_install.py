@@ -152,6 +152,24 @@ def test_installed_command_help_is_zero_side_effect_exit_0(installed: _Installed
     assert not (tmp_path / "opencode.db").exists()
 
 
+def test_installed_command_version_is_zero_side_effect_exit_0(installed: _InstalledFace, tmp_path: Path) -> None:
+    """T-C1-081 版本面 (TS parity): the installed ``opencode --version`` prints
+    'opencode v{V}' on stdout, exits 0, and touches nothing in the working
+    directory — no MAAS configuration needed (the argparse version action fires
+    during parse_args, before any config discovery)."""
+    result = subprocess.run(
+        [str(installed.exe), "--version"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.stdout.startswith("opencode v")
+    assert not (tmp_path / "opencode.db").exists()
+
+
 def test_installed_single_shot_run_succeeds_exit_0(installed: _InstalledFace, tmp_path: Path) -> None:
     """单发面 smoke (2e): mirrors test_cli.py ⑦ on the installed command — exit 0, the
     durable final line, and the succeeded terminal on stdout."""
