@@ -230,6 +230,10 @@ class TestNodeMapping:
             "extract": None,
             "output_schema": None,
             "fallback": None,
+            "transform": None,
+            "output_format": None,
+            "instance_binding": None,
+            "fallback_tools": [],
         }
 
     def test_tool_literal_params_pass_through(self) -> None:

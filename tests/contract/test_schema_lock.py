@@ -84,7 +84,8 @@ PINNED_COUNTS = {
 #: inventory, the artifact covers all 65 actual pydantic models, +1
 #: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060, +10
 #: jobs-family models at T-C1-076; cards.json opens with its 1 model; the
-#: pipelines.json with its 3 models; the worker trio (+WorkerReturn) at
+#: pipelines.json with its 4 models (3 through T-C1-084, +1 FallbackToolSpec
+#: at T-C1-086); the worker trio (+WorkerReturn) at
 #: T-C1-078 opens workers.json with its 1 model).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
@@ -93,7 +94,7 @@ PINNED_MODEL_COUNTS = {
     "messages.json": 8,
     "tools.json": 3,
     "cards.json": 1,
-    "pipelines.json": 3,
+    "pipelines.json": 4,
     "workers.json": 1,
 }
 PINNED_DURABLE_KEYS = 30

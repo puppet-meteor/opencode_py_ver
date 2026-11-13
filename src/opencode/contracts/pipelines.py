@@ -26,6 +26,20 @@ below strips the new fields whenever they are ``None`` so a pure-v1 spec's
 canonical bytes -- and therefore its hash -- are byte-identical before and
 after this extension (pinned by a contract test).
 
+**The T-C1-086 four-field port** rides the same additive precedent: the four
+StepDef fields ported from the framework repo -- ``transform`` /
+``output_format`` / ``instance_binding`` / ``fallback_tools`` -- are optional
+node faces on ``schema_version`` 1 (the emitter-side mapping stays with the
+framework repo; the pydialect converter keeps rejecting the four names,
+ruling-18). Wire depth is fail-closed to the evidence-supported levels:
+``transform`` entries, ``output_format`` and ``instance_binding`` are JSON
+objects here (the framework's string-``expr`` transform face is not ported;
+the op set, the field_map shape and the binding shape are the semantic
+gate's checks), and each ``FallbackToolSpec{tool, params}`` entry's
+``params`` follow the node-params ref shape (the shared validator). The
+hash recipe strips the four in their zero states (``None``, and the empty
+chain), so the pre-086 pinned v1 hash never flips.
+
 Topology constraints (unique entry, edge-reference closure, no orphans,
 per-type field requirements, the subworkflow depth cap) are *semantic-layer*
 rules -- they live in the engine's gate (``opencode.orchestrator.engine``),
@@ -62,10 +76,22 @@ NodeType = Literal["llm_call", "opencode_agent", "tool", "human_gate", "subworkf
 #: lineage guard is the gateway-side first line, this is the spec-side line).
 MAX_SUBWORKFLOW_DEPTH = 3
 
-#: The v2 additive node fields (T-C1-084). ``compute_spec_hash`` strips these
-#: from the serialized node whenever they are ``None`` so pure-v1 specs keep
-#: their exact pre-v2 canonical bytes (the hash-stability pin).
-_V2_NODE_FIELDS: tuple[str, ...] = ("params", "condition", "extract", "output_schema", "fallback")
+#: The additive node fields (T-C1-084 + T-C1-086). ``compute_spec_hash``
+#: strips these from the serialized node whenever they are ``None`` (and the
+#: empty ``fallback_tools`` chain, whose serialized zero state is ``[]``) so
+#: pure-v1 specs keep their exact pre-extension canonical bytes (the
+#: hash-stability pin).
+_V2_NODE_FIELDS: tuple[str, ...] = (
+    "params",
+    "condition",
+    "extract",
+    "output_schema",
+    "fallback",
+    "transform",
+    "output_format",
+    "instance_binding",
+    "fallback_tools",
+)
 
 
 def _require_dot_path(field: str, path: Any) -> None:
@@ -74,6 +100,21 @@ def _require_dot_path(field: str, path: Any) -> None:
         raise ValueError(f"{field}: a dot path must be a non-empty string")
     if any(not segment for segment in path.split(".")):
         raise ValueError(f"{field}: {path!r} has an empty dot segment")
+
+
+def _check_params_ref_shapes(value: JsonObject, prefix: str = "params") -> None:
+    """The params ref-binding shape, shared by the node's ``params`` and each
+    fallback entry's ``params`` (T-C1-086): an entry carrying a ``ref`` key
+    must be exactly the single ``ref`` key with a well-formed dot path --
+    anything else is a literal value (the pass-through case)."""
+    for name, entry in value.items():
+        if not isinstance(entry, dict) or "ref" not in entry:
+            continue  # a literal scalar/container value: the pass-through case
+        if set(entry) != {"ref"}:
+            raise ValueError(f"{prefix}.{name}: a ref binding must be exactly a single 'ref' key")
+        if not isinstance(entry["ref"], str):
+            raise ValueError(f"{prefix}.{name}: the ref path must be a string")
+        _require_dot_path(f"{prefix}.{name}", entry["ref"])
 
 
 def _reject_bool(field: str, value: Any) -> Any:
@@ -86,6 +127,25 @@ def _reject_bool(field: str, value: Any) -> Any:
     if isinstance(value, bool):
         raise ValueError(f"{field} must be an integer, not a boolean")
     return value
+
+
+class FallbackToolSpec(BaseModel):
+    """One fallback tool entry: the framework StepDef ``FallbackDef{tool, params}``
+    (step_def.py L100-104; ``fallback_tools`` L125) at the native wire depth --
+    a closed ``{tool, params}`` object, unknown keys rejected, ``params``
+    following the same ref/literal shape (and the same ref-root closure at the
+    semantic gate) as the node's own ``params``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: str = Field(min_length=1)
+    params: JsonObject = Field(default_factory=dict)
+
+    @field_validator("params")
+    @classmethod
+    def _params_refs_wellformed(cls, value: JsonObject) -> JsonObject:
+        _check_params_ref_shapes(value)
+        return value
 
 
 class PipelineNode(BaseModel):
@@ -142,19 +202,31 @@ class PipelineNode(BaseModel):
     #: requires ``output_schema`` and must satisfy it (semantic gate).
     fallback: JsonValue | None = None
 
+    # -- the ported StepDef four-field face (T-C1-086); optional additive on
+    # schema_version 1 along the T-C1-084 precedent ---------------------------
+
+    #: Derived-field ops computed onto the node's own result at the write
+    #: point: name -> op entry object. Entries must be objects on the wire
+    #: (the framework's string-``expr`` face is NOT ported); the op closure
+    #: and the per-op shapes are the semantic gate's checks.
+    transform: dict[str, JsonObject] | None = None
+    #: The deterministic zero-LLM output render: an object on the wire; the
+    #: gate pins the evidence shape (``kind == "field_map"`` + fields).
+    output_format: JsonObject | None = None
+    #: Instance provenance (the framework writes it; its engine has no
+    #: runtime consumer): an object on the wire; the gate pins the evidence
+    #: shape and the engine renders the query id into the params view.
+    instance_binding: JsonObject | None = None
+    #: The fallback tool chain in declared order; the empty tuple is the
+    #: legal zero state (never ``None`` -- the hash recipe strips ``[]``).
+    fallback_tools: tuple[FallbackToolSpec, ...] = ()
+
     @field_validator("params")
     @classmethod
     def _params_refs_wellformed(cls, value: JsonObject | None) -> JsonObject | None:
         if value is None:
             return None
-        for name, entry in value.items():
-            if not isinstance(entry, dict) or "ref" not in entry:
-                continue  # a literal scalar/container value: the pass-through case
-            if set(entry) != {"ref"}:
-                raise ValueError(f"params.{name}: a ref binding must be exactly a single 'ref' key")
-            if not isinstance(entry["ref"], str):
-                raise ValueError(f"params.{name}: the ref path must be a string")
-            _require_dot_path(f"params.{name}", entry["ref"])
+        _check_params_ref_shapes(value)
         return value
 
     @field_validator("extract")
@@ -231,17 +303,19 @@ def compute_spec_hash(spec: PipelineSpec) -> str:
     contract tests; a re-registered spec with a different hash never rebinds a
     running graph (PHASE3 §5.2: cancel -> revise -> resubmit instead).
 
-    v2 stability (T-C1-084): the serialization *strips the five v2 node
-    fields whenever they are ``None*** before hashing, so a pure-v1 spec's
-    canonical bytes -- and its hash -- are byte-identical to the pre-v2
-    engine (a v1 spec never hashed a ``params: null`` it did not carry).
-    Fields that are set participate fully, so any v2 edit re-hashes the
-    spec and running graphs fail closed against it.
+    v2 stability (T-C1-084 + T-C1-086): the serialization *strips the
+    nine additive v2 node fields whenever they are* ``None`` *(and the
+    empty* ``fallback_tools`` *chain, whose serialized zero state is
+    ``[]``)* before hashing, so a pure-v1 spec's canonical bytes -- and
+    its hash -- are byte-identical to the pre-extension engine (a v1 spec
+    never hashed a ``params: null`` or a ``fallback_tools: []`` it did
+    not carry). Fields that are set participate fully, so any v2 edit
+    re-hashes the spec and running graphs fail closed against it.
     """
     data = spec.model_dump(mode="json")
     for node in data["nodes"]:
         for field_name in _V2_NODE_FIELDS:
-            if node.get(field_name) is None:
+            if node.get(field_name) is None or (field_name == "fallback_tools" and node.get(field_name) == []):
                 node.pop(field_name, None)
     canonical = canonical_json(data)
     return sha256(canonical.encode("utf-8")).hexdigest()

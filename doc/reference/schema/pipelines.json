@@ -1,6 +1,34 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "models": {
+    "FallbackToolSpec": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {}
+      },
+      "additionalProperties": false,
+      "description": "One fallback tool entry: the framework StepDef ``FallbackDef{tool, params}``\n(step_def.py L100-104; ``fallback_tools`` L125) at the native wire depth --\na closed ``{tool, params}`` object, unknown keys rejected, ``params``\nfollowing the same ref/literal shape (and the same ref-root closure at the\nsemantic gate) as the node's own ``params``.",
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/JsonObject"
+        },
+        "tool": {
+          "minLength": 1,
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "title": "FallbackToolSpec",
+      "type": "object"
+    },
     "PipelineEdge": {
       "additionalProperties": false,
       "description": "One spec edge: a plain sequential/conditional topology edge (v1: from -> to).\n\nConditions land with conditional routing; v1's wire face carries the two\nendpoints only (CORE-CONTRACTS §8: no same-version optional-field growth).",
@@ -25,6 +53,25 @@
     },
     "PipelineNode": {
       "$defs": {
+        "FallbackToolSpec": {
+          "additionalProperties": false,
+          "description": "One fallback tool entry: the framework StepDef ``FallbackDef{tool, params}``\n(step_def.py L100-104; ``fallback_tools`` L125) at the native wire depth --\na closed ``{tool, params}`` object, unknown keys rejected, ``params``\nfollowing the same ref/literal shape (and the same ref-root closure at the\nsemantic gate) as the node's own ``params``.",
+          "properties": {
+            "params": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "tool": {
+              "minLength": 1,
+              "title": "Tool",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool"
+          ],
+          "title": "FallbackToolSpec",
+          "type": "object"
+        },
         "JsonObject": {
           "additionalProperties": {
             "$ref": "#/$defs/JsonValue"
@@ -113,6 +160,25 @@
           ],
           "default": null
         },
+        "fallback_tools": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FallbackToolSpec"
+          },
+          "title": "Fallback Tools",
+          "type": "array"
+        },
+        "instance_binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "model": {
           "anyOf": [
             {
@@ -141,6 +207,17 @@
           ],
           "title": "Node Type",
           "type": "string"
+        },
+        "output_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonObject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "output_schema": {
           "anyOf": [
@@ -190,6 +267,21 @@
           "default": null,
           "title": "Tool Ref"
         },
+        "transform": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/JsonObject"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Transform"
+        },
         "workflow_ref": {
           "anyOf": [
             {
@@ -213,6 +305,25 @@
     },
     "PipelineSpec": {
       "$defs": {
+        "FallbackToolSpec": {
+          "additionalProperties": false,
+          "description": "One fallback tool entry: the framework StepDef ``FallbackDef{tool, params}``\n(step_def.py L100-104; ``fallback_tools`` L125) at the native wire depth --\na closed ``{tool, params}`` object, unknown keys rejected, ``params``\nfollowing the same ref/literal shape (and the same ref-root closure at the\nsemantic gate) as the node's own ``params``.",
+          "properties": {
+            "params": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "tool": {
+              "minLength": 1,
+              "title": "Tool",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool"
+          ],
+          "title": "FallbackToolSpec",
+          "type": "object"
+        },
         "JsonObject": {
           "additionalProperties": {
             "$ref": "#/$defs/JsonValue"
@@ -323,6 +434,25 @@
               ],
               "default": null
             },
+            "fallback_tools": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/FallbackToolSpec"
+              },
+              "title": "Fallback Tools",
+              "type": "array"
+            },
+            "instance_binding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonObject"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "model": {
               "anyOf": [
                 {
@@ -351,6 +481,17 @@
               ],
               "title": "Node Type",
               "type": "string"
+            },
+            "output_format": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/JsonObject"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "output_schema": {
               "anyOf": [
@@ -399,6 +540,21 @@
               ],
               "default": null,
               "title": "Tool Ref"
+            },
+            "transform": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "$ref": "#/$defs/JsonObject"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Transform"
             },
             "workflow_ref": {
               "anyOf": [

@@ -50,7 +50,10 @@ service (the ``JobHandle`` face) and answers recovery questions
 from __future__ import annotations
 
 import asyncio
+import re
+import sys
 from collections import deque
+from collections.abc import Collection
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -400,6 +403,447 @@ def _project_extract(value: JsonValue, extract: dict[str, str | list[str]]) -> J
     return projected
 
 
+# -- the T-C1-086 ported StepDef four-field face (transform / output_format /
+# instance_binding / fallback_tools); the framework source is the semantic
+# authority (pydag_engine.py / structured_ir.py / transform_constants.py) ----
+
+#: The not-found sentinel (distinguishes "absent" from a legit ``None``).
+_MISSING: Any = object()
+
+#: A bare ``{identifier}`` placeholder (the ported literal-template face,
+#: pydag_engine.py ``render_param_template`` L147-155).
+_TEMPLATE_KEY = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+#: The reserved framework compute-transform names (transform_constants.py:
+#: ``_REGISTERED_CORE_TRANSFORMS`` + ``_LEGACY_SPECIAL_TRANSFORMS``). They
+#: parse on the wire but have no native executor -- skipped at the write
+#: point (disclosed; domain-registered names are not ported, fail-closed).
+_RESERVED_COMPUTE_TRANSFORMS: frozenset[str] = frozenset(
+    {
+        "format_check_results",
+        "format_engine_result",
+        "format_modelarts_check_results",
+        "normalize_alarm_events",
+        "normalize_cma_alarm_context",
+        "normalize_input_context",
+        "normalize_logs",
+        "normalize_metric_thresholds",
+        "normalize_modelarts_alarm_context",
+        "normalize_modelarts_obs_artifact",
+        "normalize_modelarts_topology",
+        "normalize_obs_artifact",
+        "normalize_topology_artifact",
+        "query_records",
+        "build_param_grid",
+        "reduce_records",
+        "apply_judgments",
+        "build_report_rows",
+        "format_output",
+        "split_csv",
+        "date_window",
+        "time_window_ms",
+        "build_dws_diagnose_request",
+        "coalesce_fields",
+        "collect_resource_ids",
+        "aggregate_rows",
+        "filter_alarms",
+    }
+)
+
+#: The ported field-op set (structured_ir.py ``_ALLOWED_TRANSFORM_OPS``
+#: L90-104) with each op's key set (the ``default`` op's value key is
+#: optional: ``{"op", "args"}`` is the minimum).
+_TRANSFORM_OPS: dict[str, frozenset[str]] = {
+    "copy": frozenset({"op", "args"}),
+    "add": frozenset({"op", "args"}),
+    "subtract": frozenset({"op", "args"}),
+    "multiply": frozenset({"op", "args"}),
+    "divide": frozenset({"op", "args"}),
+    "int": frozenset({"op", "args"}),
+    "str": frozenset({"op", "args"}),
+    "concat": frozenset({"op", "args"}),
+    "coalesce": frozenset({"op", "args"}),
+    "default": frozenset({"op", "args", "default"}),
+    "contains": frozenset({"op", "source", "needle"}),
+    "if_contains": frozenset({"op", "source", "needle", "then", "else"}),
+    "if_equals": frozenset({"op", "source", "value", "then", "else"}),
+}
+
+_BINARY_TRANSFORM_OPS = frozenset({"add", "subtract", "multiply", "divide"})
+
+
+class _TransformSkip(Exception):
+    """One transform op cannot compute: the framework logs and skips
+    (pydag_engine.py L7373-7376) -- a transform never fails the node."""
+
+
+def _gate_param_ref(
+    ref: str,
+    owner: str,
+    *,
+    node_id: str,
+    declared: Collection[str],
+    id_set: Collection[str],
+    has_schema: bool,
+) -> None:
+    """One ref's static closure (the T-C1-086 shared seam): the node's own
+    params and each fallback entry's params close over the same roots --
+    ``inputs`` must name a declared property, any other root must be a
+    declared node id."""
+    root, _, tail = ref.partition(".")
+    if root == "inputs":
+        head = tail.split(".", 1)[0]
+        if not has_schema:
+            raise ValueError(
+                f"node '{node_id}' {owner} ref '{ref}' cannot bind: the spec declares no "
+                "params schema, so inputs refs are statically unbindable"
+            )
+        if not tail or head not in declared:
+            raise ValueError(f"node '{node_id}' {owner} ref '{ref}' does not name a declared params schema property")
+    elif root not in id_set:
+        raise ValueError(
+            f"node '{node_id}' {owner} ref '{ref}' has unknown root '{root}' (expected 'inputs' or a declared node id)"
+        )
+
+
+def _gate_transform_operand(name: str, operand: JsonValue) -> None:
+    """An operand is exactly one key: ``field`` (non-empty dot path) or ``literal``."""
+    if not isinstance(operand, dict) or len(operand) != 1:
+        raise ValueError(
+            f"transform.{name}: an operand must be exactly one of {{'field': path}} or {{'literal': value}}"
+        )
+    kind = next(iter(operand))
+    if kind not in {"field", "literal"}:
+        raise ValueError(f"transform.{name}: unknown operand kind {kind!r} (expected 'field' or 'literal')")
+    if kind == "field" and (not isinstance(operand["field"], str) or not operand["field"]):
+        raise ValueError(f"transform.{name}: a field operand must be a non-empty dot path")
+
+
+def _gate_transform_op_entry(name: str, entry: JsonObject) -> None:
+    """The per-op shape gate (structured_ir.py ``_compile_op`` L1461-1501 /
+    ``_operand`` L1529-1542 evidence). Reserved compute-transform names pass
+    through (no native executor); unknown ops and unknown keys are rejected
+    -- deliberately stricter than the framework's compile, which silently
+    drops malformed ops (a disclosed deviation)."""
+    if name in _RESERVED_COMPUTE_TRANSFORMS:
+        return
+    if "op" not in entry:
+        raise ValueError(f"transform.{name}: the entry must carry an 'op' key")
+    op = entry["op"]
+    if not isinstance(op, str) or op not in _TRANSFORM_OPS:
+        raise ValueError(f"transform.{name}: unknown transform op {op!r}")
+    keys = set(entry)
+    required = _TRANSFORM_OPS[op]
+    if op == "default":
+        if not {"op", "args"} <= keys or not keys <= required:
+            raise ValueError(
+                f"transform.{name}: op '{op}' takes the keys {sorted(required)} ('default' optional, 'args' required)"
+            )
+    elif keys != required:
+        raise ValueError(f"transform.{name}: op '{op}' takes exactly the keys {sorted(required)}")
+    args = entry.get("args")
+    if op in _BINARY_TRANSFORM_OPS:
+        if not isinstance(args, list) or len(args) != 2:
+            raise ValueError(f"transform.{name}: op '{op}' takes exactly 2 args")
+    elif "args" in required and (not isinstance(args, list) or not args):
+        raise ValueError(f"transform.{name}: op '{op}' takes a non-empty args list")
+    if "source" in required:
+        _gate_transform_operand(name, entry["source"])
+    if isinstance(args, list):
+        for operand in args:
+            _gate_transform_operand(name, operand)
+
+
+def _gate_output_format(output_format: JsonObject) -> None:
+    """The evidence shape: exactly ``{kind, fields}``, ``kind == "field_map"``,
+    a non-empty name -> field-spec object (the framework's other kinds are
+    not ported, fail-closed)."""
+    if set(output_format) != {"kind", "fields"}:
+        raise ValueError(f"output_format: must be exactly the keys ['fields', 'kind'] (got {sorted(output_format)})")
+    if output_format["kind"] != "field_map":
+        raise ValueError(
+            f"output_format: kind {output_format['kind']!r} is not supported (the evidence kind is 'field_map')"
+        )
+    fields = output_format["fields"]
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("output_format: 'fields' must be a non-empty object mapping output names to field specs")
+    for name, field_spec in fields.items():
+        if not isinstance(field_spec, dict):
+            raise ValueError(f"output_format: fields.{name} must be an object (a field spec)")
+
+
+def _gate_instance_binding(binding: JsonObject, declared: frozenset[str], has_schema: bool) -> None:
+    """The evidence shape (skill_recipe.py L1176-1182 writes it; the engine
+    renders the query id): closed key set, string requirements, the exact
+    source wrapper, and ``resource_id`` = a declared request property."""
+    unknown = set(binding) - {"node_type", "source", "resource_id", "query_id_param", "query_id_template"}
+    if unknown:
+        raise ValueError(f"instance_binding declares unknown keys {sorted(unknown)}")
+    for required in ("node_type", "resource_id", "query_id_param", "query_id_template"):
+        if required not in binding:
+            raise ValueError(f"instance_binding is missing the required '{required}' key")
+    for str_key in ("node_type", "query_id_param", "query_id_template"):
+        if not isinstance(binding[str_key], str) or not binding[str_key]:
+            raise ValueError(f"instance_binding '{str_key}' must be a non-empty string")
+    if "source" in binding:
+        source = binding["source"]
+        if not isinstance(source, dict) or set(source) != {"source"} or not isinstance(source.get("source"), dict):
+            raise ValueError("instance_binding 'source' must be exactly {{'source': <object>}}")
+    resource_id = binding["resource_id"]
+    if not isinstance(resource_id, dict) or set(resource_id) != {"ref"} or not isinstance(resource_id["ref"], str):
+        raise ValueError("instance_binding 'resource_id' must be exactly {{'ref': 'request.<property>'}}")
+    ref = resource_id["ref"]
+    root, _, tail = ref.partition(".")
+    if root != "request" or not tail:
+        raise ValueError(
+            f"instance_binding 'resource_id' must reference a request property (request.<name>), got {ref!r}"
+        )
+    if not has_schema:
+        raise ValueError(
+            "instance_binding cannot bind: the spec declares no params schema, "
+            "so request refs are statically unbindable"
+        )
+    head = tail.split(".", 1)[0]
+    if head not in declared:
+        raise ValueError(
+            f"instance_binding 'resource_id' references request property '{head}' the spec does not declare"
+        )
+
+
+def _is_empty_output(value: Any) -> bool:
+    """The ported empty-output predicate (pydag_engine.py L7411-7427): None,
+    an empty/all-empty dict, an empty/all-empty list, a blank string; ``0``
+    and ``False`` are NOT empty."""
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        return all(_is_empty_output(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_is_empty_output(item) for item in value)
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def _output_format_fields(output_format: JsonObject) -> frozenset[str]:
+    """The expected output-field names (pydag_engine.py ``_field_map_output_fields`` L7171-7184)."""
+    fields = output_format.get("fields")
+    return frozenset(fields) if isinstance(fields, dict) else frozenset()
+
+
+def _find_nested_value(value: Any, key: str) -> Any:
+    """The ported nested-key finder (pydag_engine.py L4319-4333): an exact-key
+    recursion over dict values and list items, first non-None hit wins."""
+    if isinstance(value, dict):
+        if key in value and value[key] is not None:
+            return value[key]
+        for item in value.values():
+            found = _find_nested_value(item, key)
+            if found is not _MISSING:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_nested_value(item, key)
+            if found is not _MISSING:
+                return found
+    return _MISSING
+
+
+def _render_field_map(value: JsonValue, output_format: JsonObject) -> JsonObject:
+    """The deterministic zero-LLM render (pydag_engine.py ``_format_field_map``
+    L3989-4014 + ``_resolve_field_map_value`` L4002-4014): direct key, then the
+    nested finder (the framework's context-envelope candidate is envelope-
+    specific and not ported), then the spec's example/default; array coercion
+    only for a declared array type over a non-None non-list value."""
+    fields = output_format.get("fields")
+    assert isinstance(fields, dict)  # the semantic gate proved the shape
+    rendered: JsonObject = {}
+    for name, field_spec in fields.items():
+        spec = cast("dict[str, Any]", field_spec)
+        resolved: Any = _MISSING
+        if isinstance(value, dict) and name in value:
+            resolved = value[name]
+        if resolved is _MISSING or resolved is None:
+            resolved = _find_nested_value(value, name)
+        if resolved is _MISSING or resolved is None:
+            resolved = spec.get("example", spec.get("default"))
+        if spec.get("type") == "array" and resolved is not None and not isinstance(resolved, list):
+            resolved = [resolved]
+        rendered[name] = resolved
+    return rendered
+
+
+def _resolve_transform_operand(operand: JsonObject, value: Any, *, null_tolerant: bool = False) -> Any:
+    """``{"field": path}`` walks the value strictly (a miss skips the op);
+    ``{"literal": v}`` passes through (``None`` included -- the framework's
+    ``_literal(None)`` evidence for ``default``'s null-tolerant operand)."""
+    kind = next(iter(operand))
+    if kind == "literal":
+        return operand["literal"]
+    current: Any = value
+    for segment in str(operand["field"]).split("."):
+        if isinstance(current, dict) and segment in current:
+            current = current[segment]
+        else:
+            if null_tolerant:
+                return None
+            raise _TransformSkip(str(operand["field"]))
+    return current
+
+
+def _eval_transform_op(entry: JsonObject, value: Any) -> JsonValue:
+    """One field op (structured_ir.py ``_compile_op`` L1461-1501 + transform_eval
+    semantics): Python arithmetic/str/containment; ``default`` is Python
+    truthiness; ``coalesce`` is first-truthy-else-last with all operands resolved."""
+    spec = cast("dict[str, Any]", entry)
+    op = spec["op"]
+    if op == "default":
+        operand = _resolve_transform_operand(cast("JsonObject", spec["args"][0]), value, null_tolerant=True)
+        return operand or spec.get("default")
+    if op == "coalesce":
+        args = [_resolve_transform_operand(cast("JsonObject", a), value) for a in spec["args"]]
+        for arg in args:
+            if arg:
+                return arg
+        return args[-1]
+    if op in {"contains", "if_contains", "if_equals"}:
+        source = _resolve_transform_operand(cast("JsonObject", spec["source"]), value)
+        if op == "contains":
+            return spec["needle"] in source
+        if op == "if_contains":
+            return spec["then"] if spec["needle"] in source else spec["else"]
+        return spec["then"] if source == spec["value"] else spec["else"]
+    args = [_resolve_transform_operand(cast("JsonObject", a), value) for a in spec["args"]]
+    if op == "copy":
+        return args[0]
+    if op == "add":
+        return args[0] + args[1]
+    if op == "subtract":
+        return args[0] - args[1]
+    if op == "multiply":
+        return args[0] * args[1]
+    if op == "divide":
+        return args[0] / args[1]
+    if op == "int":
+        return int(args[0])
+    if op == "str":
+        return str(args[0])
+    if op == "concat":
+        return "".join(str(arg) for arg in args)
+    raise _TransformSkip(str(op))  # unreachable: the gate proved the op set
+
+
+def _apply_transform(value: JsonValue, transform: dict[str, JsonObject]) -> JsonValue:
+    """Derived fields onto the node's own result (pydag_engine.py
+    ``_build_context_update`` L7362-7376): declaration order, later entries
+    see earlier derived fields, reserved names and failing ops are skipped --
+    the node never fails on a transform (L7373-7376)."""
+    if not isinstance(value, dict):
+        return value  # nothing to compute onto: skipped (disclosed)
+    result: dict[str, Any] = dict(value)
+    for name, entry in transform.items():
+        if name in _RESERVED_COMPUTE_TRANSFORMS:
+            continue
+        try:
+            result[name] = _eval_transform_op(entry, result)
+        except (_TransformSkip, ArithmeticError, TypeError, ValueError):
+            continue
+    return result
+
+
+def _materialize_step_value(value: JsonValue, node: PipelineNode) -> JsonValue:
+    """The write-path materialization: the extract projection, then transform."""
+    if node.extract is not None:
+        value = _project_extract(value, node.extract)
+    if node.transform is not None:
+        value = _apply_transform(value, node.transform)
+    return value
+
+
+def _fallback_reasons(node: PipelineNode, raw: JsonValue, materialized: JsonValue) -> list[str]:
+    """The ported trigger predicate (pydag_engine.py ``_fallback_trigger_reasons``
+    L7214-7247): empty primary envelope (the RAW pre-extract value), empty
+    declared extract, a non-dict materialization, and declared output fields
+    empty in the materialized value; deduped in declaration order."""
+    reasons: list[str] = []
+    if _is_empty_output(raw):
+        reasons.append("primary_data_empty")
+    extracted: JsonValue | None = None
+    if node.extract is not None:
+        extracted = _project_extract(raw, node.extract)
+        if _is_empty_output(extracted):
+            reasons.append("extracted_empty")
+    candidate: JsonObject | None = None
+    if isinstance(materialized, dict):
+        candidate = materialized
+    elif isinstance(extracted, dict):
+        candidate = extracted
+    else:
+        reasons.append("materialized_output_missing")
+    if node.output_format is not None:
+        expected = _output_format_fields(node.output_format)
+        missing = sorted(name for name in expected if candidate is None or _is_empty_output(candidate.get(name)))
+        if missing:
+            reasons.append("missing_expected_fields:" + ",".join(missing))
+    return list(dict.fromkeys(reasons))
+
+
+def _merge_fallback_history(value: JsonValue, history: list[JsonObject]) -> JsonValue:
+    """The disclosure record rides the written value under ``fallback_history``
+    (a non-dict value is wrapped in ``{"value": ...}`` -- a native-defined
+    shape, recorded as OPEN in the progress file)."""
+    record = cast("list[JsonValue]", history)
+    if isinstance(value, dict):
+        return {**value, "fallback_history": record}
+    return {"value": value, "fallback_history": record}
+
+
+def _disclose_fallback_attempt(node_id: str, record: JsonObject) -> None:
+    """The ticket's stderr disclosure (the ADR-0002 L60 precedent: one
+    compact, non-fatal line per failure -- the same shape the CLI
+    composition root uses for a refused session or a failed MCP server at
+    boot). Every attempt prints exactly one operator-facing line; the
+    structured record stays the durable ``fallback_history`` face riding
+    the written value."""
+    status = str(record["status"])
+    detail = ""
+    if status == "rejected":
+        missing = cast("list[JsonValue]", record["missing_after"])
+        summary = ", ".join(str(reason) for reason in missing)
+        detail = f" (missing_after: {summary})"
+    elif status == "exception":
+        detail = f" ({record['error']})"
+    print(
+        f"opencode: node {node_id} fallback {record['tool']}: {status}{detail}",
+        file=sys.stderr,
+    )
+
+
+def _apply_instance_binding(node: PipelineNode, inputs: JsonObject, resolved: JsonObject) -> JsonObject:
+    """Render the query id into the params view (the ported literal-template
+    face, pydag_engine.py ``render_param_template`` L147-155, over the bare-key
+    value context L3788-3795: request + node params, ``None`` dropped; an
+    unresolved placeholder is the hard error). Injected under ``query_id_param``
+    only when the params do not already carry it -- params are the authority."""
+    binding = node.instance_binding
+    assert binding is not None
+    template = str(binding["query_id_template"])
+    values = {key: val for key, val in {**inputs, **resolved}.items() if val is not None}
+    query_id = template
+    for key, val in values.items():
+        query_id = query_id.replace("{" + key + "}", str(val))
+    unresolved = set(_TEMPLATE_KEY.findall(query_id)) - set(values)
+    if unresolved:
+        raise ValueError(
+            f"node '{node.node_id}' instance_binding query_id_template has unresolved "
+            f"placeholders: {sorted(unresolved)}"
+        )
+    param = str(binding["query_id_param"])
+    if param in resolved:
+        return resolved
+    return {**resolved, param: query_id}
+
+
 class LlmCallFn(Protocol):
     """The injectable ``llm_call`` node body (small-model critique/verify/summarize).
 
@@ -453,7 +897,10 @@ def validate_pipeline_spec(
     uniqueness, edge-reference closure, the entry rules, orphan
     reachability, then the v2 feature checks: the reserved ref root and
     render-context collisions, condition syntax, params ref-root closure,
-    and the llm structured-output/fallback constraints).
+    the llm structured-output/fallback constraints, and the ported
+    four-field face (T-C1-086: transform op closure and per-op shapes,
+    output_format / instance_binding evidence shapes, and the fallback
+    entries' params closing over the same roots as the node's own).
     ``implemented`` is the executed node-type set: the default is the S2 face
     (``llm_call``/``tool``) whose rejection message is pinned byte-identical
     by the S2 tests; a worker-wired engine passes its executed set so
@@ -674,29 +1121,21 @@ def validate_pipeline_spec(
             if not (isinstance(value, dict) and set(value) == {"ref"}):
                 continue  # a literal value: no closure to check
             ref = str(value["ref"])
-            root, _, tail = ref.partition(".")
-            if root == "inputs":
-                head = tail.split(".", 1)[0]
-                if spec.params_schema is None:
-                    raise PipelineSpecRejected(
-                        f"node '{node.node_id}' params ref '{ref}' cannot bind: the spec declares no "
-                        "params schema, so inputs refs are statically unbindable",
-                        code=CoreErrorCode.VALIDATION_ERROR,
-                        details={"node_id": node.node_id, "param": name, "ref": ref},
-                    )
-                if not tail or head not in declared:
-                    raise PipelineSpecRejected(
-                        f"node '{node.node_id}' params ref '{ref}' does not name a declared params schema property",
-                        code=CoreErrorCode.VALIDATION_ERROR,
-                        details={"node_id": node.node_id, "param": name, "ref": ref},
-                    )
-            elif root not in id_set:
+            try:
+                _gate_param_ref(
+                    ref,
+                    "params",
+                    node_id=node.node_id,
+                    declared=declared,
+                    id_set=id_set,
+                    has_schema=spec.params_schema is not None,
+                )
+            except ValueError as error:
                 raise PipelineSpecRejected(
-                    f"node '{node.node_id}' params ref '{ref}' has unknown root '{root}' "
-                    "(expected 'inputs' or a declared node id)",
+                    str(error),
                     code=CoreErrorCode.VALIDATION_ERROR,
                     details={"node_id": node.node_id, "param": name, "ref": ref},
-                )
+                ) from error
 
     # -- v2: the llm structured-output face. output_schema/fallback are
     # llm_call features (no other body consumes them), the schema must sit
@@ -743,6 +1182,62 @@ def validate_pipeline_spec(
                         code=CoreErrorCode.VALIDATION_ERROR,
                         details={"node_id": node.node_id},
                     )
+
+    # -- T-C1-086: the ported StepDef four-field face. transform: the op
+    # closure and per-op shapes (one shared gate; the native gate is
+    # deliberately stricter than the framework's compile, which silently
+    # drops malformed ops); output_format / instance_binding: the evidence
+    # shapes; fallback_tools: each entry's params close over the same roots
+    # as the node's own params (one closure rule, the T-C1-086 shared seam).
+    for node in spec.nodes:
+        if node.transform is not None:
+            for name, entry in node.transform.items():
+                try:
+                    _gate_transform_op_entry(name, entry)
+                except ValueError as error:
+                    raise PipelineSpecRejected(
+                        f"node '{node.node_id}' {error}",
+                        code=CoreErrorCode.VALIDATION_ERROR,
+                        details={"node_id": node.node_id, "transform": name},
+                    ) from error
+        if node.output_format is not None:
+            try:
+                _gate_output_format(node.output_format)
+            except ValueError as error:
+                raise PipelineSpecRejected(
+                    f"node '{node.node_id}' {error}",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id},
+                ) from error
+        if node.instance_binding is not None:
+            try:
+                _gate_instance_binding(node.instance_binding, declared, has_schema=spec.params_schema is not None)
+            except ValueError as error:
+                raise PipelineSpecRejected(
+                    f"node '{node.node_id}' {error}",
+                    code=CoreErrorCode.VALIDATION_ERROR,
+                    details={"node_id": node.node_id},
+                ) from error
+        for fallback in node.fallback_tools:
+            for name, value in fallback.params.items():
+                if not (isinstance(value, dict) and set(value) == {"ref"}):
+                    continue  # a literal value: no closure to check
+                ref = str(value["ref"])
+                try:
+                    _gate_param_ref(
+                        ref,
+                        f"fallback tool '{fallback.tool}' params",
+                        node_id=node.node_id,
+                        declared=declared,
+                        id_set=id_set,
+                        has_schema=spec.params_schema is not None,
+                    )
+                except ValueError as error:
+                    raise PipelineSpecRejected(
+                        str(error),
+                        code=CoreErrorCode.VALIDATION_ERROR,
+                        details={"node_id": node.node_id, "tool": fallback.tool, "param": name, "ref": ref},
+                    ) from error
 
 
 class EngineCheckpointer:
@@ -957,8 +1452,12 @@ class PipelineEngine:
                     # the ephemeral node_params view -- never a channel update,
                     # never persisted (see NodeBodyState).
                     body_state: EngineState = state
-                    if node.params is not None:
-                        resolved_params = _resolve_node_params(node, inputs, prior_results, id_set)
+                    if node.params is not None or node.instance_binding is not None:
+                        resolved_params: JsonObject = (
+                            _resolve_node_params(node, inputs, prior_results, id_set) if node.params is not None else {}
+                        )
+                        if node.instance_binding is not None:
+                            resolved_params = _apply_instance_binding(node, inputs, resolved_params)
                         view = dict(state)
                         view["node_params"] = resolved_params
                         body_state = cast("EngineState", view)
@@ -1002,11 +1501,34 @@ class PipelineEngine:
                                 ),
                             )
                         value = await self._opencode_agent(node, body_state)
-                    # -- v2 extract: the projection runs only on the executed
-                    # path (a skipped node never projects) and replaces the
-                    # node's downstream-visible result.
-                    if node.extract is not None:
-                        value = _project_extract(value, node.extract)
+                    # -- v2 extract + the T-C1-086 write-point face: the
+                    # projection runs only on the executed path (a skipped
+                    # node never projects) and replaces the downstream-visible
+                    # result; transform computes derived fields onto it; the
+                    # fallback chain fires on the ported trigger predicate and
+                    # adopts the first clean attempt (an exhausted chain keeps
+                    # the primary, unrendered); output_format renders the
+                    # deterministic field map; the history record rides the
+                    # written value.
+                    raw_value = value
+                    written: JsonValue = _materialize_step_value(value, node)
+                    history: list[JsonObject] = []
+                    render = True
+                    if node.fallback_tools:
+                        reasons = _fallback_reasons(node, raw_value, written)
+                        if reasons:
+                            adopted, history = await self._try_fallback_tools(
+                                node, inputs, prior_results, id_set, state, reasons
+                            )
+                            if adopted is not None:
+                                written = adopted
+                            else:
+                                render = False  # exhausted: the primary stays, unrendered
+                    if render and node.output_format is not None:
+                        written = _render_field_map(written, node.output_format)
+                    if history:
+                        written = _merge_fallback_history(written, history)
+                    value = written
                 except EnginePause:
                     raise  # the suspend seam passes through untouched
                 except WorkerSuspended:
@@ -1030,6 +1552,77 @@ class PipelineEngine:
         for node_id in terminal_ids:
             builder.add_edge(node_id, END)
         return builder.compile(checkpointer=saver)
+
+    # -- the T-C1-086 fallback chain -------------------------------------------
+
+    async def _try_fallback_tools(
+        self,
+        node: PipelineNode,
+        inputs: JsonObject,
+        prior_results: dict[str, JsonValue],
+        id_set: frozenset[str],
+        state: EngineState,
+        trigger_reasons: list[str],
+    ) -> tuple[JsonValue | None, list[JsonObject]]:
+        """The ported fallback chain (pydag_engine.py L6229-6294): declared
+        order, every attempt dispatched through the tool seam (the framework
+        runs fallback entries as tool calls regardless of the step's own
+        type), each attempt's params resolved through the node-params
+        machinery and its result through the same extract/transform
+        pipeline; adoption requires the FULL predicate to come back empty
+        over the attempt (L6461-6474 -- a re-evaluation, not a subset check).
+        An exhausted chain returns ``None`` (the caller keeps the primary);
+        a raised attempt is an exception record, never a job failure
+        (L6426-6445), and the control seams pass through untouched. The
+        record face is deliberately leaner than the framework's log-shaped
+        one (no params echo, no "started" phase -- disclosed);
+        instance_binding never applies to attempts (disclosed). Every
+        attempt also prints one compact, non-fatal stderr line (the
+        ADR-0002 L60 precedent -- the ticket's disclosure face; the durable
+        record stays the written value's ``fallback_history``).
+        """
+        history: list[JsonObject] = []
+        reasons = cast("list[JsonValue]", list(trigger_reasons))
+        for fallback in node.fallback_tools:
+            attempt_node = node.model_copy(update={"tool_ref": fallback.tool, "params": fallback.params})
+            try:
+                attempt_params = _resolve_node_params(attempt_node, inputs, prior_results, id_set)
+                view = dict(state)
+                view["node_params"] = attempt_params
+                raw_attempt = await self._tool(attempt_node, cast("EngineState", view))
+                attempt_value = _materialize_step_value(raw_attempt, node)
+                missing_after = _fallback_reasons(node, raw_attempt, attempt_value)
+                if not missing_after:
+                    adopted: JsonObject = {
+                        "tool": fallback.tool,
+                        "trigger_reasons": reasons,
+                        "status": "adopted",
+                    }
+                    history.append(adopted)
+                    _disclose_fallback_attempt(node.node_id, adopted)
+                    return attempt_value, history
+                rejected: JsonObject = {
+                    "tool": fallback.tool,
+                    "trigger_reasons": reasons,
+                    "status": "rejected",
+                    "missing_after": cast("list[JsonValue]", missing_after),
+                }
+                history.append(rejected)
+                _disclose_fallback_attempt(node.node_id, rejected)
+            except EnginePause:
+                raise  # the suspend seam is never an attempt record
+            except WorkerSuspended:
+                raise  # the S3 cancel seam
+            except Exception as cause:
+                failed: JsonObject = {
+                    "tool": fallback.tool,
+                    "trigger_reasons": reasons,
+                    "status": "exception",
+                    "error": str(cause),
+                }
+                history.append(failed)
+                _disclose_fallback_attempt(node.node_id, failed)
+        return None, history
 
     # -- the S5a node bodies (engine-internal executors; T-C1-080) --------------
 

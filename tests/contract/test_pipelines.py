@@ -350,7 +350,8 @@ class TestSpecHash:
         assert len({base, changed_id, changed_tier}) == 3
 
     def test_hash_is_the_sha256_of_the_canonical_serialization(self) -> None:
-        """The recipe (T-C1-084): canonical JSON of the dump, None v2 fields stripped."""
+        """The recipe (T-C1-084 + T-C1-086): canonical JSON of the dump, the
+        None-valued v2 fields and the empty fallback chain stripped."""
         from hashlib import sha256
 
         from opencode.contracts.events import canonical_json
@@ -358,8 +359,20 @@ class TestSpecHash:
         spec = _validated()
         data = spec.model_dump(mode="json")
         for node in data["nodes"]:
-            for field_name in ("params", "condition", "extract", "output_schema", "fallback"):
+            for field_name in (
+                "params",
+                "condition",
+                "extract",
+                "output_schema",
+                "fallback",
+                "transform",
+                "output_format",
+                "instance_binding",
+                "fallback_tools",
+            ):
                 if node.get(field_name) is None:
+                    node.pop(field_name, None)
+                elif field_name == "fallback_tools" and node.get(field_name) == []:
                     node.pop(field_name, None)
         expected = sha256(canonical_json(data).encode("utf-8")).hexdigest()
         assert compute_spec_hash(spec) == expected
@@ -699,3 +712,425 @@ class TestV2SemanticGate:
             )
         )
         validate_pipeline_spec(spec)
+
+
+# ---------------------------------------------------------------------------
+# The T-C1-086 four-field face: the ported StepDef fields (transform /
+# output_format / instance_binding / fallback_tools) -- the structural layer,
+# the semantic-gate closure checks, and the hash-stability extension.
+# ---------------------------------------------------------------------------
+
+
+class TestT086FourFields:
+    """Layer 1 (pydantic) for the ported StepDef four-field face (T-C1-086).
+
+    The wire depth follows the evidence (fail-closed to the supported
+    levels): transform entries are objects, output_format / instance_binding
+    are objects, fallback entries are closed ``{tool, params}`` models whose
+    params follow the node-params ref shape.
+    """
+
+    def test_the_four_fields_default_to_the_legal_zero_state(self) -> None:
+        node = PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t"})
+        assert node.transform is None
+        assert node.output_format is None
+        assert node.instance_binding is None
+        assert node.fallback_tools == ()
+
+    def test_transform_field_ops_and_reserved_names_parse(self) -> None:
+        node = PipelineNode.model_validate(
+            {
+                "node_id": "n",
+                "node_type": "tool",
+                "tool_ref": "t",
+                "transform": {
+                    "start_time": {"op": "subtract", "args": [{"field": "occur_utc"}, {"literal": 7200000}]},
+                    "flag": {"op": "if_equals", "source": {"field": "status"}, "value": "ready", "then": 1, "else": 0},
+                    # A reserved framework compute transform: parses on the
+                    # wire, has no native executor (skipped at the write point).
+                    "split_csv": {"source": "value", "target": "items"},
+                },
+            }
+        )
+        assert node.transform is not None
+        assert node.transform["start_time"] == {
+            "op": "subtract",
+            "args": [{"field": "occur_utc"}, {"literal": 7200000}],
+        }
+        assert node.transform["split_csv"] == {"source": "value", "target": "items"}
+
+    @pytest.mark.parametrize("bad", [3, "expr", [], {"a": 3}, {"a": "expr"}, {"a": []}])
+    def test_transform_entries_must_be_objects(self, bad: Any) -> None:
+        with pytest.raises(ValidationError):
+            PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "transform": bad})
+
+    def test_output_format_parses_as_the_evidence_shape(self) -> None:
+        binding: dict[str, Any] = {
+            "kind": "field_map",
+            "fields": {"answer": {"type": "string", "example": "none"}},
+        }
+        node = PipelineNode.model_validate(
+            {"node_id": "n", "node_type": "tool", "tool_ref": "t", "output_format": binding}
+        )
+        assert node.output_format == binding
+        bad_output_formats: tuple[Any, ...] = (3, "field_map", [])
+        for bad in bad_output_formats:
+            with pytest.raises(ValidationError):
+                PipelineNode.model_validate(
+                    {"node_id": "n", "node_type": "tool", "tool_ref": "t", "output_format": bad}
+                )
+
+    def test_fallback_tools_parse_with_their_own_params(self) -> None:
+        node = PipelineNode.model_validate(
+            {
+                "node_id": "n",
+                "node_type": "tool",
+                "tool_ref": "t",
+                "fallback_tools": [
+                    {"tool": "history_reader", "params": {"resource_id": {"ref": "step_1.resource_id"}, "depth": 3}},
+                    {"tool": "empty_reader"},
+                ],
+            }
+        )
+        assert len(node.fallback_tools) == 2
+        assert node.fallback_tools[0].tool == "history_reader"
+        assert node.fallback_tools[0].params == {"resource_id": {"ref": "step_1.resource_id"}, "depth": 3}
+        assert node.fallback_tools[1].tool == "empty_reader"
+        assert node.fallback_tools[1].params == {}
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"tool": ""},
+            {"params": {}},
+            {"tool": "t", "params": {}, "timeout": 1},
+            {"tool": "t", "params": {"p": {"ref": 3}}},
+            {"tool": "t", "params": {"p": {"ref": "a..b"}}},
+            {"tool": "t", "params": {"p": {"ref": "ok", "mode": "x"}}},
+        ],
+    )
+    def test_fallback_tool_entries_reject_unknown_keys_and_bad_refs(self, bad: dict[str, Any]) -> None:
+        with pytest.raises(ValidationError):
+            PipelineNode.model_validate({"node_id": "n", "node_type": "tool", "tool_ref": "t", "fallback_tools": [bad]})
+
+    def test_instance_binding_parses_as_an_object(self) -> None:
+        binding: dict[str, Any] = {
+            "node_type": "nas",
+            "source": {"source": {"need": "nas_instances", "from": "any_previous"}},
+            "resource_id": {"ref": "request.resource_id"},
+            "query_id_param": "instance_id",
+            "query_id_template": "{cluster_id={cluster_id},instance_id={resource_id}}",
+        }
+        node = PipelineNode.model_validate(
+            {"node_id": "n", "node_type": "tool", "tool_ref": "t", "instance_binding": binding}
+        )
+        assert node.instance_binding == binding
+        bad_bindings: tuple[Any, ...] = (3, "nas", [])
+        for bad in bad_bindings:
+            with pytest.raises(ValidationError):
+                PipelineNode.model_validate(
+                    {"node_id": "n", "node_type": "tool", "tool_ref": "t", "instance_binding": bad}
+                )
+
+    def test_zero_state_fields_keep_the_v1_pinned_hash(self) -> None:
+        """The T-C1-086 stability pin: explicit Nones and the empty chain are
+        the not-used state -- a pure-v1 spec's canonical bytes never change."""
+        pinned = "a881d3f4c06e24878ba25cbad28c1892a4222f54039603ee119db402c6928772"
+        explicit = _validated(
+            nodes=[
+                {
+                    "node_id": "collect",
+                    "node_type": "tool",
+                    "tool_ref": "fs.read_text",
+                    "transform": None,
+                    "output_format": None,
+                    "instance_binding": None,
+                    "fallback_tools": [],
+                },
+                {
+                    "node_id": "summarize",
+                    "node_type": "llm_call",
+                    "model": "small",
+                    "prompt_template": "Summarize the collected input.",
+                },
+            ]
+        )
+        assert compute_spec_hash(explicit) == pinned
+
+    def test_set_four_fields_move_the_hash(self) -> None:
+        base = compute_spec_hash(_validated())
+        summary_node = {
+            "node_id": "summarize",
+            "node_type": "llm_call",
+            "model": "small",
+            "prompt_template": "Summarize the collected input.",
+        }
+        variants = [
+            _validated(
+                nodes=[
+                    {
+                        "node_id": "collect",
+                        "node_type": "tool",
+                        "tool_ref": "fs.read_text",
+                        "transform": {"x": {"op": "copy", "args": [{"field": "a"}]}},
+                    },
+                    summary_node,
+                ]
+            ),
+            _validated(
+                nodes=[
+                    {
+                        "node_id": "collect",
+                        "node_type": "tool",
+                        "tool_ref": "fs.read_text",
+                        "output_format": {"kind": "field_map", "fields": {"x": {"type": "string"}}},
+                    },
+                    summary_node,
+                ]
+            ),
+            _validated(
+                params_schema={"type": "object", "properties": {"resource_id": {"type": "string"}}},
+                nodes=[
+                    {
+                        "node_id": "collect",
+                        "node_type": "tool",
+                        "tool_ref": "fs.read_text",
+                        "instance_binding": {
+                            "node_type": "nas",
+                            "resource_id": {"ref": "request.resource_id"},
+                            "query_id_param": "instance_id",
+                            "query_id_template": "{instance_id={resource_id}}",
+                        },
+                    },
+                    summary_node,
+                ],
+            ),
+            _validated(
+                nodes=[
+                    {
+                        "node_id": "collect",
+                        "node_type": "tool",
+                        "tool_ref": "fs.read_text",
+                        "fallback_tools": [{"tool": "history_reader", "params": {}}],
+                    },
+                    summary_node,
+                ]
+            ),
+        ]
+        hashes = [compute_spec_hash(spec) for spec in variants]
+        assert all(digest != base for digest in hashes)
+        assert len(set(hashes)) == len(variants)
+
+
+class TestT086FourFieldGate:
+    """Layer 2 for the ported four fields (T-C1-086): op closure, evidence shapes, ref roots."""
+
+    @staticmethod
+    def _tool_spec(**node_overrides: Any) -> PipelineSpec:
+        node: dict[str, Any] = {"node_id": "a", "node_type": "tool", "tool_ref": "t"}
+        node.update(node_overrides)
+        return PipelineSpec.model_validate(_v2_raw(nodes=[node]))
+
+    def test_field_op_transforms_and_reserved_names_pass_the_gate(self) -> None:
+        spec = self._tool_spec(
+            transform={
+                "start_time": {"op": "subtract", "args": [{"field": "occur_utc"}, {"literal": 7200000}]},
+                "copy_of": {"op": "copy", "args": [{"field": "occur_utc"}]},
+                "plus": {"op": "add", "args": [{"literal": 1}, {"literal": 2}]},
+                "times": {"op": "multiply", "args": [{"literal": 3}, {"literal": 4}]},
+                "over": {"op": "divide", "args": [{"literal": 8}, {"literal": 2}]},
+                "as_int": {"op": "int", "args": [{"literal": "42"}]},
+                "as_str": {"op": "str", "args": [{"literal": 42}]},
+                "joined": {"op": "concat", "args": [{"field": "a"}, {"literal": "b"}]},
+                "has_x": {"op": "contains", "source": {"field": "name"}, "needle": "x"},
+                "branch": {"op": "if_contains", "source": {"field": "name"}, "needle": "x", "then": 1, "else": 0},
+                "flag": {"op": "if_equals", "source": {"field": "status"}, "value": "ready", "then": 1, "else": 0},
+                "or_default": {"op": "default", "args": [{"field": "maybe"}], "default": "none"},
+                "first_ok": {"op": "coalesce", "args": [{"field": "a"}, {"field": "b"}, {"literal": "z"}]},
+                "split_csv": {"source": "value", "target": "items"},
+            },
+        )
+        validate_pipeline_spec(spec)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"op": "explode", "args": [{"field": "a"}]},
+            {"mode": "matrix"},
+            {"op": "add", "args": [{"field": "a"}]},
+            {"op": "subtract", "args": "not-a-list"},
+            {"op": "concat", "args": []},
+            {"op": "coalesce", "args": []},
+            {"op": "copy"},
+            {"op": "copy", "args": [{"field": "a", "literal": 1}]},
+            {"op": "copy", "args": [{"unknown": 1}]},
+            {"op": "contains", "source": {"field": "name"}},
+            {"op": "if_contains", "source": {"field": "name"}, "then": 1, "else": 0},
+            {"op": "if_equals", "source": {"field": "name"}, "then": 1, "else": 0},
+            {"op": "copy", "args": [{"field": "a"}], "bogus": 1},
+        ],
+    )
+    def test_malformed_or_unknown_transforms_are_rejected(self, bad: dict[str, Any]) -> None:
+        spec = self._tool_spec(transform={"entry": bad})
+        with pytest.raises(PipelineSpecRejected, match="transform"):
+            validate_pipeline_spec(spec)
+
+    def test_field_map_output_format_passes_the_gate(self) -> None:
+        spec = self._tool_spec(
+            output_format={"kind": "field_map", "fields": {"answer": {"type": "string", "example": "none"}}}
+        )
+        validate_pipeline_spec(spec)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"kind": "recommended_root_cause", "fields": {}},
+            {"kind": "template_fill", "template": "x"},
+            {"fields": {"a": {}}},
+            {"kind": "field_map"},
+            {"kind": "field_map", "fields": "x"},
+            {"kind": "field_map", "fields": {}},
+            {"kind": "field_map", "fields": {"a": 3}},
+            {"kind": "field_map", "fields": {"a": {}}, "show_type": 1},
+        ],
+    )
+    def test_non_field_map_output_format_is_rejected(self, bad: dict[str, Any]) -> None:
+        spec = self._tool_spec(output_format=bad)
+        with pytest.raises(PipelineSpecRejected, match="output_format"):
+            validate_pipeline_spec(spec)
+
+    def test_evidence_shaped_instance_binding_passes_the_gate(self) -> None:
+        spec = PipelineSpec.model_validate(
+            _v2_raw(
+                params_schema={"type": "object", "properties": {"resource_id": {"type": "string"}}},
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "tool",
+                        "tool_ref": "t",
+                        "instance_binding": {
+                            "node_type": "nas",
+                            "source": {"source": {"need": "nas_instances", "from": "any_previous"}},
+                            "resource_id": {"ref": "request.resource_id"},
+                            "query_id_param": "instance_id",
+                            "query_id_template": "{cluster_id={cluster_id},instance_id={resource_id}}",
+                        },
+                    }
+                ],
+            )
+        )
+        validate_pipeline_spec(spec)
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "request.resource_id"},
+                "query_id_param": "i",
+                "query_id_template": "x",
+                "bogus": 1,
+            },
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "inputs.resource_id"},
+                "query_id_param": "i",
+                "query_id_template": "x",
+            },
+            {"node_type": "nas", "query_id_param": "i", "query_id_template": "x"},
+            {
+                "node_type": 3,
+                "resource_id": {"ref": "request.resource_id"},
+                "query_id_param": "i",
+                "query_id_template": "x",
+            },
+            {"node_type": "nas", "resource_id": "request.resource_id", "query_id_param": "i", "query_id_template": "x"},
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "request.resource_id"},
+                "query_id_param": 3,
+                "query_id_template": "x",
+            },
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "request.resource_id"},
+                "query_id_param": "i",
+                "query_id_template": 3,
+            },
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "request.resource_id"},
+                "source": {"need": "x", "from": "any_previous"},
+                "query_id_param": "i",
+                "query_id_template": "x",
+            },
+            {
+                "node_type": "nas",
+                "resource_id": {"ref": "request.ghost"},
+                "query_id_param": "i",
+                "query_id_template": "x",
+            },
+            {"node_type": "nas", "resource_id": {"ref": "request.resource_id"}},
+        ],
+    )
+    def test_instance_binding_violations_are_rejected(self, binding: dict[str, Any]) -> None:
+        raw = _v2_raw(
+            params_schema={"type": "object", "properties": {"resource_id": {"type": "string"}}},
+            nodes=[{"node_id": "a", "node_type": "tool", "tool_ref": "t", "instance_binding": binding}],
+        )
+        spec = PipelineSpec.model_validate(raw)
+        with pytest.raises(PipelineSpecRejected, match="instance_binding"):
+            validate_pipeline_spec(spec)
+
+    def test_fallback_params_refs_close_over_the_same_roots(self) -> None:
+        step_rooted = PipelineSpec.model_validate(
+            _v2_raw(
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "tool",
+                        "tool_ref": "t",
+                        "fallback_tools": [{"tool": "t2", "params": {"x": {"ref": "b.field"}}}],
+                    },
+                    {"node_id": "b", "node_type": "llm_call", "model": "small", "prompt_template": "p"},
+                ],
+                edges=[{"from_node": "a", "to_node": "b"}],
+            )
+        )
+        validate_pipeline_spec(step_rooted)
+        unknown_root = self._tool_spec(fallback_tools=[{"tool": "t2", "params": {"x": {"ref": "ghost.x"}}}])
+        with pytest.raises(PipelineSpecRejected, match="fallback tool 't2'"):
+            validate_pipeline_spec(unknown_root)
+        unbindable = self._tool_spec(fallback_tools=[{"tool": "t2", "params": {"x": {"ref": "inputs.x"}}}])
+        with pytest.raises(PipelineSpecRejected, match="statically unbindable"):
+            validate_pipeline_spec(unbindable)
+        schema: dict[str, Any] = {"type": "object", "properties": {"known": {"type": "string"}}}
+        undeclared = PipelineSpec.model_validate(
+            _v2_raw(
+                params_schema=schema,
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "tool",
+                        "tool_ref": "t",
+                        "fallback_tools": [{"tool": "t2", "params": {"x": {"ref": "inputs.unknown"}}}],
+                    }
+                ],
+            )
+        )
+        with pytest.raises(PipelineSpecRejected, match="does not name a declared params schema property"):
+            validate_pipeline_spec(undeclared)
+        declared = PipelineSpec.model_validate(
+            _v2_raw(
+                params_schema=schema,
+                nodes=[
+                    {
+                        "node_id": "a",
+                        "node_type": "tool",
+                        "tool_ref": "t",
+                        "fallback_tools": [{"tool": "t2", "params": {"x": {"ref": "inputs.known"}}}],
+                    }
+                ],
+            )
+        )
+        validate_pipeline_spec(declared)
