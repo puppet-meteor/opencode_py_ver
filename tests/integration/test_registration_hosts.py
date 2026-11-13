@@ -17,10 +17,15 @@ no shared factory):
 The disclosure policy is asserted per host: a valid manifest binds with
 zero stderr; a broken manifest is exactly one stderr line and the boot
 continues; a missing skills tree is the silent fresh-project zero state.
+The T-C1-088 rider 2 adds the per-entry form (T-B-096 finding 2): a valid
+manifest carrying one bad entry binds the healthy entries, discloses the
+bad one as exactly one stderr line naming the skill id, the pipeline
+string and the error class, and never writes stdout.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +35,50 @@ from opencode.app import App
 from opencode.cli import main
 from opencode.httpapi import create_app
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
+from opencode.orchestrator.registration import NATIVE_SPEC_NAME
 from tests.contract.test_pipelines import _spec_raw
 from tests.integration.test_cli_r4 import _argv, _ok_response, _ServerHost
 from tests.integration.test_engine import _FakeLlm, _FakeTool
 from tests.integration.test_httpapi_server import _drive_lifespan, _require_success, _upgrade_head
 from tests.integration.test_registration_engine import _write_langgraph_skills
+
+# ---------------------------------------------------------------------------
+# The rider-2 manifest: one healthy entry + one bad entry (the missing-native-
+# spec form) -- the minimal valid-manifest-with-a-bad-entry face.
+# ---------------------------------------------------------------------------
+
+#: The locked skills-fixtures entry hash (the contract suite's shape).
+_HOST_ENTRY_HASH = "70152fa897ce94831325a87efae0039c6af197ef1e70527e5551e14da3731ef8"
+
+
+def _host_entry(skill_id: str) -> dict[str, Any]:
+    """One locked-shape langgraph manifest entry, spliced per id."""
+    return {
+        "id": skill_id,
+        "name": f"{skill_id} skill",
+        "path": f"{skill_id}/SKILL.md",
+        "size": 78,
+        "hash": _HOST_ENTRY_HASH,
+        "source": "project",
+        "execution": "langgraph",
+        "pipeline": f"{skill_id}/graph.json",
+    }
+
+
+def _write_two_entry_skills(skills: Path) -> Path:
+    """The rider-2 manifest: ``healthy`` publishes its native spec and binds;
+    ``legacy-broken`` declares a pipeline whose native spec was never
+    published (the minimal bad-entry form)."""
+    skills.mkdir(parents=True, exist_ok=True)
+    (skills / "skills.json").write_text(
+        json.dumps({"skills": [_host_entry("healthy"), _host_entry("legacy-broken")]}),
+        encoding="utf-8",
+    )
+    native = skills / "healthy" / NATIVE_SPEC_NAME
+    native.parent.mkdir(parents=True, exist_ok=True)
+    native.write_text(json.dumps(_spec_raw(pipeline_id="healthy-pipeline")), encoding="utf-8")
+    return skills
+
 
 # ---------------------------------------------------------------------------
 # The CLI host: main() in-process, the r0 fake provider, a tmp project root.
@@ -138,6 +182,48 @@ class TestCliHost:
         assert "[final] fresh" in captured.out
         assert captured.err == ""  # the fresh-project zero state is silent, not an error
 
+    def test_cli_boot_discloses_one_bad_entry_and_continues_with_the_healthy_ones_bound(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The rider-2 host form (T-B-096 finding 2): a VALID manifest with one
+        bad entry (the missing-native-spec form) boots on -- the healthy
+        entry binds inside the drive loop -- and the bad entry is disclosed
+        as exactly one stderr line naming the skill id, the declared
+        pipeline string and the error class; stdout stays the answer stream."""
+        host = _ServerHost([_ok_response("booted-past-the-bad-entry")])
+        base_url = host.start()
+        try:
+            monkeypatch.chdir(tmp_path)
+            skills = _write_two_entry_skills(tmp_path / ".opencode-py" / "skills")
+            assert (skills / "skills.json").is_file()
+            seen: list[str] = []
+            original_register = PipelineEngine.register
+
+            async def _spy_register(engine: PipelineEngine, raw: Any) -> Any:
+                seen.append(str(raw.get("pipeline_id")))
+                return await original_register(engine, raw)
+
+            monkeypatch.setattr(PipelineEngine, "register", _spy_register)
+            db_path = tmp_path / "cli-p5-bad-entry.db"
+            code = main(_argv(db_path, f"{base_url}/v1", "--project-root", str(tmp_path), "boot anyway"))
+        finally:
+            host.stop()
+        assert code == 0
+        assert seen == ["healthy-pipeline"]  # the boot continued: the healthy entry bound in the loop
+        captured = capsys.readouterr()
+        assert "[final] booted-past-the-bad-entry" in captured.out
+        lines = captured.err.strip().splitlines()
+        assert len(lines) == 1  # exactly one stderr line: the bad entry, nothing else
+        assert "legacy-broken" in lines[0]  # the skill id is named
+        assert "legacy-broken/graph.json" in lines[0]  # the declared pipeline string is named
+        assert "NativeSpecMissing" in lines[0]  # the error class is named
+        # stdout stays the answer stream: the disclosure face never writes it.
+        assert "NativeSpecMissing" not in captured.out
+        assert "rejected" not in captured.out
+
 
 # ---------------------------------------------------------------------------
 # The HTTP host: the real ASGI lifespan startup, driven by hand.
@@ -203,3 +289,27 @@ class TestAsgiLifespanHost:
         assert [event["type"] for event in events] == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
         assert capsys.readouterr().err == ""
         assert engine.bound("digest") is None
+
+    async def test_lifespan_boot_discloses_one_bad_entry_and_continues(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The rider-2 host form, the ASGI startup twin: a valid manifest with
+        one bad entry completes the lifespan startup with the healthy entry
+        bound on the serving loop, exactly one stderr line naming the skill
+        id, the pipeline string and the error class, and stdout untouched."""
+        db_path = tmp_path / "serving-p5-bad-entry.db"
+        _require_success(_upgrade_head(db_path))
+        skills = _write_two_entry_skills(tmp_path / "skills")
+        engine = _serving_engine(tmp_path)
+        app = App(db_path, pipeline_engine=engine, skills_dir=skills)
+        api = create_app(app, token="p5-registration-token")
+        events = await _drive_lifespan(api)
+        assert [event["type"] for event in events] == ["lifespan.startup.complete", "lifespan.shutdown.complete"]
+        captured = capsys.readouterr()
+        lines = captured.err.strip().splitlines()
+        assert len(lines) == 1  # exactly one stderr line: the bad entry, nothing else
+        assert "legacy-broken" in lines[0]  # the skill id is named
+        assert "legacy-broken/graph.json" in lines[0]  # the declared pipeline string is named
+        assert "NativeSpecMissing" in lines[0]  # the error class is named
+        assert "NativeSpecMissing" not in captured.out  # the disclosure face never writes stdout
+        assert engine.bound("healthy-pipeline") is not None  # the boot continued: the healthy entry bound

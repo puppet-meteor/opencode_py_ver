@@ -23,10 +23,13 @@ Coverage (the T-C1-085 acceptance judges; the T-C1-087 native-spec faces):
   fact and the framework-emitter migration pointer (the legacy 2 SPEC + 6
   missing batch is the mirror);
 * containment: the derived sibling path escaping the skills root
-  (traversal or absolute) is rejected per-entry without touching the
-  outside file;
+  (traversal, absolute, or the reparse forms -- a win32 junction, a
+  symlink) is rejected per-entry without touching the outside file, and
+  the ELOOP-shaped self-symlink never registers either (zero reads, one
+  structured row -- the reachable face of the unresolvable form);
 * the per-entry rejection face: ``OSError`` / ``json.JSONDecodeError`` /
-  pydantic ``ValidationError`` / ``NativeSpecMissing`` /
+  ``UnicodeDecodeError`` (a non-UTF-8 native spec) / pydantic
+  ``ValidationError`` / ``NativeSpecMissing`` /
   ``PipelineSpecRejected`` each land in the report by class name without
   interrupting the remaining entries;
 * manifest_error: a corrupt manifest is reported, never raised; a missing
@@ -39,6 +42,9 @@ Coverage (the T-C1-085 acceptance judges; the T-C1-087 native-spec faces):
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +107,26 @@ def _write_native(skills: Path, declared: str, payload: object) -> None:
     target = (skills / declared).parent / NATIVE_SPEC_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
+
+
+def _write_native_bytes(skills: Path, declared: str, payload: bytes) -> None:
+    """Write raw bytes as the native-spec sibling (the non-UTF-8 read face)."""
+    target = (skills / declared).parent / NATIVE_SPEC_NAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
+
+
+def _make_junction(link: Path, target: Path) -> None:
+    """A win32 junction (``mklink /J``, no elevation): the probe-borne construct
+    for the reparse-point containment face."""
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"mklink /J failed: {result.stdout}{result.stderr}"
+    assert link.is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +266,85 @@ class TestContainment:
         assert rejection.error_type == "PipelinePathEscape"
         assert report.registered == ()
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="the junction reparse form is win32-only (mklink /J)")
+    async def test_a_junction_escape_is_rejected_before_any_read(self, tmp_path: Path) -> None:
+        """The junction form (T-C1-088 rider 1): ``skills/jlink -> outside``
+        follows the reparse point on the realpath side and lands outside the
+        skills root. The OUTSIDE native spec exists with a registrable
+        payload -- the rejection can only come from containment, never from
+        a read or gate failure (the traversal-test shape)."""
+        skills = _write_skills(
+            tmp_path / "skills",
+            [_entry("jlink-skill", execution="langgraph", pipeline="jlink/graph.json")],
+        )
+        outside = tmp_path / "outside"
+        _write_graph(outside, "pipeline.opencode.json", _spec_raw(pipeline_id="escapee"))
+        _make_junction(skills / "jlink", outside)
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert engine.raws == []
+        (rejection,) = report.rejected
+        assert rejection.skill_id == "jlink-skill"
+        assert rejection.pipeline == "jlink/graph.json"
+        assert rejection.error_type == "PipelinePathEscape"
+        assert "escapes" in rejection.message
+
+    async def test_a_symlink_escape_is_rejected_before_any_read(self, tmp_path: Path) -> None:
+        """The symlink form (T-C1-088 rider 1): ``skills/slink -> outside``
+        resolves through the link and is rejected before any read. Symlink
+        creation needs a privilege on win32 (Developer Mode / elevation);
+        the construct skips honestly where the OS refuses it."""
+        skills = _write_skills(
+            tmp_path / "skills",
+            [_entry("slink-skill", execution="langgraph", pipeline="slink/graph.json")],
+        )
+        outside = tmp_path / "outside"
+        _write_graph(outside, "pipeline.opencode.json", _spec_raw(pipeline_id="escapee"))
+        try:
+            os.symlink(outside, skills / "slink", target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlink creation unavailable on this host: {error}")
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert engine.raws == []
+        (rejection,) = report.rejected
+        assert rejection.skill_id == "slink-skill"
+        assert rejection.pipeline == "slink/graph.json"
+        assert rejection.error_type == "PipelinePathEscape"
+        assert "escapes" in rejection.message
+
+    async def test_a_self_referencing_symlink_never_registers_and_lands_in_one_structured_row(
+        self, tmp_path: Path
+    ) -> None:
+        """The unresolvable form, honest shape (T-C1-088 rider 1).
+
+        The TDD-era probe finding (progress log): Python's non-strict
+        ``Path.resolve()`` raises NO OSError for any probed construct
+        (invalid chars, reserved names, trailing dots, junction and symlink
+        loops all return best-effort paths), so the glue's conservative
+        escape-on-OSError branch stays defensive. This pins the reachable
+        face of the ELOOP construct: the self-symlink keeps the derived
+        path inside the root, nothing is ever read or registered, and the
+        entry lands as exactly one structured rejection row -- never a
+        silent registration, never a boot crash."""
+        skills = _write_skills(
+            tmp_path / "skills",
+            [_entry("loop-skill", execution="langgraph", pipeline="loop/graph.json")],
+        )
+        try:
+            os.symlink(skills / "loop", skills / "loop", target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlink creation unavailable on this host: {error}")
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert engine.raws == []  # zero reads: the loop is never opened
+        assert report.registered == ()
+        assert report.manifest_error is None
+        (rejection,) = report.rejected
+        assert rejection.skill_id == "loop-skill"
+        assert rejection.pipeline == "loop/graph.json"
+        assert rejection.error_type == "NativeSpecMissing"
+
 
 class TestPerEntryRejection:
     async def test_a_missing_native_spec_is_a_structured_rejection(self, tmp_path: Path) -> None:
@@ -294,6 +399,32 @@ class TestPerEntryRejection:
         (rejection,) = report.rejected
         assert rejection.error_type == "JSONDecodeError"
         assert report.registered == ()
+
+    async def test_a_non_utf8_native_spec_is_a_unicode_decode_error_rejection(self, tmp_path: Path) -> None:
+        """The non-UTF-8 read face (T-B-096 finding 3, recast post-087 by
+        T-C1-088 rider 3): the consumed file is the native spec, decoded
+        strictly as utf-8 -- undecodable bytes land the row by the codec's
+        own class name, the remaining entries continue, and the manifest
+        itself stays healthy."""
+        skills = _write_skills(
+            tmp_path / "skills",
+            [
+                _entry("mojibake", execution="langgraph", pipeline="mojibake/graph.json"),
+                _entry("healthy", execution="langgraph", pipeline="healthy/graph.json"),
+            ],
+        )
+        _write_native_bytes(skills, "mojibake/graph.json", b"\xff\xfe{not utf-8\xff}")
+        _write_native(skills, "healthy/graph.json", _spec_raw(pipeline_id="healthy-pipeline"))
+        engine = _RecordingEngine()
+        report = await register_pipelines(engine, skills)
+        assert report.manifest_error is None  # the manifest itself stays healthy
+        assert [r.pipeline_id for r in report.registered] == ["healthy-pipeline"]  # the remaining entries continue
+        assert [raw["pipeline_id"] for raw in engine.raws] == ["healthy-pipeline"]  # never read through
+        (rejection,) = report.rejected
+        assert rejection.skill_id == "mojibake"
+        assert rejection.pipeline == "mojibake/graph.json"
+        assert rejection.error_type == "UnicodeDecodeError"
+        assert rejection.message  # the codec error's first line
 
     @pytest.mark.parametrize(
         ("make_failure", "error_name"),

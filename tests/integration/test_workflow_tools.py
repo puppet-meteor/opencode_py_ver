@@ -22,7 +22,12 @@ Coverage (the S4 acceptance judges):
   origin/anchor consistency both directions;
 * registration isolation (C#5): both adapters register and resolve in a
   plain ToolRegistry (the main-brain direction) while a builtin-only catalog
-  never exposes the workflow wire names (the worker-catalog direction);
+  never exposes the workflow wire names (the worker-catalog direction) --
+  the full builtin-set enum form (T-B-094 R4 / T-C1-088): the whole host
+  composition snapshots to exactly the exported builtin wire names,
+  (namespace, name)-sorted, the pty entry platform-conditional, set-level
+  free of any workflow namespace, and bijective against the builtin
+  package's own export surface;
 * the App wiring: ``workflow_tools=True`` without the provider composition
   fails closed, and the default App carries no registry/brain.
 
@@ -50,6 +55,7 @@ from opencode.contracts.events import JobLineage
 from opencode.contracts.messages import JsonObject, ToolTextContent
 from opencode.contracts.pipelines import PipelineSpec
 from opencode.contracts.tools import ToolResult
+from opencode.httpapi.serving import _builtin_adapters
 from opencode.orchestrator.jobs import (
     FakeJobExecutor,
     JobExecutor,
@@ -62,6 +68,33 @@ from opencode.storage import open_database
 from opencode.storage.jobs_store import JobRecord, JobsReadRepository, JobsStore
 from opencode.storage.repos import NotFoundError
 from opencode.storage.txn import StoreValidationError
+from opencode.tools import builtin
+from opencode.tools.builtin import (
+    BASH_NAME,
+    BASH_NAMESPACE,
+    EDIT_NAME,
+    EDIT_NAMESPACE,
+    GIT_DIFF_NAME,
+    GIT_NAMESPACE,
+    GIT_STATUS_NAME,
+    GLOB_NAME,
+    GLOB_NAMESPACE,
+    GREP_NAME,
+    GREP_NAMESPACE,
+    LS_NAME,
+    LS_NAMESPACE,
+    PTY_NAME,
+    PTY_NAMESPACE,
+    READ_NAME,
+    READ_NAMESPACE,
+    WRITE_NAME,
+    WRITE_NAMESPACE,
+)
+from opencode.tools.builtin.git import (
+    GIT_WORKTREE_ADD_NAME,
+    GIT_WORKTREE_LIST_NAME,
+    GIT_WORKTREE_REMOVE_NAME,
+)
 from opencode.tools.builtin.read import FsReadAdapter
 from opencode.tools.invoker import ToolContext
 from opencode.tools.registry import ToolRegistry
@@ -383,6 +416,44 @@ class TestRecursionGuard:
             await app.close()
 
 
+#: The twelve base wire names, assembled per name from the builtin surface's
+#: own namespace/name constants: a constant drifting in its defining module
+#: changes the wire name here and turns the enum red -- never a silent
+#: rename. (The worktree trio's name constants live in ``builtin/git.py``
+#: and are not re-exported by ``builtin/__init__``; they are imported from
+#: their defining module.)
+_BASE_WIRE_NAMES: frozenset[str] = frozenset(
+    {
+        f"{READ_NAMESPACE}__{READ_NAME}",
+        f"{LS_NAMESPACE}__{LS_NAME}",
+        f"{GLOB_NAMESPACE}__{GLOB_NAME}",
+        f"{GREP_NAMESPACE}__{GREP_NAME}",
+        f"{WRITE_NAMESPACE}__{WRITE_NAME}",
+        f"{EDIT_NAMESPACE}__{EDIT_NAME}",
+        f"{BASH_NAMESPACE}__{BASH_NAME}",
+        f"{GIT_NAMESPACE}__{GIT_STATUS_NAME}",
+        f"{GIT_NAMESPACE}__{GIT_DIFF_NAME}",
+        f"{GIT_NAMESPACE}__{GIT_WORKTREE_ADD_NAME}",
+        f"{GIT_NAMESPACE}__{GIT_WORKTREE_LIST_NAME}",
+        f"{GIT_NAMESPACE}__{GIT_WORKTREE_REMOVE_NAME}",
+    }
+)
+
+#: The platforms the pty face is verified on (T-B-087 ruling 2 / T-C1-073;
+#: the linux T2 face added by the T-C1-074 authorization):
+#: ``pty_adapters()`` composes the adapter there and stays empty elsewhere.
+_PTY_PLATFORMS: tuple[str, ...] = ("win32", "linux")
+
+
+def _expected_worker_wire_names() -> frozenset[str]:
+    """The worker catalog's full expected enum: the twelve base names plus the
+    pty wire name on the verified platforms only."""
+    names = set(_BASE_WIRE_NAMES)
+    if sys.platform in _PTY_PLATFORMS:
+        names.add(f"{PTY_NAMESPACE}__{PTY_NAME}")
+    return frozenset(names)
+
+
 class TestRegistryIsolation:
     async def test_the_brain_registry_resolves_the_workflow_pair(self, tmp_path: Path) -> None:
         harness = _Harness(tmp_path, executor=FakeJobExecutor())
@@ -409,6 +480,76 @@ class TestRegistryIsolation:
         catalog = registry.snapshot("ses_worker")
         assert catalog.resolve("workflow__run") is None
         assert catalog.resolve("workflow__status") is None
+
+    def test_the_full_builtin_worker_catalog_enumerates_exactly_the_builtin_set(self) -> None:
+        """The worker-catalog direction (C#5), full-enum form (T-B-094 R4 / T-C1-088).
+
+        The whole host builtin composition (``serving.py::_builtin_adapters``,
+        the CLI ``_drive`` list's frozen twin) registered into a plain
+        ToolRegistry snapshots to exactly the builtin wire names: the member
+        set, the (namespace, name) sort order, the count, per-name resolve --
+        and the enum is set-level free of any workflow namespace (worker
+        catalogs are builtin-only and never see the workflow pair).
+        """
+        registry = ToolRegistry()
+        for adapter in _builtin_adapters(("C:/work",)):
+            registry.register(adapter)
+        catalog = registry.snapshot("ses_worker_full_enum")
+        expected = _expected_worker_wire_names()
+        # (1) member exactness: every builtin wire name assembled from the
+        # builtin surface's own constants, and nothing else.
+        assert {f"{spec.namespace}__{spec.name}" for spec in catalog.specs} == expected
+        # (2) determinism: the snapshot order is the (namespace, name) sort,
+        # and the count matches the set (no duplicate hiding in the enum).
+        keys = [(spec.namespace, spec.name) for spec in catalog.specs]
+        assert keys == sorted(keys)
+        assert len(catalog.specs) == len(expected)
+        # (3) set-level mutual exclusion: no spec carries the workflow
+        # namespace at all -- not just the two probed wire names.
+        assert "workflow" not in {spec.namespace for spec in catalog.specs}
+        # (4) every expected wire name resolves on the pinned catalog...
+        for wire_name in sorted(expected):
+            assert catalog.resolve(wire_name) is not None
+        # ...while the workflow pair still does not (the probe contrast,
+        # kept beside the set-level form).
+        assert catalog.resolve("workflow__run") is None
+        assert catalog.resolve("workflow__status") is None
+
+    def test_the_pty_wire_name_is_platform_conditional_in_the_worker_catalog(self) -> None:
+        """The platform branch (T-B-087 ruling 2 / T-C1-073, T-C1-074): the
+        ``pty__run`` wire name rides the composition only on the verified
+        platforms (win32 the T1 winpty face, linux the T2 stdlib face);
+        every other platform enumerates exactly the twelve base names."""
+        registry = ToolRegistry()
+        for adapter in _builtin_adapters(("C:/work",)):
+            registry.register(adapter)
+        catalog = registry.snapshot("ses_worker_pty_branch")
+        wire_name = f"{PTY_NAMESPACE}__{PTY_NAME}"
+        if sys.platform in _PTY_PLATFORMS:  # present arm
+            assert catalog.resolve(wire_name) is not None
+            assert len(catalog.specs) == 13
+        else:  # absent arm
+            assert catalog.resolve(wire_name) is None
+            assert len(catalog.specs) == 12
+
+    def test_the_composition_and_the_builtin_export_surface_are_bijective(self) -> None:
+        """The export-surface completeness double pin (T-B-094 R4 §3-3 (5)).
+
+        Every adapter class the builtin package exports appears exactly once
+        in the host composition, and the composition carries nothing the
+        export surface does not declare: a future adapter added to
+        ``builtin/__init__`` but forgotten in the host composition -- or a
+        private addition to the composition -- goes red here. This is the
+        drift guard for the two frozen host assemblies (CLI ``_drive`` and
+        ``_builtin_adapters``), which share this one export set.
+        """
+        composed = [type(adapter).__name__ for adapter in _builtin_adapters(("C:/work",))]
+        assert len(composed) == len(set(composed))  # each exported class exactly once
+        exported = {name for name in builtin.__all__ if name.endswith("Adapter")}
+        # PtyRunAdapter is the one platform-gated class: exported, composed
+        # only on the verified platforms (the gate is the design, not drift).
+        gated = set() if sys.platform in _PTY_PLATFORMS else {"PtyRunAdapter"}
+        assert set(composed) == exported - gated
 
 
 class TestAppWiring:
