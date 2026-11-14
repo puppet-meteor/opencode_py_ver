@@ -1680,9 +1680,16 @@ class PipelineEngine:
         parks this body too (the poll loop below) until the reply resolves
         it. The node's result carries the nested job's identity, terminal
         status and result, so downstream nodes and tests can walk the
-        chain. Restart mid-node is NOT idempotent in v1 (the nested job id
-        cannot ride the graph state before the node completes -- disclosed
-        leftover, CORE-CONTRACTS §5.4 S5a).
+        chain. A re-entered body (a restart interrupted the node
+        mid-flight, the nested job already submitted) adopts the in-flight
+        child: the entry lookahead matches the job's non-terminal children
+        by lineage and ``workflow_ref`` and re-drives the match instead of
+        submitting a duplicate; an ambiguous or invariant-violating match
+        fails closed ``ExecutionUnknown``. The narrowed leftover: a child
+        that already reached a terminal status while the node never
+        completed cannot be adopted (the node-to-child binding is durable
+        only in the node's result), so that restart still submits fresh --
+        disclosed, CORE-CONTRACTS §5.4 S5a.
         """
         context = DRIVE_CONTEXT.get()
         if context is None:
@@ -1691,16 +1698,59 @@ class PipelineEngine:
                 code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
             )
         assert node.workflow_ref is not None  # the semantic gate proved it
-        anchor = context.session_anchor
-        lineage = JobLineage(
-            parent_job_id=context.job_id,
-            session_id=None if anchor == "api" else anchor,
-            origin="api" if anchor == "api" else "session",
-        )
-        handle = await context.service.submit(node.workflow_ref, {}, anchor, depth=context.depth + 1, lineage=lineage)
-        await context.service.run(handle.job_id)
+        # -- T-C1-093 (P5-S9): the adoption lookahead. A re-entered body (the
+        # process died mid-node and a plain re-drive -- or the recovery scan
+        # -- re-entered the graph from the advisory cursor) must not submit a
+        # duplicate nested job: the in-flight child is findable by lineage
+        # (parent = this job) + pipeline ref among the job's non-terminal
+        # children, so the body adopts it. Zero matches is the first-entry
+        # face (the fresh submit below, v1 behavior unchanged); more than one
+        # match cannot be attributed to this node's single submit, so it
+        # fails closed with §8 ExecutionUnknown -- the branch-④ discipline
+        # (side effects cannot be proven) -- touching no matched child (the
+        # recovery scan settles them on their own).
+        matches = [
+            child
+            for child in await context.service.non_terminal_children(context.job_id)
+            if child.pipeline_id == node.workflow_ref
+        ]
+        if len(matches) > 1:
+            raise WorkerError(
+                f"subworkflow node '{node.node_id}' cannot adopt its nested job: "
+                f"{len(matches)} in-flight children of job {context.job_id} already target "
+                f"pipeline '{node.workflow_ref}' -- the node-to-child binding cannot be "
+                "proven, failing closed",
+                code=CoreErrorCode.EXECUTION_UNKNOWN,
+            )
+        if matches:
+            adopted = matches[0]
+            # Depth defense: a matched child whose depth violates the
+            # parent+1 construction invariant (impossible through the public
+            # submit's lineage guard) is an unattributable row -- fail closed
+            # the same way rather than drive a corrupted chain.
+            if adopted.depth != context.depth + 1:
+                raise WorkerError(
+                    f"subworkflow node '{node.node_id}' cannot adopt nested job "
+                    f"{adopted.job_id}: its depth {adopted.depth} violates the parent+1 "
+                    f"invariant (this job's depth {context.depth} + 1) -- the node-to-child "
+                    "binding cannot be proven, failing closed",
+                    code=CoreErrorCode.EXECUTION_UNKNOWN,
+                )
+            nested_job_id = adopted.job_id
+        else:
+            anchor = context.session_anchor
+            lineage = JobLineage(
+                parent_job_id=context.job_id,
+                session_id=None if anchor == "api" else anchor,
+                origin="api" if anchor == "api" else "session",
+            )
+            handle = await context.service.submit(
+                node.workflow_ref, {}, anchor, depth=context.depth + 1, lineage=lineage
+            )
+            nested_job_id = handle.job_id
+        await context.service.run(nested_job_id)
         while True:
-            record = await context.service.get_job(handle.job_id)
+            record = await context.service.get_job(nested_job_id)
             if record.status in TERMINAL_STATUSES:
                 break
             await asyncio.sleep(_SUBWORKFLOW_POLL_S)
@@ -1708,16 +1758,16 @@ class PipelineEngine:
             # The cancel seam: the fold already committed the terminal
             # outcome (a parent cancel propagated here) -- end the drive
             # like the S3 WorkerSuspended face, never touching the status.
-            raise WorkerSuspended(f"nested job {handle.job_id} was cancelled")
+            raise WorkerSuspended(f"nested job {nested_job_id} was cancelled")
         if record.status == "failed":
             error = record.error if record.error is not None else {}
-            message = str(error.get("message") or f"nested job {handle.job_id} failed")
+            message = str(error.get("message") or f"nested job {nested_job_id} failed")
             try:
                 code = CoreErrorCode(str(error.get("code")))
             except ValueError:
                 code = CoreErrorCode.TOOL_FAILED
             raise WorkerError(f"subworkflow node '{node.node_id}' failed: {message}", code=code)
-        return {"job_id": handle.job_id, "status": record.status, "result": record.result}
+        return {"job_id": nested_job_id, "status": record.status, "result": record.result}
 
     # -- the JobExecutor face --------------------------------------------------
 

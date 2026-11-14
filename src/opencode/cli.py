@@ -695,7 +695,11 @@ def main(
         # are production-reachable), the S5a gate face is a fresh GateBroker
         # (P5-S8, T-C1-092, gate registry re-cast: human_gate nodes are
         # production-reachable -- the reply chain closes through the App's
-        # pre-seeded gate_broker pass-through), and the advisory-cursor
+        # pre-seeded gate_broker pass-through), the S5a subworkflow face is
+        # switched on (P5-S9, T-C1-093: subworkflow restart idempotency --
+        # the body's re-entry adoption closes the disclosed leftover, and
+        # the production composition now executes the closed set's full
+        # five elements), and the advisory-cursor
         # store is its own sqlite file derived from the DB path (M-7: never
         # a table in the main DB). Host-only discipline: base_url/api_key/model
         # stay in this composition and never enter the config snapshot, an
@@ -710,6 +714,7 @@ def main(
             tool=run_command_tool_body,
             opencode_agent=opencode_agent,
             gate_broker=GateBroker(),
+            subworkflow=True,
         )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
         # App exists — a refusal exits without ever triggering the startup

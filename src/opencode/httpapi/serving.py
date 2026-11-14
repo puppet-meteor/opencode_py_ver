@@ -292,6 +292,10 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # is a fresh GateBroker (P5-S8, T-C1-092, gate registry re-cast:
     # human_gate nodes are production-reachable -- the reply chain
     # closes through the App's pre-seeded gate_broker pass-through),
+    # the S5a subworkflow face is switched on (P5-S9, T-C1-093:
+    # subworkflow restart idempotency -- the body's re-entry adoption
+    # closes the disclosed leftover, and the production composition now
+    # executes the closed set's full five elements),
     # and the advisory-cursor store at its own sqlite file derived from
     # the DB path (M-7: never a table in the main DB). Host-only
     # discipline: base_url/api_key/model stay in this composition --
@@ -306,6 +310,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         tool=run_command_tool_body,
         opencode_agent=opencode_agent,
         gate_broker=GateBroker(),
+        subworkflow=True,
     )
     # P5-S1 (T-C1-085): the registration glue's input root -- the same
     # loader face the CLI composition uses (one source, no drift). The

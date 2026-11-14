@@ -1278,11 +1278,24 @@ class JobService:
 
     async def _non_terminal_children(self, job_id: str) -> list[str]:
         """The job's non-terminal children by lineage (the subworkflow descent walk)."""
-        children: list[str] = []
+        return [record.job_id for record in await self.non_terminal_children(job_id)]
+
+    async def non_terminal_children(self, job_id: str) -> list[JobRecord]:
+        """The job's non-terminal children by lineage, as full records (T-C1-093).
+
+        The public read face the ``_subworkflow`` body's adoption lookahead
+        reads (P5-S9, restart idempotency): a re-entered node body matches
+        the returned records by ``pipeline_id``/``depth`` to find and adopt
+        the in-flight nested job instead of submitting a duplicate. Mirrors
+        the private id-walk above over the same repository face
+        (``repos.non_terminal_jobs()``); a pure increment -- no wire, event
+        or contract change rides it.
+        """
+        children: list[JobRecord] = []
         for record in await self._repos.non_terminal_jobs():
             lineage = record.lineage if record.lineage is not None else {}
             if lineage.get("parent_job_id") == job_id:
-                children.append(record.job_id)
+                children.append(record)
         return children
 
     # -- §8: the restart-recovery scan -----------------------------------------
