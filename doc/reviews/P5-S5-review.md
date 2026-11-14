@@ -1,19 +1,19 @@
 # P5-S5-review — T-C1-089 微评审：tool 节点真实体（run_command 绑定 command 臂+tool_ref 臂诚实拒绝）
 
 - 评审对象：worktree `p5-s5` 单提交 `fd568fd`（父=`0fb3be8`，numstat 恰 10 路径：改 7[doc/CORE-CONTRACTS.md +2/−1、src/opencode/cli.py +5/−3、src/opencode/httpapi/serving.py +10/−7、src/opencode/orchestrator/engine.py +6/−3、src/opencode/orchestrator/llm_call.py +7/−30、tests/contract/test_llm_call.py +4/−15、tests/integration/test_llm_call_e2e.py +7/−4] + 新 3[orchestrator/tool.py 110L、tests/contract/test_tool.py 137L、tests/integration/test_tool_e2e.py 95L]——与票面 §8 交付面逐路径吻合零多零漏；票面拷贝 tasks/T-C1-089.md 正确排除、#180 B-② 遵守）。席位票 `T-C1-089.md` 钉面全量（调度器钉面残余亦同步：§0.5 venv 注记+§6 `-m` 形修订版）。
-- 评审基据（全部独立现读，禁继承）：`git show fd568fd` 全量 diff 逐行亲读+3 新文件全文亲读；席位日志 `logs/T-C1-089.txt`（63KB）关键证据面亲读（定向 47/47+三快门绿+CORE-CONTRACTS 双落位自证+mypy invariance 修正循 engine.py L1583 `cast("list[JsonValue]", …)` 先例）；本席独立复跑四门禁（worktree 真 python venv，`-m` 形）：ruff 0 / format 550 files already formatted exit0 / mypy `Success: no issues found in 207 source files`（204 基+3 新文件恰增）/ pytest **2216 passed, 8 skipped, 3 warnings, 0 errors exit 0** 604.68s——席位全量面被单发截断，由本席补全承证。
-- 评审时刻：2026-11-14 20:05:00（席位主弧 19:37:55 发射→19:50:35 SEAT-EXIT 0 ≈13min，止损 100min 内；席位 git 写零，提交/合流/台账归调度器）。
+- 评审基据（全部独立现读，禁继承）：`git show fd568fd` 全量 diff 逐行亲读+3 新文件全文亲读；席位日志 `logs/T-C1-089.txt`（63KB）关键证据面亲读（定向 47/47+三快门绿+CORE-CONTRACTS 双落位自证+mypy invariance 修正循 engine.py L1583 `cast("list[JsonValue]", …)` 先例）；本席独立复跑四门禁（worktree 真 python venv，`-m` 形）：ruff 0 / format 550 files already formatted exit0 / mypy `Success: no issues found in 207 source files`（204 基+3 新文件恰增）/ pytest **2216 passed, 8 skipped, 3 warnings, 0 errors exit 0** 604.68s——本席独立复跑收全（席位自跑全量亦于 ~19:59 全绿：2216P+8S+1W@599.40s，见附录双互证）。
+- 评审时刻：2026-11-14 20:05:00（席位客户端可见弧 19:37:55 发射→19:50:35 SEAT-EXIT 0 ≈13min，止损 100min 内；席位 git 写零，提交/合流/台账归调度器。收尾后发现会话侧续跑至 20:01:22——见附录）。
 
 ## VERDICT: **PASS**
 
-阻断 0 / 重大 0 / 次要 1 / 建议 2（席位进度档缺席一项；观察面两条）
+阻断 0 / 重大 0 / 次要 1 / 建议 2（席位进度档与合流相竞一项——附录订正承载；观察面两条）
 
 ## 六面逐条结论
 
 ### 1. 票面纪律 — PASS
 - 禁 git 写遵守：席位全程 HEAD 恒 `0fb3be8`（调度器独立核：席位终态工作区=10 路径未提交+票面拷贝，提交由调度器执行）；交付=工作区。
 - 票面 tasks/*.md 未入提交（fd568fd numstat 亲证零 tasks 路径）；诚实纪律遵守——llm 侧注 `_no_llm_body`（AssertionError「no llm node should reach it」，非编造结果）。
-- **次要 1（席位过程缺件——单发模式截断）**：席位把全量 pytest 放后台后续写进度档，单发会话在后台任务在飞时自然收束（终句「I'll write the progress file…」中断于 SEAT-EXIT 0）——`doc/orchestration/progress/T-C1-089.md` 缺席（票面 §0.4 返回前件）。验收证据无损：调度器独立四门禁补全（全绿）+席位日志/门禁档全在 `logs/`（T-C1-089.txt 63KB+gates-p5s5-acceptance.txt）——微评审判 0 返工；教训=单发席位禁后台化长门禁（§0.4 自证链应前台收齐或进度档先写）。
+- **次要 1（席位进度档与合流相竞——本条由附录订正）**：合流时刻（19:56 核=False、~19:58 ff 合流）席位进度档确不存在；实情=延迟落盘——`opencode run` 客户端 19:50:35 退出（SEAT-EXIT 0、transcript 定格 63KB）后会话侧进程续跑：孤儿后台全量 pytest（~19:49+599.40s）~19:59 全绿完成，续写完成进度档于 **20:01:22**（13.8KB 全版：日志+§3 锚映射逐条+§5 披露+门禁输出留档）。验收证据无损：调度器独立四门禁全绿+席位自跑全量亦绿且双互证（见附录）；进度档按 T-C1-088 先例（a150cf8 随带）入档。教训=**SEAT-EXIT 0=客户端退出信号≠会话完成信号**——单发席位禁后台化长门禁；调度器合流前应复查工作树新产出。
 
 ### 2. 决策锚落面（§3 八锚逐条）— PASS
 - 锚1 新模块 `orchestrator/tool.py`（镜像 llm_call 命名先例）、无构造态模块级 async `run_command_tool_body`（满足 ToolFn）✓。
@@ -49,3 +49,10 @@
 - **次要 1（席位进度档缺席——单发模式后台截断；处置零返工）**：见 §1。证据链由调度器独立门禁（全绿 exit 0）+席位日志（63KB 含全部过程证据）+本评审件闭合；进度档类缺件后续票面增补硬令「前台收齐门禁再返回」。
 - **建议 1（观察面，无动作）**：install 族本轮 6E→6P 全转绿（前轮 6E=全量负载下 SAC 间歇相位、隔离重跑绿）——相位消退为时序事实，非本票代码效应；venv 真修形（真 python.exe）对 install 族 fixture venv 无因果（fixture 自建隔离 venv）；trampoline 阻断面随时可复发——worktree venv 纪律（真 python `-m venv` 自建+禁重建）+`-m` 形门禁命令保持。
 - **建议 2（CI 面观察项）**：windows 腿时长链 13m30s→…→15.2m（cancelled）后，#223 已抬 `timeout-minutes: 15→25`（CI-WATCH-225 双腿绿验证收口）；本票 fd568fd 逼近「+12 测」增量（suite +~30s 量级），25min 余量充足；若腿时长再现 >24m 再议。
+
+## 附录（收尾后订正，2026-11-14 20:15——台账 #225 承载）
+
+- **进度档延迟落盘定谳**：本评审成文（~20:03，基于 19:56 核=False）后实测发现 `doc/orchestration/progress/T-C1-089.md` 已于 **20:01:22** 落盘（席位自写全文 13.8KB）。机制=单发 `opencode run` 客户端 19:50:35 退出后会话侧进程续跑：席位自起的孤儿后台全量 pytest（~19:49 起+599.40s）~19:59 全绿收束，会话续写完成进度档。**SEAT-EXIT 0 仅证客户端退出，不证会话完成**。
+- **席位自报双互证（强于 §4 原记）**：席位自跑全量=collect 2224/**2216P+8S+1W+0E**@599.40s，四门禁全绿，4551 未再现——与调度器独立验收跑（2224/2216P+8S+3W@604.68s）全量面恰合（warnings 1 vs 3=aiosqlite GC 竞争时序漂移，085-088 四方证先例）——**两独立全量绿互证**。
+- **次要 1 订正**：原「进度档缺席」表述由「进度档与合流相竞（延迟 11min 落盘、合流居中）」取代；处置不变（0 返工）。进度档按 T-C1-088 先例（a150cf8 随带入库）随 #225 入库——票面 §0.2 把进度档并入「永不入库」系调度器票面笔误漂移（#180 B-② 只辖票面拷贝 tasks/*.md）。
+- **事故附记**：worktree remove 因该未跟踪文件拒删（意外保住证据），拷出+入库后清理归弧收尾。
