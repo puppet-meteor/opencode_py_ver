@@ -80,6 +80,34 @@ _RUN_MARKER = "\n[run] "
 USAGE_POLL_INTERVAL_S = 0.25
 #: Timeout for the git worktree bookkeeping calls (not the worker run itself).
 _GIT_TIMEOUT_S = 60.0
+#: The default worker wall-clock line (the budget ``timeout_s`` face) -- a
+#: stop-loss quantity, deliberately NOT the LLM request deadline:
+#: ``RuntimeSettings.timeout_s`` is the per-request line the adapter derives
+#: its deadline ladder from (provider.md §3, the ~120s order), while one
+#: ``opencode_agent`` node is a whole real-CLI worker drive (worktree setup,
+#: the driven loop, the acceptance gate) that a request-sized line would
+#: strangle. The production assemblies pass
+#: ``JobBudget(timeout_s=WORKER_DEFAULT_TIMEOUT_S)`` as the default budget; a
+#: per-job ``budget`` in the submit params overrides it (the existing submit
+#: face). Independent-deadline discipline: TOOL_NODE_TIMEOUT_S (T-C1-089).
+#: (P5-S7, T-C1-091.)
+WORKER_DEFAULT_TIMEOUT_S = 1800.0
+
+
+def workers_runs_path_for(db_path: str | Path) -> Path:
+    """The workers runs-root directory derived from the main DB path.
+
+    A sibling of the main database (``app.db`` -> ``app-workers``) -- the
+    same sibling-derivation discipline as the advisory checkpointer
+    (:func:`opencode.orchestrator.llm_call.checkpointer_path_for`, M-7: the
+    workers arena is its own tree beside the main DB, never a table or a
+    subdir inside it). The directory holds the per-worker run dirs and
+    worktrees the manager creates beneath it: the host assemblies mkdir the
+    base directory (the composition-root guarantee), everything below it
+    belongs to the manager (P5-S7, T-C1-091).
+    """
+    resolved = Path(db_path)
+    return resolved.with_name(f"{resolved.stem}-workers")
 
 
 class WorkerError(Exception):

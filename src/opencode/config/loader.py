@@ -654,6 +654,10 @@ class ConfigLoader:
         """
         return self._project_root.joinpath(*_SKILLS_DIR_PARTS)
 
+    def project_root(self) -> Path:
+        """The pinned project root (the discovery base: ``--project-root`` when given, else the VCS root)."""
+        return self._project_root
+
     # -- §6 L285: pipeline.tiers (P5-S6, T-C1-090) — the LLM tier table --------
 
     def pipeline_tiers(self) -> Mapping[str, str] | None:

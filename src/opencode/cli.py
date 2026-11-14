@@ -95,6 +95,7 @@ from opencode.contracts.events import (
     PY_TOOL_FINISHED,
     PY_TOOL_STARTED,
     ConfigSnapshotV3,
+    JobBudget,
     McpServerRef,
     SessionCreatedData,
     SessionCreatedDataV2,
@@ -112,6 +113,7 @@ from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
 from opencode.orchestrator.registration import register_pipelines
 from opencode.orchestrator.tool import run_command_tool_body
+from opencode.orchestrator.workers import WORKER_DEFAULT_TIMEOUT_S, WorkerManager, workers_runs_path_for
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import (
     ApprovalExpiredError,
@@ -649,6 +651,37 @@ def main(
             host_mcp_refs = list(host_runtime.snapshot.mcp_servers)
         else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
             host_mcp_refs = []
+        # P5-S7 (T-C1-091): workers capability closure -- the production
+        # WorkerManager face behind ``opencode_agent`` nodes: a real CLI
+        # subprocess per node in its three-part arena (detached worktree /
+        # run dir / ``python -m opencode``, the default worker_command).
+        # Its host values are this host's own -- the loader's pinned project
+        # root (the worktree source repo: one discovery source, no drift),
+        # the provider credentials, and the HOST runtime's model id +
+        # context_limit (the manager takes the model id string, not the
+        # ModelRef). The runs root is a sibling directory of the DB path
+        # (workers_runs_path_for; mkdir'd here -- the base directory is the
+        # composition root's guarantee, the per-worker tree beneath it
+        # belongs to the manager), and the wall-clock line is the
+        # WORKER_DEFAULT_TIMEOUT_S constant -- deliberately NOT
+        # RuntimeSettings.timeout_s (that is the per-LLM-request deadline,
+        # provider.md §3; a worker run is a whole CLI drive, not one
+        # request). The cancel chain needs zero new code: the App's
+        # isinstance probe wires this manager as the jobs canceller.
+        # Host-only discipline: base_url/api_key/model stay in this
+        # composition and never enter the config snapshot, an event
+        # payload, or the graph state.
+        workers_runs_root = workers_runs_path_for(db_path)
+        workers_runs_root.mkdir(parents=True, exist_ok=True)
+        opencode_agent = WorkerManager(
+            repo_root=loader.project_root(),
+            runs_root=workers_runs_root,
+            default_budget=JobBudget(timeout_s=WORKER_DEFAULT_TIMEOUT_S),
+            base_url=args.base_url,
+            api_key=args.api_key,
+            model=host_runtime.settings.model.model,
+            context_limit=host_runtime.settings.context_limit,
+        )
         # P4-S1 (T-C1-082): the production pipeline engine. The real llm_call
         # body runs over this process's own MAAS provider (P5-S6, T-C1-090:
         # the tier table comes from the layered config's ``pipeline.tiers`` --
@@ -656,7 +689,9 @@ def main(
         # runtime's --model source, never the possibly-recovered session's
         # replayed snapshot), the tool body is the real run_command-backed
         # command arm (P5-S5, T-C1-089; a tool_ref node refuses honestly
-        # until the registry slice), and the advisory-cursor store is its own
+        # until the registry slice), the S3 worker face is the production
+        # WorkerManager wired above (P5-S7, T-C1-091: opencode_agent nodes
+        # are production-reachable), and the advisory-cursor store is its own
         # sqlite file derived from the DB path (M-7: never a table in the
         # main DB). Host-only discipline: base_url/api_key/model stay in this
         # composition and never enter the config snapshot, an event payload,
@@ -669,6 +704,7 @@ def main(
                 tiers=loader.pipeline_tiers(),
             ),
             tool=run_command_tool_body,
+            opencode_agent=opencode_agent,
         )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
         # App exists — a refusal exits without ever triggering the startup

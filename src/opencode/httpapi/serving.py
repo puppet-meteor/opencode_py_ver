@@ -37,12 +37,13 @@ import uvicorn
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.config import ConfigLoader
-from opencode.contracts.events import ConfigSnapshotV3
+from opencode.contracts.events import ConfigSnapshotV3, JobBudget
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
 from opencode.orchestrator.tool import run_command_tool_body
+from opencode.orchestrator.workers import WORKER_DEFAULT_TIMEOUT_S, WorkerManager, workers_runs_path_for
 from opencode.tools.builtin import (
     BashAdapter,
     FsEditAdapter,
@@ -246,6 +247,36 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
         mcp_refs = []
     provider = MaasAdapter(base_url, api_key)
+    # P5-S7 (T-C1-091): workers capability closure -- the production
+    # WorkerManager face behind ``opencode_agent`` nodes, composed here
+    # isomorphically to the CLI's assembly (deliberately not a shared
+    # factory -- this host chain stays a frozen face): a real CLI subprocess
+    # per node in its three-part arena (the default worker_command), with
+    # this host's own values -- the loader's pinned project root (the
+    # worktree source repo: one discovery source, no drift), the provider
+    # credentials, and the resolved runtime's model id + context_limit (the
+    # manager takes the model id string, not the ModelRef). The runs root is
+    # a sibling directory of the DB path (workers_runs_path_for; mkdir'd
+    # here -- the base directory is the composition root's guarantee, the
+    # per-worker tree beneath it belongs to the manager), and the
+    # wall-clock line is the WORKER_DEFAULT_TIMEOUT_S constant --
+    # deliberately NOT RuntimeSettings.timeout_s (that is the per-LLM-request
+    # deadline, provider.md §3; a worker run is a whole CLI drive, not one
+    # request). The cancel chain needs zero new code: the App's isinstance
+    # probe wires this manager as the jobs canceller. Host-only discipline:
+    # base_url/api_key/model stay in this composition -- never the
+    # snapshot, events or graph state.
+    workers_runs_root = workers_runs_path_for(resolved_db)
+    workers_runs_root.mkdir(parents=True, exist_ok=True)
+    opencode_agent = WorkerManager(
+        repo_root=loader.project_root(),
+        runs_root=workers_runs_root,
+        default_budget=JobBudget(timeout_s=WORKER_DEFAULT_TIMEOUT_S),
+        base_url=base_url,
+        api_key=api_key,
+        model=runtime.settings.model.model,
+        context_limit=runtime.settings.context_limit,
+    )
     # P4-S1 (T-C1-082): the production pipeline engine, composed here
     # isomorphically to the CLI's assembly (deliberately not a shared
     # factory -- this host chain stays a frozen face): the real llm_call
@@ -254,10 +285,13 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # means tier fallback = the resolved runtime's model, the
     # --model/config source), the real run_command-backed tool body
     # (P5-S5, T-C1-089: the command arm is real, a tool_ref node refuses
-    # honestly until the registry slice), and the advisory-cursor store at
-    # its own sqlite file derived from the DB path (M-7: never a table in
-    # the main DB). Host-only discipline: base_url/api_key/model stay in
-    # this composition -- never the snapshot, events or graph state.
+    # honestly until the registry slice), the S3 worker face is the
+    # production WorkerManager wired above (P5-S7, T-C1-091:
+    # opencode_agent nodes are production-reachable), and the
+    # advisory-cursor store at its own sqlite file derived from the DB
+    # path (M-7: never a table in the main DB). Host-only discipline:
+    # base_url/api_key/model stay in this composition -- never the
+    # snapshot, events or graph state.
     pipeline_engine = PipelineEngine(
         checkpointer=EngineCheckpointer(checkpointer_path_for(resolved_db)),
         llm_call=MaasLlmCall(
@@ -266,6 +300,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
             tiers=loader.pipeline_tiers(),
         ),
         tool=run_command_tool_body,
+        opencode_agent=opencode_agent,
     )
     # P5-S1 (T-C1-085): the registration glue's input root -- the same
     # loader face the CLI composition uses (one source, no drift). The
