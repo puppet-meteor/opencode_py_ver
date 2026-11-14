@@ -41,6 +41,7 @@ from opencode.contracts.events import ConfigSnapshotV3, JobBudget
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
+from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
 from opencode.orchestrator.tool import run_command_tool_body
 from opencode.orchestrator.workers import WORKER_DEFAULT_TIMEOUT_S, WorkerManager, workers_runs_path_for
@@ -287,11 +288,14 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # (P5-S5, T-C1-089: the command arm is real, a tool_ref node refuses
     # honestly until the registry slice), the S3 worker face is the
     # production WorkerManager wired above (P5-S7, T-C1-091:
-    # opencode_agent nodes are production-reachable), and the
-    # advisory-cursor store at its own sqlite file derived from the DB
-    # path (M-7: never a table in the main DB). Host-only discipline:
-    # base_url/api_key/model stay in this composition -- never the
-    # snapshot, events or graph state.
+    # opencode_agent nodes are production-reachable), the S5a gate face
+    # is a fresh GateBroker (P5-S8, T-C1-092, gate registry re-cast:
+    # human_gate nodes are production-reachable -- the reply chain
+    # closes through the App's pre-seeded gate_broker pass-through),
+    # and the advisory-cursor store at its own sqlite file derived from
+    # the DB path (M-7: never a table in the main DB). Host-only
+    # discipline: base_url/api_key/model stay in this composition --
+    # never the snapshot, events or graph state.
     pipeline_engine = PipelineEngine(
         checkpointer=EngineCheckpointer(checkpointer_path_for(resolved_db)),
         llm_call=MaasLlmCall(
@@ -301,6 +305,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         ),
         tool=run_command_tool_body,
         opencode_agent=opencode_agent,
+        gate_broker=GateBroker(),
     )
     # P5-S1 (T-C1-085): the registration glue's input root -- the same
     # loader face the CLI composition uses (one source, no drift). The

@@ -110,6 +110,7 @@ from opencode.contracts.messages import (
 )
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
+from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
 from opencode.orchestrator.registration import register_pipelines
 from opencode.orchestrator.tool import run_command_tool_body
@@ -691,11 +692,14 @@ def main(
         # command arm (P5-S5, T-C1-089; a tool_ref node refuses honestly
         # until the registry slice), the S3 worker face is the production
         # WorkerManager wired above (P5-S7, T-C1-091: opencode_agent nodes
-        # are production-reachable), and the advisory-cursor store is its own
-        # sqlite file derived from the DB path (M-7: never a table in the
-        # main DB). Host-only discipline: base_url/api_key/model stay in this
-        # composition and never enter the config snapshot, an event payload,
-        # or the graph state.
+        # are production-reachable), the S5a gate face is a fresh GateBroker
+        # (P5-S8, T-C1-092, gate registry re-cast: human_gate nodes are
+        # production-reachable -- the reply chain closes through the App's
+        # pre-seeded gate_broker pass-through), and the advisory-cursor
+        # store is its own sqlite file derived from the DB path (M-7: never
+        # a table in the main DB). Host-only discipline: base_url/api_key/model
+        # stay in this composition and never enter the config snapshot, an
+        # event payload, or the graph state.
         pipeline_engine = PipelineEngine(
             checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
             llm_call=MaasLlmCall(
@@ -705,6 +709,7 @@ def main(
             ),
             tool=run_command_tool_body,
             opencode_agent=opencode_agent,
+            gate_broker=GateBroker(),
         )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
         # App exists — a refusal exits without ever triggering the startup
