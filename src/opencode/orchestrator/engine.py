@@ -857,9 +857,12 @@ class LlmCallFn(Protocol):
 class ToolFn(Protocol):
     """The injectable ``tool`` node body (shell command / static tool reference).
 
-    S2 ships no real body either (the optional ``run_command``-backed real
-    implementation was left out to keep the injection face the single tested
-    seam); a future slice may bind command nodes onto the process primitives.
+    S5 (T-C1-089) ships the real body for the ``command`` arm:
+    :func:`opencode.orchestrator.tool.run_command_tool_body` binds
+    explicit-argv nodes onto the §5.3 process primitives. The ``tool_ref``
+    arm still refuses honestly inside that body (the tool-registry face is
+    a later slice). The injection seam remains the single tested face --
+    tests keep injecting fakes.
     """
 
     async def __call__(self, node: PipelineNode, state: EngineState) -> JsonValue: ...

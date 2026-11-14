@@ -30,12 +30,13 @@ with its own CORE-CONTRACTS §8 code (a scripted HTTP 500 therefore surfaces
 as ``ProviderUnavailable``), and a stream that ends without any terminal
 chunk fails closed as ``ProviderStreamInterrupted``.
 
-This module also carries the production assembly's two remaining faces: the
-honest fail-closed ``tool`` node body (the real ``run_command``-backed
-implementation is a later slice -- refusing explicitly beats a silent
-no-op) and the advisory-cursor path derivation (the checkpointer lives in
-its own sqlite file derived from the main DB path -- the M-7/§14
-dual-database boundary, never a table in the main DB).
+This module also carries the production assembly's advisory-cursor face:
+the checkpointer path derivation (the checkpointer lives in its own sqlite
+file derived from the main DB path -- the M-7/§14 dual-database boundary,
+never a table in the main DB). The ``tool`` node body this module carried
+until P5-S5 now lives in ``opencode.orchestrator.tool`` (T-C1-089): the
+``run_command``-backed command arm is real, and the ``tool_ref`` arm
+refuses honestly there until the tool-registry slice.
 """
 
 from __future__ import annotations
@@ -76,14 +77,6 @@ DEFAULT_MAX_OUTPUT_TOKENS = 4096
 #: One pipeline node completion's total request budget (the adapter derives
 #: its header/chunk/total deadline ladder from it, provider.md §3).
 DEFAULT_TIMEOUT_S = 120.0
-
-#: The honest ``tool`` node refusal message (the production assembly wires
-#: :func:`unsupported_tool_body` until the real tool body lands).
-TOOL_BODY_UNSUPPORTED_MESSAGE = (
-    "the real 'tool' node body is not wired in this composition: node '{node_id}' refuses to execute "
-    "(the run_command-backed tool body lands with a later slice; this is the honest fail-closed face, "
-    "never a silent no-op)"
-)
 
 
 def checkpointer_path_for(db_path: str | Path) -> Path:
@@ -199,22 +192,6 @@ def render_prompt(template: str, params: JsonObject) -> str:
             f"prompt template is not a valid format template: {error}",
             code=CoreErrorCode.VALIDATION_ERROR,
         ) from error
-
-
-async def unsupported_tool_body(node: PipelineNode, state: EngineState) -> JsonValue:
-    """The honest fail-closed ``tool`` node body (a ``ToolFn`` face).
-
-    The registration gate still accepts ``tool`` nodes (the closed set's
-    S2 face), but the real ``run_command``-backed body is a later slice --
-    so the production assembly wires this body instead of a fake: a tool
-    node that actually executes fails the job with the explicit
-    ``UnsupportedCapability`` §8 face naming the node, never a silent
-    no-op and never a made-up result.
-    """
-    raise WorkerError(
-        TOOL_BODY_UNSUPPORTED_MESSAGE.format(node_id=node.node_id),
-        code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
-    )
 
 
 class MaasLlmCall:

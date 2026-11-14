@@ -109,8 +109,9 @@ from opencode.contracts.messages import (
 )
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
-from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
+from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
 from opencode.orchestrator.registration import register_pipelines
+from opencode.orchestrator.tool import run_command_tool_body
 from opencode.session.runner import DEFAULT_MAX_STEPS
 from opencode.session.service import (
     ApprovalExpiredError,
@@ -652,7 +653,8 @@ def main(
         # body runs over this process's own MAAS provider (the tier fallback
         # model is the HOST runtime's -- the --model source, never the
         # possibly-recovered session's replayed snapshot), the tool body is
-        # the honest fail-closed refusal (the real one is a later slice), and
+        # the real run_command-backed command arm (P5-S5, T-C1-089; a
+        # tool_ref node refuses honestly until the registry slice), and
         # the advisory-cursor store is its own sqlite file derived from the
         # DB path (M-7: never a table in the main DB). Host-only discipline:
         # base_url/api_key/model stay in this composition and never enter the
@@ -660,7 +662,7 @@ def main(
         pipeline_engine = PipelineEngine(
             checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
             llm_call=MaasLlmCall(provider=provider, default_model=host_runtime.settings.model),
-            tool=unsupported_tool_body,
+            tool=run_command_tool_body,
         )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any
         # App exists — a refusal exits without ever triggering the startup

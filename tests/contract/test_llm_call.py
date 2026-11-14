@@ -7,9 +7,10 @@ pinned by ``tests/integration/test_llm_call_e2e.py``. Everything else is
 real: the tier resolution, the ``str.format`` prompt rendering with its
 structured missing-key face, the stream aggregation (terminal error chunk
 -> its own §8 code, no terminal chunk -> fail closed, tool_calls finish ->
-rejected), the honest fail-closed tool body, the advisory-cursor path
-derivation, and the host-only snapshot pin (the config snapshot face gains
-no provider field).
+rejected), the advisory-cursor path derivation, and the host-only snapshot
+pin (the config snapshot face gains no provider field). The ``tool`` node
+body moved to its own module with its real face (T-C1-089,
+``tests/contract/test_tool.py``).
 
 v2 (T-C1-084) additions pinned here: the merged render context (submitted
 params plus the non-skipped node results, index chains stepping into real
@@ -41,11 +42,9 @@ from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.contracts.pipelines import PipelineNode
 from opencode.orchestrator.engine import EngineState
 from opencode.orchestrator.llm_call import (
-    TOOL_BODY_UNSUPPORTED_MESSAGE,
     MaasLlmCall,
     checkpointer_path_for,
     render_prompt,
-    unsupported_tool_body,
 )
 from opencode.orchestrator.workers import WorkerError
 
@@ -345,16 +344,6 @@ class TestConstructorFace:
     def test_credentials_require_both_parts(self) -> None:
         with pytest.raises(ValueError, match="both base_url and api_key"):
             MaasLlmCall(base_url="http://maas", default_model=_DEFAULT_MODEL)
-
-
-class TestUnsupportedToolBody:
-    async def test_the_tool_body_refuses_with_the_unsupported_capability_face(self) -> None:
-        node = PipelineNode(node_id="collect", node_type="tool", tool_ref="fs.read_text")
-        with pytest.raises(WorkerError, match="later slice") as error:
-            await unsupported_tool_body(node, _state({}))
-        assert error.value.code is CoreErrorCode.UNSUPPORTED_CAPABILITY
-        assert str(error.value) == TOOL_BODY_UNSUPPORTED_MESSAGE.format(node_id="collect")
-        assert "node 'collect'" in str(error.value)
 
 
 class TestHostOnlyFaces:

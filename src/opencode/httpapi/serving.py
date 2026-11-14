@@ -41,7 +41,8 @@ from opencode.contracts.events import ConfigSnapshotV3
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
-from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
+from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
+from opencode.orchestrator.tool import run_command_tool_body
 from opencode.tools.builtin import (
     BashAdapter,
     FsEditAdapter,
@@ -249,15 +250,17 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # isomorphically to the CLI's assembly (deliberately not a shared
     # factory -- this host chain stays a frozen face): the real llm_call
     # body over this process's own provider (tier fallback = the resolved
-    # runtime's model, the --model/config source), the honest fail-closed
-    # tool body (the real one is a later slice), and the advisory-cursor
-    # store at its own sqlite file derived from the DB path (M-7: never a
-    # table in the main DB). Host-only discipline: base_url/api_key/model
-    # stay in this composition -- never the snapshot, events or graph state.
+    # runtime's model, the --model/config source), the real run_command-
+    # backed tool body (P5-S5, T-C1-089: the command arm is real, a
+    # tool_ref node refuses honestly until the registry slice), and the
+    # advisory-cursor store at its own sqlite file derived from the DB
+    # path (M-7: never a table in the main DB). Host-only discipline:
+    # base_url/api_key/model stay in this composition -- never the
+    # snapshot, events or graph state.
     pipeline_engine = PipelineEngine(
         checkpointer=EngineCheckpointer(checkpointer_path_for(resolved_db)),
         llm_call=MaasLlmCall(provider=provider, default_model=runtime.settings.model),
-        tool=unsupported_tool_body,
+        tool=run_command_tool_body,
     )
     # P5-S1 (T-C1-085): the registration glue's input root -- the same
     # loader face the CLI composition uses (one source, no drift). The

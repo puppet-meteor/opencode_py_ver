@@ -2,8 +2,10 @@
 
 The exact assembly the CLI and the HTTP server now wire -- ``EngineCheckpointer``
 at the DB-derived sqlite path (M-7: its own file), the real ``MaasLlmCall``
-body over the ported ``MaasAdapter``, the honest fail-closed tool body, and
-``App(pipeline_engine=...)`` routing the jobs service onto the engine -- driven
+body over the ported ``MaasAdapter``, the real ``run_command``-backed tool
+body (T-C1-089; unexercised by this spec's single ``llm_call`` node -- pinned
+by ``tests/integration/test_tool_e2e.py``), and ``App(pipeline_engine=...)``
+routing the jobs service onto the engine -- driven
 end to end against ``tests/r0/fake_openai_server.py`` over real loopback HTTP:
 register a pipeline with an ``llm_call`` node, submit a job, and pin that
 ``node_results`` carries the fake model's text. The scripted HTTP 500 pins the
@@ -22,7 +24,8 @@ from opencode.app import App
 from opencode.contracts.llm import ModelRef
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
-from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for, unsupported_tool_body
+from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
+from opencode.orchestrator.tool import run_command_tool_body
 from opencode.session.context import RuntimeSettings
 from tests.integration.test_engine import _upgrade_head
 from tests.r0.fake_openai_server import (
@@ -79,7 +82,7 @@ async def _drive_one_job(
     engine = PipelineEngine(
         checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
         llm_call=MaasLlmCall(provider=provider, default_model=ModelRef(provider="maas", model=_MODEL_ID)),
-        tool=unsupported_tool_body,
+        tool=run_command_tool_body,
     )
     await engine.register(_pipeline_spec())
     async with App(
