@@ -11,16 +11,24 @@ register a pipeline with an ``llm_call`` node, submit a job, and pin that
 ``node_results`` carries the fake model's text. The scripted HTTP 500 pins the
 ``ProviderUnavailable`` §8 face, and the host-only test pins that the provider
 assembly values (base_url/api_key/resolved model id) never leak into any event
-payload or the advisory-cursor file.
+payload or the advisory-cursor file. The P5-S6 (T-C1-090) tests drive the
+same composition with a tier table the layered config supplied
+(``pipeline.tiers`` -> ``ConfigLoader.pipeline_tiers()`` ->
+``MaasLlmCall(tiers=...)``): the wire request carries the table's model id
+for the named tier, and a tier the table does not define keeps the
+structured ``ProviderUnavailable`` §8 face.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
+from opencode.config import ConfigLoader
 from opencode.contracts.llm import ModelRef
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
@@ -159,3 +167,115 @@ async def test_no_host_provider_values_leak_into_events_or_the_checkpointer(tmp_
     checkpoint_bytes = checkpointer_path_for(db_path).read_bytes()
     for needle in needles:
         assert needle.encode() not in checkpoint_bytes, f"host-only leak into the advisory cursor: {needle}"
+
+
+# ---------------------------------------------------------------------------
+# P5-S6 (T-C1-090): the config-loaded tier table through the production
+# assembly seam — a temp config layer declares pipeline.tiers, the loader
+# reads it, the composition passes it to MaasLlmCall, the engine drives the
+# llm_call node over the fake server.
+# ---------------------------------------------------------------------------
+
+
+def _tiered_pipeline_spec(node_model: str) -> JsonObject:
+    """One single-node llm_call pipeline naming the given model tier."""
+    return {
+        "schema_version": 1,
+        "pipeline_id": "digest",
+        "entry": "summarize",
+        "nodes": [
+            {
+                "node_id": "summarize",
+                "node_type": "llm_call",
+                "model": node_model,
+                "prompt_template": "Summarize: {topic}",
+            }
+        ],
+        "edges": [],
+    }
+
+
+def _config_loaded_tiers(tmp_path: Path) -> dict[str, str]:
+    """A hermetic loader over one temp global layer declaring ``pipeline.tiers``
+    (the same loader face the production compositions use: an injected tmp
+    product directory, so the real ~/.config/opencode is never read)."""
+    global_path = tmp_path / "tier-global.json"
+    global_path.write_text(json.dumps({"pipeline": {"tiers": {"small": "tier-config-model"}}}), encoding="utf-8")
+    loader = ConfigLoader(working_dir=tmp_path, global_config=global_path, product_config_dir=tmp_path / "no-product")
+    tiers = loader.pipeline_tiers()
+    assert isinstance(tiers, dict)
+    return tiers
+
+
+async def _drive_one_tier_job(
+    tmp_path: Path,
+    server: FakeOpenAIServer,
+    tiers: Mapping[str, str] | None,
+    node_model: str,
+) -> tuple[str, JsonValue | None, JsonObject | None]:
+    """The T-C1-090 assembly face: the tier table read from a config layer
+    passes into MaasLlmCall exactly the way the production wiring does."""
+    db_path = tmp_path / "main.db"
+    assert _upgrade_head(db_path).returncode == 0
+    provider = MaasAdapter(f"{server.base_url}/v1", _API_KEY)
+    engine = PipelineEngine(
+        checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
+        llm_call=MaasLlmCall(
+            provider=provider,
+            default_model=ModelRef(provider="maas", model=_MODEL_ID),
+            tiers=tiers,
+        ),
+        tool=run_command_tool_body,
+    )
+    await engine.register(_tiered_pipeline_spec(node_model))
+    async with App(
+        db_path,
+        working_dir=str(tmp_path),
+        provider=provider,
+        settings=_settings(),
+        pipeline_engine=engine,
+    ) as app:
+        handle = await app.jobs.submit("digest", {"topic": "the release notes"}, "api")
+        await app.jobs.run(handle.job_id)
+        record = await app.jobs.get_job(handle.job_id)
+        return record.status, record.result, record.error
+
+
+async def test_a_config_loaded_tier_table_resolves_the_wire_model_id(tmp_path: Path) -> None:
+    server = FakeOpenAIServer(responses=[_ok_response("summary")])
+    await server.start()
+    try:
+        tiers = _config_loaded_tiers(tmp_path)
+        assert tiers == {"small": "tier-config-model"}
+        status, _, error = await _drive_one_tier_job(tmp_path, server, tiers, "small")
+    finally:
+        await server.aclose()
+    assert status == "done", f"error: {error}"
+    # The wire face: the tier resolved through the config-supplied table (not
+    # the default model), the provider inherited from the default model's.
+    assert len(server.requests) == 1
+    body = server.requests[0].body
+    assert isinstance(body, dict)
+    assert body["model"] == "tier-config-model"
+
+
+async def test_an_unknown_tier_with_a_config_loaded_table_fails_provider_unavailable(tmp_path: Path) -> None:
+    """With a table present the fail-closed face stays: a tier the table does
+    not define is a structured ProviderUnavailable node failure (raised before
+    any provider call), the §8 face the engine surfaces."""
+    server = FakeOpenAIServer(responses=[])
+    await server.start()
+    try:
+        tiers = _config_loaded_tiers(tmp_path)
+        status, result, error = await _drive_one_tier_job(tmp_path, server, tiers, "huge")
+    finally:
+        await server.aclose()
+    assert status == "failed"
+    assert result is None
+    assert error is not None
+    assert error["code"] == "ProviderUnavailable"
+    details = error["details"]
+    assert isinstance(details, dict)
+    assert details["node_id"] == "summarize"
+    assert details["node_type"] == "llm_call"
+    assert not server.requests  # the refusal happened before any provider call

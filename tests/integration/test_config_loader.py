@@ -683,3 +683,77 @@ def test_project_layers_still_reject_host_only_keys_with_the_product_tier_presen
         _write_json(tmp_path / "opencode.json", {key: value})
         with pytest.raises(ConfigError, match="host-tier"):
             ConfigLoader(product_config_dir=product_dir).load()
+
+
+# ---------------------------------------------------------------------------
+# P5-S6 (T-C1-090): the pipeline.tiers config key — nested guard, shape
+# validation, recursive merge, the None fold. Every loader here is hermetic:
+# an explicit tmp global path + a tmp product directory (the real
+# ~/.config/opencode is never read).
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_unknown_subkey_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The nested guard (the ``_PERMISSION_KEYS`` precedent): only ``tiers``
+    is a known ``pipeline`` sub-key; anything else is an unknown-field error
+    naming the exact path."""
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "g.json", {"model": "m"})
+    _write_json(tmp_path / "opencode.json", {"pipeline": {"oops": 1}})
+    with pytest.raises(ConfigError, match=r"unknown config field 'pipeline\.oops'"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+def test_pipeline_tiers_shape_violations_name_the_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P5-S6 value validation: ``pipeline`` must be an object and
+    ``pipeline.tiers`` an object (an empty one is the legal undeclared form);
+    every tier name and every model id a non-empty string — each rejection
+    names the path (``pipeline.tiers.<name>``)."""
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "g.json", {"model": "m"})
+    for bad, message in (
+        ({"pipeline": []}, "'pipeline' in .* must be an object"),
+        ({"pipeline": {"tiers": ["small"]}}, "'pipeline.tiers' in .* must be an object"),
+        ({"pipeline": {"tiers": {"": "m"}}}, "'pipeline.tiers' keys in .* must be non-empty tier names"),
+        ({"pipeline": {"tiers": {"small": ""}}}, "'pipeline.tiers.small' in .* must be a non-empty model id string"),
+        ({"pipeline": {"tiers": {"small": 7}}}, "'pipeline.tiers.small' in .* must be a non-empty model id string"),
+    ):
+        _write_json(tmp_path / "opencode.json", bad)
+        with pytest.raises(ConfigError, match=message):
+            ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+def test_pipeline_tiers_merge_recursively_across_layers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero new merge code: ``pipeline`` is a map, so the plain recursion
+    applies — a global-layer tier and a project-layer tier both survive, and a
+    tier named in both resolves to the later (project) layer's model id. The
+    key is legal in a project layer (model selection is not a trust
+    extension), and the resolved snapshot face gains nothing from it."""
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "g.json", {"pipeline": {"tiers": {"small": "m1"}}})
+    loader = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product")
+    assert loader.pipeline_tiers() == {"small": "m1"}
+    _write_json(tmp_path / "opencode.json", {"pipeline": {"tiers": {"big": "m2", "small": "override"}}})
+    loader = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product")
+    assert loader.pipeline_tiers() == {"small": "override", "big": "m2"}
+    # resolve_runtime tolerates the new key and the snapshot face gains nothing
+    # (the tier table is host-only assembly data, never snapshot data).
+    runtime = loader.resolve_runtime(cli=CliOverrides(model="m", context_limit=100000), endpoint_url="https://e.test")
+    assert "pipeline" not in ConfigSnapshotV2.model_fields
+    assert "pipeline" not in runtime.snapshot.model_dump()
+
+
+def test_pipeline_tiers_folds_undeclared_forms_to_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The None fold: no ``pipeline`` key, an empty ``pipeline`` object, an
+    empty ``tiers`` object, and ``tiers: null`` all read as the undeclared
+    form (``None``) — never an empty dict, which would take MaasLlmCall's
+    table path and fail every tier with ProviderUnavailable."""
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "g.json", {"model": "m"})
+    loader = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product")
+    assert loader.pipeline_tiers() is None  # no pipeline key anywhere
+    undeclared: tuple[JsonObject, ...] = ({"pipeline": {}}, {"pipeline": {"tiers": {}}}, {"pipeline": {"tiers": None}})
+    for values in undeclared:
+        _write_json(tmp_path / "opencode.json", values)
+        loader = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product")
+        assert loader.pipeline_tiers() is None

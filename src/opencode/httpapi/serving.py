@@ -249,17 +249,22 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # P4-S1 (T-C1-082): the production pipeline engine, composed here
     # isomorphically to the CLI's assembly (deliberately not a shared
     # factory -- this host chain stays a frozen face): the real llm_call
-    # body over this process's own provider (tier fallback = the resolved
-    # runtime's model, the --model/config source), the real run_command-
-    # backed tool body (P5-S5, T-C1-089: the command arm is real, a
-    # tool_ref node refuses honestly until the registry slice), and the
-    # advisory-cursor store at its own sqlite file derived from the DB
-    # path (M-7: never a table in the main DB). Host-only discipline:
-    # base_url/api_key/model stay in this composition -- never the
-    # snapshot, events or graph state.
+    # body over this process's own provider (P5-S6, T-C1-090: the tier
+    # table comes from the config's ``pipeline.tiers`` -- absent/empty
+    # means tier fallback = the resolved runtime's model, the
+    # --model/config source), the real run_command-backed tool body
+    # (P5-S5, T-C1-089: the command arm is real, a tool_ref node refuses
+    # honestly until the registry slice), and the advisory-cursor store at
+    # its own sqlite file derived from the DB path (M-7: never a table in
+    # the main DB). Host-only discipline: base_url/api_key/model stay in
+    # this composition -- never the snapshot, events or graph state.
     pipeline_engine = PipelineEngine(
         checkpointer=EngineCheckpointer(checkpointer_path_for(resolved_db)),
-        llm_call=MaasLlmCall(provider=provider, default_model=runtime.settings.model),
+        llm_call=MaasLlmCall(
+            provider=provider,
+            default_model=runtime.settings.model,
+            tiers=loader.pipeline_tiers(),
+        ),
         tool=run_command_tool_body,
     )
     # P5-S1 (T-C1-085): the registration glue's input root -- the same

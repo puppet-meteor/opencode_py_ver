@@ -650,18 +650,24 @@ def main(
         else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
             host_mcp_refs = []
         # P4-S1 (T-C1-082): the production pipeline engine. The real llm_call
-        # body runs over this process's own MAAS provider (the tier fallback
-        # model is the HOST runtime's -- the --model source, never the
-        # possibly-recovered session's replayed snapshot), the tool body is
-        # the real run_command-backed command arm (P5-S5, T-C1-089; a
-        # tool_ref node refuses honestly until the registry slice), and
-        # the advisory-cursor store is its own sqlite file derived from the
-        # DB path (M-7: never a table in the main DB). Host-only discipline:
-        # base_url/api_key/model stay in this composition and never enter the
-        # config snapshot, an event payload, or the graph state.
+        # body runs over this process's own MAAS provider (P5-S6, T-C1-090:
+        # the tier table comes from the layered config's ``pipeline.tiers`` --
+        # absent/empty folds to None and every tier falls back to the HOST
+        # runtime's --model source, never the possibly-recovered session's
+        # replayed snapshot), the tool body is the real run_command-backed
+        # command arm (P5-S5, T-C1-089; a tool_ref node refuses honestly
+        # until the registry slice), and the advisory-cursor store is its own
+        # sqlite file derived from the DB path (M-7: never a table in the
+        # main DB). Host-only discipline: base_url/api_key/model stay in this
+        # composition and never enter the config snapshot, an event payload,
+        # or the graph state.
         pipeline_engine = PipelineEngine(
             checkpointer=EngineCheckpointer(checkpointer_path_for(db_path)),
-            llm_call=MaasLlmCall(provider=provider, default_model=host_runtime.settings.model),
+            llm_call=MaasLlmCall(
+                provider=provider,
+                default_model=host_runtime.settings.model,
+                tiers=loader.pipeline_tiers(),
+            ),
             tool=run_command_tool_body,
         )
         # R4-S6 selection (§6.2 L107): --continue/--session resolve BEFORE any

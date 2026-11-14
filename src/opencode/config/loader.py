@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
@@ -111,6 +111,7 @@ _RUN_KEYS: frozenset[str] = frozenset(
         "max_steps",
         "instructions",
         "permission",
+        "pipeline",
     }
 )
 _KNOWN_KEYS: frozenset[str] = _RUN_KEYS | HOST_ONLY_KEYS
@@ -121,6 +122,14 @@ _APPEND_LIST_PATHS: frozenset[tuple[str, ...]] = frozenset({("instructions",), (
 
 #: Known sub-keys of the ``permission`` map (anything else is a config error).
 _PERMISSION_KEYS: frozenset[str] = frozenset({"rules"})
+
+#: Known sub-keys of the ``pipeline`` map (P5-S6, T-C1-090; the nested-guard
+#: precedent is ``_PERMISSION_KEYS`` — anything else is a config error). The
+#: ``pipeline`` key is a namespace reserved for pipeline-facing configuration;
+#: ``tiers`` is the LLM tier table (tier name -> a model id string inside the
+#: provider the host composition already assembled — model selection is not a
+#: trust extension, so the key is legal in every layer, host-only never).
+_PIPELINE_KEYS: frozenset[str] = frozenset({"tiers"})
 
 #: Known sub-keys of the host-tier ``mcp`` block (R4-S3). ``timeout`` (TS
 #: ``TimeoutConfig`` L7-17: startup/catalog/execution) is deliberately NOT
@@ -467,6 +476,24 @@ def _validate_layer_keys(path: Path, values: JsonObject, *, host_tier: bool) -> 
                 raise ConfigError(f"'permission.rules' in {path} must be a list of rule objects")
             for index, rule in enumerate(rules):
                 _validate_permission_rule(path, index, rule)
+    pipeline = values.get("pipeline")
+    if pipeline is not None:
+        if not isinstance(pipeline, dict):
+            raise ConfigError(f"'pipeline' in {path} must be an object")
+        for key in pipeline:
+            if key not in _PIPELINE_KEYS:
+                raise ConfigError(f"unknown config field 'pipeline.{key}' in {path} (CORE-CONTRACTS §6 L285)")
+        tiers = pipeline.get("tiers")
+        if tiers is not None:
+            # The tiers map is the undeclared-when-absent form: an EMPTY object
+            # is legal here (the reader folds it to None); only the shapes fail.
+            if not isinstance(tiers, dict):
+                raise ConfigError(f"'pipeline.tiers' in {path} must be an object")
+            for name, model_id in tiers.items():
+                if not isinstance(name, str) or not name:
+                    raise ConfigError(f"'pipeline.tiers' keys in {path} must be non-empty tier names")
+                if not isinstance(model_id, str) or not model_id:
+                    raise ConfigError(f"'pipeline.tiers.{name}' in {path} must be a non-empty model id string")
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +653,48 @@ class ConfigLoader:
         skills discovery is a non-snapshot config face).
         """
         return self._project_root.joinpath(*_SKILLS_DIR_PARTS)
+
+    # -- §6 L285: pipeline.tiers (P5-S6, T-C1-090) — the LLM tier table --------
+
+    def pipeline_tiers(self) -> Mapping[str, str] | None:
+        """The merged ``pipeline.tiers`` LLM tier table, or ``None`` (P5-S6, T-C1-090).
+
+        Loads + merges + validates the same §6 L283 chain :meth:`load` walks
+        (every layer's ``pipeline`` block was shape-checked by
+        :func:`_validate_layer_keys` on the way in), then hands the host
+        assembly the tier table for ``MaasLlmCall(tiers=...)`` — the two
+        production compositions (cli/serving) call this at engine assembly.
+        The merge needs no code of its own: ``pipeline`` is a map, so the
+        plain map recursion applies — an outer layer may declare tiers an
+        inner layer completes, or overrides tier-for-tier.
+
+        The None fold is pinned: a missing ``pipeline``/``pipeline.tiers`` or
+        an EMPTY tiers object is the undeclared form and folds to ``None``
+        (every tier then falls back to the default model, the ``--model``
+        source) — the reader never returns an empty dict, which would take
+        MaasLlmCall's table path and fail every tier with
+        ProviderUnavailable; "declare nothing" and "reject every tier" are
+        deliberately not the same configuration.
+
+        Host-only discipline: the tier table is assembly data, a model
+        mapping the host owns — it never enters any config snapshot, an
+        event payload, or the graph state (the engine pins tier NAMES in
+        the ``py.job`` spec; the name→model mapping is host behavior).
+        """
+        pipeline = self.load().values.get("pipeline")
+        if not isinstance(pipeline, dict):
+            return None  # absent (or null): the undeclared form
+        tiers = pipeline.get("tiers")
+        if not isinstance(tiers, dict) or not tiers:
+            return None  # absent, null, or the empty object: all undeclared
+        # Type-level narrowing only: _validate_layer_keys proved every tier
+        # name and model id a non-empty string at load time; the comprehension
+        # restates that for the checker (JsonValue -> str) and can never drop
+        # a real entry. A fresh dict leaves with the caller (snapshot
+        # semantics: the caller may not mutate the merged layer state).
+        return {
+            name: model_id for name, model_id in tiers.items() if isinstance(name, str) and isinstance(model_id, str)
+        }
 
     # -- §6 L287: runtime resolution -----------------------------------------
 
