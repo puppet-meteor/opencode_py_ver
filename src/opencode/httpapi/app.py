@@ -61,6 +61,17 @@ call inline in the request whenever the threshold holds):
   status-only, ``discarded`` adds the spent usage; empty body only — the TS
   ``{id, delivery?}`` inbox-steering payload is not ported, DIFFERENT-BY-DESIGN)
 
+T-C1-101 (P7-S2) adds the background conversion route — the TS
+``session.background`` group face (protocol groups/session.ts L695):
+
+* ``POST /session/{session_id}/background``               -> 204 No Content
+  (move the session's live foreground subagent wait to the background: the
+  wait's next poll consumes the request, commits the durable marker and
+  returns the background result, and the observer owns the completion
+  delivery. Idle requests are a no-op, the TS contract verbatim — nothing
+  is registered to convert, still 204; a missing or deleted session
+  answers 404. No request body.)
+
 
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
@@ -1233,6 +1244,24 @@ def create_app(app: App, *, token: str) -> FastAPI:
             resume = raw_resume == "true"
         receipt = await service.interrupt(session_id, resume=resume)
         return _json_response(_interrupt_wire(receipt))
+
+    # -- T-C1-101 (P7-S2): the background conversion route ---------------------
+
+    @api.post("/session/{session_id}/background")
+    async def session_background(session_id: str) -> Response:
+        """§3-5 background: move the session's foreground subagent wait back.
+
+        The TS ``session.background`` face (``jobs.backgroundAll``): the
+        live foreground wait's next poll cycle consumes the armed request,
+        commits the durable per-generation marker, hands the child to the
+        observer and returns the background result to the run. An idle
+        session -- no live wait -- is the honest no-op (the TS "Idle
+        requests are a no-op" contract, structurally: nothing is
+        registered to convert); both arms answer 204 No Content, a missing
+        or deleted session answers 404. No request body.
+        """
+        await service.request_session_background(session_id)
+        return Response(status_code=204)
 
     api.add_exception_handler(_TransportError, _transport_error_handler)
     api.add_exception_handler(StoreError, _store_error_handler)

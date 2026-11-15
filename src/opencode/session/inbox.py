@@ -37,6 +37,7 @@ from opencode.contracts import (
     EVENT_VERSION,
     PY_PROMPT_ACCEPTED,
     EventDraft,
+    JsonObject,
     PromptAcceptedData,
     UserMessage,
 )
@@ -179,6 +180,61 @@ class SessionInbox:
             kind=kind,
             delivery=delivery,
             request_id=request_id if kind == "user" else None,
+        )
+
+    async def admit_synthetic(
+        self,
+        session_id: str,
+        *,
+        inbox_id: str,
+        text: str,
+        message_metadata: JsonObject,
+        delivery: Literal["steer", "queue"],
+    ) -> InboxRef:
+        """Park one service-authored completion notification (T-C1-101, the S2 face).
+
+        The subagent background observer's delivery entry point: the inbox_id
+        is the CALLER's notification id (``subagent:{run_id}``, the TS
+        ``sessions.synthetic({id: notificationID})`` mapping -- deterministic
+        per generation, so the fold's admission pop consumes the outstanding
+        observation by the same key) and the wrapped delivery text parks
+        verbatim. ``message_metadata`` rides the parked ``UserMessage`` as
+        its metadata carrier (the TS ``{source, childID, agent, state}`` set)
+        -- the fold and read model keep it whole, so the consuming run sees
+        provenance without a disk re-read. No request id (the synthetic
+        seam); the admission folds as ``kind="synthetic"``.
+        """
+        created_at = self._clock()
+        message = UserMessage(
+            id=self._ids.message_id(),
+            type="user",
+            created_at=created_at,
+            metadata=message_metadata,
+            text=text,
+        )
+        data = InboxEnqueuedData(
+            inbox_id=inbox_id,
+            kind="synthetic",
+            delivery=delivery,
+            request_id=None,
+            message=message,
+        )
+        draft = EventDraft[InboxEnqueuedData](
+            id=self._ids.event_id(),
+            type=PY_INBOX_ENQUEUED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=created_at,
+            data=data,
+            metadata={},
+        )
+        await self._commit(session_id, EventBatch(self._ids.batch_id(), (draft,), None))
+        return InboxRef(
+            session_id=session_id,
+            inbox_id=inbox_id,
+            kind="synthetic",
+            delivery=delivery,
+            request_id=None,
         )
 
     async def admit_and_start(

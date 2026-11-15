@@ -91,13 +91,15 @@ from opencode.contracts.events import (
     PY_PERMISSION_REVOKED,
     PY_RUN_CANCEL_REQUESTED,
     PY_SKILL_ACTIVATED,
+    PY_SUBAGENT_BACKGROUNDED,
     ConfigSnapshotV3,
     PermissionRevokedData,
     RunCancelRequestedData,
     SessionCreatedDataV3,
     SkillActivatedData,
+    SubagentBackgroundedData,
 )
-from opencode.contracts.messages import AssistantMessage, IdleMessage, SessionMessage
+from opencode.contracts.messages import AssistantMessage, AssistantTextPart, IdleMessage, SessionMessage
 from opencode.session.compaction import (
     CompactionEngine,
     CompactionOutcome,
@@ -190,6 +192,37 @@ _CLOSE_GRACE_S = 1.0
 #: scheduled runner commits concurrently through its own EventCommitter locks,
 #: so a stale expected_seq is possible and is retried with the same batch).
 _COMMIT_ATTEMPTS = 3
+
+#: T-C1-101 (P7-S2): the background observer's poll cadence over the durable
+#: ``run_status`` face (the same throttle as the tool's foreground poll -- a
+#: scripted settle answers within one tick in tests, and a real child holds a
+#: provider stream so 20 durable reads/second is noise).
+SUBAGENT_OBSERVER_POLL_S = 0.05
+
+#: T-C1-101 (P7-S2): the delivery re-entry bound. A settle can land inside a
+#: live parent run's commit burst (the parked-item wake run, a successor
+#: prompt), and the runner's EventCommitter shares no lock with the service's
+#: session lock -- the inbox commit's tight same-batch CAS bound exhausts
+#: there (each attempt's await gap hands the runner one more batch), so a
+#: ConflictError re-enters the whole delivery after one poll tick: the burst
+#: drains, the parent's log settles, the next attempt commits clean. The
+#: bound's last ConflictError records like any storage error -- the marker
+#: stays outstanding and a restart's re-arm retries.
+_SUBAGENT_DELIVERY_ATTEMPTS = 3
+
+#: T-C1-101 (P7-S2): the TS subagent-completion.ts delivery texts, verbatim.
+#: The no-text sentence is canonical HERE (the delivery face lives on this
+#: service); the tool module's S5 ``NO_TEXT_RESPONSE`` name aliases this
+#: constant so both faces can never drift.
+SUBAGENT_NO_TEXT_RESPONSE = "Subagent completed without a text response."
+SUBAGENT_ERROR_RESPONSE = "Subagent failed"
+SUBAGENT_CANCELLED_RESPONSE = "Subagent cancelled"
+
+#: T-C1-101 (P7-S2): the notification-id form -- ``subagent:{run_id}`` over
+#: the CHILD's run id. Unique per generation (one accepted child prompt = one
+#: child run), deterministic and restart-stable (the re-arm scan and the
+#: admission's completeBackground-pop key on the same text).
+SUBAGENT_NOTIFICATION_PREFIX = "subagent:"
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MILLISECOND = timedelta(milliseconds=1)
@@ -773,6 +806,28 @@ class SessionService:
         # commit lock (the ordering contract), so no separate lock state
         # lives here.
         self._inbox = SessionInbox(store=store, repos=repos, bus=bus, ids=self._ids, clock=self._clock)
+        # T-C1-101 (P7-S2): the background subagent observation faces.
+        # ``_subagent_observers``: notification_id -> (parent session id,
+        # task) -- the process-local arm of the durable markers (strong
+        # references, the _tasks precedent; the observer life outlives the
+        # tool call that armed it, the TS global-scope fork). ``_subagent_
+        # foreground_waits``: parent session id -> the child run id whose
+        # foreground wait is live -- the session.background endpoint's
+        # conversion target set (an idle session holds no entry, so an idle
+        # request is structurally a no-op, the TS blockingSessions filter).
+        # ``_subagent_background_requests``: the armed conversion requests
+        # (consumed by the foreground wait's poll). ``_subagent_delivery_
+        # failures``: the last delivery error per notification id --
+        # recorded, inspectable, never silently dropped (the
+        # _compaction_errors precedent); the marker stays outstanding, so a
+        # restart's re-arm retries.
+        self._subagent_observers: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        self._subagent_foreground_waits: dict[str, str] = {}
+        self._subagent_background_requests: set[str] = set()
+        self._subagent_delivery_failures: dict[str, BaseException] = {}
+        # Lazily-built event-log reader for the re-arm scan's full fold (the
+        # _compaction_log precedent).
+        self._subagent_log: EventLog | None = None
 
     @property
     def closed(self) -> bool:
@@ -1348,6 +1403,418 @@ class SessionService:
                 raise SessionClosedError("service is closed")
             await self._read_live_record(session_id)
             return await self._inbox.update_delivery(session_id, inbox_id, delivery)
+
+    # -- §3 T-C1-101: subagent background observation (P7-S2) ------------------
+
+    async def subagent_final_text(self, session_id: str) -> str:
+        """The session's final assistant text (TS subagent-completion.ts ``text``).
+
+        The last ``AssistantMessage`` of the session, its text parts joined;
+        a child that settled without any assistant text answers the TS
+        no-text sentence verbatim. Cursor-paged to the true tail so a long
+        child history is not truncated by the first page. ONE extraction
+        shared by the tool's foreground face (the S5 behavior, byte-identical
+        since T-C1-098) and the background delivery (T-C1-101 §3-2), so the
+        same child run always yields the same text either way.
+        """
+        after: str | None = None
+        last: AssistantMessage | None = None
+        while True:
+            page = await self.messages(session_id, after_message_id=after)
+            for message in page.items:
+                if isinstance(message, AssistantMessage):
+                    last = message
+            if not page.has_more:
+                break
+            after = page.next_after_message_id
+        if last is None:
+            return SUBAGENT_NO_TEXT_RESPONSE
+        texts = [part.text for part in last.parts if isinstance(part, AssistantTextPart)]
+        if not texts:
+            return SUBAGENT_NO_TEXT_RESPONSE
+        return "\n".join(texts)
+
+    async def commit_subagent_background(
+        self,
+        parent_session_id: str,
+        *,
+        child_session_id: str,
+        run_id: str,
+        agent: str,
+        description: str,
+    ) -> str:
+        """Hand one child generation to the background observer (§3-1/§3-3).
+
+        The durable per-generation marker (``py.subagent.backgrounded``)
+        commits to the PARENT's log under the parent's session lock, then
+        the process-local observer arms over it -- the TS
+        ``SubagentJob.background`` (jobs.background + notify) with the
+        in-memory Set replaced by the durable row keyed by the deterministic
+        notification id. Returns the notification id (the admission's
+        completeBackground key). Fail-closed double face: the ids must
+        match their ^ses_/^run_ patterns and the parent must be live
+        (missing or tombstoned -> the same NotFound); a duplicate marker
+        (the same run observed twice) folds illegal and the commit fails
+        closed, never a silent overwrite.
+        """
+        _require_session_id_arg(parent_session_id)
+        _require_run_id_arg(run_id)
+        if not isinstance(child_session_id, str) or not child_session_id.startswith(_SES_PREFIX):
+            raise StoreValidationError("child_session_id must be a session id matching ^ses_")
+        if not isinstance(agent, str) or not agent:
+            raise StoreValidationError("agent must be a non-empty string")
+        if not isinstance(description, str):
+            raise StoreValidationError("description must be a string")
+        notification_id = f"{SUBAGENT_NOTIFICATION_PREFIX}{run_id}"
+        async with self._session_lock(parent_session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._read_live_record(parent_session_id)
+            await self._commit_subagent_background(
+                parent_session_id,
+                child_session_id=child_session_id,
+                run_id=run_id,
+                agent=agent,
+                description=description,
+                notification_id=notification_id,
+            )
+        self._arm_subagent_observer(
+            parent_session_id,
+            child_session_id=child_session_id,
+            run_id=run_id,
+            agent=agent,
+            description=description,
+            notification_id=notification_id,
+        )
+        return notification_id
+
+    async def _commit_subagent_background(
+        self,
+        parent_session_id: str,
+        *,
+        child_session_id: str,
+        run_id: str,
+        agent: str,
+        description: str,
+        notification_id: str,
+    ) -> None:
+        """Commit one ``py.subagent.backgrounded`` under the session lock.
+
+        Bounded ConflictError retries with the same batch (the scheduled
+        runner commits concurrently, so a stale expected_seq is retried);
+        no dedupe key -- the duplicate-generation fence is the fold's
+        duplicate-notification_id rejection.
+        """
+        draft = EventDraft[SubagentBackgroundedData](
+            id=self._ids.event_id(),
+            type=PY_SUBAGENT_BACKGROUNDED,
+            version=EVENT_VERSION,
+            session_id=parent_session_id,
+            created_at=self._clock(),
+            data=SubagentBackgroundedData(
+                child_session_id=child_session_id,
+                run_id=run_id,
+                agent=agent,
+                description=description,
+                notification_id=notification_id,
+            ),
+            metadata={},
+        )
+        batch = EventBatch(self._ids.batch_id(), (draft,))
+        conflict: ConflictError | None = None
+        for _ in range(_COMMIT_ATTEMPTS):
+            expected_seq = await self._repos.log_high(parent_session_id)
+            try:
+                committed = await self._store.commit(parent_session_id, batch, expected_seq)
+            except ConflictError as error:
+                conflict = error
+                continue
+            self._bus.notify(parent_session_id, committed)
+            return
+        assert conflict is not None
+        raise conflict
+
+    def _arm_subagent_observer(
+        self,
+        parent_session_id: str,
+        *,
+        child_session_id: str,
+        run_id: str,
+        agent: str,
+        description: str,
+        notification_id: str,
+    ) -> None:
+        """Arm the process-local observer for one outstanding generation.
+
+        Idempotent by notification id (a re-arm over an already-armed
+        generation is a no-op) and never armed on a closing service -- the
+        durable marker survives, so the next boot's re-arm picks the
+        generation up (the TS durable-notification-marker recovery shape).
+        """
+        if notification_id in self._subagent_observers:
+            return
+        if self._closed or self._closing:
+            return
+        task = asyncio.create_task(
+            self._observe_subagent(
+                parent_session_id,
+                child_session_id=child_session_id,
+                run_id=run_id,
+                agent=agent,
+                description=description,
+                notification_id=notification_id,
+            ),
+            name=f"opencode-subagent-observer-{notification_id}",
+        )
+        self._subagent_observers[notification_id] = (parent_session_id, task)
+
+    async def _observe_subagent(
+        self,
+        parent_session_id: str,
+        *,
+        child_session_id: str,
+        run_id: str,
+        agent: str,
+        description: str,
+        notification_id: str,
+    ) -> None:
+        """One observer task: poll the durable child run, deliver once.
+
+        The TS notify fork (jobs.wait -> deliver, global scope so the
+        observer outlives the tool call): the durable run_status face is
+        the only truth (never an in-memory task handle). The running arm
+        of TS ``deliver`` (status running -> no delivery) is structural
+        here -- the loop only breaks on a terminal status, so a delivery
+        never precedes the settle.
+
+        The delivery RE-ENTERS on ConflictError rather than leaning on
+        the inbox commit's tight same-batch bound: a settle landing
+        inside a live parent run's commit burst (the parked-item wake
+        run, a successor prompt) exhausts that bound -- the runner's
+        EventCommitter shares no lock with the service's session lock,
+        and each tight attempt's await gap hands the runner one more
+        batch -- so a drained burst, not a fresher CAS, is what makes
+        the retry commit clean. One poll tick between attempts; re-entry
+        is safe (the pending-row gate folds an already-admitted
+        generation, a rejected batch leaves nothing partial behind);
+        the bound's last ConflictError re-raises.
+
+        A storage/read error is recorded per notification id and the
+        marker stays outstanding (the _compaction_errors face; a
+        restart's re-arm retries); the CancelledError of a close-time
+        cancel propagates clean.
+        """
+        try:
+            while True:
+                status = await self.run_status(run_id)
+                if status.status.is_terminal:
+                    break
+                await asyncio.sleep(SUBAGENT_OBSERVER_POLL_S)
+            # The honest PY terminal -> TS state mapping (recorded): a
+            # succeeded child is "completed", a failed child is "error",
+            # and every other terminal (interrupted -- the cooperative
+            # cancel and the R4 recovery fold both land here) is
+            # "cancelled", the TS third state.
+            if status.status is RunStatusValue.SUCCEEDED:
+                state = "completed"
+                error_text: str | None = None
+            elif status.status is RunStatusValue.FAILED:
+                state = "error"
+                error_text = status.error
+            else:
+                state = "cancelled"
+                error_text = None
+            for attempt in range(_SUBAGENT_DELIVERY_ATTEMPTS):
+                try:
+                    await self._deliver_subagent_completion(
+                        parent_session_id,
+                        child_session_id=child_session_id,
+                        agent=agent,
+                        description=description,
+                        notification_id=notification_id,
+                        state=state,
+                        error_text=error_text,
+                    )
+                    break
+                except ConflictError:
+                    if attempt == _SUBAGENT_DELIVERY_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(SUBAGENT_OBSERVER_POLL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._subagent_delivery_failures[notification_id] = error
+        finally:
+            self._subagent_observers.pop(notification_id, None)
+
+    async def _deliver_subagent_completion(
+        self,
+        parent_session_id: str,
+        *,
+        child_session_id: str,
+        agent: str,
+        description: str,
+        notification_id: str,
+        state: str,
+        error_text: str | None,
+    ) -> None:
+        """TS ``SubagentCompletion.deliver``: three-state text + XML + admission.
+
+        The text mapping is TS verbatim: completed -> the shared final-text
+        extraction (the no-text case folds into the TS sentence), error ->
+        ``error ?? "Subagent failed"``, else -> ``"Subagent cancelled"``;
+        the wrapper and the metadata carrier are interpolated raw exactly
+        as TS writes them. The admission is the S1 inbox synthetic seam --
+        steer into the active run, or queue + immediate promote when the
+        parent is idle (PY has no TS ``resume:false`` suspension face, so
+        the honest idle mapping wakes the parent; disclosed) -- and the
+        ``completeBackground`` acknowledgment is the admission fold's
+        observation pop, keyed by the same notification id.
+        """
+        if state == "completed":
+            text = await self.subagent_final_text(child_session_id)
+        elif state == "error":
+            text = error_text if error_text is not None else SUBAGENT_ERROR_RESPONSE
+        else:
+            text = SUBAGENT_CANCELLED_RESPONSE
+        wrapped = (
+            f'<subagent sessionID="{child_session_id}" state="{state}" description="{description}">\n'
+            f"{text}\n"
+            "</subagent>"
+        )
+        message_metadata: JsonObject = {
+            "source": "subagent",
+            "childID": child_session_id,
+            "agent": agent,
+            "state": state,
+        }
+        async with self._session_lock(parent_session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            record = await self._read_live_record(parent_session_id)
+            # The completeBackground idempotency: a still-pending synthetic
+            # row under the same notification id means this generation
+            # already delivered (an armed duplicate or a re-arm race); the
+            # admission fold's pop owns the real consumption.
+            if await self._repos.inbox_item(parent_session_id, notification_id) is not None:
+                return
+            delivery: Literal["steer", "queue"] = "steer" if record.active_run_id is not None else "queue"
+            await self._inbox.admit_synthetic(
+                parent_session_id,
+                inbox_id=notification_id,
+                text=wrapped,
+                message_metadata=message_metadata,
+                delivery=delivery,
+            )
+            if delivery == "queue":
+                await self._promote_next(parent_session_id, "input")
+
+    def subagent_foreground_wait_begin(self, session_id: str, child_run_id: str) -> None:
+        """Record one live foreground wait (the endpoint's conversion target).
+
+        The ToolRegistry serializes invocations per session (the T-C1-098
+        mechanism correction), so one parent holds at most one live
+        subagent foreground wait; the tool calls begin/end around its poll
+        loop (end runs in the finally arm, so a cancel stays balanced).
+        """
+        self._subagent_foreground_waits[session_id] = child_run_id
+
+    def subagent_foreground_wait_end(self, session_id: str) -> None:
+        """Drop the foreground-wait record (balanced with begin by the tool)."""
+        self._subagent_foreground_waits.pop(session_id, None)
+
+    async def request_session_background(self, session_id: str) -> bool:
+        """§3-5 ``session.background``: move the session's foreground wait back.
+
+        The TS ``backgroundAll`` face: arm the conversion request for THIS
+        session's live foreground subagent wait, which the wait's own poll
+        consumes (it commits the marker, returns the background result and
+        hands the child to the observer). An idle session -- no live wait
+        -- commits nothing and answers ``False``: the TS "Idle requests are
+        a no-op" contract, structurally (nothing is registered to arm).
+        Returns whether a wait was found; both arms are NoContent at the
+        route. A missing or deleted session answers NotFound (the TS
+        SessionNotFound error).
+        """
+        _require_session_id_arg(session_id)
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        await self._read_live_record(session_id)
+        if session_id not in self._subagent_foreground_waits:
+            return False
+        self._subagent_background_requests.add(session_id)
+        return True
+
+    def consume_subagent_background_request(self, session_id: str) -> bool:
+        """The foreground wait's endpoint-conversion check: consume or miss.
+
+        Poll-based by design (the recorded seat form): the TS
+        ``block``/``backgrounded`` deferred pair over the in-memory job
+        registry maps to the wait's existing poll cycle -- one set
+        membership probe per tick, no event subscription face added.
+        """
+        if session_id in self._subagent_background_requests:
+            self._subagent_background_requests.discard(session_id)
+            return True
+        return False
+
+    async def recover_subagent_observations(self) -> list[str]:
+        """§3-3 restart recovery: re-arm observers for outstanding markers.
+
+        The post-recovery-scan follow-up (the _wake_pending_inbox_after_scan
+        shape): every session that ever committed a ``py.subagent.backgrounded``
+        marker gets its full log folded -- the fold pops every marker whose
+        delivery already admitted, so exactly the still-outstanding
+        generations re-arm. A parent deleted before its delivery keeps its
+        marker (idempotent) and is skipped, never an error; a storage error
+        on one parent skips that parent without blocking the others (the
+        wake_pending_inbox discipline). In-flight children the R4 scan
+        folded to interrupted deliver through the re-armed observer's own
+        terminal poll (§4-6), so no special recovery delivery path exists.
+        """
+        if self._closed or self._closing:
+            return []
+        armed: list[str] = []
+        for session_id in await self._repos.subagent_backgrounded_session_ids():
+            try:
+                state = await self._fold_session_state(session_id)
+            except StoreError:
+                continue
+            for observation in state.subagent_observations.values():
+                self._arm_subagent_observer(
+                    session_id,
+                    child_session_id=observation.child_session_id,
+                    run_id=observation.run_id,
+                    agent=observation.agent,
+                    description=observation.description,
+                    notification_id=observation.notification_id,
+                )
+                armed.append(observation.notification_id)
+        return armed
+
+    def _subagent_event_log(self) -> EventLog:
+        """Lazily-built event-log reader over the wired engine (the compaction
+        precedent: the same wiring discriminant -- a service constructed
+        without the storage engine cannot fold the committed log, so the read
+        face fails closed with StoreValidationError instead of half-answering)."""
+        if self._subagent_log is None:
+            if self._engine is None:
+                raise StoreValidationError("subagent recovery requires the storage engine (engine=)")
+            self._subagent_log = EventLog(self._engine, repos=self._repos)
+        return self._subagent_log
+
+    async def _fold_session_state(self, session_id: str) -> SessionState:
+        """Fold one session's full committed log (the recovery.py ``_fold`` shape)."""
+        log = self._subagent_event_log()
+        state = SessionState()
+        after: EventCursor | None = None
+        while True:
+            page = await log.read(session_id, after, MAX_READ_LIMIT)
+            for event in page.items:
+                state = apply_event(state, event)
+            if not page.has_more:
+                return state
+            after = page.next_cursor
 
     async def interrupt(self, session_id: str, *, resume: bool = False) -> InterruptReceipt:
         """§3-5 interrupt: stop the active run (the cancel machinery), optionally resume.
@@ -2387,6 +2854,22 @@ class SessionService:
                 for task in pending2:
                     run_id, session_id = by_task[task]
                     await self._mark_cleanup_failed(session_id, run_id, REASON_CLOSE_TIMEOUT)
+        # Phase 2.5 (T-C1-101): the background subagent observers are
+        # process-local arms of durable markers. Every scheduled run has
+        # settled, so nothing new can deliver: cancel the observers and let
+        # a mid-flight (bounded) admission commit finish first -- the
+        # marker of an undelivered generation stays outstanding and the
+        # next boot's re-arm re-observes it (the TS durable notification
+        # marker surviving the process). The conversion bookkeeping dies
+        # with the process faces (no wait can still be live).
+        observers = [entry[1] for entry in self._subagent_observers.values()]
+        self._subagent_observers.clear()
+        for task in observers:
+            task.cancel()
+        if observers:
+            await asyncio.gather(*observers, return_exceptions=True)
+        self._subagent_background_requests.clear()
+        self._subagent_foreground_waits.clear()
         # Phase 3: every own task has exited or is durably marked -- close in
         # the §7 L339 order: MCP first, then the provider, then the service
         # gate. The DB/engine stays with the App.

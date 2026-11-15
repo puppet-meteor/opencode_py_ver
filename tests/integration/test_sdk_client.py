@@ -934,6 +934,7 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         "/session/{session_id}/inbox",
         "/session/{session_id}/inbox/{inbox_id}",
         "/session/{session_id}/interrupt",
+        "/session/{session_id}/background",
         "/session/import",
         "/run/{run_id}/cancel",
         "/run/{run_id}/status",
@@ -952,7 +953,7 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         for method in item
         if method in ("get", "post", "delete", "patch")
     }
-    assert len(operations) == 25
+    assert len(operations) == 26
     for path, method in (
         ("/session", "post"),
         ("/session", "get"),
@@ -969,6 +970,7 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         ("/session/{session_id}/inbox/{inbox_id}", "delete"),
         ("/session/{session_id}/inbox/{inbox_id}", "patch"),
         ("/session/{session_id}/interrupt", "post"),
+        ("/session/{session_id}/background", "post"),
         ("/session/import", "post"),
         ("/run/{run_id}/cancel", "post"),
         ("/run/{run_id}/status", "get"),

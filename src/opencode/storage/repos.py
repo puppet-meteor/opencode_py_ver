@@ -190,6 +190,19 @@ _SELECT_INBOX_ITEM = sa.text(
     "FROM inbox WHERE session_id = :sid AND inbox_id = :iid"
 )
 _SELECT_PENDING_INBOX_SESSIONS = sa.text("SELECT session_id FROM inbox GROUP BY session_id ORDER BY session_id")
+# -- T-C1-101 (P7-S2): the subagent background re-arm scan statement. The
+# startup re-arm enumerates every session that ever committed a
+# ``py.subagent.backgrounded`` marker (the parent's log); the fold of that
+# parent's full log then decides which observations are still outstanding
+# (a delivered generation's marker was popped at the synthetic admission),
+# so this face is the candidate set, the same one-shot GROUP BY shape as
+# the pending-inbox wake scan above. The literal type string restates the
+# contracts registry the same way the pinned statements above do (repos
+# must not import the session layer; the events table's type column is the
+# scan's own vocabulary).
+_SELECT_SUBAGENT_BACKGROUNDED_SESSIONS = sa.text(
+    "SELECT session_id FROM events WHERE type = 'py.subagent.backgrounded' GROUP BY session_id ORDER BY session_id"
+)
 # -- T-C1-040 (R4-S6): the CLI session-selection statements. The sessions
 # table carries no working_dir column (0001_initial), so both selection
 # queries scan the events log by type; ``created`` is the INTEGER epoch-ms
@@ -845,6 +858,20 @@ class ReadRepositories:
         """
         async with self._engine.connect() as connection:
             rows = (await connection.execute(_SELECT_PENDING_INBOX_SESSIONS)).fetchall()
+        return [str(row.session_id) for row in rows]
+
+    async def subagent_backgrounded_session_ids(self) -> list[str]:
+        """Every session that ever committed a subagent background marker (T-C1-101).
+
+        The startup re-arm enumeration: each listed parent gets its fold
+        re-computed (the full-log replay pops every consumed marker at its
+        synthetic admission), and one observer re-arms per still-outstanding
+        observation -- the same zero-recovery-writes shape as the
+        pending-inbox wake scan. A parent whose every marker was consumed
+        simply re-derives an empty observation set and arms nothing.
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_SUBAGENT_BACKGROUNDED_SESSIONS)).fetchall()
         return [str(row.session_id) for row in rows]
 
     def _decode_inbox_row(self, session_id: str, row: Any) -> InboxItemRow:

@@ -99,6 +99,7 @@ from opencode.contracts.events import (
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
     PY_STEP_STARTED,
+    PY_SUBAGENT_BACKGROUNDED,
     PY_TEXT_FINALIZED,
     PY_TOOL_FINISHED,
     PY_TOOL_REQUESTED,
@@ -124,6 +125,7 @@ from opencode.contracts.events import (
     StepFinishedData,
     StepGeneratedData,
     StepStartedData,
+    SubagentBackgroundedData,
     TextFinalizedData,
     ToolFinishedData,
     ToolRequestedData,
@@ -408,6 +410,32 @@ class InboxInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class SubagentObservation:
+    """T-C1-101 (P7-S2): one outstanding background subagent generation (fold face).
+
+    The durable form of TS ``SubagentJob``'s per-generation in-memory Set: a
+    ``py.subagent.backgrounded`` marker parked on the PARENT's fold, keyed
+    by ``notification_id`` (``subagent:{run_id}`` -- unique per generation,
+    restart-stable). The observer (and the startup re-arm scan) read these
+    to know which children still owe a completion delivery; the delivery
+    consumes the entry by admitting the synthetic inbox item under the same
+    ``notification_id`` (the ``py.inbox.enqueued`` fold pops it, mirroring
+    TS ``jobs.completeBackground``), so a completed generation never
+    re-delivers after a restart. ``run_id`` is the CHILD's run id -- the
+    generation identity; the parent's own run ids never appear here.
+    """
+
+    notification_id: str
+    child_session_id: str
+    run_id: str
+    agent: str
+    description: str
+    #: The seq of the ``py.subagent.backgrounded`` event -- the marker's
+    #: log position, kept for diagnostics and the re-arm scan's ordering.
+    backgrounded_seq: int
+
+
+@dataclass(frozen=True, slots=True)
 class SessionState:
     """Fold state of one session: empty until ``py.session.created`` is folded.
 
@@ -460,6 +488,15 @@ class SessionState:
     # the delivery in place (position preserved). The parked payload rides
     # the fold so rebuild re-projects pending rows without a disk re-read.
     inbox: dict[str, InboxInfo] = field(default_factory=dict)
+    # T-C1-101 (P7-S2): the outstanding background subagent observations,
+    # keyed by notification_id (``subagent:{run_id}``). ``py.subagent.
+    # backgrounded`` parks a marker here; the delivery consumes it by
+    # admitting the synthetic inbox item under the same id (the
+    # ``py.inbox.enqueued`` fold pops the entry, TS ``completeBackground``
+    # semantics), so a completed generation never re-delivers. Survives a
+    # restart through the fold -- the re-arm scan re-arms observers for
+    # exactly these rows.
+    subagent_observations: dict[str, SubagentObservation] = field(default_factory=dict)
 
     @property
     def created(self) -> bool:
@@ -536,6 +573,8 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_inbox_delivery_changed(state, event)
     if event.type == PY_INBOX_DELIVERED:
         return _apply_inbox_delivered(state, event)
+    if event.type == PY_SUBAGENT_BACKGROUNDED:
+        return _apply_subagent_backgrounded(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -1382,7 +1421,22 @@ def _apply_inbox_enqueued(state: SessionState, event: DurableEvent[Any]) -> Sess
         message=event.data.message,
         enqueued_seq=event.seq,
     )
-    return replace(state, applied_seq=event.seq, inbox={**state.inbox, item.inbox_id: item})
+    # T-C1-101: a synthetic admission under a notification_id IS the delivery
+    # acknowledgment -- pop the outstanding subagent observation (TS
+    # ``jobs.completeBackground``). Admission, not history-consumption, is
+    # the commit point: the parked inbox item is itself durable, so the S1
+    # seam (steer/idle promotion) can take its time delivering the turn into
+    # history without the observer staying armed. Other kinds never carry a
+    # notification_id, so the pop is a plain key miss for them.
+    subagent_observations = state.subagent_observations
+    if item.inbox_id in subagent_observations:
+        subagent_observations = {key: value for key, value in subagent_observations.items() if key != item.inbox_id}
+    return replace(
+        state,
+        applied_seq=event.seq,
+        inbox={**state.inbox, item.inbox_id: item},
+        subagent_observations=subagent_observations,
+    )
 
 
 def _apply_inbox_cancelled(state: SessionState, event: DurableEvent[Any]) -> SessionState:
@@ -1466,6 +1520,42 @@ def _apply_inbox_delivered(state: SessionState, event: DurableEvent[Any]) -> Ses
         message_seqs = (*state.message_seqs, event.seq)
     inbox = {key: value for key, value in state.inbox.items() if key != item.inbox_id}
     return replace(state, applied_seq=event.seq, messages=messages, message_seqs=message_seqs, inbox=inbox)
+
+
+def _apply_subagent_backgrounded(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.subagent.backgrounded``: active -> active, one observation parked.
+
+    The durable per-generation background marker (T-C1-101): a background
+    subagent run owes exactly one completion delivery into this (parent)
+    session. A duplicate notification_id is an illegal transition, never a
+    silent overwrite -- the id embeds the child's run id, so a duplicate
+    means the same generation was marked twice (log corruption), and a
+    re-observed generation after a delivery uses a fresh run id.
+    """
+    if not isinstance(event.data, SubagentBackgroundedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected SubagentBackgroundedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.subagent.backgrounded requires an active session (event {event.id})")
+    if event.data.notification_id in state.subagent_observations:
+        raise IllegalTransitionError(
+            f"subagent observation {event.data.notification_id!r} is already outstanding "
+            f"for session {event.session_id} (event {event.id})"
+        )
+    observation = SubagentObservation(
+        notification_id=event.data.notification_id,
+        child_session_id=event.data.child_session_id,
+        run_id=event.data.run_id,
+        agent=event.data.agent,
+        description=event.data.description,
+        backgrounded_seq=event.seq,
+    )
+    return replace(
+        state,
+        applied_seq=event.seq,
+        subagent_observations={**state.subagent_observations, observation.notification_id: observation},
+    )
 
 
 # -- shared helpers -----------------------------------------------------------

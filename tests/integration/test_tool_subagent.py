@@ -3,11 +3,13 @@
 What is pinned here, per the ticket's §4 list:
 
 * the guard matrix (§4-1): an unbound adapter is a wiring defect
-  (ToolInvokeError), ``background: true`` is rejected fail-closed, a
-  missing parent session answers ValidationError, an unknown agent is
-  rejected, the depth guard refuses a session that is already a child
-  (``SUBAGENT_MAX_DEPTH == 1``), and the resume face refuses a
-  non-child session id (``not a child``) and a missing one;
+  (ToolInvokeError), a missing parent session answers ValidationError, an
+  unknown agent is rejected, the depth guard refuses a session that is
+  already a child (``SUBAGENT_MAX_DEPTH == 1``), and the resume face
+  refuses a non-child session id (``not a child``) and a missing one.
+  The pre-S2 ``background: true`` rejection row is GONE (the face is
+  T-C1-101's import -- the background acceptance chain lives in
+  ``test_subagent_background.py``);
 * the resume-reuse face (§4-2): a second invocation with ``sessionID``
   reuses the same child session -- a second run, message growth, no
   new session;
@@ -417,13 +419,6 @@ async def test_the_guard_matrix_rejects_every_fail_closed_face(tmp_path: Path) -
         # An unrelated root session (a valid session, not a child of root).
         stranger = await service.create(_SNAPSHOT)
         cases: list[tuple[ToolContext, JsonObject, CoreErrorCode, str]] = [
-            # background: true -- foreground-only v1 (hoisted before everything).
-            (
-                _ctx(root.session_id, tmp_path),
-                {**_INPUT, "background": True},
-                CoreErrorCode.UNSUPPORTED_CAPABILITY,
-                "background is not supported",
-            ),
             # ① a parent session that does not exist on the resource face.
             (
                 _ctx("ses_missing_parent", tmp_path),

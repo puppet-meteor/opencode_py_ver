@@ -911,3 +911,18 @@ class OpencodeClient:
         query: dict[str, str] | None = {"resume": "true"} if resume else None
         path = f"/session/{_path(session_id)}/interrupt"
         return _interrupt_receipt(self._call("POST", path, query=query, timeout_s=timeout_s))
+
+    # -- T-C1-101 (P7-S2): the background conversion face ----------------------
+
+    def background(self, session_id: str, *, timeout_s: float | None = None) -> None:
+        """``POST /session/{id}/background`` — move the foreground subagent wait back.
+
+        The live foreground wait converts on its next poll cycle (the
+        durable marker commits, the observer takes the completion
+        delivery, the run sees the background result). An idle request is
+        the no-op (both arms answer 204, no body — ``None``); a missing or
+        deleted session raises :class:`OpencodeApiError` with the 404 §8
+        body.
+        """
+        path = f"/session/{_path(session_id)}/background"
+        self._call("POST", path, timeout_s=timeout_s)

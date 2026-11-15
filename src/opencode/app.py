@@ -236,12 +236,32 @@ class App:
                 return
             await self._service.wake_pending_inbox()
 
+        # T-C1-101 (P7-S2): the subagent observation re-arm follow-up, the
+        # same post-scan shape. Awaits the gate FIRST so the R4 recovery
+        # scan has already folded every in-flight background child to its
+        # terminal -- the re-armed observers then see settled runs and
+        # deliver exactly once (the admission-consumed markers fold away).
+        # A failed scan re-raises at the gate and keeps the re-arm skipped;
+        # outside a running loop the face is never scheduled (the same
+        # eager-composition disclosure as the wake).
+        self._subagent_rearm_task: asyncio.Task[None] | None = None
+
+        async def _rearm_subagent_observations_after_scan() -> None:
+            try:
+                await recovery_gate.wait()
+            except Exception:
+                return
+            await self._service.recover_subagent_observations()
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop is not None:
             self._inbox_wake_task = loop.create_task(_wake_pending_inbox_after_scan(), name="opencode-inbox-wake")
+            self._subagent_rearm_task = loop.create_task(
+                _rearm_subagent_observations_after_scan(), name="opencode-subagent-rearm"
+            )
         runner: Runner | None = None
         summarizer: ProviderSummarizer | None = None
         approvals: ApprovalCoordinator | None = None
@@ -508,6 +528,18 @@ class App:
             wake.cancel()
             try:
                 await wake
+            except asyncio.CancelledError:
+                pass
+        rearm = self._subagent_rearm_task
+        if rearm is not None and not rearm.done():
+            # The post-scan observation re-arm is App-owned the same way:
+            # cancelling it is safe because every observer it armed is
+            # reclaimed by the service close below (Phase 2.5), and any
+            # marker it did not reach yet survives durably for the next
+            # boot's re-arm.
+            rearm.cancel()
+            try:
+                await rearm
             except asyncio.CancelledError:
                 pass
         await self._jobs.close()

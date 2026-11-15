@@ -104,6 +104,17 @@ PY_INBOX_CANCELLED = "py.inbox.cancelled"
 PY_INBOX_DELIVERY_CHANGED = "py.inbox.delivery_changed"
 PY_INBOX_DELIVERED = "py.inbox.delivered"
 
+# Subagent background family (T-C1-101, P7-S2): ``py.subagent.backgrounded``
+# -- the durable per-generation background marker. Appended to the PARENT
+# session's event log when a ``subagent__run`` background=true call (or a
+# foreground block conversion) hands the child to the background observer;
+# the marker is consumed by the delivery (the S1 inbox synthetic admission
+# keyed by notification_id), so a completed generation never re-delivers
+# after a restart. Durable v1 and NOT run-scoped (the session.resource/jobs
+# precedent): the marker is a parent-session resource observation, not a §7
+# run, so ``metadata={}`` is legal.
+PY_SUBAGENT_BACKGROUNDED = "py.subagent.backgrounded"
+
 EVENT_VERSION = 1
 
 #: Event types that belong to a run; their envelope metadata must carry run_id (§3.1).
@@ -962,6 +973,31 @@ class InboxDeliveredData(BaseModel):
     inbox_id: str = Field(min_length=1)
 
 
+class SubagentBackgroundedData(BaseModel):
+    """``py.subagent.backgrounded`` v1 data (T-C1-101): one durable generation marker.
+
+    Appended to the PARENT session's log when a subagent child run is handed
+    to the background observer (background=true or a foreground block
+    conversion). The TS in-memory per-generation Set (key
+    ``${childSessionID}:${startedAt}``) becomes a durable row: the pair
+    (``child_session_id``, ``run_id``) identifies exactly one generation of
+    the child, and ``notification_id`` (``subagent:{run_id}``, minted
+    deterministically so a restart re-arms the same observation) keys the
+    marker in the fold -- the delivery consumes it by the same id, so a
+    completed generation never re-delivers. ``agent``/``description`` ride
+    verbatim so the observer (and the re-arm scan) need no disk re-read of
+    the tool call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    child_session_id: str = Field(min_length=1, pattern=_SES_ID)
+    run_id: str = Field(min_length=1, pattern=_RUN_ID)
+    agent: str = Field(min_length=1)
+    description: str
+    notification_id: str = Field(min_length=1)
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -1290,6 +1326,18 @@ INBOX_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: Subagent background family (T-C1-101, P7-S2): the durable per-generation
+#: background marker, one durable v1 type. Kept in a separate tuple so the
+#: frozen R2 boundary pins hold (no py.subagent.* rows in R2) while
+#: ``default_event_registry`` resolves the full table. NOT run-scoped (the
+#: session.resource/jobs/inbox precedent): the marker is a parent-session
+#: resource observation, not a §7 run, so no envelope metadata.run_id is
+#: required -- the whenever-present ^run_ guard below still applies.
+SUBAGENT_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_SUBAGENT_BACKGROUNDED, durability="durable", data_model=SubagentBackgroundedData),
+)
+
+
 # ---------------------------------------------------------------------------
 # Jobs family (§3.1 py.job.* rows; PHASE3-ORCHESTRATOR §5.4/§7 A fork-3):
 # the orchestrator's job lifecycle events, committed to the synthesized
@@ -1526,8 +1574,8 @@ JOB_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 
 
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs+session-resource+inbox
-    event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4, T-C1-094, T-C1-100)."""
+    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs+session-resource+inbox+subagent
+    event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4, T-C1-094, T-C1-100, T-C1-101)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1540,5 +1588,6 @@ def default_event_registry() -> EventRegistry:
             *JOB_EVENT_DEFINITIONS,
             *SESSION_RESOURCE_EVENT_DEFINITIONS,
             *INBOX_EVENT_DEFINITIONS,
+            *SUBAGENT_EVENT_DEFINITIONS,
         )
     )

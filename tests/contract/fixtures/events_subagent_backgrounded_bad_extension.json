@@ -1,0 +1,16 @@
+{
+  "id": "evt_0000000000000000000000000113",
+  "type": "py.subagent.backgrounded",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:03Z",
+  "data": {
+    "child_session_id": "child_0000000000000000000002",
+    "run_id": "run_0000000000000000000000000113",
+    "agent": "general",
+    "description": "child_session_id must start with ses_",
+    "notification_id": "subagent:run_0000000000000000000000000113"
+  },
+  "metadata": {},
+  "seq": 113
+}

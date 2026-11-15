@@ -69,11 +69,13 @@ WORKERS_ARTIFACT = SCHEMA_DIR / "workers.json"
 #: trio at T-C1-078 is its own bucket too (+1 valid +1 missing_field
 #: +1 bad_extension, classified "worker-return" -- worker returns lock
 #: against workers.json). The py.inbox.* quadruplet at T-C1-100 lands the
-#: steering-inbox family (+4 valid +4 missing_field +4 bad_extension).
-PINNED_TOTAL = 136
+#: steering-inbox family (+4 valid +4 missing_field +4 bad_extension); the
+#: py.subagent.backgrounded triplet at T-C1-101 lands the durable background
+#: completion marker (+1 valid +1 missing_field +1 bad_extension).
+PINNED_TOTAL = 139
 PINNED_COUNTS = {
-    "positive": 37,
-    "schema-level": 71,
+    "positive": 38,
+    "schema-level": 73,
     "behavior-level": 20,
     "pipeline-spec": 5,
     "worker-return": 3,
@@ -93,7 +95,7 @@ PINNED_COUNTS = {
 #: + InboxDeliveredData)).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
-    "events.json": 52,
+    "events.json": 53,
     "llm.json": 17,
     "messages.json": 8,
     "tools.json": 3,
@@ -101,7 +103,7 @@ PINNED_MODEL_COUNTS = {
     "pipelines.json": 4,
     "workers.json": 1,
 }
-PINNED_DURABLE_KEYS = 34
+PINNED_DURABLE_KEYS = 35
 PINNED_EPHEMERAL_KEYS = 4
 
 
@@ -364,7 +366,7 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 136-file closure (128 event-face fixtures + the pipeline-spec five:
+    """The 139-file closure (128 event-face fixtures + the pipeline-spec five:
     the T-C1-077 trio + the T-C1-079 params-schema pair, plus the T-C1-078
     worker-return trio) and the pinned classification mix."""
 

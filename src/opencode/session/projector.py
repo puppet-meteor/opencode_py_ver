@@ -112,6 +112,7 @@ from opencode.contracts.events import (
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
     PY_STEP_STARTED,
+    PY_SUBAGENT_BACKGROUNDED,
     PY_TEXT_FINALIZED,
     PY_TOOL_FINISHED,
     PY_TOOL_REQUESTED,
@@ -402,6 +403,8 @@ class SessionProjector:
             await self._project_message_imported(connection, event)
         elif event.type in _INBOX_TYPES:
             await self._project_inbox(connection, event)
+        elif event.type == PY_SUBAGENT_BACKGROUNDED:
+            await self._project_subagent_background(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -537,6 +540,21 @@ class SessionProjector:
         fold, the applied_seq advance, then the cache update. The saved
         instruction body rides the fold state, so recovery replays the
         saved content and never re-reads disk (§6.3 L345/L354).
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_subagent_background(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.subagent.backgrounded`` event (T-C1-101); no read-model row.
+
+        The background generation marker lives in the fold state -- the
+        per-session subagent observations keyed by notification id, consumed
+        by the admission fold's pop -- and in the event log itself; the ticket
+        defines no marker read-model table (zero new tables), so this
+        dispatch branch writes no diff: pre-state, one fold, the applied_seq
+        advance, then the cache update (the skills/compaction shape).
         """
         pre, digest = await self._pre_state(connection, event)
         post = _fold(pre, event)

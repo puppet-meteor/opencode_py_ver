@@ -4758,6 +4758,47 @@
       "title": "StepStartedData",
       "type": "object"
     },
+    "SubagentBackgroundedData": {
+      "additionalProperties": false,
+      "description": "``py.subagent.backgrounded`` v1 data (T-C1-101): one durable generation marker.\n\nAppended to the PARENT session's log when a subagent child run is handed\nto the background observer (background=true or a foreground block\nconversion). The TS in-memory per-generation Set (key\n``${childSessionID}:${startedAt}``) becomes a durable row: the pair\n(``child_session_id``, ``run_id``) identifies exactly one generation of\nthe child, and ``notification_id`` (``subagent:{run_id}``, minted\ndeterministically so a restart re-arms the same observation) keys the\nmarker in the fold -- the delivery consumes it by the same id, so a\ncompleted generation never re-delivers. ``agent``/``description`` ride\nverbatim so the observer (and the re-arm scan) need no disk re-read of\nthe tool call.",
+      "properties": {
+        "agent": {
+          "minLength": 1,
+          "title": "Agent",
+          "type": "string"
+        },
+        "child_session_id": {
+          "minLength": 1,
+          "pattern": "^ses_",
+          "title": "Child Session Id",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "notification_id": {
+          "minLength": 1,
+          "title": "Notification Id",
+          "type": "string"
+        },
+        "run_id": {
+          "minLength": 1,
+          "pattern": "^run_",
+          "title": "Run Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "child_session_id",
+        "run_id",
+        "agent",
+        "description",
+        "notification_id"
+      ],
+      "title": "SubagentBackgroundedData",
+      "type": "object"
+    },
     "TextDeltaData": {
       "additionalProperties": false,
       "description": "``py.text.delta`` ephemeral data (§3.1 L140): live preview only, never persisted.",
