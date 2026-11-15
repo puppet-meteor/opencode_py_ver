@@ -105,6 +105,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: "ask" the declared side_effects=True already produced via the residual
 #: rule; ``subagent`` NOT added to ``_ASK_NAMESPACES`` (the git-trio
 #: precedent, ticket §3-5).
+#: P7-S3 (T-C1-102) added ``webfetch__fetch`` (the subagent__run shape
+#: again): an outbound HTTP(S) request is a real side effect observable
+#: off-host (ticket §3-5/§3-6), so the explicit key documents the same
+#: "ask" the declared side_effects=True already produced via the residual
+#: rule; ``webfetch`` NOT added to ``_ASK_NAMESPACES`` (the git-trio
+#: precedent, ticket §3-6).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -123,6 +129,7 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "todo__write": "allow",
     "question__ask": "allow",
     "subagent__run": "ask",
+    "webfetch__fetch": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.
@@ -360,8 +367,11 @@ def extract_resources(action: str, raw_input: JsonObject) -> tuple[str, ...]:
     Policy-owned convention mirroring the TS ``Permission.Request`` anchor
     (action string + resources array): fs-family tools bind their ``path``
     target; shell-family tools bind the full command/cwd pair (the shell tool
-    itself is R3-S5 -- the binding face is fixed here). Tools with neither
-    input carry no resources.
+    itself is R3-S5 -- the binding face is fixed here); the webfetch tool
+    binds its ``url`` target (P7-S3, T-C1-102 §3-6: the TS webfetch.ts
+    ``permission.assert`` carries ``resources=[input.url]`` and the adapter
+    re-checks the URL per redirect hop). Tools with none of these inputs
+    carry no resources.
     """
     path = raw_input.get("path")
     if isinstance(path, str) and path:
@@ -370,6 +380,9 @@ def extract_resources(action: str, raw_input: JsonObject) -> tuple[str, ...]:
     if isinstance(command, str) and command:
         cwd = raw_input.get("cwd")
         return (command, cwd) if isinstance(cwd, str) and cwd else (command,)
+    url = raw_input.get("url")
+    if isinstance(url, str) and url:
+        return (url,)
     return ()
 
 

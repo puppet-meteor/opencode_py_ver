@@ -23,7 +23,12 @@ P6-S5 (T-C1-098) adds the foreground subagent tool ``subagent__run``
 (same constant shape, same dual-host ride): the one stateful builtin --
 hosts bind the App service to the named instance after construction
 (``SubagentRunAdapter.bind``), so host faces carry 17 adapters (16
-base + the platform-gated PTY adapter).
+base + the platform-gated PTY adapter). P7-S3 (T-C1-102) adds the
+webfetch tool ``webfetch__fetch`` (same constant shape, same dual-host
+ride): the one network builtin -- hosts bind the App permission policy
+to the named instance after construction (``WebFetchAdapter.bind``),
+so host faces carry 18 adapters (17 base + the platform-gated PTY
+adapter).
 """
 
 from opencode.tools.builtin.bash import (
@@ -167,6 +172,20 @@ from opencode.tools.builtin.todo import (
     TODO_VERSION,
     TodoWriteAdapter,
 )
+from opencode.tools.builtin.webfetch import (
+    WEBFETCH_DEFAULT_TIMEOUT_SECONDS,
+    WEBFETCH_DESCRIPTION,
+    WEBFETCH_INPUT_SCHEMA,
+    WEBFETCH_MAX_MARKDOWN_BYTES,
+    WEBFETCH_MAX_REDIRECTS,
+    WEBFETCH_MAX_RESPONSE_BYTES,
+    WEBFETCH_MAX_TIMEOUT_SECONDS,
+    WEBFETCH_NAME,
+    WEBFETCH_NAMESPACE,
+    WEBFETCH_SPEC,
+    WEBFETCH_VERSION,
+    WebFetchAdapter,
+)
 from opencode.tools.builtin.write import (
     WRITE_DESCRIPTION,
     WRITE_INPUT_SCHEMA,
@@ -279,6 +298,17 @@ __all__ = [
     "TODO_SPEC",
     "TODO_STATUSES",
     "TODO_VERSION",
+    "WEBFETCH_DEFAULT_TIMEOUT_SECONDS",
+    "WEBFETCH_DESCRIPTION",
+    "WEBFETCH_INPUT_SCHEMA",
+    "WEBFETCH_MAX_MARKDOWN_BYTES",
+    "WEBFETCH_MAX_REDIRECTS",
+    "WEBFETCH_MAX_RESPONSE_BYTES",
+    "WEBFETCH_MAX_TIMEOUT_SECONDS",
+    "WEBFETCH_NAME",
+    "WEBFETCH_NAMESPACE",
+    "WEBFETCH_SPEC",
+    "WEBFETCH_VERSION",
     "WRITE_DESCRIPTION",
     "WRITE_INPUT_SCHEMA",
     "WRITE_MAX_BYTES",
@@ -303,5 +333,6 @@ __all__ = [
     "QuestionAskAdapter",
     "SubagentRunAdapter",
     "TodoWriteAdapter",
+    "WebFetchAdapter",
     "pty_adapters",
 ]

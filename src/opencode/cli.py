@@ -148,6 +148,7 @@ from opencode.tools.builtin import (
     QuestionAskAdapter,
     SubagentRunAdapter,
     TodoWriteAdapter,
+    WebFetchAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
@@ -974,6 +975,11 @@ async def _drive(
     # adapters process-wide while the service is per-App, so the subagent
     # adapter is a named instance bound right after App construction.
     subagent_run = SubagentRunAdapter()
+    # P7-S3 (T-C1-102): the webfetch twin of the subagent named instance --
+    # bound to the App's permission policy right after construction (the
+    # redirect-hop assertNotDenied face rides the same policy the Invoker
+    # gates the initial URL with).
+    webfetch_fetch = WebFetchAdapter()
     app = App(
         db_path,
         provider=provider,
@@ -999,6 +1005,9 @@ async def _drive(
             TodoWriteAdapter(),
             QuestionAskAdapter(),
             subagent_run,
+            # P7-S3 (T-C1-102): the webfetch tool rides the same twin
+            # compositions (17 base adapters per host face).
+            webfetch_fetch,
             *pty_adapters(),
         ),
         settings=runtime.settings,
@@ -1013,6 +1022,10 @@ async def _drive(
     # subagent instance before any run can reach the tool (an unbound
     # adapter would fail closed as a wiring defect at first invoke).
     subagent_run.bind(app.service)
+    # P7-S3 (T-C1-102): the policy bind is the webfetch twin of the service
+    # bind above (the provider composition guarantees the policy exists).
+    assert app.policy is not None
+    webfetch_fetch.bind(app.policy)
     # R4-S6: the driving act itself waits for the startup scan. The gated
     # store already orders every WRITE behind the scan, but prompt()'s
     # active-run busy check is a READ — a recovered session whose crashed run

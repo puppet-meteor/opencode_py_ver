@@ -62,6 +62,7 @@ from opencode.tools.builtin import (
     QuestionAskAdapter,
     SubagentRunAdapter,
     TodoWriteAdapter,
+    WebFetchAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
@@ -193,7 +194,12 @@ def _compose_mcp_manager(loader: ConfigLoader) -> McpManager | None:
     return manager
 
 
-def _builtin_adapters(roots: Sequence[str], *, subagent: SubagentRunAdapter | None = None) -> tuple[ToolAdapter, ...]:
+def _builtin_adapters(
+    roots: Sequence[str],
+    *,
+    subagent: SubagentRunAdapter | None = None,
+    webfetch: WebFetchAdapter | None = None,
+) -> tuple[ToolAdapter, ...]:
     """The builtin tool adapters (the CLI ``_drive`` list, same order).
 
     Platform gate: ``*pty_adapters()`` appends the win32-verified PTY T1
@@ -211,9 +217,18 @@ def _builtin_adapters(roots: Sequence[str], *, subagent: SubagentRunAdapter | No
     instance it binds to the App service right after construction; a
     caller that omits it gets a fresh unbound instance, so the census
     face keeps composing the complete host set.
+
+    P7-S3 (T-C1-102): the webfetch tool rides the same twin compositions
+    (18 adapters per host face = 17 base + the platform-gated PTY
+    adapter). ``serve`` passes the named instance it binds to the App
+    permission policy right after construction (the redirect-hop
+    assertNotDenied face); a caller that omits it gets a fresh unbound
+    instance, so the census face keeps composing the complete host set.
     """
     if subagent is None:
         subagent = SubagentRunAdapter()
+    if webfetch is None:
+        webfetch = WebFetchAdapter()
     return (
         FsReadAdapter(roots=roots),
         FsLsAdapter(roots=roots),
@@ -231,6 +246,7 @@ def _builtin_adapters(roots: Sequence[str], *, subagent: SubagentRunAdapter | No
         TodoWriteAdapter(),
         QuestionAskAdapter(),
         subagent,
+        webfetch,
         *pty_adapters(),
     )
 
@@ -342,10 +358,15 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # P6-S5 (T-C1-098): the one stateful builtin -- a named instance so
     # ``serve`` can bind the App's session service right after construction.
     subagent_run = SubagentRunAdapter()
+    # P7-S3 (T-C1-102): the webfetch twin -- a named instance so ``serve``
+    # can bind the App's permission policy right after construction (the
+    # redirect-hop assertNotDenied face rides the same policy the Invoker
+    # gates the initial URL with).
+    webfetch_fetch = WebFetchAdapter()
     app = App(
         resolved_db,
         provider=provider,
-        tools=_builtin_adapters(runtime.roots, subagent=subagent_run),
+        tools=_builtin_adapters(runtime.roots, subagent=subagent_run, webfetch=webfetch_fetch),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
         rules=permission_rules_from_snapshot(runtime.snapshot.permission_rules),
@@ -358,6 +379,10 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # (an unbound adapter would fail closed as a wiring defect at first
     # invoke).
     subagent_run.bind(app.service)
+    # P7-S3 (T-C1-102): the policy bind is the webfetch twin of the service
+    # bind above (the provider composition guarantees the policy exists).
+    assert app.policy is not None
+    webfetch_fetch.bind(app.policy)
     api = create_app(app, token=token)
     server = uvicorn.Server(_server_config(api, port=port))
     asyncio.run(server.serve())

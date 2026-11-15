@@ -708,14 +708,15 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
     """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073; the
     linux branch added by the T2 authorization T-C1-074).
 
-    Every unverified platform (darwin etc.) asserts the sixteen-name tuple
+    Every unverified platform (darwin etc.) asserts the seventeen-name tuple
     (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098 subagent
-    tool) unchanged; win32 (the T1 winpty-agent face) and linux (the T2
-    stdlib face) assert the sixteen plus the appended ``PtyRunAdapter``
-    (17 names), the ``*pty_adapters()`` splice in ``_builtin_adapters``.
-    The trio census bump is the additive expected-minimum-update face
-    (the T-C1-096 route-census precedent); the T-C1-098 subagent bump is
-    the same additive shape.
+    tool plus the T-C1-102 webfetch tool) unchanged; win32 (the T1
+    winpty-agent face) and linux (the T2 stdlib face) assert the seventeen
+    plus the appended ``PtyRunAdapter`` (18 names), the ``*pty_adapters()``
+    splice in ``_builtin_adapters``. The trio census bump is the additive
+    expected-minimum-update face (the T-C1-096 route-census precedent); the
+    T-C1-098 subagent bump and the T-C1-102 webfetch bump are the same
+    additive shape.
     """
     names = tuple(type(adapter).__name__ for adapter in _builtin_adapters(("C:/work",)))
     expected = (
@@ -735,6 +736,7 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
         "TodoWriteAdapter",
         "QuestionAskAdapter",
         "SubagentRunAdapter",
+        "WebFetchAdapter",
     )
     if sys.platform == "win32" or sys.platform == "linux":
         assert names == (*expected, "PtyRunAdapter")

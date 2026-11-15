@@ -456,6 +456,17 @@ class App:
         return self._registry
 
     @property
+    def policy(self) -> PermissionPolicy | None:
+        """The provider composition's permission policy (None without a provider).
+
+        P7-S3 (T-C1-102): the webfetch adapter re-checks every redirect hop
+        against the SAME policy the Invoker gated the initial call with, so
+        each host binds it right after construction
+        (``WebFetchAdapter.bind(app.policy)``) beside the subagent bind.
+        """
+        return self._policy
+
+    @property
     def brain(self) -> BrainDriver | None:
         """The P3-S4 main-brain driver (None unless ``workflow_tools=True``)."""
         return self._brain
