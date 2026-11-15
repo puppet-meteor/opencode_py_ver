@@ -24,6 +24,8 @@
 
 - 2026-11-15 [T-C1-094]：落地会话资源 HTTP/SDK 面——§3.1 增 `py.session.deleted`/`py.message.imported` 两 v1 durable 事件行（非 run-scoped：删除墓碑 data 为空对象，折叠 created+ACTIVE+无 active_run→status=deleted，tombstone 非物理删除，投影后 get/list/messages/events 一律 404、重复 delete 404、写入门禁 SessionClosed；imported 以 §2.1 消息联合逐条回放投影消息——fork 至截断点前、import 按导出 payload 重建，折叠仅收 ACTIVE 会话上新 message_id，任何消息解码失败整批拒绝、不静默丢消息）。HTTP 七路由（沿既有无 /api 前缀、PY 平 JSON 无 data 包裹）：GET /session（created 降序全量、v1 无分页）、GET /session/{id}（wire 恰 `{session_id,status,applied_seq,active_run_id}`）、DELETE /session/{id}（204 空体；active run 409）、POST /session/{id}/fork（before 缺席/异会话 404，源会话只读不动）、GET /session/{id}/export、POST /session/import（同 id 已存 409——已删 id 仍被墓碑占用，仅全新 id 恢复且状态恒 ACTIVE）、GET /session/{id}/message/{message_id}；SDK 客户端七方法（list_sessions/get_session/delete_session/fork_session/export_session/import_session/get_message）对齐；既有 12 路由零语义漂移，OpenAPI census 12→19。
 
+- 2026-11-15 [T-C1-096]：落地 compaction 手动接线面+§2.4/§3.1 状态标注翻新——HTTP `POST /session/{session_id}/compact`（service 公面 `compact_session`：S1 delete 守卫序先例——存在/删除墓碑 404→状态类→active run 409→引擎可用性 422 fail-closed（summarizer 未注入组合）；守卫锁释放后引擎单趟同步跑——锁内捕获→锁外摘要→短提交锁 CAS 拥有竞态；手动面不吞错不入 `_compaction_errors`（与自动触发吞错面语义分立）；notify 仅 committed event；TS `{id, delivery?}` inbox-steering 载荷不移植=DIFFERENT-BY-DESIGN，空体/缺省体接受、非空对象 422）+outcome wire=扁平 per-status 恰形键集（compacted：`{status,covered_seq,retained_from,message_count,summary_hash,event_id,usage}`——summary_text 留 durable-only、hash+event_id 承载审计；below_threshold：`{status}` 单键；discarded：`{status,usage}`）+SDK `compact_session`（`CompactionReceipt` per-status 恰形解码；OpenAPI census 20→21）+§2.4/§3.1「规划契约，未实现」标注随 T-C1-060/062/063 实现翻牌已实现态（标题/状态引块/阈值现值句 `COMPACT_TRIGGER_MESSAGE_COUNT=40`+`COMPACT_RETAINED_TAIL_MESSAGES=8`/fixture 在库事实句/§3.1 行；契约语义句零改写——状态标注翻新非契约变更）+首批 compaction 集成测试（`tests/integration/test_httpapi_compaction.py`：compacted 全链/below_threshold/404 双面/409 busy/休眠 422+守卫序/自动触发端到端/SDK 往返）。零新事件类型（`py.context.compacted` 已在库）——contracts/projector/state/repos/schema-lock 零触碰；自动触发接线（T-C1-062）零回改。
+
 ## 1. 共同规则
 
 - wire/persisted model 用 Pydantic v2；运行时资源用 dataclass/Protocol。所有集合使用工厂默认值，不共享可变容器。
@@ -119,9 +121,9 @@ adapter 按 call_index 聚合工具 ID/名称碎片；runner 按同一 index 聚
 
 一次请求最多一个终止 chunk：finish 或 error。EOF 没有终止 chunk 视为流被中断；取消通过 CancelledError 传播。adapter 可以暂存 SDK 的 finish_reason，读完末尾 usage 后再发逻辑 finish；不能让 finish 后的 usage 丢失。provider_metadata 不能成为执行权限或恢复真相，保存前按敏感字段规则处理。
 
-### 2.4 自动 compaction（M6-compaction 规划契约，未实现）
+### 2.4 自动 compaction（M6-compaction 已实现——T-C1-060/062/063 引擎+自动触发落地，T-C1-096 手动 HTTP/SDK 面）
 
-> 状态标注（PHASE2-MODULES L130 原文）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节与 §3.1 的 `py.context.compacted` 事件行是该句的 compaction 承载面，**规划契约，未实现**。本节只承载契约文本与 fixture 行为要求——fixture 文件建立归 compaction 实现切片（编号调度器后续定），本票不预建。§7 零增补：卡片无宿主命令面（skills activate 有 §7 审计命令行先例，compaction 卡无此面——由阈值触发的引擎面承载，非宿主显式命令）；若实现期研判需要命令面=超出卡片语义，停下浮报。
+> 状态标注（PHASE2-MODULES L130 原文）：「上述四项的接口/事件是各模块开始前需要补充的契约，**不属于 core 0.1 已实现能力**；建立 fixture 并复估后才进入实现，不要求一期提前建空扩展框架。」本小节与 §3.1 的 `py.context.compacted` 事件行是该句的 compaction 承载面；该前置已执行并实现——**已实现态**（T-C1-060 引擎核心、T-C1-062 服务接缝+阈值触发、T-C1-063 真实 LLM 摘要适配器落地，原「规划契约，未实现」标注随实现翻牌）：引擎在库=`src/opencode/session/compaction.py` `CompactionEngine`（三相位执行序：锁内捕获→释放锁摘要→短提交锁 expected_seq/CAS，`CompactionOutcome` 三态 compacted/below_threshold/discarded）；生产组合接线=`SessionService` 构造参数 `compaction_summarizer`（App 注入 `ProviderSummarizer`，provider 缺席=None=休眠面）；自动触发=run settled 后 `_drive_run` 阈值检查趟（cancelled/crashed 永不触发，L132 矩阵）；手动面=HTTP `POST /session/{session_id}/compact`+SDK `compact_session`（T-C1-096）；fixture 已随实现切片建立（`tests/contract/fixtures/` 三件套：valid/bad_run_id/missing_field）+契约级测试（test_compaction_engine/test_compaction_projection）+集成级覆盖（test_app_compaction/test_httpapi_compaction/test_session_compaction）。§7 零增补保持（卡片无宿主命令面——引擎阈值触发面+HTTP 手动面承载，非宿主显式命令）。
 
 compaction 挂既有接缝（PHASE2-MODULES L123 前置列）：S1 ContextBuilder（§2.2 既有面——「从历史 + 配置快照生成请求」的历史侧有效替换）+S6 新事件/投影。最低验收（PHASE2-MODULES L123 原文）：`context.compacted(covered_seq, retained_from, summary_hash, model, usage)`；阈值/锁/CAS 明确，不拆 call/result；失败/取消不替换原上下文。
 
@@ -139,7 +141,7 @@ compaction 挂既有接缝（PHASE2-MODULES L123 前置列）：S1 ContextBuilde
 
 **执行语义**（PHASE2-MODULES L138 原文逐句）：compaction 以新 `py.context.compacted` 事件记录有效上下文替换，payload 至少含 covered_seq、retained_from、summary_text、summary_hash、model、usage、message_count。锁内捕获 settled 历史边界/hash，释放锁后生成摘要，再在短提交锁内用 expected_seq/CAS 校验；边界变化就丢弃该摘要。保留原始事件和工具结果，ContextBuilder 从已保存的 replacement + retained history 生成，永远不拆 call/result。摘要失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage；物理删除原日志另走 M1 归档设计。
 
-**阈值**：compaction 由明确阈值触发（上下文压力达阈值）；阈值具体值=契约待定面，实现切片定（沿 §6.3「上限值 P2-S2 定」先例形）。
+**阈值**：compaction 由明确阈值触发（上下文压力达阈值）；阈值具体值已由实现切片定谳（沿 §6.3「上限值 P2-S2 定」先例形）——src 现读 `COMPACT_TRIGGER_MESSAGE_COUNT = 40`（settled 消息计数——零分词器红线的计数代理，token 面精化为独立裁定量）+尾保留 `COMPACT_RETAINED_TAIL_MESSAGES = 8`（retained history 起始边界 `retained_from` 自该尾计算）。
 
 **红线承接**：
 
@@ -147,7 +149,7 @@ compaction 挂既有接缝（PHASE2-MODULES L123 前置列）：S1 ContextBuilde
 - 「永远不拆 call/result」（L123/L138）：保留原始事件和工具结果；ContextBuilder 从已保存的 replacement + retained history 生成，call 与其 result 的配对在任何替换路径下不被拆开。
 - 「物理删除原日志另走 M1 归档设计」（L138）：本节只定义有效上下文替换，不定义日志删除。
 
-**fixture 行为要求**：阈值触发、锁/CAS 提交序、边界变化丢弃摘要、失败/取消/崩溃不替换原上下文，均须以正/反例 fixture 锁定形状与行为（沿 §1「以正/反例 JSON fixture 锁定 wire 形状」既有路径）；fixture 文件建立归 compaction 实现切片，本票不预建。
+**fixture 行为要求**：阈值触发、锁/CAS 提交序、边界变化丢弃摘要、失败/取消/崩溃不替换原上下文，均须以正/反例 fixture 锁定形状与行为（沿 §1「以正/反例 JSON fixture 锁定 wire 形状」既有路径）；fixture 文件已随实现切片建立（`tests/contract/fixtures/` `events_context_compacted_valid/bad_run_id/missing_field` 三件套锁定 wire 形状，test_compaction_engine/test_compaction_projection 锁定行为矩阵）。
 
 **场景注记**（PHASE2-MODULES L159 原文锚，承载注记级不新建场景节）：「本地 CLI 自用：Phase 1 已能交付；按需要增加 skills、compaction 或 M2。」
 
@@ -187,7 +189,7 @@ durable event = draft + `seq: int >= 1`。seq 在 DB 事务内按 session 分配
 | py.permission.revoked / py.permission.expired | `decision_id, reason`；前者是宿主撤销，后者是到期检查产生 |
 | py.run.finished | `run_id, outcome, error?`；投影 idle 消息并释放 active run |
 | py.skill.activated | `skill_id, source, path, hash, size, body`；M6-skills 已实现（§6.3——P2-S1/P2-S2 落地并回 #171 [90f0073]）——durable activation 记录（bounded 正文，上限值=src 现读 `SKILL_BODY_MAX_BYTES` 64 KiB）；恢复使用已保存内容，不悄悄重读磁盘 |
-| py.context.compacted | `covered_seq, retained_from, summary_text, summary_hash, model, usage, message_count`；M6-compaction 规划契约未实现（§2.4）——有效上下文替换记录：保留原始事件和工具结果，永远不拆 call/result；失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage |
+| py.context.compacted | `covered_seq, retained_from, summary_text, summary_hash, model, usage, message_count`；M6-compaction 已实现（§2.4——T-C1-060/062/063 引擎+触发落地，T-C1-096 手动 HTTP/SDK 面）——有效上下文替换记录：保留原始事件和工具结果，永远不拆 call/result；失败/取消/崩溃不替换原上下文，额外模型调用也记录 usage |
 | py.job.created | `job_id, pipeline_id, depth, lineage, budget, trace`；jobs 身份先行（A fork-3 提交序，§5.4）——`depth` 为工作流嵌套深度（子工作流 ≤3 为网关策略），`lineage` 记录 parent_job_id/session_id/origin，`budget` 为执行预算，`trace` 四字段相关性集见 §5.4 |
 | py.job.spec_bound | `job_id, params, params_hash, session_anchor, trace`；spec 绑定——`params_hash` 为 canonical params JSON 的 SHA-256，`session_anchor` 为 `"api"`（无会话 API 提交）或 `ses_` 前缀会话 id；created 后恰一次，与 created 同批原子提交后才允许执行（§5.4） |
 | py.job.started | `job_id, attempt_id, trace`；执行启动（created→running；S5a 起 gated→running 亦合法——门回复链 approve/revise 复用本事件恢复执行，零新事件类型），attempt 身份 |

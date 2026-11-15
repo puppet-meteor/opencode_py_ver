@@ -100,6 +100,7 @@ from opencode.contracts.events import (
 from opencode.contracts.messages import AssistantMessage, IdleMessage, SessionMessage
 from opencode.session.compaction import (
     CompactionEngine,
+    CompactionOutcome,
     SettledHistoryView,
     SettledMessage,
     SummaryGenerator,
@@ -1905,6 +1906,66 @@ class SessionService:
                 details={"session_id": session_id, "message_id": before},
             )
         return collected
+
+    # -- T-C1-096 (P6-S3): the manual compaction face -----------------------------
+
+    async def compact_session(self, session_id: str) -> CompactionOutcome:
+        """One manual compaction pass on a live session (T-C1-096 §3 decision 2).
+
+        The guard order is the S1 delete precedent (§3 decision 4), all under
+        the session lock: the live-record read (missing or deleted tombstone
+        -> NotFound), then the status classes (read_only / cleanup_failed /
+        closed answer their own codes), then the active-run gate (409 -- a
+        live run is never compacted under; it settles first). The lock is
+        then RELEASED before the engine trip: the engine re-takes it for the
+        capture and the short commit (its captured expected_seq/CAS owns the
+        release-to-commit race) and the summary call runs unlocked by design
+        (§2.4 L126). A composition without the summarizer seam answers
+        StoreValidationError -- the ``_compaction_event_log`` precedent: the
+        face fails closed instead of half-answering or silently no-oping
+        (a 200 for a pass that never ran is the forbidden fiction).
+
+        Error policy (§3 decision 6, deliberately split from the auto
+        trigger): the manual face does NOT swallow -- the engine's exception
+        propagates to the caller on the normal §8 mapping, and it is NOT
+        recorded in ``_compaction_errors`` (that ledger belongs to the auto
+        trigger's best-effort background policy; a manual failure is
+        caller-visible, §8 delivery discipline). The bus notification keeps
+        the ``_post_run_compaction`` shape: only a committed event notifies
+        (below_threshold and the discarded pass are no-ops). One synchronous
+        engine trip per call -- its latency is the summary model call
+        whenever the threshold holds; there is no background job and no
+        queue steering (ticket §5 disclosure 4).
+        """
+        _require_session_id_arg(session_id)
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            record = await self._read_live_record(session_id)
+            if record.status == SessionStatus.READ_ONLY_DIAGNOSTIC:
+                raise SessionReadOnlyError(
+                    f"session {session_id} is read_only_diagnostic", details={"session_id": session_id}
+                )
+            if record.status == SessionStatus.CLEANUP_FAILED:
+                raise LifecycleCleanupFailedError(
+                    f"session {session_id} failed resource cleanup", details={"session_id": session_id}
+                )
+            if record.status == SessionStatus.CLOSED:
+                raise SessionClosedError(f"session {session_id} is closed")
+            if record.active_run_id is not None:
+                raise SessionBusyError(
+                    f"session {session_id} already holds an active run",
+                    details={"session_id": session_id, "active_run_id": record.active_run_id},
+                )
+        engine = self._compaction()
+        if engine is None:
+            raise StoreValidationError("manual compaction requires the compaction engine (compaction_summarizer=)")
+        outcome = await engine.compact(session_id)
+        if outcome.event is not None:
+            self._bus.notify(session_id, [outcome.event])
+        return outcome
 
     # -- §7 close -------------------------------------------------------------
 

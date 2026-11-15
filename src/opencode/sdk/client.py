@@ -32,6 +32,11 @@ T-C1-095 (P6-S2) adds the global volatile event stream (the TS
 
 * ``GET    /events``                                -> :meth:`OpencodeClient.stream_global_events`
 
+T-C1-096 (P6-S3) adds the manual compaction route (the synchronous manual
+twin of the server's post-settlement auto trigger):
+
+* ``POST   /session/{session_id}/compact``          -> :meth:`OpencodeClient.compact_session`
+
 Return types are the core models themselves (``service.RunRef`` /
 ``RunStatus`` / ``DecisionReceipt`` / ``SessionRef`` / ``SessionInfo`` /
 ``SessionSummary`` / ``SessionExport``, ``repos.MessagePage``,
@@ -69,12 +74,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Generator, Iterable
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
 from opencode.contracts.errors import CoreError
 from opencode.contracts.events import DurableEvent, default_event_registry
+from opencode.contracts.llm import Usage
 from opencode.contracts.messages import (
     AssistantMessage,
     IdleMessage,
@@ -284,6 +291,68 @@ def _session_export(payload: Any) -> SessionExport:
         created_at_ms=_int_field(fields, "created_at_ms"),
         messages=tuple(_wire_message(raw) for raw in raw_messages),
     )
+
+
+@dataclass(frozen=True)
+class CompactionReceipt:
+    """The decoded manual-compaction outcome wire (T-C1-096 §3 decision 3).
+
+    ``status`` is the engine's three-value enum; every other field is set
+    only for its status face — ``compacted`` carries the settled boundary
+    (``covered_seq``/``retained_from``/``message_count``), the summary
+    identity (``summary_hash``), the committed event's id and the summary
+    call's ``usage``; ``discarded`` carries only the spent ``usage`` of the
+    dropped summary (zero commits); ``below_threshold`` carries nothing
+    else (no summary call happened). The server's per-status key sets are
+    checked exactly, so a field here is evidence the server sent it.
+    """
+
+    status: Literal["compacted", "below_threshold", "discarded"]
+    covered_seq: int | None = None
+    retained_from: int | None = None
+    message_count: int | None = None
+    summary_hash: str | None = None
+    event_id: str | None = None
+    usage: Usage | None = None
+
+
+def _usage_field(fields: dict[str, Any]) -> Usage:
+    """The wire usage object decoded through the §2.1 ``Usage`` model, fail closed."""
+    raw = fields["usage"]
+    if not isinstance(raw, dict):
+        raise OpencodeClientError(f"wire field 'usage' must be a JSON object, got {raw!r}")
+    try:
+        return Usage.model_validate(raw)
+    except ValidationError as error:
+        raise OpencodeClientError(f"wire field 'usage' did not decode: {error}") from error
+
+
+def _compaction_receipt(payload: Any) -> CompactionReceipt:
+    """The T-C1-096 outcome wire: per-status exact key sets, checked (no shared shape)."""
+    if not isinstance(payload, dict):
+        raise OpencodeClientError(f"unexpected wire shape: expected a JSON object, got {type(payload).__name__}")
+    status = payload.get("status")
+    if status == "compacted":
+        fields = _expect_object(
+            payload,
+            frozenset({"status", "covered_seq", "retained_from", "message_count", "summary_hash", "event_id", "usage"}),
+        )
+        return CompactionReceipt(
+            status="compacted",
+            covered_seq=_int_field(fields, "covered_seq"),
+            retained_from=_int_field(fields, "retained_from"),
+            message_count=_int_field(fields, "message_count"),
+            summary_hash=_string_field(fields, "summary_hash"),
+            event_id=_string_field(fields, "event_id"),
+            usage=_usage_field(fields),
+        )
+    if status == "below_threshold":
+        _expect_object(payload, frozenset({"status"}))
+        return CompactionReceipt(status="below_threshold")
+    if status == "discarded":
+        fields = _expect_object(payload, frozenset({"status", "usage"}))
+        return CompactionReceipt(status="discarded", usage=_usage_field(fields))
+    raise OpencodeClientError(f"unknown compaction status on the wire: {status!r}")
 
 
 def _api_error(error: urllib.error.HTTPError) -> OpencodeApiError:
@@ -630,3 +699,22 @@ class OpencodeClient:
                 response.close()
 
         return _generate()
+
+    # -- T-C1-096 (P6-S3): the manual compaction route --------------------------
+
+    def compact_session(self, session_id: str, *, timeout_s: float | None = None) -> CompactionReceipt:
+        """``POST /session/{id}/compact`` — one manual compaction pass (T-C1-096).
+
+        The synchronous single-trip face: the server runs one §2.4 engine
+        pass (one summary model call when the threshold holds) and answers
+        the flat outcome wire, decoded here into
+        :class:`~opencode.sdk.client.CompactionReceipt` —
+        ``below_threshold`` is a normal result, never an error. The error
+        faces raise :class:`OpencodeApiError`: 404 for a missing or deleted
+        session, 409 while a run is in flight, and 422 on a composition
+        whose compaction engine is unavailable (no provider wired — the
+        fail-closed guard). The timeout should cover one summary call:
+        the pass runs inline in this request.
+        """
+        path = f"/session/{_path(session_id)}/compact"
+        return _compaction_receipt(self._call("POST", path, body={}, timeout_s=timeout_s))

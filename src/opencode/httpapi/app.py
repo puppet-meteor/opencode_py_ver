@@ -50,6 +50,17 @@ T-C1-095 (P6-S2) adds the global volatile event stream — the TS
 * ``GET  /events``                                       -> live SSE across every session
   (``?types=a,b,c`` server-side filter; volatile by contract)
 
+T-C1-096 (P6-S3) adds the manual compaction route — the user-reachable face
+over the §2.4 engine (the post-settlement auto trigger stays the engine's
+own wiring; this route is its synchronous manual twin — one summary model
+call inline in the request whenever the threshold holds):
+
+* ``POST /session/{session_id}/compact``                 -> the flat outcome wire
+  (``status`` always; ``compacted`` adds covered_seq/retained_from/
+  message_count/summary_hash/event_id/usage, ``below_threshold`` is
+  status-only, ``discarded`` adds the spent usage; empty body only — the TS
+  ``{id, delivery?}`` inbox-steering payload is not ported, DIFFERENT-BY-DESIGN)
+
 
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
@@ -161,6 +172,7 @@ from opencode.contracts.events import DurableEvent
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.jobs import JobTransitionError
 from opencode.orchestrator.registration import register_pipelines
+from opencode.session.compaction import CompactionOutcome
 from opencode.session.service import (
     DecisionReceipt,
     RunRef,
@@ -382,6 +394,41 @@ def _job_wire(record: JobRecord) -> JsonObject:
         "error": record.error,
         "created_at_ms": record.created_epoch_ms,
         "updated_at_ms": record.updated_epoch_ms,
+    }
+
+
+def _compaction_wire(outcome: CompactionOutcome) -> JsonObject:
+    """T-C1-096 §3 decision 3: the flat per-status outcome wire.
+
+    ``status`` rides every answer (the engine's three-value enum;
+    ``below_threshold`` is a result, never an error). The per-status faces
+    are exact key sets: ``compacted`` carries the settled boundary
+    (covered_seq/retained_from/message_count), the summary identity
+    (summary_hash) plus the committed event's id and the summary call's
+    usage; ``below_threshold`` is ``{status}`` alone (no summary call
+    happened); ``discarded`` adds the spent usage of the dropped summary
+    (the CAS answered ConflictError: zero commits, §2.4 L132).
+    ``summary_text`` deliberately stays durable-only (the event body): the
+    wire carries its hash + the event id, so the replacement stays
+    auditable without shipping the body (seat whitelist, ticket §5
+    disclosure 6).
+    """
+    if outcome.status == "below_threshold":
+        return {"status": outcome.status}
+    usage = outcome.usage
+    assert usage is not None  # the engine pins usage whenever a summary call happened
+    if outcome.status == "discarded":
+        return {"status": outcome.status, "usage": usage.model_dump(mode="json")}
+    capture, event = outcome.capture, outcome.event
+    assert capture is not None and event is not None  # the compacted pairing is the engine's invariant
+    return {
+        "status": outcome.status,
+        "covered_seq": capture.covered_seq,
+        "retained_from": capture.retained_from,
+        "message_count": capture.message_count,
+        "summary_hash": event.data.summary_hash,
+        "event_id": event.id,
+        "usage": usage.model_dump(mode="json"),
     }
 
 
@@ -934,6 +981,32 @@ def create_app(app: App, *, token: str) -> FastAPI:
         """§3 decision 6: one projected message (§2.1 wire); a mismatched pair answers 404."""
         message = await service.message(session_id, message_id)
         return _json_response(message.model_dump(mode="json"))
+
+    # -- T-C1-096 (P6-S3): the manual compaction route --------------------------
+
+    @api.post("/session/{session_id}/compact")
+    async def compact_session(session_id: str, request: Request) -> Response:
+        """§3 decision 1: one synchronous engine pass (empty body only; the
+        404/409/422 guard faces run before the trip; below_threshold is 200).
+
+        The manual twin of the post-settlement auto trigger: the same engine
+        pass, the same notify-on-committed-only discipline, run inline in
+        this request (one summary model call when the threshold holds; the
+        outcome's three states report honestly). The body is deliberately
+        empty — the TS ``{id, delivery?}`` inbox-steering payload is not
+        ported (PY has no inbox face, DIFFERENT-BY-DESIGN), so a non-empty
+        object answers 422 on the §1 unknown-fields rule.
+        """
+        payload = await _read_optional_json_object(request)
+        if payload:
+            raise _TransportError(
+                422,
+                _validation(
+                    f"the compact face accepts an empty body only (unknown fields: {', '.join(sorted(payload))})"
+                ),
+            )
+        outcome = await service.compact_session(session_id)
+        return _json_response(_compaction_wire(outcome))
 
     # -- P3-S1 (T-C1-076): the five /jobs routes over app.jobs ---------------
 
