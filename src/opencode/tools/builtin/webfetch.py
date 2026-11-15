@@ -390,8 +390,17 @@ async def _fetch(
 ) -> tuple[bytes, str]:
     """One client per invocation: a fresh ``AsyncClient`` with the httpx2
     default timeout disabled (``Timeout(None)`` -- wait_for is the only
-    deadline) and redirects manual, closed with the invocation."""
-    async with httpx2.AsyncClient(timeout=httpx2.Timeout(None), follow_redirects=False) as client:
+    deadline) and redirects manual, closed with the invocation.
+
+    ``trust_env=False`` is the TS parity face (#256): webfetch.ts rides
+    ``FetchHttpClient`` (Node fetch), which never consults environment or
+    system proxies on its own, while httpx2's default ``trust_env=True``
+    would route the request through the host's configured proxy (a Windows
+    system proxy answered a bare loopback refusal with an HTTP 502) --
+    the tool's outbound URL is exactly the policy-gated URL, not whatever
+    a local proxy decides to answer for it.
+    """
+    async with httpx2.AsyncClient(timeout=httpx2.Timeout(None), follow_redirects=False, trust_env=False) as client:
         return await _attempt(client, _make_hop_check(policy, context), url, format, _OPENCODE_USER_AGENT)
 
 
