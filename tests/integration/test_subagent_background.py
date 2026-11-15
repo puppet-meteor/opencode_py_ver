@@ -715,8 +715,17 @@ async def test_a_parked_queue_item_converts_the_foreground_wait(tmp_path: Path) 
         markers = _event_data(db_path, parent.session_id, PY_SUBAGENT_BACKGROUNDED)
         assert len(markers) == 1
         child_run_id = str(markers[0]["run_id"])
-        pending = await app.service.inbox_list(parent.session_id)
-        assert [item.inbox_id for item in pending] == [parked.inbox_id]
+        # The survival face is the item's own consumption record: the S1
+        # idle-wake (the run-settle doorbell) fires the moment the converted
+        # run settles and hands the parked queue item to its own successor
+        # run, and inbox.promote commits the accepted+delivered pair with the
+        # promotion itself -- a fast host can have that whole leg done before
+        # a bare inbox_list read lands here. Await the delivery first (both
+        # timing arms converge on it), then read the inbox: it holds nothing
+        # else before the child's completion lands.
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, parked.inbox_id)
+        remaining = await app.service.inbox_list(parent.session_id)
+        assert [item.inbox_id for item in remaining] == []
         # Release the child: the observer delivers into the parent. The
         # delivery arm is racy by design -- if the parked item's wake run is
         # still active the synthetic lands as a pending STEER (consumed at a
