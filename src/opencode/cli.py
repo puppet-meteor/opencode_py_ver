@@ -144,6 +144,9 @@ from opencode.tools.builtin import (
     GitWorktreeAddAdapter,
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
+    PatchApplyAdapter,
+    QuestionAskAdapter,
+    TodoWriteAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
@@ -982,6 +985,12 @@ async def _drive(
             GitWorktreeAddAdapter(roots=runtime.roots),
             GitWorktreeListAdapter(roots=runtime.roots),
             GitWorktreeRemoveAdapter(roots=runtime.roots),
+            # P6-S4 (T-C1-097, toolkit A): the patch/todo/question trio
+            # rides both production host compositions (this drive list and
+            # the serving ``_builtin_adapters`` twin) beside the twelve.
+            PatchApplyAdapter(),
+            TodoWriteAdapter(),
+            QuestionAskAdapter(),
             *pty_adapters(),
         ),
         settings=runtime.settings,

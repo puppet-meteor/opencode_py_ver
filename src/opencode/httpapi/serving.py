@@ -58,6 +58,9 @@ from opencode.tools.builtin import (
     GitWorktreeAddAdapter,
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
+    PatchApplyAdapter,
+    QuestionAskAdapter,
+    TodoWriteAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
@@ -195,6 +198,12 @@ def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
     Platform gate: ``*pty_adapters()`` appends the win32-verified PTY T1
     adapter on win32 and is empty elsewhere (PHASE2-MODULES L68: an
     unverified platform is not enabled; T-B-087 ruling 2 / T-C1-073).
+
+    P6-S4 (T-C1-097, toolkit A): the patch/todo/question trio rides this
+    composition (and the CLI ``_drive`` twin) beside the twelve -- hosts
+    carry 16 adapters. The trio is host-face wiring, never an App default:
+    the app.py ``tools`` loop is host-param plumbing, and a tool-less App
+    composition (recovery scans, minimal harnesses) must stay tool-less.
     """
     return (
         FsReadAdapter(roots=roots),
@@ -209,6 +218,9 @@ def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
         GitWorktreeAddAdapter(roots=roots),
         GitWorktreeListAdapter(roots=roots),
         GitWorktreeRemoveAdapter(roots=roots),
+        PatchApplyAdapter(),
+        TodoWriteAdapter(),
+        QuestionAskAdapter(),
         *pty_adapters(),
     )
 

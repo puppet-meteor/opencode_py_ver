@@ -91,6 +91,14 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: "ask" its declared side_effects=True already produced via the residual
 #: rule (the bash__run row #28 zero-behavior closure shape); ``pty`` NOT
 #: added to ``_ASK_NAMESPACES`` (the git-trio precedent).
+#: P6-S4 (T-C1-097, toolkit A) added the trio: ``patch__apply`` writes
+#: files and declares side_effects=True, so it asks (the
+#: fs__write/fs__edit mutation-family precedent); ``todo__write`` /
+#: ``question__ask`` are the stateless echo pair (side_effects=False),
+#: so the residual rule already allowed both -- the explicit keys
+#: document the pair inside the closed enumeration (the bash__run row
+#: #28 zero-behavior closure shape); none of the three joins
+#: ``_ASK_NAMESPACES`` (ticket §3-6: not namespace-level ask families).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -105,6 +113,9 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "git__worktree_add": "ask",
     "git__worktree_remove": "ask",
     "pty__run": "ask",
+    "patch__apply": "ask",
+    "todo__write": "allow",
+    "question__ask": "allow",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

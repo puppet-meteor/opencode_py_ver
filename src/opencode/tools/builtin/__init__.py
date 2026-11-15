@@ -12,7 +12,13 @@ semantics; the session working_dir always stays a root). P2-S6 (M2-git)
 adds the read-only git pair ``git__status`` / ``git__diff`` (T-C1-053) and
 P2-S7 (M2-git) the approved worktree trio ``git__worktree_add`` /
 ``git__worktree_list`` / ``git__worktree_remove`` (T-C1-055) -- same
-``roots`` constructor shape.
+``roots`` constructor shape. P6-S4 (T-C1-097, toolkit A) adds the
+multi-file patch tool ``patch__apply`` and the stateless echo pair
+``todo__write`` / ``question__ask``: same constant shape, and the three
+ride both production host compositions (the CLI ``_drive`` tuple and
+``serving._builtin_adapters``) beside the twelve, so every host face
+carries 16 adapters while a tool-less App composition stays tool-less
+(the app.py ``tools`` loop is host-param plumbing, not a registry).
 """
 
 from opencode.tools.builtin.bash import (
@@ -88,6 +94,16 @@ from opencode.tools.builtin.ls import (
     LS_VERSION,
     FsLsAdapter,
 )
+from opencode.tools.builtin.patch import (
+    PATCH_DESCRIPTION,
+    PATCH_INPUT_SCHEMA,
+    PATCH_MAX_SOURCE_BYTES,
+    PATCH_NAME,
+    PATCH_NAMESPACE,
+    PATCH_SPEC,
+    PATCH_VERSION,
+    PatchApplyAdapter,
+)
 from opencode.tools.builtin.pty import (
     PTY_DEFAULT_TIMEOUT_S,
     PTY_DESCRIPTION,
@@ -100,6 +116,15 @@ from opencode.tools.builtin.pty import (
     PtyRunAdapter,
     pty_adapters,
 )
+from opencode.tools.builtin.question import (
+    QUESTION_DESCRIPTION,
+    QUESTION_INPUT_SCHEMA,
+    QUESTION_NAME,
+    QUESTION_NAMESPACE,
+    QUESTION_SPEC,
+    QUESTION_VERSION,
+    QuestionAskAdapter,
+)
 from opencode.tools.builtin.read import (
     MAX_LINE_LENGTH,
     MAX_LINE_SUFFIX,
@@ -111,6 +136,16 @@ from opencode.tools.builtin.read import (
     READ_SPEC,
     READ_VERSION,
     FsReadAdapter,
+)
+from opencode.tools.builtin.todo import (
+    TODO_DESCRIPTION,
+    TODO_INPUT_SCHEMA,
+    TODO_NAME,
+    TODO_NAMESPACE,
+    TODO_SPEC,
+    TODO_STATUSES,
+    TODO_VERSION,
+    TodoWriteAdapter,
 )
 from opencode.tools.builtin.write import (
     WRITE_DESCRIPTION,
@@ -178,6 +213,13 @@ __all__ = [
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
+    "PATCH_DESCRIPTION",
+    "PATCH_INPUT_SCHEMA",
+    "PATCH_MAX_SOURCE_BYTES",
+    "PATCH_NAME",
+    "PATCH_NAMESPACE",
+    "PATCH_SPEC",
+    "PATCH_VERSION",
     "PTY_DEFAULT_TIMEOUT_S",
     "PTY_DESCRIPTION",
     "PTY_INPUT_SCHEMA",
@@ -186,12 +228,25 @@ __all__ = [
     "PTY_NAMESPACE",
     "PTY_SPEC",
     "PTY_VERSION",
+    "QUESTION_DESCRIPTION",
+    "QUESTION_INPUT_SCHEMA",
+    "QUESTION_NAME",
+    "QUESTION_NAMESPACE",
+    "QUESTION_SPEC",
+    "QUESTION_VERSION",
     "READ_DESCRIPTION",
     "READ_INPUT_SCHEMA",
     "READ_NAME",
     "READ_NAMESPACE",
     "READ_SPEC",
     "READ_VERSION",
+    "TODO_DESCRIPTION",
+    "TODO_INPUT_SCHEMA",
+    "TODO_NAME",
+    "TODO_NAMESPACE",
+    "TODO_SPEC",
+    "TODO_STATUSES",
+    "TODO_VERSION",
     "WRITE_DESCRIPTION",
     "WRITE_INPUT_SCHEMA",
     "WRITE_MAX_BYTES",
@@ -211,6 +266,9 @@ __all__ = [
     "GitWorktreeAddAdapter",
     "GitWorktreeListAdapter",
     "GitWorktreeRemoveAdapter",
+    "PatchApplyAdapter",
     "PtyRunAdapter",
+    "QuestionAskAdapter",
+    "TodoWriteAdapter",
     "pty_adapters",
 ]
