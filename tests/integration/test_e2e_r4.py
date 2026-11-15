@@ -1,6 +1,6 @@
 """R4-S7 closeout e2e (T-C1-041): side-effect uncertainty + recovery over the full stack.
 
-Seven tests over the genuine end-to-end composition -- scripted OpenAI server on
+Eight tests over the genuine end-to-end composition -- scripted OpenAI server on
 real loopback HTTP (owned by the test process) -> MaasAdapter SSE -> App ->
 SessionService/runner/step engine -> Invoker -> a REAL stdio MCP fixture
 server spawned across a process boundary (``McpManager.start_server`` +
@@ -63,12 +63,23 @@ test states its rung honestly):
    L339 order through the close-timeout face: one session parked
    mid-execution in the wrapper (the REAL fixture call already counted)
    past the 1.0s wait, so close hard-cancels it and the grace period
-   carries the folded unknown/unknown tool terminal. The split is honest
-   accounting (task clause 8): the registry's Phase-1 serial invoke lock
-   means only one invoke can sit inside the pipeline at a time, so the task
-   book's literal combined close (one App holding BOTH an approval-parked
-   and a mid-execution-parked invoke) is structurally unreachable -- ④
-   float report.
+   carries the folded unknown/unknown tool terminal. The split was honest
+   accounting (task clause 8) under the Phase-1 serial invoke lock as it
+   then stood: the registry-wide lock meant only one invoke could sit
+   inside the pipeline at a time, so the task book's literal combined
+   close (one App holding BOTH an approval-parked and a
+   mid-execution-parked invoke) was structurally unreachable -- ④ float
+   report at the time. T-C1-098 keyed that serial lock per session
+   (cross-session concurrency unblocked; same-session serial semantics
+   unchanged), so the combined face became reachable and ⑥c pins it.
+⑥c ``test_close_folds_combined_approval_park_and_in_flight_park`` -- the
+   literal combined close face: one App, two sessions each holding an
+   invoke concurrently (A approval-parked on ``fs__write``, B
+   mid-execution-parked in the wrapper past the 1.0s wait), ``close()``
+   folds both runs in their own right (A the ⑥a sequence, B the ⑥b
+   unknown/unknown terminal inside the grace window) with the §7 L339
+   resource order, the never-approved write, and the once-only external
+   call all intact.
 
 Planned exemption (task clause 7): the acceptance C front-half sentences
 (pending-approval invalidation on restart, saved-decision audit, duplicate
@@ -1196,11 +1207,14 @@ async def test_generation_half_batch_crash_leaves_no_orphan_rows(
 # ---------------------------------------------------------------------------
 # ⑥ The shutdown/crash race: §7 L339 close order + durable fold sequence.
 # Split into ⑥a (approval-park + provider-stream park) and ⑥b (mid-execution
-# park past the close timeout): the registry's Phase-1 serial invoke lock
-# means only one invoke can sit inside the pipeline at a time, so the task
-# book's literal combined close (one App holding BOTH an approval-parked and
-# a mid-execution-parked invoke) is structurally unreachable -- ④ float
-# report; each face is pinned deterministically instead.
+# park past the close timeout), each face pinned deterministically: at the
+# time of the split the registry's Phase-1 serial invoke lock was
+# registry-wide, so only one invoke could sit inside the pipeline at a time
+# and the task book's literal combined close (one App holding BOTH an
+# approval-parked and a mid-execution-parked invoke) was structurally
+# unreachable -- ④ float report then. T-C1-098 keyed the serial lock per
+# session (cross-session concurrency unblocked; same-session serial
+# semantics unchanged), so ⑥c now pins the combined close face directly.
 # ---------------------------------------------------------------------------
 
 
@@ -1373,6 +1387,132 @@ async def test_close_timeout_folds_in_flight_mcp_call_unknown(tmp_path: Path) ->
                 for row in _event_data(db_path, session_id.session_id, "py.tool.finished")
             ] == [("unknown", "unknown")]
             assert [str(row["outcome"]) for row in _event_data(db_path, session_id.session_id, "py.run.finished")] == [
+                "interrupted"
+            ]
+        await _wait_pids_gone([_fixture_server_pid(mcp_log)])
+    finally:
+        await server.aclose()
+
+
+async def test_close_folds_combined_approval_park_and_in_flight_park(tmp_path: Path) -> None:
+    """⑥c (the literal combined close face, pinned after T-C1-098 keyed the
+    registry's Phase-1 serial invoke lock per session): one App, two sessions
+    each holding an invoke concurrently -- A parked on a real ``fs__write``
+    approval (the ⑥a face), B parked mid-execution in the task-book
+    sanctioned wrapper (the ⑥b face: the REAL fixture call already went out
+    and is counted) past the injected ``close_timeout_s=1.0``. ``App.close()``
+    must fold both runs in their own right -- A through shutdown intent ->
+    closed approval -> not-started tool terminal -> interrupted step/run, B
+    through the hard-cancel + grace face's honest unknown/unknown terminal
+    -> interrupted step/run -- while the §7 L339 resource order (MCP with
+    the DB still readable inside it -> provider -> DB handle) holds, the
+    never-approved write never happens, and the external call is never
+    re-executed."""
+    db_dir = tmp_path.parent / f"{tmp_path.name}-db"
+    db_dir.mkdir()
+    db_path = db_dir / "e2e.db"
+    _require_success(_upgrade_head(db_path))
+    order: list[str] = []
+    marker = tmp_path / "wrapper.marker"
+    mcp_log = tmp_path / "fixture.log"
+    server = FakeOpenAIServer(
+        [
+            _tool_calls_response(
+                "let me write", ("call_write", "fs__write", {"path": "note.txt", "content": "side effect\n"})
+            ),
+            _tool_calls_response("let me echo", ("call_echo", "mcp__echo", {"text": "golden"})),
+        ]
+    )
+    base_url = await server.start()
+    manager = _OrderRecordingManager(order, db_path)
+    manager.add_server(
+        StdioServerDefinition(
+            name="fixture",
+            command=sys.executable,
+            args=(str(SERVER_SCRIPT),),
+            env={"MCP_FIXTURE_MODE": "ok", "MCP_FIXTURE_LOG": str(mcp_log), "PYTHONUNBUFFERED": "1"},
+        )
+    )
+    remote_tools = await manager.start_server("fixture")
+    echo = next(tool for tool in remote_tools if tool.name == "echo")
+    echo_adapter = _ParkedAfterCallAdapter(
+        MCPToolAdapter(
+            manager=manager,
+            server="fixture",
+            tool=echo,
+            spec=mcp_tool_spec(echo.name, echo.description, echo.input_schema),
+        ),
+        marker,
+    )
+    provider = _OrderRecordingProvider(f"{base_url}/v1", order, db_path)
+    try:
+        async with App(
+            db_path,
+            working_dir=str(tmp_path),
+            provider=provider,
+            tools=(FsWriteAdapter(), echo_adapter),
+            settings=_settings(),
+            rules=(PermissionRule(action="mcp__echo", effect="allow"),),
+            mcp_manager=manager,
+            close_timeout_s=1.0,
+        ) as app:
+            session_a = await app.service.create(ConfigSnapshot.create())
+            await app.service.prompt(session_a.session_id, "write the note", "req_a")
+            await _await_event_count(db_path, session_a.session_id, "py.permission.requested", 1)
+            # A's invoke now holds its per-session pipeline slot while parked
+            # on the approval; B's invoke needs only its own session's slot
+            # (the T-C1-098 per-session lock face).
+            session_b = await app.service.create(ConfigSnapshot.create())
+            await app.service.prompt(session_b.session_id, "echo golden", "req_b")
+            await _await_file_text(marker)
+            await _await_event_count(db_path, session_b.session_id, "py.tool.started", 1)
+
+            await app.close()
+            assert order == _CLOSE_ORDER
+            assert app.database.closed is True
+            assert not (tmp_path / "note.txt").exists()  # the never-approved write never ran
+            assert _fixture_call_count(mcp_log) == 1  # close does not re-execute the call
+
+            # session A (approval-parked): intent -> closed approval -> not-started
+            # terminal -> interrupted fold
+            types_a = _event_types(db_path, session_a.session_id)
+            _assert_ordered_subsequence(
+                types_a,
+                [
+                    "py.run.cancel_requested",
+                    "py.permission.closed",
+                    "py.tool.finished",
+                    "py.step.finished",
+                    "py.run.finished",
+                ],
+            )
+            assert [
+                str(row["reason"]) for row in _event_data(db_path, session_a.session_id, "py.run.cancel_requested")
+            ] == ["shutdown"]
+            assert [
+                str(row["outcome"]) for row in _event_data(db_path, session_a.session_id, "py.permission.closed")
+            ] == ["cancelled"]
+            assert [
+                (str(row["state"]), str(row["effect_status"]))
+                for row in _event_data(db_path, session_a.session_id, "py.tool.finished")
+            ] == [("cancelled", "not_started")]
+            assert [str(row["outcome"]) for row in _event_data(db_path, session_a.session_id, "py.run.finished")] == [
+                "interrupted"
+            ]
+
+            # session B (mid-execution past the timeout): the honest
+            # unknown/unknown terminal folds inside the grace window, then the
+            # interrupted fold
+            types_b = _event_types(db_path, session_b.session_id)
+            _assert_ordered_subsequence(
+                types_b,
+                ["py.run.cancel_requested", "py.tool.finished", "py.step.finished", "py.run.finished"],
+            )
+            assert [
+                (str(row["state"]), str(row["effect_status"]))
+                for row in _event_data(db_path, session_b.session_id, "py.tool.finished")
+            ] == [("unknown", "unknown")]
+            assert [str(row["outcome"]) for row in _event_data(db_path, session_b.session_id, "py.run.finished")] == [
                 "interrupted"
             ]
         await _wait_pids_gone([_fixture_server_pid(mcp_log)])
