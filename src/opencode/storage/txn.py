@@ -106,6 +106,10 @@ REASON_REBUILD_DUPLICATE_RUN = "rebuild_duplicate_run"
 #: defensive only (NOT NULL/FK violations); a duplicate is structurally
 #: impossible over the just-cleared table given the fold's fresh-id gates.
 REASON_REBUILD_DUPLICATE_PERMISSION = "rebuild_duplicate_permission"
+#: Rebuild re-projection of the inbox read model (T-C1-100): the 0004 PK
+#: (session_id, inbox_id) makes a duplicate structurally impossible over the
+#: just-cleared table given the fold's fresh-id gate; defensive only.
+REASON_REBUILD_DUPLICATE_INBOX = "rebuild_duplicate_inbox"
 
 _SELECT_SESSION_STATUS = sa.text("SELECT status, applied_seq FROM sessions WHERE session_id = :sid")
 _SELECT_SESSION_APPLIED = sa.text("SELECT applied_seq FROM sessions WHERE session_id = :sid")
@@ -155,6 +159,7 @@ _DELETE_SESSION_MESSAGES = sa.text("DELETE FROM messages WHERE session_id = :sid
 _DELETE_SESSION_TOOL_EXECUTIONS = sa.text("DELETE FROM tool_executions WHERE session_id = :sid")
 _DELETE_SESSION_RUNS = sa.text("DELETE FROM runs WHERE session_id = :sid")
 _DELETE_SESSION_PERMISSIONS = sa.text("DELETE FROM permissions WHERE session_id = :sid")
+_DELETE_SESSION_INBOX = sa.text("DELETE FROM inbox WHERE session_id = :sid")
 _DELETE_SESSION_ROW = sa.text("DELETE FROM sessions WHERE session_id = :sid")
 _INSERT_REBUILT_SESSION = sa.text(
     "INSERT INTO sessions (session_id, status, config_snapshot, snapshot_hash, "
@@ -181,6 +186,10 @@ _INSERT_REBUILT_PERMISSION = sa.text(
 _INSERT_REBUILT_DECISION = sa.text(
     "INSERT INTO permissions (session_id, decision_id, scope, expires_at, state) "
     "VALUES (:sid, :decision_id, :scope, :expires_at, :state)"
+)
+_INSERT_REBUILT_INBOX = sa.text(
+    "INSERT INTO inbox (session_id, inbox_id, kind, delivery, request_id, enqueued_seq, message) "
+    "VALUES (:sid, :inbox_id, :kind, :delivery, :request_id, :enqueued_seq, :message)"
 )
 
 
@@ -866,6 +875,7 @@ class TransactionWriter:
         await connection.execute(_DELETE_SESSION_TOOL_EXECUTIONS, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_RUNS, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_PERMISSIONS, {"sid": session_id})
+        await connection.execute(_DELETE_SESSION_INBOX, {"sid": session_id})
         await connection.execute(_DELETE_SESSION_ROW, {"sid": session_id})
 
         state = SessionState()
@@ -1086,6 +1096,35 @@ class TransactionWriter:
                     Diagnostic(
                         reason=REASON_REBUILD_DUPLICATE_PERMISSION,
                         first_bad_seq=state.applied_seq,
+                        applied_seq=applied_at_discovery,
+                    ),
+                ) from error
+
+        # The T-C1-100 inbox read model: pending rows from ``state.inbox`` in
+        # enqueue order (the fold's dict order), mirroring the commit-path
+        # projection -- without the explicit clear+re-insert above the
+        # sessions-row CASCADE would drop the rows and the rebuild would
+        # silently lose the pending inbox (the permissions precedent).
+        for item in state.inbox.values():
+            try:
+                await connection.execute(
+                    _INSERT_REBUILT_INBOX,
+                    {
+                        "sid": session_id,
+                        "inbox_id": item.inbox_id,
+                        "kind": item.kind,
+                        "delivery": item.delivery,
+                        "request_id": item.request_id,
+                        "enqueued_seq": item.enqueued_seq,
+                        "message": canonical_json(item.message.model_dump(mode="json")),
+                    },
+                )
+            except IntegrityError as error:
+                raise _corruption(
+                    REASON_REBUILD_DUPLICATE_INBOX,
+                    Diagnostic(
+                        reason=REASON_REBUILD_DUPLICATE_INBOX,
+                        first_bad_seq=item.enqueued_seq,
                         applied_seq=applied_at_discovery,
                     ),
                 ) from error

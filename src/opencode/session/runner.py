@@ -359,6 +359,7 @@ class Runner:
         clock: Clock | None = None,
         limits: ToolLimits | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        steer_consume: Callable[[str, str], Awaitable[str | None]] | None = None,
     ) -> None:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError(f"max_steps must be an integer >= 1, got {max_steps!r}")
@@ -372,6 +373,13 @@ class Runner:
         self._ids: IdFactory = ids if ids is not None else AscendingIds(self._clock)
         self._limits: ToolLimits = limits if limits is not None else ToolLimits()
         self._max_steps = max_steps
+        #: §3-3 (T-C1-100, P7-S1): the service-owned step-boundary steer
+        #: hook. Called at the top of every step-loop iteration BEFORE the
+        #: state re-fold; the wrapper takes the per-session commit lock,
+        #: commits one ``py.inbox.delivered`` per pending steer and returns
+        #: its id. None keeps the loop byte-identical (the unwired
+        #: composition answers every existing test unchanged).
+        self._steer_consume = steer_consume
         self._cancel_events: dict[str, asyncio.Event] = {}
         #: Per-run open-step context (model, started_at) -- not folded state:
         #: single-flight runner memory between step.started and step closure,
@@ -500,6 +508,13 @@ class Runner:
         """
         steps = 0
         while True:
+            # §3-3 (T-C1-100, P7-S1): the step-boundary steer recheck -- at
+            # most one pending steer per step, consumed BEFORE the state
+            # re-fold so the steered user turn lands in this step's context
+            # (the delivered fold appends it to history). None keeps the
+            # loop byte-identical.
+            if self._steer_consume is not None:
+                await self._steer_consume(session_id, run_id)
             state = await self._load_state(session_id)
             run = state.runs[run_id]
             if run.status is RunStatus.CANCELLING:

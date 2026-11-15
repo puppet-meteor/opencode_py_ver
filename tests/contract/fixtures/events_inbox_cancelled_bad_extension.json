@@ -1,0 +1,12 @@
+{
+  "id": "evt_0000000000000000000000000106",
+  "type": "py.inbox.cancelled",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:06Z",
+  "data": {
+    "inbox_id": 106
+  },
+  "metadata": {},
+  "seq": 106
+}

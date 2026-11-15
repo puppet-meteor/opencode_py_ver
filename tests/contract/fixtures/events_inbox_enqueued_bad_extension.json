@@ -1,0 +1,22 @@
+{
+  "id": "evt_0000000000000000000000000103",
+  "type": "py.inbox.enqueued",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:03Z",
+  "data": {
+    "inbox_id": "inb_0000000000000000000000000103",
+    "kind": "user",
+    "delivery": "sideways",
+    "request_id": "req_0000000000000000000000000103",
+    "message": {
+      "id": "msg_0000000000000000000000000103",
+      "type": "user",
+      "created_at": "2026-11-15T08:00:03Z",
+      "metadata": {},
+      "text": "delivery must be steer or queue, not a free string"
+    }
+  },
+  "metadata": {},
+  "seq": 103
+}

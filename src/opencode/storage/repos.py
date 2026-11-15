@@ -119,6 +119,12 @@ REASON_CREATED_ROW_DUPLICATED = "created_row_duplicated"
 #: unknown versions, so a stored row outside the set is corruption).
 REASON_CREATED_ROW_UNEXPECTED_VERSION = "created_row_unexpected_version"
 
+#: An inbox row whose message payload no longer decodes as a user message
+#: (sanitized reason; T-C1-100 — the parked payload rode the committed
+#: ``py.inbox.enqueued`` event verbatim, so a row that does not decode is
+#: stored corruption).
+REASON_INBOX_ROW_DECODE_FAILED = "inbox_row_decode_failed"
+
 #: The registered wire versions of ``py.session.created`` (the three
 #: EventDefinition rows in the contracts registry; pinned here so repos stays
 #: contracts-registry-free — the same pinned-vocabulary tradeoff as the runs
@@ -149,6 +155,7 @@ _SELECT_PROMPT_EVENTS = sa.text(
 # session/service.py; existence probes intentionally lighter than the full-row
 # faces -- no JSON column decode, classification stays with the caller).
 _SELECT_RUN_BY_ID = sa.text("SELECT session_id, request_id, status, error FROM runs WHERE run_id = :rid")
+_SELECT_RUN_ID_BY_REQUEST = sa.text("SELECT run_id FROM runs WHERE session_id = :sid AND request_id = :rid")
 _SELECT_RUN_STATUS_BY_ID = sa.text("SELECT status FROM runs WHERE run_id = :rid")
 _SELECT_SESSION_OWNER = sa.text("SELECT session_id, status FROM sessions WHERE session_id = :sid")
 _SELECT_MESSAGE_SESSION_ID = sa.text("SELECT session_id FROM messages WHERE message_id = :mid")
@@ -170,6 +177,19 @@ _SELECT_PENDING_PERMISSIONS = sa.text(
     "SELECT session_id, permission_id, execution_id FROM permissions "
     "WHERE state = 'pending' ORDER BY session_id, permission_id"
 )
+# -- T-C1-100 (P7-S1): the steering-inbox read faces. The 0004 table is
+# pending-only -- ``py.inbox.delivered``/``py.inbox.cancelled`` delete the
+# row in the same commit as the consumption/revocation -- so the list face
+# needs no state filter; ``enqueued_seq`` is the enqueue-order key.
+_SELECT_INBOX = sa.text(
+    "SELECT session_id, inbox_id, kind, delivery, request_id, enqueued_seq, message "
+    "FROM inbox WHERE session_id = :sid ORDER BY enqueued_seq"
+)
+_SELECT_INBOX_ITEM = sa.text(
+    "SELECT session_id, inbox_id, kind, delivery, request_id, enqueued_seq, message "
+    "FROM inbox WHERE session_id = :sid AND inbox_id = :iid"
+)
+_SELECT_PENDING_INBOX_SESSIONS = sa.text("SELECT session_id FROM inbox GROUP BY session_id ORDER BY session_id")
 # -- T-C1-040 (R4-S6): the CLI session-selection statements. The sessions
 # table carries no working_dir column (0001_initial), so both selection
 # queries scan the events log by type; ``created`` is the INTEGER epoch-ms
@@ -342,6 +362,27 @@ class SessionListRow:
     applied_seq: int
     active_run_id: str | None
     created_epoch_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class InboxItemRow:
+    """One pending steering-inbox row (T-C1-100, P7-S1).
+
+    The list/cancel/update read face: the parked user turn decodes
+    fail-closed into ``UserMessage`` (it rode the committed
+    ``py.inbox.enqueued`` event verbatim); ``enqueued_seq`` is the
+    enqueue-order key; ``kind``/``delivery`` are the raw stored texts --
+    classifying unknown values is the caller's job (the same
+    pinned-vocabulary tradeoff as the scan statements).
+    """
+
+    session_id: str
+    inbox_id: str
+    kind: str
+    delivery: str
+    request_id: str | None
+    enqueued_seq: int
+    message: UserMessage
 
 
 def _corrupt(reason: str, message: str, details: JsonObject) -> StorageCorruptError:
@@ -631,6 +672,24 @@ class ReadRepositories:
             row = (await connection.execute(_SELECT_RUN_STATUS_BY_ID, {"rid": run_id})).first()
         return None if row is None else str(row.status)
 
+    async def run_id_by_request(self, session_id: str, request_id: str) -> str | None:
+        """The run accepted under ``(session_id, request_id)``; ``None`` when absent.
+
+        T-C1-100 (P7-S1) §3-1 step-2.5 retry probe: the 0002 runs read model
+        owns the unique(session_id, request_id) mapping, so a run accepted
+        through an inbox promotion or an idle admission -- whose
+        ``py.prompt.accepted`` event commits inside a multi-event batch and
+        therefore carries no dedupe-key row (unique(session_id, dedupe_key)
+        makes a keyed batch single-row) -- is still discoverable for the
+        prompt face's idempotent retry recognition.
+        """
+        _require_session_id(session_id)
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_RUN_ID_BY_REQUEST, {"sid": session_id, "rid": request_id})).first()
+        return None if row is None else str(row.run_id)
+
     async def session_owner(self, session_id: str) -> SessionOwnerRow | None:
         """The ``(session_id, status)`` pair of one sessions row (light probe).
 
@@ -742,6 +801,85 @@ class ReadRepositories:
             )
             for row in rows
         ]
+
+    # -- T-C1-100 (P7-S1): the steering-inbox read faces ------------------------
+
+    async def inbox_items(self, session_id: str) -> list[InboxItemRow]:
+        """Every pending inbox row of one session, in enqueue order.
+
+        The list endpoint's base face: the 0004 table is pending-only
+        (delivered/cancelled delete the row in the same commit), so no state
+        filter is needed and the ``enqueued_seq`` order IS the TS rowid
+        order. Rows decode fail-closed; one bad row fails the whole list
+        without returning a half page (the messages-page discipline).
+        """
+        _require_session_id(session_id)
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_INBOX, {"sid": session_id})).fetchall()
+        return [self._decode_inbox_row(session_id, row) for row in rows]
+
+    async def inbox_item(self, session_id: str, inbox_id: str) -> InboxItemRow | None:
+        """One pending inbox row; ``None`` when no such pending item exists.
+
+        The cancel/update endpoints' pre-check face: a missing row means the
+        item was already delivered or cancelled (the endpoint's no-op /
+        Conflict decision), not an error.
+        """
+        _require_session_id(session_id)
+        if not isinstance(inbox_id, str) or not inbox_id:
+            raise ValueError("inbox_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_INBOX_ITEM, {"sid": session_id, "iid": inbox_id})).first()
+        if row is None:
+            return None
+        return self._decode_inbox_row(session_id, row)
+
+    async def pending_inbox_session_ids(self) -> list[str]:
+        """Every session that still owns pending inbox rows (T-C1-100 R4).
+
+        The post-recovery-scan wake enumeration: pending inbox items are
+        plain read-model rows that survive the scan untouched (zero recovery
+        writes), so this face is the only re-check the startup wiring needs
+        -- each listed session gets the idle-wake promote decision re-run
+        against its fold truth.
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_PENDING_INBOX_SESSIONS)).fetchall()
+        return [str(row.session_id) for row in rows]
+
+    def _decode_inbox_row(self, session_id: str, row: Any) -> InboxItemRow:
+        """Decode one pending inbox row fail-closed (§3.2.1)."""
+        try:
+            payload = _json_column(row.message)
+        except ValueError as error:
+            raise _corrupt(
+                REASON_INBOX_ROW_DECODE_FAILED,
+                f"session {session_id} has an inbox row with an undecodable message payload",
+                {"reason": REASON_INBOX_ROW_DECODE_FAILED, "session_id": session_id},
+            ) from error
+        if not isinstance(payload, dict):
+            raise _corrupt(
+                REASON_INBOX_ROW_DECODE_FAILED,
+                f"session {session_id} has an inbox row whose message payload is not an object",
+                {"reason": REASON_INBOX_ROW_DECODE_FAILED, "session_id": session_id},
+            )
+        try:
+            message = UserMessage.model_validate(payload)
+        except ValueError as error:
+            raise _corrupt(
+                REASON_INBOX_ROW_DECODE_FAILED,
+                f"session {session_id} has an inbox row that does not decode as a user message",
+                {"reason": REASON_INBOX_ROW_DECODE_FAILED, "session_id": session_id},
+            ) from error
+        return InboxItemRow(
+            session_id=str(row.session_id),
+            inbox_id=str(row.inbox_id),
+            kind=str(row.kind),
+            delivery=str(row.delivery),
+            request_id=row.request_id if row.request_id is None else str(row.request_id),
+            enqueued_seq=int(row.enqueued_seq),
+            message=message,
+        )
 
     # -- T-C1-040 (R4-S6): the CLI session-selection faces -----------------------
 

@@ -1,0 +1,22 @@
+{
+  "id": "evt_0000000000000000000000000101",
+  "type": "py.inbox.enqueued",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:01Z",
+  "data": {
+    "inbox_id": "inb_0000000000000000000000000101",
+    "kind": "user",
+    "delivery": "steer",
+    "request_id": "req_0000000000000000000000000101",
+    "message": {
+      "id": "msg_0000000000000000000000000101",
+      "type": "user",
+      "created_at": "2026-11-15T08:00:01Z",
+      "metadata": {},
+      "text": "steer: use the faster plan"
+    }
+  },
+  "metadata": {},
+  "seq": 101
+}

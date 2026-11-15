@@ -61,7 +61,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -105,6 +105,7 @@ from opencode.session.compaction import (
     SettledMessage,
     SummaryGenerator,
 )
+from opencode.session.inbox import InboxRef, SessionInbox
 from opencode.session.state import SessionState, SessionStatus
 from opencode.session.state import apply as apply_event
 from opencode.skills import SkillActivationReceipt, SkillCatalog
@@ -125,7 +126,7 @@ from opencode.storage import (
     StoreError,
     StoreValidationError,
 )
-from opencode.storage.repos import MAX_PAGE_LIMIT
+from opencode.storage.repos import MAX_PAGE_LIMIT, InboxItemRow
 from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError, from_epoch_ms
 
 if TYPE_CHECKING:
@@ -359,6 +360,27 @@ class RunStatus:
     request_id: str
     status: RunStatusValue
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptReceipt:
+    """§3-5 (T-C1-100): the interrupt face's honest receipt.
+
+    ``interrupted`` is True only when the run this call targeted settled on
+    the interrupted terminal; a run that finished on its own first answers
+    its original outcome (``interrupted=False``, the late-interrupt parity
+    of cancel). ``run_id``/``status`` carry the target run; a session with
+    no active run answers the idle no-op (both ``None``).
+    ``resumed_run_id`` is the resume drive's fresh run over the oldest
+    pending steer (None = no resume asked, no pending steer, or the idle
+    no-op).
+    """
+
+    interrupted: bool
+    session_id: str
+    run_id: str | None
+    status: RunStatusValue | None
+    resumed_run_id: str | None = None
 
 
 #: Injectable clock: returns timezone-aware UTC datetimes (§1).
@@ -745,6 +767,12 @@ class SessionService:
         # be garbage-collected mid-flight.
         self._tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
         self._schedule_errors: dict[str, BaseException] = {}
+        # T-C1-100 (P7-S1): the durable steering-inbox face. Built eagerly
+        # over the same store/repos/bus/id/clock -- every committing method
+        # there runs with the CALLER holding this service's per-session
+        # commit lock (the ordering contract), so no separate lock state
+        # lives here.
+        self._inbox = SessionInbox(store=store, repos=repos, bus=bus, ids=self._ids, clock=self._clock)
 
     @property
     def closed(self) -> bool:
@@ -895,7 +923,21 @@ class SessionService:
 
     # -- §7 prompt -----------------------------------------------------------
 
-    async def prompt(self, session_id: str, text: str, request_id: str) -> RunRef:
+    # T-C1-100: the overloads pin the default face's static contract --
+    # ``delivery=None`` (or omitted) can never answer InboxRef, so every
+    # pre-P7 caller keeps the plain RunRef type; an explicit delivery opts
+    # into the union (busy parks, idle admits-and-starts).
+    @overload
+    async def prompt(self, session_id: str, text: str, request_id: str, *, delivery: None = ...) -> RunRef: ...
+
+    @overload
+    async def prompt(
+        self, session_id: str, text: str, request_id: str, *, delivery: Literal["steer", "queue"]
+    ) -> RunRef | InboxRef: ...
+
+    async def prompt(
+        self, session_id: str, text: str, request_id: str, *, delivery: Literal["steer", "queue"] | None = None
+    ) -> RunRef | InboxRef:
         """Accept one user prompt: persist ``py.prompt.accepted``, return RunRef.
 
         §7 L318-323 four-step fixed order, the whole sequence under the
@@ -908,11 +950,30 @@ class SessionService:
         behind (the whole batch rolls back), and a fresh call re-enters from
         step 1 (a stored-batch retry inside one store commit reuses the fixed
         values by construction -- the same drafts go in).
+
+        T-C1-100 (P7-S1) adds the opt-in ``delivery`` face on top; the
+        default stays byte-identical (``delivery=None`` keeps this §7
+        four-step contract exactly -- a busy session still answers
+        :class:`SessionBusyError`, and every pre-P7 test of this face runs
+        against the same path). An explicit ``"steer"``/``"queue"`` parks
+        the prompt in the durable inbox when the session is busy
+        (:class:`InboxRef`, the admission face) or admits-and-starts it in
+        one atomic batch when idle (RunRef, the §4-1 matrix). Step 2.5
+        recognizes the retries: the same request_id with a different text
+        is the §7 idempotency conflict, the same text while the item stays
+        parked and the session busy keeps the busy face (never a second
+        item), the same text on an idle session promotes the parked item
+        now, and a request_id whose parked item was already promoted or
+        admitted-and-started (an unkeyed accept -- a keyed batch is
+        single-row) answers the ORIGINAL RunRef through the runs read
+        model, exactly like step 2's keyed face.
         """
         _require_session_id_arg(session_id)
         _require_request_id_arg(request_id)
         if not isinstance(text, str):
             raise StoreValidationError("text must be a string (no implicit conversion)")
+        if delivery is not None and delivery not in ("steer", "queue"):
+            raise StoreValidationError('delivery must be None, "steer" or "queue"')
         dedupe_key = prompt_dedupe_key(request_id)
 
         async with self._session_lock(session_id):
@@ -947,14 +1008,66 @@ class SessionService:
                     details={"session_id": session_id, "request_id": request_id},
                 )
 
+            # -- step 2.5: parked-retry recognition (T-C1-100, P7-S1) ----------
+            parked = await self._inbox.pending_by_request(session_id, request_id)
+            if parked is not None:
+                if parked.message.text != text:
+                    raise IdempotencyConflictError(
+                        f"request {request_id!r} was already accepted with a different text",
+                        details={"session_id": session_id, "request_id": request_id},
+                    )
+                if record.active_run_id is not None:
+                    # Same item, still busy: it stays parked; the honest
+                    # answer is the busy face, never a second admission.
+                    raise SessionBusyError(
+                        f"session {session_id} already holds an active run",
+                        details={"session_id": session_id, "active_run_id": record.active_run_id},
+                    )
+                run_id, accepted_request_id = await self._inbox.promote(session_id, parked)
+                self._schedule_run(session_id, run_id)
+                return RunRef(session_id=session_id, run_id=run_id, request_id=accepted_request_id)
+            promoted_run_id = await self._repos.run_id_by_request(session_id, request_id)
+            if promoted_run_id is not None:
+                # §3-1 step 2.5: the request was already accepted through an
+                # inbox promotion or an idle admission -- an unkeyed accept
+                # (a keyed batch is single-row, unique(session_id,
+                # dedupe_key)), invisible to step 2. The runs read model's
+                # unique(session_id, request_id) is the retry face, with
+                # step 2's exact semantics: same text -> the original
+                # RunRef (never a second run); different text -> the §7
+                # idempotency conflict.
+                promoted = await self._repos.prompt_by_run_id(session_id, promoted_run_id)
+                assert promoted is not None  # a runs row and its accepted event commit together
+                if promoted.message_text != text:
+                    raise IdempotencyConflictError(
+                        f"request {request_id!r} was already accepted with a different text",
+                        details={"session_id": session_id, "request_id": request_id},
+                    )
+                return RunRef(session_id=session_id, run_id=promoted_run_id, request_id=promoted.request_id)
+
             # -- step 3: active_run_id gate (§7 L323) ------------------------
             if record.active_run_id is not None:
-                raise SessionBusyError(
-                    f"session {session_id} already holds an active run",
-                    details={"session_id": session_id, "active_run_id": record.active_run_id},
-                )
+                if delivery is None:
+                    raise SessionBusyError(
+                        f"session {session_id} already holds an active run",
+                        details={"session_id": session_id, "active_run_id": record.active_run_id},
+                    )
+                # §4-1: explicit delivery parks the prompt (the busy face
+                # becomes an admission); the run's step boundaries and its
+                # settle recheck own every later transition.
+                return await self._inbox.admit(session_id, text=text, request_id=request_id, delivery=delivery)
 
             # -- step 4: generate + fix IDs, expected_seq = H, commit, notify -
+            if delivery is not None:
+                # §4-1 idle + explicit delivery: the item never rests -- one
+                # atomic batch parks the provenance, accepts the run over
+                # the parked message and records the delivery (a stored
+                # same-batch retry replays under the same prompt dedupe key).
+                run_id, accepted_request_id = await self._inbox.admit_and_start(
+                    session_id, text=text, request_id=request_id, delivery=delivery
+                )
+                self._schedule_run(session_id, run_id)
+                return RunRef(session_id=session_id, run_id=run_id, request_id=accepted_request_id)
             run_id = self._ids.run_id()
             created_at = self._clock()
             data = PromptAcceptedData(
@@ -1185,6 +1298,164 @@ class SessionService:
         # No live task: the intent is durable, there are no in-process
         # resources to reclaim, and R4 owns the terminal.
         return await self._run_status_by_runs_table(run_id)
+
+    # -- §3 inbox + interrupt (T-C1-100, P7-S1) --------------------------------
+
+    async def inbox_list(self, session_id: str) -> list[InboxItemRow]:
+        """§3-6 list: every pending inbox row of one session, in enqueue order.
+
+        A pure read-model query (no lock, no recovery trigger); the
+        deleted-tombstone face answers NotFound exactly like every other
+        resource face.
+        """
+        _require_session_id_arg(session_id)
+        await self._read_live_record(session_id)
+        return await self._inbox.pending(session_id)
+
+    async def inbox_cancel(self, session_id: str, inbox_id: str) -> bool:
+        """§3-6 cancel: withdraw one pending item; ``False`` is the no-op.
+
+        Withdrawing an item that is no longer pending (already delivered or
+        already cancelled) commits nothing and answers ``False`` -- the
+        endpoint's honest 200, never an error and never a second event.
+        """
+        _require_session_id_arg(session_id)
+        if not isinstance(inbox_id, str) or not inbox_id:
+            raise StoreValidationError("inbox_id must be a non-empty string")
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._read_live_record(session_id)
+            return await self._inbox.cancel(session_id, inbox_id)
+
+    async def inbox_update(self, session_id: str, inbox_id: str, delivery: Literal["steer", "queue"]) -> InboxItemRow:
+        """§3-6 update: re-arm one pending item's delivery; returns the row.
+
+        A flip to ``"steer"`` rings the doorbell implicitly: the runner's
+        step-boundary recheck consumes the re-armed steer within one step
+        (no in-memory signal exists to set -- the durable log is the only
+        truth). An update on an item that is no longer pending raises
+        :class:`ConflictError` (the §3-6 face is NOT a no-op, unlike
+        cancel); unknown delivery values fail closed before any lock.
+        """
+        _require_session_id_arg(session_id)
+        if not isinstance(inbox_id, str) or not inbox_id:
+            raise StoreValidationError("inbox_id must be a non-empty string")
+        if delivery not in ("steer", "queue"):
+            raise StoreValidationError('delivery must be "steer" or "queue"')
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._read_live_record(session_id)
+            return await self._inbox.update_delivery(session_id, inbox_id, delivery)
+
+    async def interrupt(self, session_id: str, *, resume: bool = False) -> InterruptReceipt:
+        """§3-5 interrupt: stop the active run (the cancel machinery), optionally resume.
+
+        The cancel face verbatim underneath (``py.run.cancel_requested``
+        reason="user" -> cooperative signal -> honest terminal): a session
+        with no active run is the idle no-op ``{interrupted: False}`` --
+        no event, no error. ``resume=True`` after an interrupted settle
+        promotes the oldest pending STEER into a fresh run; queued prompts
+        stay parked under BOTH faces (the interrupted settle never
+        auto-continues the queue -- the resume drive is the explicit
+        control point). A non-local active run is N/A on this face: the
+        in-process ``active_run_id`` implies the live task.
+        """
+        _require_session_id_arg(session_id)
+        if not isinstance(resume, bool):
+            raise StoreValidationError("resume must be a boolean")
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            record = await self._read_live_record(session_id)
+            active = record.active_run_id
+        if active is None:
+            return InterruptReceipt(
+                interrupted=False, session_id=session_id, run_id=None, status=None, resumed_run_id=None
+            )
+        status = await self.cancel(active)
+        interrupted = status.status is RunStatusValue.INTERRUPTED
+        resumed: str | None = None
+        if resume and interrupted:
+            async with self._session_lock(session_id):
+                ref = await self._promote_next(session_id, "steer")
+            if ref is not None:
+                resumed = ref.run_id
+        return InterruptReceipt(
+            interrupted=interrupted,
+            session_id=session_id,
+            run_id=active,
+            status=status.status,
+            resumed_run_id=resumed,
+        )
+
+    async def consume_steer(self, session_id: str, run_id: str) -> str | None:
+        """§3-3: the runner-facing step-boundary steer hook.
+
+        Called at the top of every step-loop iteration before the state
+        re-fold; the per-session lock is taken HERE (the runner's
+        EventCommitter shares no service lock) and the oldest pending steer
+        commits its ``py.inbox.delivered``. Returns the consumed
+        ``inbox_id`` for provenance, or ``None`` (nothing pending -- the
+        common case costs one read-model query per step).
+        """
+        if self._closed or self._closing:
+            return None
+        async with self._session_lock(session_id):
+            return await self._inbox.deliver_steer(session_id, run_id)
+
+    async def wake_pending_inbox(self) -> list[RunRef]:
+        """§3-10: the post-recovery-scan idle-wake.
+
+        Every session that still owns pending inbox rows after the startup
+        recovery scan gets its oldest queued input auto-started -- one run
+        per session; each successor run's own settle recheck chains the
+        rest. Steer rows are never woken (an active run consumes them at
+        its step boundaries, §3-3). A storage error on one session skips
+        that session (its items stay pending and listed) without blocking
+        the others. No runner (the storage-only composition) keeps the face
+        a strict no-op: an accepted run nobody drives would be a zombie
+        busy slot -- the exact R1 hazard this composition avoids.
+        """
+        if self._runner is None or self._closed or self._closing:
+            return []
+        woken: list[RunRef] = []
+        for session_id in await self._repos.pending_inbox_session_ids():
+            try:
+                async with self._session_lock(session_id):
+                    ref = await self._promote_next(session_id, "input")
+            except StoreError:
+                continue
+            if ref is not None:
+                woken.append(ref)
+        return woken
+
+    async def _promote_next(self, session_id: str, scope: Literal["input", "steer"]) -> RunRef | None:
+        """Promote one pending item into a fresh run (caller holds the session lock).
+
+        ``scope="input"`` mirrors TS ``Promotable="input"``: only
+        queue-delivery rows are candidates (the idle boundary consumes
+        queued input one at a time, in enqueue order); ``scope="steer"``
+        (the interrupt resume drive) consumes only steer rows. A session
+        holding an active run, a write-gated status, or a closing service
+        never auto-promotes; ``None`` = nothing promoted.
+        """
+        if self._closed or self._closing:
+            return None
+        record = await self._read_record(session_id)
+        if record.active_run_id is not None:
+            return None
+        if SessionStatus(record.status) is not SessionStatus.ACTIVE:
+            return None
+        wanted = "steer" if scope == "steer" else "queue"
+        for item in await self._inbox.pending(session_id):
+            if item.delivery != wanted:
+                continue
+            run_id, request_id = await self._inbox.promote(session_id, item)
+            self._schedule_run(session_id, run_id)
+            return RunRef(session_id=session_id, run_id=run_id, request_id=request_id)
+        return None
 
     # -- §7 reply_permission / revoke_permission (R3-S2) ----------------------
 
@@ -2245,8 +2516,9 @@ class SessionService:
         """
         assert self._runner is not None
         settled = False
+        result: object | None = None
         try:
-            await self._runner.run(session_id, run_id)
+            result = await self._runner.run(session_id, run_id)
             settled = True
         except asyncio.CancelledError:
             raise
@@ -2259,6 +2531,24 @@ class SessionService:
             # compaction pass follows it. A cancelled or crashed runner never
             # reaches here (no trigger, no replacement, §2.4 L132 matrix).
             await self._post_run_compaction(session_id)
+            # §3-4 (T-C1-100): the idle-wake doorbell. The queued-input
+            # recheck runs under the per-session commit lock, so a prompt
+            # that admitted a queue item while this run's terminal event
+            # committed (the runner's EventCommitter shares no service lock)
+            # cannot slip past: either the admission lands before this
+            # recheck reads the inbox (promoted here) or the prompt's own
+            # busy-gate read already saw the settle (never parked). One
+            # queued input per settle; the successor run's own settle
+            # chains the rest.
+            if getattr(result, "outcome", None) == "interrupted":
+                # §3-5: a deliberately interrupted run never auto-continues
+                # the queue -- interrupt leaves everything parked and the
+                # resume drive is the explicit control point (RunResult's
+                # outcome read structurally: runner imports this module,
+                # so the concrete type cannot).
+                return
+            async with self._session_lock(session_id):
+                await self._promote_next(session_id, "input")
 
     async def _commit_cancel_intent(self, session_id: str, run_id: str, reason: Literal["user", "shutdown"]) -> None:
         """Commit one ``py.run.cancel_requested`` under the session lock.

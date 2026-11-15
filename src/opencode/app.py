@@ -29,6 +29,7 @@ opens the database; ``App`` composes an already-migrated data directory.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
@@ -216,6 +217,31 @@ class App:
         )
         recovery_gate.bind(lambda: _startup_scan(recovery_coordinator, recovery_roots))
         self._recovery_gate = recovery_gate
+        # §3-10 (T-C1-100): the post-recovery-scan idle-wake follow-up. NOT
+        # part of the bound scan itself -- the wake commits through the
+        # gated store, and a gated write awaiting the scan from inside the
+        # scan would await its own task (deadlock). The follow-up first
+        # awaits the gate (idempotent; it starts the scan if nothing else
+        # did) and then auto-starts every surviving queued input. A failed
+        # scan re-raises at the gate and keeps the wake skipped
+        # (fail-closed with every other write face); a composition built
+        # outside any running loop never schedules it (the wake is an
+        # eager-composition face -- disclosed in the progress doc).
+        self._inbox_wake_task: asyncio.Task[None] | None = None
+
+        async def _wake_pending_inbox_after_scan() -> None:
+            try:
+                await recovery_gate.wait()
+            except Exception:
+                return
+            await self._service.wake_pending_inbox()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            self._inbox_wake_task = loop.create_task(_wake_pending_inbox_after_scan(), name="opencode-inbox-wake")
         runner: Runner | None = None
         summarizer: ProviderSummarizer | None = None
         approvals: ApprovalCoordinator | None = None
@@ -248,6 +274,11 @@ class App:
                 clock=clock,
                 limits=limits,
                 max_steps=max_steps,
+                # §3-3 (T-C1-100): the service-owned steer hook. Late-bound
+                # on purpose -- the service is constructed after the
+                # runner; the hook only ever runs inside a driven run, by
+                # which time the composition is complete.
+                steer_consume=lambda session_id, run_id: self._service.consume_steer(session_id, run_id),
             )
             # M6 slice three (T-C1-063): the real LLM-backed summary face over
             # the SAME provider and runtime settings -- the §2.4 L126 model
@@ -466,6 +497,19 @@ class App:
         """Release in order: the jobs tasks first (which cancels every engine
         drive), then the engine's own advisory-cursor store, then the service
         lifecycle, then the engine/lock."""
+        wake = self._inbox_wake_task
+        if wake is not None and not wake.done():
+            # The post-scan idle-wake is App-owned: cancel it here. A
+            # mid-wake cancellation is safe -- each promotion's commit is
+            # atomic and the schedule step is synchronous (no await can
+            # split them), so a promoted item can never be left
+            # unscheduled, and the service close below reclaims anything
+            # the wake already scheduled.
+            wake.cancel()
+            try:
+                await wake
+            except asyncio.CancelledError:
+                pass
         await self._jobs.close()
         if self._pipeline_engine is not None:
             await self._pipeline_engine.close()

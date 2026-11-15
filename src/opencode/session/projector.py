@@ -92,6 +92,10 @@ from opencode.contracts import (
 )
 from opencode.contracts.events import (
     PY_CONTEXT_COMPACTED,
+    PY_INBOX_CANCELLED,
+    PY_INBOX_DELIVERED,
+    PY_INBOX_DELIVERY_CHANGED,
+    PY_INBOX_ENQUEUED,
     PY_MESSAGE_IMPORTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
@@ -132,6 +136,7 @@ REASON_DUPLICATE_MESSAGE_ID = "duplicate_message_id"
 REASON_DUPLICATE_RUN = "duplicate_run_projection"
 REASON_DUPLICATE_TOOL_EXECUTION = "duplicate_tool_execution_projection"
 REASON_DUPLICATE_PERMISSION = "duplicate_permission_projection"
+REASON_DUPLICATE_INBOX = "duplicate_inbox_projection"
 REASON_READ_MODEL_ROW_MISSING = "read_model_row_missing"
 REASON_STORED_DECODE_FAILED = "stored_event_decode_failed"
 
@@ -161,6 +166,18 @@ _PERMISSION_TYPES = frozenset(
         PY_PERMISSION_SAVED,
         PY_PERMISSION_REVOKED,
         PY_PERMISSION_EXPIRED,
+    }
+)
+
+#: The T-C1-100 inbox family: the steering inbox's durable lifecycle
+#: (enqueued/cancelled/delivery_changed/delivered), projected through the
+#: shared fold + diff shape below.
+_INBOX_TYPES = frozenset(
+    {
+        PY_INBOX_ENQUEUED,
+        PY_INBOX_CANCELLED,
+        PY_INBOX_DELIVERY_CHANGED,
+        PY_INBOX_DELIVERED,
     }
 )
 
@@ -207,6 +224,14 @@ _UPDATE_PERMISSION = sa.text(
 _UPDATE_DECISION = sa.text(
     "UPDATE permissions SET state = :state WHERE session_id = :sid AND decision_id = :decision_id"
 )
+_INSERT_INBOX = sa.text(
+    "INSERT INTO inbox (session_id, inbox_id, kind, delivery, request_id, enqueued_seq, message) "
+    "VALUES (:sid, :inbox_id, :kind, :delivery, :request_id, :enqueued_seq, :message)"
+)
+_UPDATE_INBOX_DELIVERY = sa.text(
+    "UPDATE inbox SET delivery = :delivery WHERE session_id = :sid AND inbox_id = :inbox_id"
+)
+_DELETE_INBOX = sa.text("DELETE FROM inbox WHERE session_id = :sid AND inbox_id = :inbox_id")
 _SELECT_EVENTS_BEFORE = sa.text(
     "SELECT id, session_id, seq, type, version, created, data, metadata "
     "FROM events WHERE session_id = :sid AND seq < :seq ORDER BY seq"
@@ -375,6 +400,8 @@ class SessionProjector:
             await self._project_session_deleted(connection, event)
         elif event.type == PY_MESSAGE_IMPORTED:
             await self._project_message_imported(connection, event)
+        elif event.type in _INBOX_TYPES:
+            await self._project_inbox(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -578,6 +605,76 @@ class SessionProjector:
         await self._write_message_diff(connection, event, pre, post)
         await self._advance_applied_seq(connection, event)
         await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_inbox(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.inbox.*`` event (T-C1-100) and write the inbox diff.
+
+        The steering inbox's read-model footprint is the 0004 pending-only
+        table: ``py.inbox.enqueued`` inserts the parked row (enqueued_seq =
+        the enqueue-order key), ``py.inbox.delivery_changed`` re-arms the
+        delivery column in place, and ``py.inbox.cancelled`` /
+        ``py.inbox.delivered`` drop the row -- delivered may also append the
+        parked user turn as one messages row through the shared diff writer
+        (the mid-run steer form; the idle promotion's paired
+        ``py.prompt.accepted`` already inserted the message, so the fold's
+        short-circuit makes that diff empty). The transition rules stay in
+        the state fold; the projector only translates fold output into rows.
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        await self._write_inbox_diff(connection, event, pre, post)
+        await self._write_message_diff(connection, event, pre, post)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _write_inbox_diff(
+        self, connection: AsyncConnection, event: DurableEvent[Any], pre: SessionState, post: SessionState
+    ) -> None:
+        """Insert new pending rows; re-arm delivery changes; drop consumed/revoked."""
+        for inbox_id in pre.inbox:
+            if inbox_id not in post.inbox:
+                result = await connection.execute(_DELETE_INBOX, {"sid": event.session_id, "inbox_id": inbox_id})
+                if not result.rowcount:
+                    raise _corrupt(
+                        REASON_READ_MODEL_ROW_MISSING,
+                        event,
+                        f"inbox row {inbox_id} vanished before its removal projection",
+                    )
+        for inbox_id, item in post.inbox.items():
+            old = pre.inbox.get(inbox_id)
+            if old is item:
+                continue
+            if old is None:
+                try:
+                    await connection.execute(
+                        _INSERT_INBOX,
+                        {
+                            "sid": event.session_id,
+                            "inbox_id": item.inbox_id,
+                            "kind": item.kind,
+                            "delivery": item.delivery,
+                            "request_id": item.request_id,
+                            "enqueued_seq": item.enqueued_seq,
+                            "message": canonical_json(item.message.model_dump(mode="json")),
+                        },
+                    )
+                except IntegrityError as error:
+                    raise _corrupt(
+                        REASON_DUPLICATE_INBOX,
+                        event,
+                        f"inbox item {item.inbox_id} is already projected for session {event.session_id}",
+                    ) from error
+            elif old.delivery != item.delivery:
+                result = await connection.execute(
+                    _UPDATE_INBOX_DELIVERY,
+                    {"sid": event.session_id, "inbox_id": item.inbox_id, "delivery": item.delivery},
+                )
+                if not result.rowcount:
+                    raise _corrupt(
+                        REASON_READ_MODEL_ROW_MISSING,
+                        event,
+                        f"inbox row {item.inbox_id} vanished before its delivery re-arm",
+                    )
 
     async def _pre_state(self, connection: AsyncConnection, event: DurableEvent[Any]) -> tuple[SessionState, bytes]:
         """The fold pre-state plus the digest of the prefix it was derived from."""

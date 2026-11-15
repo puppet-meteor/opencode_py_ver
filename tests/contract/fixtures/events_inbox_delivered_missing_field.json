@@ -1,0 +1,10 @@
+{
+  "id": "evt_0000000000000000000000000111",
+  "type": "py.inbox.delivered",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:11Z",
+  "data": {},
+  "metadata": {},
+  "seq": 111
+}

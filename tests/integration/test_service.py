@@ -611,7 +611,7 @@ async def test_prompt_rejects_invalid_inputs_before_any_read(
 
     async with _service(db_path) as service:
         with pytest.raises(StoreValidationError) as error:
-            await service.prompt(session_id, text, request_id)  # type: ignore[arg-type]
+            await service.prompt(session_id, text, request_id)  # type: ignore[call-overload]
         assert error.value.core.code == CoreErrorCode.VALIDATION_ERROR
         assert _fetch_scalar(db_path, "SELECT COUNT(*) FROM events") == (0,)
 

@@ -79,6 +79,10 @@ from opencode.contracts import (
 )
 from opencode.contracts.events import (
     PY_CONTEXT_COMPACTED,
+    PY_INBOX_CANCELLED,
+    PY_INBOX_DELIVERED,
+    PY_INBOX_DELIVERY_CHANGED,
+    PY_INBOX_ENQUEUED,
     PY_MESSAGE_IMPORTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
@@ -100,6 +104,10 @@ from opencode.contracts.events import (
     PY_TOOL_REQUESTED,
     PY_TOOL_STARTED,
     ContextCompactedData,
+    InboxCancelledData,
+    InboxDeliveredData,
+    InboxDeliveryChangedData,
+    InboxEnqueuedData,
     MessageImportedData,
     PermissionClosedData,
     PermissionExpiredData,
@@ -373,6 +381,33 @@ FoldedMessage = UserMessage | AssistantMessage | IdleMessage
 
 
 @dataclass(frozen=True, slots=True)
+class InboxInfo:
+    """T-C1-100 (P7-S1): one pending steering-inbox item (fold face).
+
+    ``delivery`` is ``"steer"`` (consume at the active run's next step
+    boundary, at most one per step) or ``"queue"`` (deliver at the idle
+    boundary, driving a new run); ``kind`` carries provenance --
+    ``user`` = a caller prompt, ``synthetic`` = the service-injection seam.
+    The parked ``message`` rides the fold whole so ``py.inbox.delivered``
+    is pure event replay (no disk re-read); ``request_id`` re-arms only for
+    ``user`` items (the idle promotion re-uses it for the paired
+    ``py.prompt.accepted``). Dict insertion order is the enqueue order --
+    the read model's list face -- preserved through rebuild because the
+    log replays in seq order.
+    """
+
+    inbox_id: str
+    kind: str
+    delivery: str
+    request_id: str | None
+    message: UserMessage
+    #: The seq of the ``py.inbox.enqueued`` event that parked the item -- the
+    #: read model's enqueue-order key (the fold's dict insertion order re-
+    #: derives it for in-memory faces; the table needs it as an ORDER BY).
+    enqueued_seq: int
+
+
+@dataclass(frozen=True, slots=True)
 class SessionState:
     """Fold state of one session: empty until ``py.session.created`` is folded.
 
@@ -415,6 +450,16 @@ class SessionState:
     # facts (None before the first compaction event folds). Only the newest
     # record matters -- each compaction replaces the whole prior view.
     compaction: CompactionInfo | None = None
+    # T-C1-100 (P7-S1): the pending steering inbox, keyed by inbox_id in
+    # enqueue order (dict insertion order = the read model's list face).
+    # ``py.inbox.enqueued`` parks an item here; ``py.inbox.delivered`` folds
+    # the parked user turn into history and drops the entry (the paired
+    # ``py.prompt.accepted`` of an idle promotion already appended the turn,
+    # so the delivered fold short-circuits the second insert);
+    # ``py.inbox.cancelled`` drops it; ``py.inbox.delivery_changed`` re-arms
+    # the delivery in place (position preserved). The parked payload rides
+    # the fold so rebuild re-projects pending rows without a disk re-read.
+    inbox: dict[str, InboxInfo] = field(default_factory=dict)
 
     @property
     def created(self) -> bool:
@@ -483,6 +528,14 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_session_deleted(state, event)
     if event.type == PY_MESSAGE_IMPORTED:
         return _apply_message_imported(state, event)
+    if event.type == PY_INBOX_ENQUEUED:
+        return _apply_inbox_enqueued(state, event)
+    if event.type == PY_INBOX_CANCELLED:
+        return _apply_inbox_cancelled(state, event)
+    if event.type == PY_INBOX_DELIVERY_CHANGED:
+        return _apply_inbox_delivery_changed(state, event)
+    if event.type == PY_INBOX_DELIVERED:
+        return _apply_inbox_delivered(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -1292,6 +1345,127 @@ def _apply_message_imported(state: SessionState, event: DurableEvent[Any]) -> Se
         messages=(*state.messages, message),
         message_seqs=(*state.message_seqs, event.seq),
     )
+
+
+# -- T-C1-100 (P7-S1) inbox handlers ------------------------------------------
+
+
+def _apply_inbox_enqueued(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.inbox.enqueued``: active -> active, one pending item parked.
+
+    The durable admission record for a steer/queue delivery (T-C1-100): the
+    full user-turn payload parks in the fold, so ``py.inbox.delivered`` is
+    pure event replay. A duplicate inbox_id is an illegal transition, never
+    a silent overwrite; a parked message id that already sits in folded
+    history is likewise rejected (the delivered fold is the one place a
+    parked turn enters history, bar the paired accepted insert).
+    """
+    if not isinstance(event.data, InboxEnqueuedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected InboxEnqueuedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.inbox.enqueued requires an active session (event {event.id})")
+    if event.data.inbox_id in state.inbox:
+        raise IllegalTransitionError(
+            f"inbox item {event.data.inbox_id!r} is already pending for session {event.session_id} (event {event.id})"
+        )
+    if any(existing.id == event.data.message.id for existing in state.messages):
+        raise IllegalTransitionError(
+            f"message id {event.data.message.id} is already folded for session {event.session_id} (event {event.id})"
+        )
+    item = InboxInfo(
+        inbox_id=event.data.inbox_id,
+        kind=event.data.kind,
+        delivery=event.data.delivery,
+        request_id=event.data.request_id,
+        message=event.data.message,
+        enqueued_seq=event.seq,
+    )
+    return replace(state, applied_seq=event.seq, inbox={**state.inbox, item.inbox_id: item})
+
+
+def _apply_inbox_cancelled(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.inbox.cancelled``: pending item dropped (the revocation tombstone).
+
+    The endpoint face is ``unavailable = no-op 200`` (ticket §3-6): the
+    service only ever commits this event against a live pending item, so the
+    fold never owes a no-op -- an event naming an unknown or already-gone
+    item is a hand-crafted log corruption and fails closed.
+    """
+    if not isinstance(event.data, InboxCancelledData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected InboxCancelledData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.inbox.cancelled requires an active session (event {event.id})")
+    if event.data.inbox_id not in state.inbox:
+        raise IllegalTransitionError(
+            f"py.inbox.cancelled references unknown pending item {event.data.inbox_id!r} (event {event.id})"
+        )
+    inbox = {key: value for key, value in state.inbox.items() if key != event.data.inbox_id}
+    return replace(state, applied_seq=event.seq, inbox=inbox)
+
+
+def _apply_inbox_delivery_changed(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.inbox.delivery_changed``: pending item re-armed steer <-> queue.
+
+    The update endpoint commits this only for a live pending item and only
+    on a real change (a same-value update is a no-op that writes no event,
+    disclosed in the progress doc); a change to ``steer`` rings the
+    doorbell for an active run at the service face. Dict re-assignment
+    keeps the entry's original insertion position, so the enqueue order
+    survives a re-arm.
+    """
+    if not isinstance(event.data, InboxDeliveryChangedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected InboxDeliveryChangedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.inbox.delivery_changed requires an active session (event {event.id})")
+    item = state.inbox.get(event.data.inbox_id)
+    if item is None:
+        raise IllegalTransitionError(
+            f"py.inbox.delivery_changed references unknown pending item {event.data.inbox_id!r} (event {event.id})"
+        )
+    if item.delivery == event.data.delivery:
+        raise IllegalTransitionError(
+            f"inbox item {item.inbox_id!r} already has delivery {item.delivery!r} (event {event.id})"
+        )
+    updated = replace(item, delivery=event.data.delivery)
+    return replace(state, applied_seq=event.seq, inbox={**state.inbox, updated.inbox_id: updated})
+
+
+def _apply_inbox_delivered(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.inbox.delivered``: pending item consumed -- history + dropped.
+
+    Mid-run steer: the parked user turn appends to ``messages`` (settling
+    seq = this event's seq) and the pending entry drops. Idle promotion:
+    the same commit pairs ``py.prompt.accepted``, whose fold already
+    appended the turn -- the already-folded message id short-circuits the
+    second insert, so the delivered event only drops the pending entry
+    (the promotion batch's dedupe face). Both forms are one commit: no
+    reader ever sees the turn without its pending row gone.
+    """
+    if not isinstance(event.data, InboxDeliveredData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected InboxDeliveredData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.inbox.delivered requires an active session (event {event.id})")
+    item = state.inbox.get(event.data.inbox_id)
+    if item is None:
+        raise IllegalTransitionError(
+            f"py.inbox.delivered references unknown pending item {event.data.inbox_id!r} (event {event.id})"
+        )
+    if any(existing.id == item.message.id for existing in state.messages):
+        messages = state.messages
+        message_seqs = state.message_seqs
+    else:
+        messages = (*state.messages, item.message)
+        message_seqs = (*state.message_seqs, event.seq)
+    inbox = {key: value for key, value in state.inbox.items() if key != item.inbox_id}
+    return replace(state, applied_seq=event.seq, messages=messages, message_seqs=message_seqs, inbox=inbox)
 
 
 # -- shared helpers -----------------------------------------------------------

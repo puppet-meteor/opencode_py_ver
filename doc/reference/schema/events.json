@@ -744,6 +744,159 @@
       "title": "EventDraft",
       "type": "object"
     },
+    "InboxCancelledData": {
+      "additionalProperties": false,
+      "description": "``py.inbox.cancelled`` v1 data (T-C1-100): the pending-item tombstone.\n\nLike ``py.session.deleted``, the event is fully described by its target\nid -- the fold and read model drop the pending row; any field beyond the\nid is a schema violation (extra=forbid). Cancelling an already-delivered\nor already-cancelled item is an endpoint-level no-op (ticket §3-6), so\nthis event only ever folds against a live pending item.",
+      "properties": {
+        "inbox_id": {
+          "minLength": 1,
+          "title": "Inbox Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "inbox_id"
+      ],
+      "title": "InboxCancelledData",
+      "type": "object"
+    },
+    "InboxDeliveredData": {
+      "additionalProperties": false,
+      "description": "``py.inbox.delivered`` v1 data (T-C1-100): the consumption record.\n\nThe parked user turn folds into history here -- mid-run steer: the active\nrun's next-step context; idle promotion: paired with a\n``py.prompt.accepted`` in the same commit (the accepted fold appends the\nmessage, the delivered fold then removes the pending row without a\nsecond insert). The payload itself rides the ``py.inbox.enqueued`` fold\nstate, so this event carries only the id (TS ``InboxDelivered`` parity).",
+      "properties": {
+        "inbox_id": {
+          "minLength": 1,
+          "title": "Inbox Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "inbox_id"
+      ],
+      "title": "InboxDeliveredData",
+      "type": "object"
+    },
+    "InboxDeliveryChangedData": {
+      "additionalProperties": false,
+      "description": "``py.inbox.delivery_changed`` v1 data (T-C1-100): delivery re-arm.\n\nA pending item's delivery flips between ``steer`` and ``queue`` (the\nupdate endpoint); a change to ``steer`` rings the doorbell for an active\nrun (ticket §3-6). A same-value update is a no-op that commits no event\n(disclosed in the progress doc); the Literal rejects every other value\nfail-closed.",
+      "properties": {
+        "delivery": {
+          "enum": [
+            "steer",
+            "queue"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "inbox_id": {
+          "minLength": 1,
+          "title": "Inbox Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "inbox_id",
+        "delivery"
+      ],
+      "title": "InboxDeliveryChangedData",
+      "type": "object"
+    },
+    "InboxEnqueuedData": {
+      "$defs": {
+        "JsonObject": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "type": "object"
+        },
+        "JsonValue": {},
+        "UserMessage": {
+          "additionalProperties": false,
+          "description": "User-authored session message (§2.1 ``user`` row).\n\n``files`` stays out until media lands (M6): the R1 v1 wire has no optional\n``files`` field (CORE-CONTRACTS §2.1, T-A-003 option b) — a ``files`` key\n(even an empty list) on the wire is rejected here by ``extra=\"forbid\"``\nrather than silently dropped; Phase 1 callers send plain text and a non-empty\nfiles list is rejected as UnsupportedCapability at the tool/config layer.",
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "id": {
+              "minLength": 1,
+              "pattern": "^msg_",
+              "title": "Id",
+              "type": "string"
+            },
+            "metadata": {
+              "$ref": "#/$defs/JsonObject"
+            },
+            "text": {
+              "title": "Text",
+              "type": "string"
+            },
+            "type": {
+              "const": "user",
+              "title": "Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "type",
+            "created_at",
+            "text"
+          ],
+          "title": "UserMessage",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "``py.inbox.enqueued`` v1 data (T-C1-100): one parked inbox item.\n\nThe durable admission record for a steer/queue delivery: the full\nuser-turn payload parks verbatim (``message``), so the delivered fold is\npure event replay with no disk re-read. ``kind`` carries provenance --\n``user`` (a caller prompt) requires the originating ``request_id`` (the\nidle promotion re-uses it for the paired ``py.prompt.accepted`` batch),\nwhile ``synthetic`` (the service-injection seam, the S2 import-delivery\nentry point) parks service-authored text. compaction/move kinds are NOT\nported (DIFFERENT-BY-DESIGN, ticket §3-2).",
+      "properties": {
+        "delivery": {
+          "enum": [
+            "steer",
+            "queue"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "inbox_id": {
+          "minLength": 1,
+          "title": "Inbox Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "user",
+            "synthetic"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/$defs/UserMessage"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        }
+      },
+      "required": [
+        "inbox_id",
+        "kind",
+        "delivery",
+        "message"
+      ],
+      "title": "InboxEnqueuedData",
+      "type": "object"
+    },
     "InstructionSource": {
       "additionalProperties": false,
       "description": "One instruction contribution with provenance (§6.1 L287): file path + text.\n\n``path`` is the resolved file that contributed ``text`` — an AGENTS.md\npath, or the declaring config file for config-declared instruction\nstrings. Instructions only shape the system prompt; they never raise\npermissions (§6.1 L287).",

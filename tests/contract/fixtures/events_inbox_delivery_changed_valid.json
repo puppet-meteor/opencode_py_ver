@@ -1,0 +1,13 @@
+{
+  "id": "evt_0000000000000000000000000107",
+  "type": "py.inbox.delivery_changed",
+  "version": 1,
+  "session_id": "ses_0000000000000000000000000001",
+  "created_at": "2026-11-15T08:00:07Z",
+  "data": {
+    "inbox_id": "inb_0000000000000000000000000101",
+    "delivery": "queue"
+  },
+  "metadata": {},
+  "seq": 107
+}

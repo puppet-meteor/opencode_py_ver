@@ -175,6 +175,8 @@ from opencode.orchestrator.registration import register_pipelines
 from opencode.session.compaction import CompactionOutcome
 from opencode.session.service import (
     DecisionReceipt,
+    InboxRef,
+    InterruptReceipt,
     RunRef,
     RunStatus,
     SessionExport,
@@ -184,7 +186,7 @@ from opencode.session.service import (
 )
 from opencode.storage import StoreError
 from opencode.storage.jobs_store import JobRecord, job_stream_key
-from opencode.storage.repos import MessagePage
+from opencode.storage.repos import InboxItemRow, MessagePage
 
 #: §7 L106 "限制请求/并发/输出大小" — the transport-level caps (module-level,
 #: pinned by tests). Request bodies above the cap answer 413 before any
@@ -756,6 +758,13 @@ def _lifespan_for(app: App) -> Any:
     @asynccontextmanager
     async def lifespan(_api: FastAPI) -> AsyncIterator[None]:
         await app.recovery_gate.wait()
+        # T-C1-100 (P7-S1) §3-10: with the scan done, drive the pending-inbox
+        # idle-wake. The App-owned wake task usually already covered this
+        # (compositions constructed inside a running loop); the lifespan drives
+        # it again for server compositions whose App was built outside any
+        # loop (the boot-helper form) — the face is idempotent (a session that
+        # already woke holds an active run and is skipped).
+        await app.service.wake_pending_inbox()
         for server, error in await app.start_mcp_servers():
             print(f"opencode-http: MCP server {server!r} failed to start: {error}", file=sys.stderr)
         # P5-S1 (T-C1-085): the manifest -> engine registration face — the
@@ -793,6 +802,39 @@ async def _store_error_handler(_request: Request, error: Exception) -> Response:
     return _error_response(error.core, _HTTP_STATUS_BY_CODE[error.core.code])
 
 
+def _inbox_ref_wire(ref: InboxRef) -> JsonObject:
+    """T-C1-100 (P7-S1) §4-1: the parked-admission wire — the InboxRef field set."""
+    return {
+        "session_id": ref.session_id,
+        "inbox_id": ref.inbox_id,
+        "kind": ref.kind,
+        "delivery": ref.delivery,
+        "request_id": ref.request_id,
+    }
+
+
+def _inbox_item_wire(item: InboxItemRow) -> JsonObject:
+    """T-C1-100 (P7-S1) §3-6: one pending inbox row (the list/update element)."""
+    return {
+        "inbox_id": item.inbox_id,
+        "kind": item.kind,
+        "delivery": item.delivery,
+        "request_id": item.request_id,
+        "enqueued_seq": item.enqueued_seq,
+        "message": item.message.model_dump(mode="json"),
+    }
+
+
+def _interrupt_wire(receipt: InterruptReceipt) -> JsonObject:
+    """T-C1-100 (P7-S1) §3-5: ``{interrupted, run_id, status, resumed_run_id}``."""
+    return {
+        "interrupted": receipt.interrupted,
+        "run_id": receipt.run_id,
+        "status": str(receipt.status) if receipt.status is not None else None,
+        "resumed_run_id": receipt.resumed_run_id,
+    }
+
+
 def create_app(app: App, *, token: str) -> FastAPI:
     """Build the FastAPI transport over one App composition (the public face).
 
@@ -823,8 +865,27 @@ def create_app(app: App, *, token: str) -> FastAPI:
     @api.post("/session/{session_id}/prompt")
     async def prompt(session_id: str, request: Request) -> Response:
         payload = await _read_json_object(request)
-        fields = _strict_string_fields(payload, frozenset({"text", "request_id"}))
-        ref: RunRef = await service.prompt(session_id, fields["text"], fields["request_id"])
+        unknown = sorted(set(payload) - {"text", "request_id", "delivery"})
+        if unknown:
+            raise _TransportError(422, _validation(f"request body has unknown fields: {', '.join(unknown)}"))
+        # ``delivery`` is optional and validated by hand above; the strict
+        # extractor is exact-shape, so it must not see the optional field.
+        fields = _strict_string_fields(
+            {key: value for key, value in payload.items() if key != "delivery"},
+            frozenset({"text", "request_id"}),
+        )
+        delivery: Literal["steer", "queue"] | None = None
+        if "delivery" in payload:
+            raw_delivery = payload["delivery"]
+            if not isinstance(raw_delivery, str) or raw_delivery not in ("steer", "queue"):
+                raise _TransportError(422, _validation('request body field "delivery" must be "steer" or "queue"'))
+            delivery = cast(Literal["steer", "queue"], raw_delivery)
+        ref: RunRef | InboxRef = await service.prompt(
+            session_id, fields["text"], fields["request_id"], delivery=delivery
+        )
+        if isinstance(ref, InboxRef):
+            # §4-1: the prompt parked in the durable inbox — the InboxRef wire.
+            return _json_response(_inbox_ref_wire(ref))
         return _json_response({"session_id": ref.session_id, "run_id": ref.run_id, "request_id": ref.request_id})
 
     @api.post("/run/{run_id}/cancel")
@@ -1121,6 +1182,57 @@ def create_app(app: App, *, token: str) -> FastAPI:
                 ),
             ) from error
         return _json_response({"job_id": job_id, "gate_id": gate_id, "reply": reply, "status": record.status})
+
+    # -- T-C1-100 (P7-S1): the inbox + interrupt routes -----------------------
+
+    @api.get("/session/{session_id}/inbox")
+    async def session_inbox_list(session_id: str) -> Response:
+        """§3-6 list: every pending inbox row, in enqueue order (the durable read face)."""
+        rows = await service.inbox_list(session_id)
+        return _json_response({"items": [_inbox_item_wire(row) for row in rows]})
+
+    @api.delete("/session/{session_id}/inbox/{inbox_id}")
+    async def session_inbox_cancel(session_id: str, inbox_id: str) -> Response:
+        """§3-6 cancel: withdraw one pending item; unavailable = the honest no-op."""
+        cancelled = await service.inbox_cancel(session_id, inbox_id)
+        return _json_response({"inbox_id": inbox_id, "cancelled": cancelled})
+
+    @api.patch("/session/{session_id}/inbox/{inbox_id}")
+    async def session_inbox_update(session_id: str, inbox_id: str, request: Request) -> Response:
+        """§3-6 update: flip one pending item's delivery (steer <-> queue).
+
+        A flip to steer rings the doorbell implicitly -- the active run's
+        next step boundary consumes the re-armed steer (the durable recheck,
+        at most one step of latency; no in-memory signal exists to set). An
+        item that is no longer pending answers 409 through the store error
+        face (the §3-6 update contract is NOT a no-op, unlike cancel).
+        """
+        payload = await _read_json_object(request)
+        fields = _strict_string_fields(payload, frozenset({"delivery"}))
+        delivery = fields["delivery"]
+        if delivery not in ("steer", "queue"):
+            raise _TransportError(422, _validation('request body field "delivery" must be "steer" or "queue"'))
+        row = await service.inbox_update(session_id, inbox_id, cast(Literal["steer", "queue"], delivery))
+        return _json_response(_inbox_item_wire(row))
+
+    @api.post("/session/{session_id}/interrupt")
+    async def session_interrupt(session_id: str, request: Request) -> Response:
+        """§3-5 interrupt: stop the session's active run; ``?resume=true`` drives pending steering.
+
+        ``{interrupted: bool}`` — True only when a live run settled on the
+        interrupted terminal; an idle session answers the no-op False with
+        no event and no error. The ``resume`` query param accepts exactly
+        ``true``/``false`` (absent = false); queued prompts stay parked
+        under both faces — the resume drive consumes steering only.
+        """
+        raw_resume = request.query_params.get("resume")
+        resume: bool = False
+        if raw_resume is not None:
+            if raw_resume not in ("true", "false"):
+                raise _TransportError(422, _validation(f"resume must be 'true' or 'false', got {raw_resume!r}"))
+            resume = raw_resume == "true"
+        receipt = await service.interrupt(session_id, resume=resume)
+        return _json_response(_interrupt_wire(receipt))
 
     api.add_exception_handler(_TransportError, _transport_error_handler)
     api.add_exception_handler(StoreError, _store_error_handler)

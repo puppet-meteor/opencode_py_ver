@@ -889,7 +889,7 @@ def test_malformed_sse_lines_and_frames_fail_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_runtime_openapi_document_answers_the_twenty_one_routes(running: _Running) -> None:
+def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _Running) -> None:
     """f: the runtime OpenAPI document (direct pull per the ruling; 054 owns the 401 face).
 
     T-C1-094 grows the face from twelve to nineteen route operations: the
@@ -905,6 +905,12 @@ def test_the_runtime_openapi_document_answers_the_twenty_one_routes(running: _Ru
     T-C1-096 adds the manual compaction route as the twenty-first
     operation: POST /session/{session_id}/compact, a nineteenth distinct
     path key.
+
+    T-C1-100 adds the durable inbox + interrupt face as operations
+    twenty-two through twenty-five: GET /session/{session_id}/inbox,
+    DELETE and PATCH /session/{session_id}/inbox/{inbox_id} (one shared
+    path key), and POST /session/{session_id}/interrupt — twenty-two
+    distinct path keys in total.
     """
     request = urllib.request.Request(
         running.base + "/openapi.json", headers={"Authorization": f"Bearer {_TOKEN}"}, method="GET"
@@ -925,6 +931,9 @@ def test_the_runtime_openapi_document_answers_the_twenty_one_routes(running: _Ru
         "/session/{session_id}/export",
         "/session/{session_id}/message/{message_id}",
         "/session/{session_id}/compact",
+        "/session/{session_id}/inbox",
+        "/session/{session_id}/inbox/{inbox_id}",
+        "/session/{session_id}/interrupt",
         "/session/import",
         "/run/{run_id}/cancel",
         "/run/{run_id}/status",
@@ -941,9 +950,9 @@ def test_the_runtime_openapi_document_answers_the_twenty_one_routes(running: _Ru
         for path, item in paths.items()
         if isinstance(item, dict)
         for method in item
-        if method in ("get", "post", "delete")
+        if method in ("get", "post", "delete", "patch")
     }
-    assert len(operations) == 21
+    assert len(operations) == 25
     for path, method in (
         ("/session", "post"),
         ("/session", "get"),
@@ -956,6 +965,10 @@ def test_the_runtime_openapi_document_answers_the_twenty_one_routes(running: _Ru
         ("/session/{session_id}/export", "get"),
         ("/session/{session_id}/message/{message_id}", "get"),
         ("/session/{session_id}/compact", "post"),
+        ("/session/{session_id}/inbox", "get"),
+        ("/session/{session_id}/inbox/{inbox_id}", "delete"),
+        ("/session/{session_id}/inbox/{inbox_id}", "patch"),
+        ("/session/{session_id}/interrupt", "post"),
         ("/session/import", "post"),
         ("/run/{run_id}/cancel", "post"),
         ("/run/{run_id}/status", "get"),

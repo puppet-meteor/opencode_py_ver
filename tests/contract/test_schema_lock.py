@@ -55,7 +55,7 @@ PIPELINES_ARTIFACT = SCHEMA_DIR / "pipelines.json"
 WORKERS_ARTIFACT = SCHEMA_DIR / "workers.json"
 
 #: Pinned census (doc/reference/r5-fixture-inventory.md closes the same counts):
-#: 33 positive, 63 schema-level negatives, 20 behavior-level negatives
+#: 37 positive, 71 schema-level negatives, 20 behavior-level negatives
 #: (15 missing run_id + 1 bad run_id + 2 bad snapshot hash + 2 registry probes;
 #: the compaction trio lands the py.context.compacted faces at T-C1-060; the
 #: py.job.* septet lands the jobs family at T-C1-076: +7 valid +7 missing_field
@@ -68,11 +68,12 @@ WORKERS_ARTIFACT = SCHEMA_DIR / "workers.json"
 #: so the pipelines.json artifact regenerated with it). The worker-return
 #: trio at T-C1-078 is its own bucket too (+1 valid +1 missing_field
 #: +1 bad_extension, classified "worker-return" -- worker returns lock
-#: against workers.json).
-PINNED_TOTAL = 124
+#: against workers.json). The py.inbox.* quadruplet at T-C1-100 lands the
+#: steering-inbox family (+4 valid +4 missing_field +4 bad_extension).
+PINNED_TOTAL = 136
 PINNED_COUNTS = {
-    "positive": 33,
-    "schema-level": 63,
+    "positive": 37,
+    "schema-level": 71,
     "behavior-level": 20,
     "pipeline-spec": 5,
     "worker-return": 3,
@@ -87,10 +88,12 @@ PINNED_COUNTS = {
 #: (SessionDeletedData + MessageImportedData); cards.json opens with its 1
 #: model; the pipelines.json with its 4 models (3 through T-C1-084, +1
 #: FallbackToolSpec at T-C1-086); the worker trio (+WorkerReturn) at
-#: T-C1-078 opens workers.json with its 1 model).
+#: T-C1-078 opens workers.json with its 1 model; +4 inbox-family models at
+#: T-C1-100 (InboxEnqueuedData + InboxCancelledData + InboxDeliveryChangedData
+#: + InboxDeliveredData)).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
-    "events.json": 48,
+    "events.json": 52,
     "llm.json": 17,
     "messages.json": 8,
     "tools.json": 3,
@@ -98,7 +101,7 @@ PINNED_MODEL_COUNTS = {
     "pipelines.json": 4,
     "workers.json": 1,
 }
-PINNED_DURABLE_KEYS = 30
+PINNED_DURABLE_KEYS = 34
 PINNED_EPHEMERAL_KEYS = 4
 
 
@@ -341,7 +344,7 @@ class TestArtifactDrift:
 
 
 class TestSchemaEnumeration:
-    """The artifacts enumerate the full model face (80 models; see the inventory)."""
+    """The artifacts enumerate the full model face (87 models; see the inventory)."""
 
     def test_module_artifacts_enumerate_the_pinned_model_counts(self) -> None:
         for filename, expected in PINNED_MODEL_COUNTS.items():
@@ -361,7 +364,7 @@ class TestSchemaEnumeration:
 
 
 class TestFixtureCensus:
-    """The 124-file closure (116 event-face fixtures + the pipeline-spec five:
+    """The 136-file closure (128 event-face fixtures + the pipeline-spec five:
     the T-C1-077 trio + the T-C1-079 params-schema pair, plus the T-C1-078
     worker-return trio) and the pinned classification mix."""
 

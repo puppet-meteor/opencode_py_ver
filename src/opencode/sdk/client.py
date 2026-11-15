@@ -75,7 +75,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from pydantic import ValidationError
 
@@ -294,6 +294,56 @@ def _session_export(payload: Any) -> SessionExport:
 
 
 @dataclass(frozen=True)
+class InboxRef:
+    """The T-C1-100 parked-admission wire (P7-S1 §4-1).
+
+    The prompt face's explicit-delivery busy answer: the item parks in the
+    durable inbox. An idle session never returns this ref — its item is
+    admitted and started atomically, answering the three-field
+    :class:`~opencode.session.service.RunRef` wire instead (the decode
+    branch dispatches on ``inbox_id``).
+    """
+
+    session_id: str
+    inbox_id: str
+    kind: str
+    delivery: str
+    request_id: str | None
+
+
+@dataclass(frozen=True)
+class PendingInboxItem:
+    """One pending inbox row of the T-C1-100 §3-6 list/update faces.
+
+    The parked user turn rides ``message`` (a §2.1 wire message, decoded
+    fail closed); ``enqueued_seq`` is the enqueue-order key.
+    """
+
+    inbox_id: str
+    kind: str
+    delivery: str
+    request_id: str | None
+    enqueued_seq: int
+    message: SessionMessage
+
+
+@dataclass(frozen=True)
+class InterruptReceipt:
+    """The T-C1-100 §3-5 interrupt wire.
+
+    ``interrupted`` is True only when a live run settled on the interrupted
+    terminal; an idle session answers the no-op (run_id/status both None).
+    ``resumed_run_id`` carries the resume drive's fresh run (None without
+    one).
+    """
+
+    interrupted: bool
+    run_id: str | None
+    status: str | None
+    resumed_run_id: str | None
+
+
+@dataclass(frozen=True)
 class CompactionReceipt:
     """The decoded manual-compaction outcome wire (T-C1-096 §3 decision 3).
 
@@ -353,6 +403,68 @@ def _compaction_receipt(payload: Any) -> CompactionReceipt:
         fields = _expect_object(payload, frozenset({"status", "usage"}))
         return CompactionReceipt(status="discarded", usage=_usage_field(fields))
     raise OpencodeClientError(f"unknown compaction status on the wire: {status!r}")
+
+
+def _inbox_ref(payload: Any) -> InboxRef:
+    """The T-C1-100 parked-admission wire, exact key set checked."""
+    fields = _expect_object(payload, frozenset({"session_id", "inbox_id", "kind", "delivery", "request_id"}))
+    raw_request = fields["request_id"]
+    if raw_request is not None and not isinstance(raw_request, str):
+        raise OpencodeClientError(f"wire field 'request_id' must be a string or null, got {raw_request!r}")
+    return InboxRef(
+        session_id=_string_field(fields, "session_id"),
+        inbox_id=_string_field(fields, "inbox_id"),
+        kind=_string_field(fields, "kind"),
+        delivery=_string_field(fields, "delivery"),
+        request_id=raw_request,
+    )
+
+
+def _pending_inbox_item(payload: Any) -> PendingInboxItem:
+    """One T-C1-100 pending row, exact key set checked (the parked turn decodes fail closed)."""
+    fields = _expect_object(
+        payload,
+        frozenset({"inbox_id", "kind", "delivery", "request_id", "enqueued_seq", "message"}),
+    )
+    raw_request = fields["request_id"]
+    if raw_request is not None and not isinstance(raw_request, str):
+        raise OpencodeClientError(f"wire field 'request_id' must be a string or null, got {raw_request!r}")
+    return PendingInboxItem(
+        inbox_id=_string_field(fields, "inbox_id"),
+        kind=_string_field(fields, "kind"),
+        delivery=_string_field(fields, "delivery"),
+        request_id=raw_request,
+        enqueued_seq=_int_field(fields, "enqueued_seq"),
+        message=_wire_message(fields["message"]),
+    )
+
+
+def _inbox_cancel_receipt(payload: Any) -> bool:
+    """The T-C1-100 cancel wire — True when withdrawn now, False is the no-op."""
+    fields = _expect_object(payload, frozenset({"inbox_id", "cancelled"}))
+    cancelled = fields["cancelled"]
+    if not isinstance(cancelled, bool):
+        raise OpencodeClientError(f"wire field 'cancelled' must be a boolean, got {cancelled!r}")
+    _string_field(fields, "inbox_id")
+    return cancelled
+
+
+def _interrupt_receipt(payload: Any) -> InterruptReceipt:
+    """The T-C1-100 interrupt wire, exact key set checked."""
+    fields = _expect_object(payload, frozenset({"interrupted", "run_id", "status", "resumed_run_id"}))
+    interrupted = fields["interrupted"]
+    if not isinstance(interrupted, bool):
+        raise OpencodeClientError(f"wire field 'interrupted' must be a boolean, got {interrupted!r}")
+    for key in ("run_id", "status", "resumed_run_id"):
+        value = fields[key]
+        if value is not None and not isinstance(value, str):
+            raise OpencodeClientError(f"wire field {key!r} must be a string or null, got {value!r}")
+    return InterruptReceipt(
+        interrupted=interrupted,
+        run_id=fields["run_id"],
+        status=fields["status"],
+        resumed_run_id=fields["resumed_run_id"],
+    )
 
 
 def _api_error(error: urllib.error.HTTPError) -> OpencodeApiError:
@@ -496,15 +608,53 @@ class OpencodeClient:
         """
         return _session_ref(self._call("POST", "/session", body=config, timeout_s=timeout_s))
 
-    def prompt(self, session_id: str, text: str, request_id: str, *, timeout_s: float | None = None) -> RunRef:
+    # T-C1-100: same static pin as the service face -- ``delivery=None``
+    # (or omitted) is the plain RunRef wire and can never answer InboxRef.
+    @overload
+    def prompt(
+        self, session_id: str, text: str, request_id: str, *, delivery: None = ..., timeout_s: float | None = ...
+    ) -> RunRef: ...
+
+    @overload
+    def prompt(
+        self,
+        session_id: str,
+        text: str,
+        request_id: str,
+        *,
+        delivery: Literal["steer", "queue"],
+        timeout_s: float | None = ...,
+    ) -> RunRef | InboxRef: ...
+
+    def prompt(
+        self,
+        session_id: str,
+        text: str,
+        request_id: str,
+        *,
+        delivery: Literal["steer", "queue"] | None = None,
+        timeout_s: float | None = None,
+    ) -> RunRef | InboxRef:
         """``POST /session/{id}/prompt`` — the request_id idempotency core (§7 L107).
 
         An identical ``(request_id, text)`` retry returns the original
         :class:`~opencode.session.service.RunRef`; a different text under the
-        same request_id answers 409 IdempotencyConflict.
+        same request_id answers 409 IdempotencyConflict. T-C1-100 (P7-S1)
+        adds the opt-in ``delivery`` passthrough: ``None`` keeps the busy
+        hard-refusal face exactly; an explicit ``"steer"``/``"queue"`` parks
+        the prompt on a busy session (the returned :class:`InboxRef`) or
+        admits-and-starts it on an idle one (the ordinary RunRef wire).
         """
+        if delivery is not None and delivery not in ("steer", "queue"):
+            raise ValueError('delivery must be None, "steer" or "queue"')
         path = f"/session/{_path(session_id)}/prompt"
-        return _run_ref(self._call("POST", path, body={"text": text, "request_id": request_id}, timeout_s=timeout_s))
+        body: JsonObject = {"text": text, "request_id": request_id}
+        if delivery is not None:
+            body["delivery"] = delivery
+        payload = self._call("POST", path, body=body, timeout_s=timeout_s)
+        if isinstance(payload, dict) and "inbox_id" in payload:
+            return _inbox_ref(payload)
+        return _run_ref(payload)
 
     def cancel_run(self, run_id: str, *, timeout_s: float | None = None) -> RunStatus:
         """``POST /run/{id}/cancel`` — a late cancel returns the original terminal status."""
@@ -718,3 +868,46 @@ class OpencodeClient:
         """
         path = f"/session/{_path(session_id)}/compact"
         return _compaction_receipt(self._call("POST", path, body={}, timeout_s=timeout_s))
+
+    # -- T-C1-100 (P7-S1): the inbox + interrupt faces --------------------------
+
+    def inbox_list(self, session_id: str, *, timeout_s: float | None = None) -> list[PendingInboxItem]:
+        """``GET /session/{id}/inbox`` — every pending row, in enqueue order."""
+        path = f"/session/{_path(session_id)}/inbox"
+        fields = _expect_object(self._call("GET", path, timeout_s=timeout_s), frozenset({"items"}))
+        raw_items = fields["items"]
+        if not isinstance(raw_items, list):
+            raise OpencodeClientError(f"wire field 'items' must be a list, got {raw_items!r}")
+        return [_pending_inbox_item(raw) for raw in raw_items]
+
+    def inbox_cancel(self, session_id: str, inbox_id: str, *, timeout_s: float | None = None) -> bool:
+        """``DELETE /session/{id}/inbox/{inbox_id}`` — True when withdrawn now, False = the no-op."""
+        path = f"/session/{_path(session_id)}/inbox/{_path(inbox_id)}"
+        return _inbox_cancel_receipt(self._call("DELETE", path, timeout_s=timeout_s))
+
+    def inbox_update(
+        self, session_id: str, inbox_id: str, delivery: Literal["steer", "queue"], *, timeout_s: float | None = None
+    ) -> PendingInboxItem:
+        """``PATCH /session/{id}/inbox/{inbox_id}`` — re-arm one pending item's delivery.
+
+        A flip to ``"steer"`` is the doorbell: the active run's next step
+        boundary consumes it. An item no longer pending answers 409
+        Conflict (the §3-6 update face is not a no-op, unlike cancel).
+        """
+        if delivery not in ("steer", "queue"):
+            raise ValueError('delivery must be "steer" or "queue"')
+        path = f"/session/{_path(session_id)}/inbox/{_path(inbox_id)}"
+        return _pending_inbox_item(self._call("PATCH", path, body={"delivery": delivery}, timeout_s=timeout_s))
+
+    def interrupt(self, session_id: str, *, resume: bool = False, timeout_s: float | None = None) -> InterruptReceipt:
+        """``POST /session/{id}/interrupt?resume=`` — stop the active run; resume drives pending steering.
+
+        ``interrupted`` is True only when a live run settled on the
+        interrupted terminal; an idle session answers the no-op. With
+        ``resume=True`` the settled interrupt promotes the oldest pending
+        steer into a fresh run (``resumed_run_id``); queued prompts stay
+        parked under both faces.
+        """
+        query: dict[str, str] | None = {"resume": "true"} if resume else None
+        path = f"/session/{_path(session_id)}/interrupt"
+        return _interrupt_receipt(self._call("POST", path, query=query, timeout_s=timeout_s))

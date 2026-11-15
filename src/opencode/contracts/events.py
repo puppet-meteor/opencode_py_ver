@@ -90,6 +90,20 @@ PY_CONTEXT_COMPACTED = "py.context.compacted"
 PY_SESSION_DELETED = "py.session.deleted"
 PY_MESSAGE_IMPORTED = "py.message.imported"
 
+# Inbox family (T-C1-100, P7-S1): the durable steering inbox -- admission
+# (enqueued), revocation (cancelled), delivery re-arm (delivery_changed) and
+# consumption (delivered). All four are durable v1 and NOT run-scoped (the
+# session.resource/jobs precedent): an inbox item is a session resource, not
+# a §7 run, so ``metadata={}`` is legal; ``py.inbox.delivered`` MAY carry the
+# consuming run's id as metadata.run_id (the whenever-present ^run_ guard
+# applies). Only the ``user`` (caller prompt) and ``synthetic``
+# (service-injection seam) kinds are ported; compaction/move kinds are NOT
+# (DIFFERENT-BY-DESIGN, ticket §3-2).
+PY_INBOX_ENQUEUED = "py.inbox.enqueued"
+PY_INBOX_CANCELLED = "py.inbox.cancelled"
+PY_INBOX_DELIVERY_CHANGED = "py.inbox.delivery_changed"
+PY_INBOX_DELIVERED = "py.inbox.delivered"
+
 EVENT_VERSION = 1
 
 #: Event types that belong to a run; their envelope metadata must carry run_id (§3.1).
@@ -871,6 +885,83 @@ class MessageImportedData(BaseModel):
     message: UserMessage | AssistantMessage | IdleMessage
 
 
+class InboxEnqueuedData(BaseModel):
+    """``py.inbox.enqueued`` v1 data (T-C1-100): one parked inbox item.
+
+    The durable admission record for a steer/queue delivery: the full
+    user-turn payload parks verbatim (``message``), so the delivered fold is
+    pure event replay with no disk re-read. ``kind`` carries provenance --
+    ``user`` (a caller prompt) requires the originating ``request_id`` (the
+    idle promotion re-uses it for the paired ``py.prompt.accepted`` batch),
+    while ``synthetic`` (the service-injection seam, the S2 import-delivery
+    entry point) parks service-authored text. compaction/move kinds are NOT
+    ported (DIFFERENT-BY-DESIGN, ticket §3-2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inbox_id: str = Field(min_length=1)
+    kind: Literal["user", "synthetic"]
+    delivery: Literal["steer", "queue"]
+    request_id: str | None = None
+    message: UserMessage
+
+    @model_validator(mode="after")
+    def _kind_payload_match(self) -> InboxEnqueuedData:
+        if self.kind == "user" and not self.request_id:
+            raise ValueError("kind='user' requires request_id (the originating prompt request id)")
+        if self.kind == "synthetic" and self.request_id is not None:
+            raise ValueError("kind='synthetic' must not carry request_id")
+        return self
+
+
+class InboxCancelledData(BaseModel):
+    """``py.inbox.cancelled`` v1 data (T-C1-100): the pending-item tombstone.
+
+    Like ``py.session.deleted``, the event is fully described by its target
+    id -- the fold and read model drop the pending row; any field beyond the
+    id is a schema violation (extra=forbid). Cancelling an already-delivered
+    or already-cancelled item is an endpoint-level no-op (ticket §3-6), so
+    this event only ever folds against a live pending item.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inbox_id: str = Field(min_length=1)
+
+
+class InboxDeliveryChangedData(BaseModel):
+    """``py.inbox.delivery_changed`` v1 data (T-C1-100): delivery re-arm.
+
+    A pending item's delivery flips between ``steer`` and ``queue`` (the
+    update endpoint); a change to ``steer`` rings the doorbell for an active
+    run (ticket §3-6). A same-value update is a no-op that commits no event
+    (disclosed in the progress doc); the Literal rejects every other value
+    fail-closed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inbox_id: str = Field(min_length=1)
+    delivery: Literal["steer", "queue"]
+
+
+class InboxDeliveredData(BaseModel):
+    """``py.inbox.delivered`` v1 data (T-C1-100): the consumption record.
+
+    The parked user turn folds into history here -- mid-run steer: the active
+    run's next-step context; idle promotion: paired with a
+    ``py.prompt.accepted`` in the same commit (the accepted fold appends the
+    message, the delivered fold then removes the pending row without a
+    second insert). The payload itself rides the ``py.inbox.enqueued`` fold
+    state, so this event carries only the id (TS ``InboxDelivered`` parity).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inbox_id: str = Field(min_length=1)
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -1183,6 +1274,22 @@ SESSION_RESOURCE_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: Inbox family (T-C1-100, P7-S1): the durable steering inbox, four durable
+#: v1 types. Kept in a separate tuple so the frozen R2 boundary pins hold
+#: (len(R2_EVENT_DEFINITIONS) == 15; no py.inbox.* rows in R2) while
+#: ``default_event_registry`` resolves the full table. NOT run-scoped (the
+#: session.resource/jobs precedent): an inbox item is a session resource, not
+#: a §7 run, so no envelope metadata.run_id is required -- the
+#: whenever-present ^run_ guard below still applies to any metadata.run_id a
+#: producer chooses to attach (e.g. the consuming run on delivered).
+INBOX_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_INBOX_ENQUEUED, durability="durable", data_model=InboxEnqueuedData),
+    EventDefinition(event_type=PY_INBOX_CANCELLED, durability="durable", data_model=InboxCancelledData),
+    EventDefinition(event_type=PY_INBOX_DELIVERY_CHANGED, durability="durable", data_model=InboxDeliveryChangedData),
+    EventDefinition(event_type=PY_INBOX_DELIVERED, durability="durable", data_model=InboxDeliveredData),
+)
+
+
 # ---------------------------------------------------------------------------
 # Jobs family (§3.1 py.job.* rows; PHASE3-ORCHESTRATOR §5.4/§7 A fork-3):
 # the orchestrator's job lifecycle events, committed to the synthesized
@@ -1419,8 +1526,8 @@ JOB_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 
 
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs+session-resource
-    event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4, T-C1-094)."""
+    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs+session-resource+inbox
+    event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4, T-C1-094, T-C1-100)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1432,5 +1539,6 @@ def default_event_registry() -> EventRegistry:
             *COMPACTION_EVENT_DEFINITIONS,
             *JOB_EVENT_DEFINITIONS,
             *SESSION_RESOURCE_EVENT_DEFINITIONS,
+            *INBOX_EVENT_DEFINITIONS,
         )
     )

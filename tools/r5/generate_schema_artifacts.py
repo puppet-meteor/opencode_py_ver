@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from opencode.contracts import cards, errors, events, llm, messages, pipelines, tools, workers
 from opencode.contracts.events import (
     COMPACTION_EVENT_DEFINITIONS,
+    INBOX_EVENT_DEFINITIONS,
     JOB_EVENT_DEFINITIONS,
     R1_EVENT_DEFINITIONS,
     R2_EVENT_DEFINITIONS,
@@ -59,7 +60,8 @@ MODULES: tuple[ModuleType, ...] = (errors, events, llm, messages, tools, cards, 
 #: added here by T-C1-052a, fulfilling the T-C1-045 disclosure; the seventh
 #: (COMPACTION_EVENT_DEFINITIONS, py.context.compacted) by T-C1-060; the
 #: eighth (JOB_EVENT_DEFINITIONS, the seven py.job.* types) by T-C1-076;
-#: the registry still exposes no enumeration API.
+#: the ninth (INBOX_EVENT_DEFINITIONS, the four py.inbox.* steering types)
+#: by T-C1-100; the registry still exposes no enumeration API.
 ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *R1_EVENT_DEFINITIONS,
     *R2_EVENT_DEFINITIONS,
@@ -69,6 +71,7 @@ ENVELOPE_DEFINITIONS: tuple[EventDefinition, ...] = (
     *SKILL_EVENT_DEFINITIONS,
     *COMPACTION_EVENT_DEFINITIONS,
     *JOB_EVENT_DEFINITIONS,
+    *INBOX_EVENT_DEFINITIONS,
 )
 
 
