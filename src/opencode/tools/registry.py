@@ -4,7 +4,7 @@ Owns the registration side of the tool chain: :class:`ToolAdapter` (the
 adapter seam an implementation plugs into), :class:`ToolCatalog` (the
 immutable per-request catalog shown to the provider) and
 :meth:`ToolRegistry.invoke` -- the single call entry that drives
-:func:`opencode.tools.invoker.invoke_tool` under the Phase-1 serial lock
+:func:`opencode.tools.invoker.invoke_tool` under the Phase-1 serial locks
 (PHASE1-SLIM L85: calls execute serially in call-start order).
 
 Contract notes (float-reported where the plan left a choice):
@@ -212,9 +212,30 @@ class ToolRegistry:
     :class:`~opencode.session.service.AscendingIds` so ``evt_`` ids share
     one ascending format with the rest of the process).
 
-    Phase 1 executes calls serially in call-start order: one registry-wide
-    :class:`asyncio.Lock` covers the whole requested→finished pipeline, so
-    concurrent invokes never interleave (PHASE1-SLIM L85).
+    Phase 1 executes calls serially in call-start order: one lock per
+    session covers the whole requested→finished pipeline, so concurrent
+    invokes within one session never interleave (PHASE1-SLIM L85).
+
+    P6-S5 mechanism correction (T-C1-098, the S4 precedent form): this lock
+    was one registry-wide :class:`asyncio.Lock` until the subagent tool
+    landed. The foreground subagent face holds its session's invoke pipeline
+    open while a *child* session's run executes tool calls through this same
+    registry (the runner is one process-wide composition); under a single
+    registry-wide lock the child's first invoke blocks on the lock the
+    parent's ``subagent__run`` execute still holds, and the parent's
+    foreground wait polls a child that can never settle -- a deterministic
+    process-wide deadlock for every tool-using subagent. The correction keys
+    the serial lock by session (the :class:`EventCommitter` per-session
+    ``_lock`` shape): within one session nothing changes (one active run
+    per session, the runner already awaits calls serially), and PHASE1-SLIM
+    L85's pinned sentence -- tools execute serially in call-start order --
+    is a per-run guarantee and holds unchanged. Only cross-session
+    head-of-line blocking is removed. Side effect recorded in the T-C1-098
+    progress file: two sessions may now hold pipeline slots simultaneously,
+    so the e2e_r4 §⑥ split note ("only one invoke can sit inside the
+    pipeline") became historical; the split tests themselves still pin the
+    close-order faces and stay green, and the combined close face they
+    avoided remains untested (scheduler open item).
     """
 
     def __init__(
@@ -228,7 +249,11 @@ class ToolRegistry:
         self._sink = sink
         self._clock: Clock = clock if clock is not None else _utc_now
         self._ids: IdFactory = ids if ids is not None else AscendingIds(self._clock)
-        self._lock = asyncio.Lock()
+        # P6-S5 (T-C1-098): per-session Phase-1 serialization locks (see the
+        # class docstring mechanism-correction note). Lazy get-or-create and
+        # never pruned -- the EventCommitter per-session lock and the Runner's
+        # per-run cancel-event dicts are the same bounded-by-lifetime shape.
+        self._locks: dict[str, asyncio.Lock] = {}
         self._adapters: dict[tuple[str, str], ToolAdapter] = {}
         self._pinned: dict[str, ToolCatalog] = {}
         # R4-S3 (§5.1 L255): remote tool name -> owning MCP server id.
@@ -387,6 +412,20 @@ class ToolRegistry:
 
     # -- §5.1 L247 the single call entry ------------------------------------
 
+    def _serial_lock(self, session_id: str) -> asyncio.Lock:
+        """The per-session Phase-1 serialization lock (P6-S5, T-C1-098).
+
+        Lazy get-or-create over the ``_locks`` dict -- the
+        :class:`EventCommitter._lock` shape. Never pruned: the entries are
+        bounded by the process's session lifetime, the same tradeoff the
+        committer and the Runner's cancel-event dict already make.
+        """
+        lock = self._locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[session_id] = lock
+        return lock
+
     async def invoke(
         self,
         context: ToolContext,
@@ -400,7 +439,9 @@ class ToolRegistry:
         e.g. ``"fs__read"``); it is resolved against the session's pinned
         catalog here so unknown tools still produce the full
         requested→finished(not_started) sequence. The whole pipeline runs
-        under the Phase-1 serial lock in call-start order.
+        under the calling session's Phase-1 serial lock in call-start order
+        (PHASE1-SLIM L85; the P6-S5 per-session key -- see the class
+        docstring).
         """
         if self._sink is None:
             raise ToolInvokeError("invoke requires an event sink (construct ToolRegistry with sink=)")
@@ -416,7 +457,7 @@ class ToolRegistry:
             # below is provably present -- no defensive unknown-tool path.
             else ResolvedTool(spec=spec, adapter=self._adapters[(spec.namespace, spec.name)])
         )
-        async with self._lock:
+        async with self._serial_lock(context.session_id):
             return await invoke_tool(
                 tool=tool,
                 context=context,

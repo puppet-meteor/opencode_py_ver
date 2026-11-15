@@ -759,7 +759,10 @@ class SessionService:
     # -- §7 create ---------------------------------------------------------
 
     async def create(
-        self, config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3 | JsonObject
+        self,
+        config_snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3 | JsonObject,
+        *,
+        parent_id: str | None = None,
     ) -> SessionRef:
         """Create and persist a session (§7 L304); every call is a new ses_ id.
 
@@ -774,12 +777,21 @@ class SessionService:
         the projector inserts the sessions row in the same transaction. The
         bus is notified after the commit like every commit path (§3.2 L159
         step 5; open point E -- a session without subscribers is a no-op).
+
+        P6-S5 (T-C1-098, ticket §3-3 ①): the optional ``parent_id`` records
+        the subagent parent link on the durable created event (``None`` =
+        a root session, the pre-P6 face unchanged). The link carries no
+        lifecycle: no delete cascade, no status coupling -- the child is a
+        fully independent session that merely remembers its origin for the
+        subagent depth guard.
         """
         if self._closed or self._closing:
             raise SessionClosedError("service is closed")
+        if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.startswith("ses_")):
+            raise StoreValidationError("parent_id must be None or a string matching ^ses_")
         snapshot = _coerce_config_snapshot(config_snapshot)
         session_id = self._ids.session_id()
-        draft = self._created_draft(session_id, self._working_dir, snapshot, self._clock())
+        draft = self._created_draft(session_id, self._working_dir, snapshot, self._clock(), parent_id=parent_id)
         committed = await self._store.commit(session_id, EventBatch(self._ids.batch_id(), (draft,)), 0)
         self._bus.notify(session_id, committed)
         return SessionRef(session_id=session_id)
@@ -790,6 +802,8 @@ class SessionService:
         working_dir: str,
         snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3,
         created_at: datetime,
+        *,
+        parent_id: str | None = None,
     ) -> EventDraft[SessionCreatedData] | EventDraft[SessionCreatedDataV2] | EventDraft[SessionCreatedDataV3]:
         """One ``py.session.created`` draft with the wire version routed by the data shape.
 
@@ -798,7 +812,10 @@ class SessionService:
         (checked first — a v3 snapshot is a standalone model, never a v2
         subclass), a v2 snapshot version 2, a v1 snapshot version 1. The
         snapshot hash is computed from the same model the draft carries, so
-        the §6.2 re-validation on decode can never disagree.
+        the §6.2 re-validation on decode can never disagree. The P6-S5
+        ``parent_id`` (T-C1-098) threads through every wire version with a
+        ``None`` default, so fork/import keep the root-session face
+        unchanged without touching their call sites.
         """
         if isinstance(snapshot, ConfigSnapshotV3):
             return EventDraft[SessionCreatedDataV3](
@@ -811,6 +828,7 @@ class SessionService:
                     working_dir=working_dir,
                     config_snapshot=snapshot,
                     snapshot_hash=compute_snapshot_hash(snapshot),
+                    parent_id=parent_id,
                 ),
             )
         if isinstance(snapshot, ConfigSnapshotV2):
@@ -824,6 +842,7 @@ class SessionService:
                     working_dir=working_dir,
                     config_snapshot=snapshot,
                     snapshot_hash=compute_snapshot_hash(snapshot),
+                    parent_id=parent_id,
                 ),
             )
         return EventDraft[SessionCreatedData](
@@ -836,6 +855,7 @@ class SessionService:
                 working_dir=working_dir,
                 config_snapshot=snapshot,
                 snapshot_hash=compute_snapshot_hash(snapshot),
+                parent_id=parent_id,
             ),
         )
 
@@ -1608,6 +1628,25 @@ class SessionService:
             applied_seq=record.applied_seq,
             active_run_id=record.active_run_id,
         )
+
+    async def session_created_data(self, session_id: str) -> SessionCreatedData:
+        """The typed ``py.session.created`` payload of one session (P6-S5, T-C1-098).
+
+        The public read face over :meth:`_session_creation` for callers that
+        need the created payload without the export/fork bulk: the subagent
+        tool reads the parent's config snapshot (the child inherits it
+        verbatim, the fork precedent) and walks ``parent_id`` up the chain
+        for the depth guard. The read runs over the events log through the
+        same fail-closed version routing, so a tombstoned session still
+        answers with its creation payload (the durable row survives the
+        delete); a session that never existed has no created row and
+        surfaces as read-model corruption -- callers that need the resource
+        face (``NotFound`` for missing or deleted) read ``get_session``
+        first, exactly like fork/export do.
+        """
+        _require_session_id_arg(session_id)
+        data, _ = await self._session_creation(session_id)
+        return data
 
     async def message(self, session_id: str, message_id: str) -> SessionMessage:
         """One projected message by ``(session_id, message_id)`` (§3 decision 6).

@@ -19,6 +19,11 @@ ride both production host compositions (the CLI ``_drive`` tuple and
 ``serving._builtin_adapters``) beside the twelve, so every host face
 carries 16 adapters while a tool-less App composition stays tool-less
 (the app.py ``tools`` loop is host-param plumbing, not a registry).
+P6-S5 (T-C1-098) adds the foreground subagent tool ``subagent__run``
+(same constant shape, same dual-host ride): the one stateful builtin --
+hosts bind the App service to the named instance after construction
+(``SubagentRunAdapter.bind``), so host faces carry 17 adapters (16
+base + the platform-gated PTY adapter).
 """
 
 from opencode.tools.builtin.bash import (
@@ -137,6 +142,21 @@ from opencode.tools.builtin.read import (
     READ_VERSION,
     FsReadAdapter,
 )
+from opencode.tools.builtin.subagent import (
+    NO_TEXT_RESPONSE,
+    SUBAGENT_AGENTS,
+    SUBAGENT_CANCEL_WAIT_S,
+    SUBAGENT_DESCRIPTION,
+    SUBAGENT_INPUT_SCHEMA,
+    SUBAGENT_MAX_DEPTH,
+    SUBAGENT_NAME,
+    SUBAGENT_NAMESPACE,
+    SUBAGENT_POLL_INTERVAL_S,
+    SUBAGENT_SPEC,
+    SUBAGENT_TIMEOUT_S,
+    SUBAGENT_VERSION,
+    SubagentRunAdapter,
+)
 from opencode.tools.builtin.todo import (
     TODO_DESCRIPTION,
     TODO_INPUT_SCHEMA,
@@ -213,6 +233,7 @@ __all__ = [
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
+    "NO_TEXT_RESPONSE",
     "PATCH_DESCRIPTION",
     "PATCH_INPUT_SCHEMA",
     "PATCH_MAX_SOURCE_BYTES",
@@ -240,6 +261,17 @@ __all__ = [
     "READ_NAMESPACE",
     "READ_SPEC",
     "READ_VERSION",
+    "SUBAGENT_AGENTS",
+    "SUBAGENT_CANCEL_WAIT_S",
+    "SUBAGENT_DESCRIPTION",
+    "SUBAGENT_INPUT_SCHEMA",
+    "SUBAGENT_MAX_DEPTH",
+    "SUBAGENT_NAME",
+    "SUBAGENT_NAMESPACE",
+    "SUBAGENT_POLL_INTERVAL_S",
+    "SUBAGENT_SPEC",
+    "SUBAGENT_TIMEOUT_S",
+    "SUBAGENT_VERSION",
     "TODO_DESCRIPTION",
     "TODO_INPUT_SCHEMA",
     "TODO_NAME",
@@ -269,6 +301,7 @@ __all__ = [
     "PatchApplyAdapter",
     "PtyRunAdapter",
     "QuestionAskAdapter",
+    "SubagentRunAdapter",
     "TodoWriteAdapter",
     "pty_adapters",
 ]

@@ -60,6 +60,7 @@ from opencode.tools.builtin import (
     GitWorktreeRemoveAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
+    SubagentRunAdapter,
     TodoWriteAdapter,
     pty_adapters,
 )
@@ -192,7 +193,7 @@ def _compose_mcp_manager(loader: ConfigLoader) -> McpManager | None:
     return manager
 
 
-def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
+def _builtin_adapters(roots: Sequence[str], *, subagent: SubagentRunAdapter | None = None) -> tuple[ToolAdapter, ...]:
     """The builtin tool adapters (the CLI ``_drive`` list, same order).
 
     Platform gate: ``*pty_adapters()`` appends the win32-verified PTY T1
@@ -204,7 +205,15 @@ def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
     carry 16 adapters. The trio is host-face wiring, never an App default:
     the app.py ``tools`` loop is host-param plumbing, and a tool-less App
     composition (recovery scans, minimal harnesses) must stay tool-less.
+
+    P6-S5 (T-C1-098): the foreground subagent tool rides the same twin
+    compositions (17 adapters per host face). ``serve`` passes the named
+    instance it binds to the App service right after construction; a
+    caller that omits it gets a fresh unbound instance, so the census
+    face keeps composing the complete host set.
     """
+    if subagent is None:
+        subagent = SubagentRunAdapter()
     return (
         FsReadAdapter(roots=roots),
         FsLsAdapter(roots=roots),
@@ -221,6 +230,7 @@ def _builtin_adapters(roots: Sequence[str]) -> tuple[ToolAdapter, ...]:
         PatchApplyAdapter(),
         TodoWriteAdapter(),
         QuestionAskAdapter(),
+        subagent,
         *pty_adapters(),
     )
 
@@ -329,10 +339,13 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # registration itself runs in the ASGI lifespan startup (app.py, the
     # startup twin of the shutdown reclaim face) on the serving loop.
     skills_dir = loader.skills_directory()
+    # P6-S5 (T-C1-098): the one stateful builtin -- a named instance so
+    # ``serve`` can bind the App's session service right after construction.
+    subagent_run = SubagentRunAdapter()
     app = App(
         resolved_db,
         provider=provider,
-        tools=_builtin_adapters(runtime.roots),
+        tools=_builtin_adapters(runtime.roots, subagent=subagent_run),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
         rules=permission_rules_from_snapshot(runtime.snapshot.permission_rules),
@@ -341,6 +354,10 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         pipeline_engine=pipeline_engine,
         skills_dir=skills_dir,
     )
+    # P6-S5 (T-C1-098): late-bind before the server starts taking requests
+    # (an unbound adapter would fail closed as a wiring defect at first
+    # invoke).
+    subagent_run.bind(app.service)
     api = create_app(app, token=token)
     server = uvicorn.Server(_server_config(api, port=port))
     asyncio.run(server.serve())

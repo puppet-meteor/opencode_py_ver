@@ -2839,10 +2839,22 @@
         "JsonValue": {}
       },
       "additionalProperties": false,
-      "description": "``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash.",
+      "description": "``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash.\n\nP6-S5 (T-C1-098, ticket §3-3 mechanism ①): the optional ``parent_id``\nis the subagent parent-link seam — ``None`` on every root session (the\ndecode-compatible default, so every pre-existing row and fixture reads\nunchanged), the owning ``ses_`` id on a subagent's child session. The\nlink exists for the subagent depth guard only: it introduces no delete\ncascade (the service's §3 decision-4 no-cascade record stands) and no\nread-model column (the parent walk reads the raw created row through\nthe service's typed decode, never a projected face).",
       "properties": {
         "config_snapshot": {
           "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Id"
         },
         "snapshot_hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -3027,6 +3039,18 @@
       "properties": {
         "config_snapshot": {
           "$ref": "#/$defs/ConfigSnapshotV2"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Id"
         },
         "snapshot_hash": {
           "pattern": "^[0-9a-f]{64}$",
@@ -3270,6 +3294,18 @@
       "properties": {
         "config_snapshot": {
           "$ref": "#/$defs/ConfigSnapshotV3"
+        },
+        "parent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Id"
         },
         "snapshot_hash": {
           "pattern": "^[0-9a-f]{64}$",

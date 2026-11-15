@@ -146,6 +146,7 @@ from opencode.tools.builtin import (
     GitWorktreeRemoveAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
+    SubagentRunAdapter,
     TodoWriteAdapter,
     pty_adapters,
 )
@@ -969,6 +970,10 @@ async def _drive(
     # falsely collide, so every driven boot gets its own uuid namespace.
     request_base = f"req_cli_{uuid4().hex[:12]}"
     rules = permission_rules_from_snapshot(runtime.snapshot.permission_rules)
+    # P6-S5 (T-C1-098): the one stateful builtin -- the registry owns
+    # adapters process-wide while the service is per-App, so the subagent
+    # adapter is a named instance bound right after App construction.
+    subagent_run = SubagentRunAdapter()
     app = App(
         db_path,
         provider=provider,
@@ -988,9 +993,12 @@ async def _drive(
             # P6-S4 (T-C1-097, toolkit A): the patch/todo/question trio
             # rides both production host compositions (this drive list and
             # the serving ``_builtin_adapters`` twin) beside the twelve.
+            # P6-S5 (T-C1-098): the foreground subagent tool rides the
+            # same twin compositions (16 base adapters per host face).
             PatchApplyAdapter(),
             TodoWriteAdapter(),
             QuestionAskAdapter(),
+            subagent_run,
             *pty_adapters(),
         ),
         settings=runtime.settings,
@@ -1001,6 +1009,10 @@ async def _drive(
         mcp_refs=mcp_refs,
         pipeline_engine=pipeline_engine,
     )
+    # P6-S5 (T-C1-098): late-bind the App's session service to the named
+    # subagent instance before any run can reach the tool (an unbound
+    # adapter would fail closed as a wiring defect at first invoke).
+    subagent_run.bind(app.service)
     # R4-S6: the driving act itself waits for the startup scan. The gated
     # store already orders every WRITE behind the scan, but prompt()'s
     # active-run busy check is a READ — a recovered session whose crashed run

@@ -346,13 +346,24 @@ class ConfigSnapshotV3(BaseModel):
 
 
 class SessionCreatedData(BaseModel):
-    """``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash."""
+    """``py.session.created`` v1 data (§3.1/§6.1): working_dir + config_snapshot + snapshot_hash.
+
+    P6-S5 (T-C1-098, ticket §3-3 mechanism ①): the optional ``parent_id``
+    is the subagent parent-link seam — ``None`` on every root session (the
+    decode-compatible default, so every pre-existing row and fixture reads
+    unchanged), the owning ``ses_`` id on a subagent's child session. The
+    link exists for the subagent depth guard only: it introduces no delete
+    cascade (the service's §3 decision-4 no-cascade record stands) and no
+    read-model column (the parent walk reads the raw created row through
+    the service's typed decode, never a projected face).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     working_dir: str = Field(min_length=1)
     config_snapshot: ConfigSnapshot
     snapshot_hash: str = Field(pattern=_SHA256_HEX)
+    parent_id: str | None = None
 
     @model_validator(mode="after")
     def _snapshot_hash_verified(self) -> SessionCreatedData:

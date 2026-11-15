@@ -99,6 +99,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: document the pair inside the closed enumeration (the bash__run row
 #: #28 zero-behavior closure shape); none of the three joins
 #: ``_ASK_NAMESPACES`` (ticket §3-6: not namespace-level ask families).
+#: P6-S5 (T-C1-098) added ``subagent__run`` (the bash__run shape again):
+#: spawning a child session is a real side effect (a durable session plus
+#: provider spend, ticket §3-5), so the explicit key documents the same
+#: "ask" the declared side_effects=True already produced via the residual
+#: rule; ``subagent`` NOT added to ``_ASK_NAMESPACES`` (the git-trio
+#: precedent, ticket §3-5).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -116,6 +122,7 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "patch__apply": "ask",
     "todo__write": "allow",
     "question__ask": "allow",
+    "subagent__run": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.
