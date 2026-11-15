@@ -27,6 +27,11 @@ group subset, same flat JSON wire):
 * ``POST   /session/import``                        -> :meth:`OpencodeClient.import_session`
 * ``GET    /session/{session_id}/message/{message_id}`` -> :meth:`OpencodeClient.get_message`
 
+T-C1-095 (P6-S2) adds the global volatile event stream (the TS
+``event.subscribe`` face, ``GET /events``):
+
+* ``GET    /events``                                -> :meth:`OpencodeClient.stream_global_events`
+
 Return types are the core models themselves (``service.RunRef`` /
 ``RunStatus`` / ``DecisionReceipt`` / ``SessionRef`` / ``SessionInfo`` /
 ``SessionSummary`` / ``SessionExport``, ``repos.MessagePage``,
@@ -48,7 +53,12 @@ frame raises :class:`OpencodeStreamError`.
 connected generator — and :meth:`resume_cursor` exposes the Last-Event-ID
 state, so after a disconnect the caller reconnects with
 ``stream_events(session_id, after=client.resume_cursor(session_id))`` and
-receives exactly the missed events.
+receives exactly the missed events. :meth:`stream_global_events` is the
+global volatile twin (T-C1-095): it yields the synthetic
+:class:`~opencode.sdk.sse.ServerConnected` marker first, then every live bus
+event across sessions — and it never resumes: a reconnect starts fresh, and
+events published while disconnected are missed (the session stream above
+owns durable replay).
 """
 
 from __future__ import annotations
@@ -58,7 +68,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from typing import Any
 
 from pydantic import ValidationError
@@ -73,7 +83,7 @@ from opencode.contracts.messages import (
     UserMessage,
 )
 from opencode.sdk.errors import OpencodeApiError, OpencodeClientError, OpencodeConnectionError
-from opencode.sdk.sse import stream_durable_events
+from opencode.sdk.sse import GlobalStreamItem, stream_durable_events, stream_global_events
 from opencode.session.service import (
     DecisionReceipt,
     RunRef,
@@ -375,6 +385,37 @@ class OpencodeClient:
             raise OpencodeConnectionError(f"GET {path} never answered") from error
         return response
 
+    def _open_global_stream(
+        self,
+        *,
+        types: Iterable[str] | None,
+        timeout_s: float | None,
+    ) -> http.client.HTTPResponse:
+        """Open the global SSE route; the caller owns closing the response.
+
+        ``types`` rides as the ``?types=a,b,c`` query (server-side filter);
+        the client-side shape check mirrors the bus's own argument guard, so
+        a malformed filter fails before the wire.
+        """
+        headers = {"Authorization": f"Bearer {self._token}", "Accept": "text/event-stream"}
+        path = "/events"
+        if types is not None:
+            if isinstance(types, str):
+                raise ValueError("types must be an iterable of event type names, not a single string")
+            names = list(types)
+            for name in names:
+                if not isinstance(name, str) or not name:
+                    raise ValueError("every entry of types must be a non-empty event type name")
+            path += "?" + urllib.parse.urlencode({"types": ",".join(names)})
+        request = urllib.request.Request(self._base + path, headers=headers, method="GET")
+        try:
+            response: http.client.HTTPResponse = self._opener.open(request, timeout=self._timeout(timeout_s))
+        except urllib.error.HTTPError as error:
+            raise _api_error(error) from None
+        except (urllib.error.URLError, OSError) as error:
+            raise OpencodeConnectionError(f"GET {path} never answered") from error
+        return response
+
     # -- the §7 routes ------------------------------------------------------
 
     def create_session(self, config: JsonObject, *, timeout_s: float | None = None) -> SessionRef:
@@ -553,3 +594,39 @@ class OpencodeClient:
 
     def _on_cursor(self, session_id: str, cursor: str) -> None:
         self._last_event_ids[session_id] = cursor
+
+    # -- T-C1-095 (P6-S2): the global volatile event stream -------------------
+
+    def stream_global_events(
+        self,
+        *,
+        types: Iterable[str] | None = None,
+        timeout_s: float | None = None,
+    ) -> Generator[GlobalStreamItem, None, None]:
+        """``GET /events`` — the global volatile SSE stream as typed items (T-C1-095).
+
+        The TS ``event.subscribe`` parity face: one live broadcast across
+        every session. The first ``next()`` issues the connection lazily and
+        yields the synthetic :class:`~opencode.sdk.sse.ServerConnected`
+        marker; live bus events then arrive as
+        :class:`~opencode.contracts.events.DurableEvent` or
+        :class:`~opencode.contracts.events.EphemeralEvent` envelopes.
+        ``types`` narrows the stream server-side (``?types=a,b``; ``None``
+        receives every event type). Volatile by contract — no resume, no
+        backfill: a reconnect starts fresh, and events published while
+        disconnected are missed (the session stream owns durable replay);
+        there is no cursor callback and no dedup on this face. The terminal
+        ``event: error`` frame raises :class:`OpencodeStreamError` (e.g. the
+        SlowConsumer overflow after this reader stopped consuming); comments
+        (keepalive) are skipped. The first version is a single connection
+        with no auto-reconnect: close the generator and call again.
+        """
+
+        def _generate() -> Generator[GlobalStreamItem, None, None]:
+            response = self._open_global_stream(types=types, timeout_s=timeout_s)
+            try:
+                yield from stream_global_events(response, registry=self._registry)
+            finally:
+                response.close()
+
+        return _generate()

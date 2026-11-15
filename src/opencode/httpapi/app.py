@@ -44,6 +44,12 @@ ValidationError 422):
   living at the payload id answers 409 Conflict)
 * ``GET    /session/{session_id}/message/{message_id}``    -> one projected message (§2.1 wire)
 
+T-C1-095 (P6-S2) adds the global volatile event stream — the TS
+``event.subscribe`` face over :meth:`opencode.bus.bus.VolatileBus.subscribe_all`:
+
+* ``GET  /events``                                       -> live SSE across every session
+  (``?types=a,b,c`` server-side filter; volatile by contract)
+
 
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
@@ -79,6 +85,33 @@ eight request slots — the two 429 faces share the SlowConsumer code with
 disjoint causes (connection capacity vs. slow-but-tolerated consumers, so a
 slow SSE reader is never an error).
 
+Global volatile SSE (T-C1-095, TS ``event.subscribe`` /
+``packages/server/src/event-feed.ts``): ``GET /events`` is the deliberately
+separate design face — a *volatile* live broadcast of every bus notification
+across sessions (durable committed + ephemeral), where the session routes
+above are *durable* catch-up + follow streams. Volatile by contract, in both
+directions: no replay, no backfill, no resume — a ``Last-Event-ID`` header is
+refused (422) instead of honored, and events published while no subscriber
+watches are simply missed. The connection opens with the synthetic
+``server.connected`` frame (a stream-level marker, not a bus event and not a
+registry type — ``{type: "server.connected", data: {}}``, TS parity); then
+each bus event renders through the same frame discipline as the session
+stream (durable events keep the exact ``id: {session_id}:{seq}`` +
+eight-field envelope form; an ephemeral event carries no seq, so its frame
+has no ``id:`` line), paced by the same ``: keepalive`` cadence and capped by
+the same ``MAX_SSE_FRAME_BYTES``. The subscription is the bus's own bounded
+queue (``VolatileBus.subscribe_all``, DEFAULT_QUEUE_LIMIT 1000 — the TS 4096
+capacity is not ported, DIFFERENT-BY-DESIGN): a consumer that stops reading
+overflows loudly — the accepted prefix is delivered, then one terminal
+``event: error`` frame carrying the §8 SlowConsumer body closes the stream.
+``?types=a,b,c`` narrows server-side (per-subscription filter, the bus's own
+face); a malformed value (empty or an empty segment) answers 422
+ValidationError. PY keeps its ``Cache-Control: no-store`` header form (the TS
+no-cache/no-transform/X-Accel-Buffering/nosniff header set is not ported).
+The ``_GuardMiddleware`` stream budget covers this route structurally
+(``_is_sse_request``), so auth/Origin and the stream-slot accounting apply
+unchanged.
+
 Security face (PHASE2-MODULES L106): the loopback binding is the host's face
 (:mod:`opencode.httpapi.serving`); this module enforces the single-user bearer
 token (timing-safe comparison, 401 on failure), refuses every request that
@@ -112,7 +145,7 @@ import asyncio
 import json
 import secrets
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from typing import Any, Literal, cast
 
@@ -121,8 +154,10 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from opencode.app import App
+from opencode.bus import Event, SlowConsumerError
 from opencode.bus.eventlog import EventCursor, EventLog, LogItem, Synced
 from opencode.contracts.errors import CoreError, CoreErrorCode
+from opencode.contracts.events import DurableEvent
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.jobs import JobTransitionError
 from opencode.orchestrator.registration import register_pipelines
@@ -395,19 +430,44 @@ def _last_event_id_cursor(request: Request, session_id: str) -> EventCursor | No
     return EventCursor(session_id=session_id, seq=int(raw_seq))
 
 
-def _is_sse_request(scope: Scope) -> bool:
-    """``GET /session/{id}/events`` and ``GET /jobs/{id}/events``: the stream-slot routes.
+def _global_event_types(request: Request) -> frozenset[str] | None:
+    """The ``?types=a,b,c`` filter of ``GET /events`` (T-C1-095 §3-1).
 
-    Matched structurally (three path segments: ``session``/``jobs`` + id +
-    ``events``) so the stream budget only ever counts requests the router
-    itself would accept as a stream route; anything else stays on the request
-    budget. The P3-S1 generalization keeps the two stream families on the
-    same ``MAX_CONCURRENT_SSE_STREAMS`` budget (disjoint causes are not
-    split per family in v1).
+    An absent parameter is ``None`` — every event type (TS: "When omitted,
+    all events are sent"). A present one is a comma-separated list of
+    non-empty event type names; an empty value or an empty segment is a 422
+    ValidationError, fail-closed: a silently-empty filter would deliver
+    nothing without telling the client why.
+    """
+    raw = request.query_params.get("types")
+    if raw is None:
+        return None
+    names = raw.split(",")
+    if any(not name for name in names):
+        raise _TransportError(
+            422,
+            _validation(f"types must be a comma-separated list of non-empty event type names, got {raw!r}"),
+        )
+    return frozenset(names)
+
+
+def _is_sse_request(scope: Scope) -> bool:
+    """``GET /events`` and ``GET /{session,jobs}/{id}/events``: the stream-slot routes.
+
+    Matched structurally (the bare ``/events`` path, or three path segments:
+    ``session``/``jobs`` + id + ``events``) so the stream budget only ever
+    counts requests the router itself would accept as a stream route;
+    anything else stays on the request budget. The P3-S1 generalization keeps
+    the stream families on the same ``MAX_CONCURRENT_SSE_STREAMS`` budget
+    (disjoint causes are not split per family in v1); T-C1-095's global
+    stream joins that same budget.
     """
     if scope.get("method") != "GET":
         return False
-    parts = (scope.get("path") or "").split("/")
+    path = scope.get("path") or ""
+    if path == "/events":
+        return True
+    parts = path.split("/")
     return (
         len(parts) == 4
         and parts[0] == ""
@@ -432,33 +492,79 @@ def _frame_for(item: LogItem) -> bytes:
     return f"id: {item.session_id}:{item.seq}\nevent: {item.type}\ndata: {data}\n\n".encode()
 
 
+#: The synthetic first-frame event type of the global stream (T-C1-095, TS
+#: parity): a stream-level marker, not a bus event and not a registry type.
+#: The SDK carries the same literal (``opencode.sdk.sse.SERVER_CONNECTED``);
+#: the two constants are pinned equal by the integration tests.
+SERVER_CONNECTED = "server.connected"
+
+
+def _connected_frame() -> bytes:
+    """The synthetic ``server.connected`` frame (T-C1-095): first on the wire.
+
+    Emitted at connection establishment so the client learns the stream is
+    live before any bus event flows (TS ``event.subscribe`` parity). It
+    carries no ``id:`` line — nothing on the volatile stream may advance a
+    Last-Event-ID — and its data is the constant TS payload shape.
+    """
+    data = json.dumps({"type": SERVER_CONNECTED, "data": {}}, separators=(",", ":"), ensure_ascii=False)
+    return f"event: {SERVER_CONNECTED}\ndata: {data}\n\n".encode()
+
+
+def _global_frame_for(event: Event) -> bytes:
+    """One global-stream SSE wire block: the bus envelope (durable or ephemeral).
+
+    Durable events keep the session-stream event-frame form exactly —
+    ``id: {session_id}:{seq}`` plus the eight-field envelope (T-C1-095 §3-5,
+    maximum frame reuse across the two SSE faces). An ephemeral event carries
+    no seq, so its frame has no ``id:`` line: the volatile stream owns no
+    resume cursor, and no frame on it may advance a Last-Event-ID the route
+    refuses anyway.
+    """
+    data = json.dumps(event.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=False)
+    if isinstance(event, DurableEvent):
+        return f"id: {event.session_id}:{event.seq}\nevent: {event.type}\ndata: {data}\n\n".encode()
+    return f"event: {event.type}\ndata: {data}\n\n".encode()
+
+
 def _error_frame(core: CoreError) -> bytes:
     """The terminal ``event: error`` frame (the §8 CoreError wire, in-stream)."""
     data = json.dumps(core.model_dump(mode="json"), separators=(",", ":"), ensure_ascii=False)
     return f"event: error\ndata: {data}\n\n".encode()
 
 
-async def _sse_frames(
-    follow: AbstractAsyncContextManager[AsyncIterator[LogItem]],
-    items: AsyncIterator[LogItem],
+async def _sse_frames[ItemT](
+    follow: AbstractAsyncContextManager[AsyncIterator[ItemT]],
+    items: AsyncIterator[ItemT],
+    *,
+    frame_for: Callable[[ItemT], bytes],
+    preface: tuple[bytes, ...] = (),
 ) -> AsyncIterator[bytes]:
     """Stream the already-entered follow context as SSE bytes (pull-shaped).
 
-    Exactly one ``__anext__`` is outstanding at a time, wrapped in a task so
-    an idle stream can still emit ``: keepalive`` comments — a plain
-    ``wait_for`` would cancel the follow at its park point and kill the
-    stream, so the timeout only ends the outer wait while the follow keeps
-    parking (§7 L108: a slow consumer suspends this generator, never the
-    runner; at most one decoded item is ever buffered). A StoreError raised
-    by the follow (a bad page mid-stream, after its healthy events were
-    already yielded) or a frame over MAX_SSE_FRAME_BYTES answers one terminal
-    ``event: error`` frame and ends the response. Leaving the generator —
-    normally, on disconnect, or on cancellation — cancels the outstanding
-    ``__anext__`` and leaves the follow context, which unregisters the
-    wakeup (断线/取消安全).
+    The shared SSE machinery of both stream families: the durable session /
+    jobs faces pass :func:`_frame_for` over their EventLog follow items, the
+    global volatile stream (T-C1-095) passes :func:`_global_frame_for` over
+    its bus subscription items plus a one-frame ``preface`` (the synthetic
+    ``server.connected`` marker). Exactly one ``__anext__`` is outstanding at
+    a time, wrapped in a task so an idle stream can still emit ``: keepalive``
+    comments — a plain ``wait_for`` would cancel the follow at its park point
+    and kill the stream, so the timeout only ends the outer wait while the
+    follow keeps parking (§7 L108: a slow consumer suspends this generator,
+    never the runner; at most one decoded item is ever buffered). A StoreError
+    raised by the follow (a bad page mid-stream, after its healthy events
+    were already yielded), a SlowConsumerError raised by the bus iterator (a
+    global subscription that overflowed its bounded queue — the accepted
+    prefix was already yielded), or a frame over MAX_SSE_FRAME_BYTES answers
+    one terminal ``event: error`` frame and ends the response. Leaving the
+    generator — normally, on disconnect, or on cancellation — cancels the
+    outstanding ``__anext__`` and leaves the follow context, which unregisters
+    the wakeup (断线/取消安全).
     """
     try:
-        pending: asyncio.Task[LogItem] | None = None
+        for frame in preface:
+            yield frame
+        pending: asyncio.Task[ItemT] | None = None
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(items.__anext__())
@@ -471,10 +577,10 @@ async def _sse_frames(
                 item = task.result()
             except StopAsyncIteration:
                 return
-            except StoreError as error:
+            except (StoreError, SlowConsumerError) as error:
                 yield _error_frame(error.core)
                 return
-            frame = _frame_for(item)
+            frame = frame_for(item)
             if len(frame) > MAX_SSE_FRAME_BYTES:
                 yield _error_frame(
                     _validation(f"a single SSE event frame exceeds MAX_SSE_FRAME_BYTES ({MAX_SSE_FRAME_BYTES} bytes)")
@@ -484,7 +590,7 @@ async def _sse_frames(
     finally:
         if pending is not None:
             pending.cancel()
-            with suppress(asyncio.CancelledError, StopAsyncIteration, StoreError):
+            with suppress(asyncio.CancelledError, StopAsyncIteration, StoreError, SlowConsumerError):
                 await pending
         with suppress(Exception):
             await follow.__aexit__(None, None, None)
@@ -718,7 +824,49 @@ def create_app(app: App, *, token: str) -> FastAPI:
         follow = log.follow(session_id, cursor)
         items = await follow.__aenter__()
         return StreamingResponse(
-            _sse_frames(follow, items),
+            _sse_frames(follow, items, frame_for=_frame_for),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @api.get("/events")
+    async def global_events(request: Request) -> Response:
+        """The global volatile event stream (T-C1-095): every live bus event, all sessions.
+
+        The TS ``event.subscribe`` parity face over
+        :meth:`opencode.bus.bus.VolatileBus.subscribe_all` — a volatile
+        broadcast, deliberately separate from this module's durable session
+        and jobs SSE faces. The synthetic ``server.connected`` frame opens the
+        wire (a stream-level marker, not a registry event); ``?types=`` then
+        narrows the stream server-side through the bus's own per-subscription
+        filter. Volatile by contract: no replay, no backfill, no resume — a
+        ``Last-Event-ID`` header is refused (422) instead of honored (the
+        session stream owns durable catch-up), and a slow consumer's queue
+        overflow ends the stream with the terminal SlowConsumer error frame
+        after its accepted prefix was delivered. The subscription is entered
+        here, before the first byte: events notified between entry and the
+        response start queue in the bus's bounded queue and flow right after
+        the connected frame; leaving the generator (disconnect included)
+        releases the subscription.
+        """
+        if request.headers.get("last-event-id") is not None:
+            raise _TransportError(
+                422,
+                _validation(
+                    "the global event stream is volatile: Last-Event-ID resume is not supported; "
+                    "reconnect fresh (the session stream owns durable replay)"
+                ),
+            )
+        types = _global_event_types(request)
+        subscription = app.bus.subscribe_all(types=types)
+        events = await subscription.__aenter__()
+        return StreamingResponse(
+            _sse_frames(
+                subscription,
+                events,
+                frame_for=_global_frame_for,
+                preface=(_connected_frame(),),
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store"},
         )
@@ -841,7 +989,7 @@ def create_app(app: App, *, token: str) -> FastAPI:
         follow = log.follow(stream_key, cursor)
         items = await follow.__aenter__()
         return StreamingResponse(
-            _sse_frames(follow, items),
+            _sse_frames(follow, items, frame_for=_frame_for),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store"},
         )

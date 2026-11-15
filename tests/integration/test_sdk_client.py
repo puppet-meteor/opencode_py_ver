@@ -889,7 +889,7 @@ def test_malformed_sse_lines_and_frames_fail_closed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_runtime_openapi_document_answers_the_nineteen_routes(running: _Running) -> None:
+def test_the_runtime_openapi_document_answers_the_twenty_routes(running: _Running) -> None:
     """f: the runtime OpenAPI document (direct pull per the ruling; 054 owns the 401 face).
 
     T-C1-094 grows the face from twelve to nineteen route operations: the
@@ -898,6 +898,9 @@ def test_the_runtime_openapi_document_answers_the_nineteen_routes(running: _Runn
     (/session/import) and the single-message get — seventeen distinct path
     keys in total (GET and POST /session share one key, as do get and
     DELETE on /session/{session_id}).
+
+    T-C1-095 adds the global volatile event stream as the twentieth
+    operation: GET /events, an eighteenth distinct path key.
     """
     request = urllib.request.Request(
         running.base + "/openapi.json", headers={"Authorization": f"Bearer {_TOKEN}"}, method="GET"
@@ -921,6 +924,7 @@ def test_the_runtime_openapi_document_answers_the_nineteen_routes(running: _Runn
         "/run/{run_id}/cancel",
         "/run/{run_id}/status",
         "/permission/{permission_id}/reply",
+        "/events",
         "/jobs",
         "/jobs/{job_id}",
         "/jobs/{job_id}/cancel",
@@ -934,7 +938,7 @@ def test_the_runtime_openapi_document_answers_the_nineteen_routes(running: _Runn
         for method in item
         if method in ("get", "post", "delete")
     }
-    assert len(operations) == 19
+    assert len(operations) == 20
     for path, method in (
         ("/session", "post"),
         ("/session", "get"),
@@ -950,6 +954,7 @@ def test_the_runtime_openapi_document_answers_the_nineteen_routes(running: _Runn
         ("/run/{run_id}/cancel", "post"),
         ("/run/{run_id}/status", "get"),
         ("/permission/{permission_id}/reply", "post"),
+        ("/events", "get"),
     ):
         assert isinstance(paths[path], dict) and method in paths[path], path
 
