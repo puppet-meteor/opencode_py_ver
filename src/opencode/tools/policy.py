@@ -111,6 +111,12 @@ REASON_DECISION_EXPIRED = "saved decision expired"
 #: "ask" the declared side_effects=True already produced via the residual
 #: rule; ``webfetch`` NOT added to ``_ASK_NAMESPACES`` (the git-trio
 #: precedent, ticket §3-6).
+#: P7-S4 (T-C1-103) added ``websearch__search`` (the webfetch shape
+#: again): a web search ships the query to the selected external provider,
+#: a real side effect observable off-host (ticket §3-5/§3-7), so the
+#: explicit key documents the same "ask" the declared side_effects=True
+#: already produced via the residual rule; ``websearch`` NOT added to
+#: ``_ASK_NAMESPACES`` (the git-trio precedent, ticket §3-7).
 _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "fs__read": "allow",
     "fs__glob": "allow",
@@ -130,6 +136,7 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "question__ask": "allow",
     "subagent__run": "ask",
     "webfetch__fetch": "ask",
+    "websearch__search": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.
@@ -370,7 +377,9 @@ def extract_resources(action: str, raw_input: JsonObject) -> tuple[str, ...]:
     itself is R3-S5 -- the binding face is fixed here); the webfetch tool
     binds its ``url`` target (P7-S3, T-C1-102 §3-6: the TS webfetch.ts
     ``permission.assert`` carries ``resources=[input.url]`` and the adapter
-    re-checks the URL per redirect hop). Tools with none of these inputs
+    re-checks the URL per redirect hop); the websearch tool binds its
+    ``query`` (P7-S4, T-C1-103 §3-7: the TS websearch.ts permission.assert
+    carries ``resources=[input.query]``). Tools with none of these inputs
     carry no resources.
     """
     path = raw_input.get("path")
@@ -383,6 +392,9 @@ def extract_resources(action: str, raw_input: JsonObject) -> tuple[str, ...]:
     url = raw_input.get("url")
     if isinstance(url, str) and url:
         return (url,)
+    query = raw_input.get("query")
+    if isinstance(query, str) and query:
+        return (query,)
     return ()
 
 

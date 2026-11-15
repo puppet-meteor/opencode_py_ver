@@ -28,7 +28,12 @@ webfetch tool ``webfetch__fetch`` (same constant shape, same dual-host
 ride): the one network builtin -- hosts bind the App permission policy
 to the named instance after construction (``WebFetchAdapter.bind``),
 so host faces carry 18 adapters (17 base + the platform-gated PTY
-adapter).
+adapter). P7-S4 (T-C1-103) adds the websearch tool
+``websearch__search`` (same constant shape, same dual-host ride):
+the one consent-flow builtin -- hosts bind a WebSearchService (the
+provider registry + KV selection seam) to the named instance after
+construction (``WebSearchAdapter.bind``), so host faces carry 19
+adapters (18 base + the platform-gated PTY adapter).
 """
 
 from opencode.tools.builtin.bash import (
@@ -186,6 +191,17 @@ from opencode.tools.builtin.webfetch import (
     WEBFETCH_VERSION,
     WebFetchAdapter,
 )
+from opencode.tools.builtin.websearch import (
+    WEBSEARCH_CONSENT_TIMEOUT_S,
+    WEBSEARCH_DESCRIPTION,
+    WEBSEARCH_INPUT_SCHEMA,
+    WEBSEARCH_NAME,
+    WEBSEARCH_NAMESPACE,
+    WEBSEARCH_NO_RESULTS,
+    WEBSEARCH_SPEC,
+    WEBSEARCH_VERSION,
+    WebSearchAdapter,
+)
 from opencode.tools.builtin.write import (
     WRITE_DESCRIPTION,
     WRITE_INPUT_SCHEMA,
@@ -309,6 +325,14 @@ __all__ = [
     "WEBFETCH_NAMESPACE",
     "WEBFETCH_SPEC",
     "WEBFETCH_VERSION",
+    "WEBSEARCH_CONSENT_TIMEOUT_S",
+    "WEBSEARCH_DESCRIPTION",
+    "WEBSEARCH_INPUT_SCHEMA",
+    "WEBSEARCH_NAME",
+    "WEBSEARCH_NAMESPACE",
+    "WEBSEARCH_NO_RESULTS",
+    "WEBSEARCH_SPEC",
+    "WEBSEARCH_VERSION",
     "WRITE_DESCRIPTION",
     "WRITE_INPUT_SCHEMA",
     "WRITE_MAX_BYTES",
@@ -334,5 +358,6 @@ __all__ = [
     "SubagentRunAdapter",
     "TodoWriteAdapter",
     "WebFetchAdapter",
+    "WebSearchAdapter",
     "pty_adapters",
 ]

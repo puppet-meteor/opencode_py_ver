@@ -63,10 +63,12 @@ from opencode.tools.builtin import (
     SubagentRunAdapter,
     TodoWriteAdapter,
     WebFetchAdapter,
+    WebSearchAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
 from opencode.tools.registry import ToolAdapter
+from opencode.websearch import KV_FILE_NAME, WebSearchService
 
 #: §7 L106: loopback-only binding, fixed for the first version (L152 risk
 #: line — opening the host face is a later, deliberate decision).
@@ -199,6 +201,7 @@ def _builtin_adapters(
     *,
     subagent: SubagentRunAdapter | None = None,
     webfetch: WebFetchAdapter | None = None,
+    websearch: WebSearchAdapter | None = None,
 ) -> tuple[ToolAdapter, ...]:
     """The builtin tool adapters (the CLI ``_drive`` list, same order).
 
@@ -224,11 +227,20 @@ def _builtin_adapters(
     permission policy right after construction (the redirect-hop
     assertNotDenied face); a caller that omits it gets a fresh unbound
     instance, so the census face keeps composing the complete host set.
+
+    P7-S4 (T-C1-103): the websearch tool rides the same twin compositions
+    (19 adapters per host face = 18 base + the platform-gated PTY
+    adapter). ``serve`` passes the named instance it binds to a
+    WebSearchService right after construction (the provider registry +
+    KV selection seam); a caller that omits it gets a fresh unbound
+    instance, so the census face keeps composing the complete host set.
     """
     if subagent is None:
         subagent = SubagentRunAdapter()
     if webfetch is None:
         webfetch = WebFetchAdapter()
+    if websearch is None:
+        websearch = WebSearchAdapter()
     return (
         FsReadAdapter(roots=roots),
         FsLsAdapter(roots=roots),
@@ -247,6 +259,7 @@ def _builtin_adapters(
         QuestionAskAdapter(),
         subagent,
         webfetch,
+        websearch,
         *pty_adapters(),
     )
 
@@ -363,10 +376,16 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # redirect-hop assertNotDenied face rides the same policy the Invoker
     # gates the initial URL with).
     webfetch_fetch = WebFetchAdapter()
+    # P7-S4 (T-C1-103): the websearch twin -- a named instance so ``serve``
+    # can bind a WebSearchService (the provider registry + KV selection
+    # seam) right after construction.
+    websearch_search = WebSearchAdapter()
     app = App(
         resolved_db,
         provider=provider,
-        tools=_builtin_adapters(runtime.roots, subagent=subagent_run, webfetch=webfetch_fetch),
+        tools=_builtin_adapters(
+            runtime.roots, subagent=subagent_run, webfetch=webfetch_fetch, websearch=websearch_search
+        ),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,
         rules=permission_rules_from_snapshot(runtime.snapshot.permission_rules),
@@ -383,6 +402,10 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     # bind above (the provider composition guarantees the policy exists).
     assert app.policy is not None
     webfetch_fetch.bind(app.policy)
+    # P7-S4 (T-C1-103): the service bind -- the provider registry + KV
+    # selection seam, with the KV document landing beside the App's
+    # database (the data directory the writer lock already owns).
+    websearch_search.bind(WebSearchService(app.database.path.parent / KV_FILE_NAME))
     api = create_app(app, token=token)
     server = uvicorn.Server(_server_config(api, port=port))
     asyncio.run(server.serve())

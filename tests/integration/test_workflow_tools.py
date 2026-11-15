@@ -97,6 +97,8 @@ from opencode.tools.builtin import (
     TODO_NAMESPACE,
     WEBFETCH_NAME,
     WEBFETCH_NAMESPACE,
+    WEBSEARCH_NAME,
+    WEBSEARCH_NAMESPACE,
     WRITE_NAME,
     WRITE_NAMESPACE,
 )
@@ -426,9 +428,9 @@ class TestRecursionGuard:
             await app.close()
 
 
-#: The seventeen base wire names (the twelve plus the T-C1-097 toolkit-A
-#: trio plus the T-C1-098 subagent tool plus the T-C1-102 webfetch tool),
-#: assembled per name from the builtin
+#: The eighteen base wire names (the twelve plus the T-C1-097 toolkit-A
+#: trio plus the T-C1-098 subagent tool plus the T-C1-102 webfetch tool
+#: plus the T-C1-103 websearch tool), assembled per name from the builtin
 #: surface's own namespace/name constants: a constant drifting in its
 #: defining module changes the wire name here and turns the enum red --
 #: never a silent rename. (The worktree trio's name constants live in
@@ -453,6 +455,7 @@ _BASE_WIRE_NAMES: frozenset[str] = frozenset(
         f"{QUESTION_NAMESPACE}__{QUESTION_NAME}",
         f"{SUBAGENT_NAMESPACE}__{SUBAGENT_NAME}",
         f"{WEBFETCH_NAMESPACE}__{WEBFETCH_NAME}",
+        f"{WEBSEARCH_NAMESPACE}__{WEBSEARCH_NAME}",
     }
 )
 
@@ -463,10 +466,10 @@ _PTY_PLATFORMS: tuple[str, ...] = ("win32", "linux")
 
 
 def _expected_worker_wire_names() -> frozenset[str]:
-    """The worker catalog's full expected enum: the seventeen base names (the
+    """The worker catalog's full expected enum: the eighteen base names (the
     twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098 subagent tool
-    plus the T-C1-102 webfetch tool) plus the pty wire name on the verified
-    platforms only."""
+    plus the T-C1-102 webfetch tool plus the T-C1-103 websearch tool) plus
+    the pty wire name on the verified platforms only."""
     names = set(_BASE_WIRE_NAMES)
     if sys.platform in _PTY_PLATFORMS:
         names.add(f"{PTY_NAMESPACE}__{PTY_NAME}")
@@ -538,9 +541,10 @@ class TestRegistryIsolation:
         """The platform branch (T-B-087 ruling 2 / T-C1-073, T-C1-074): the
         ``pty__run`` wire name rides the composition only on the verified
         platforms (win32 the T1 winpty face, linux the T2 stdlib face);
-        every other platform enumerates exactly the seventeen base names
+        every other platform enumerates exactly the eighteen base names
         (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098
-        subagent tool plus the T-C1-102 webfetch tool)."""
+        subagent tool plus the T-C1-102 webfetch tool plus the T-C1-103
+        websearch tool)."""
         registry = ToolRegistry()
         for adapter in _builtin_adapters(("C:/work",)):
             registry.register(adapter)
@@ -548,10 +552,10 @@ class TestRegistryIsolation:
         wire_name = f"{PTY_NAMESPACE}__{PTY_NAME}"
         if sys.platform in _PTY_PLATFORMS:  # present arm
             assert catalog.resolve(wire_name) is not None
-            assert len(catalog.specs) == 18
+            assert len(catalog.specs) == 19
         else:  # absent arm
             assert catalog.resolve(wire_name) is None
-            assert len(catalog.specs) == 17
+            assert len(catalog.specs) == 18
 
     def test_the_composition_and_the_builtin_export_surface_are_bijective(self) -> None:
         """The export-surface completeness double pin (T-B-094 R4 §3-3 (5)).

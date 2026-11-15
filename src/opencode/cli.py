@@ -149,9 +149,11 @@ from opencode.tools.builtin import (
     SubagentRunAdapter,
     TodoWriteAdapter,
     WebFetchAdapter,
+    WebSearchAdapter,
     pty_adapters,
 )
 from opencode.tools.policy import permission_rules_from_snapshot
+from opencode.websearch import KV_FILE_NAME, WebSearchService
 
 #: Terminal poll cadence for ``service.run_status`` (the durable authority).
 _POLL_INTERVAL_S = 0.05
@@ -980,6 +982,10 @@ async def _drive(
     # redirect-hop assertNotDenied face rides the same policy the Invoker
     # gates the initial URL with).
     webfetch_fetch = WebFetchAdapter()
+    # P7-S4 (T-C1-103): the websearch twin of the webfetch named instance --
+    # bound to a WebSearchService (the provider registry + KV selection
+    # seam) right after construction.
+    websearch_search = WebSearchAdapter()
     app = App(
         db_path,
         provider=provider,
@@ -1008,6 +1014,9 @@ async def _drive(
             # P7-S3 (T-C1-102): the webfetch tool rides the same twin
             # compositions (17 base adapters per host face).
             webfetch_fetch,
+            # P7-S4 (T-C1-103): the websearch tool rides the same twin
+            # compositions (18 base adapters per host face).
+            websearch_search,
             *pty_adapters(),
         ),
         settings=runtime.settings,
@@ -1026,6 +1035,10 @@ async def _drive(
     # bind above (the provider composition guarantees the policy exists).
     assert app.policy is not None
     webfetch_fetch.bind(app.policy)
+    # P7-S4 (T-C1-103): the service bind -- the provider registry + KV
+    # selection seam, with the KV document landing beside the App's
+    # database (the data directory the writer lock already owns).
+    websearch_search.bind(WebSearchService(app.database.path.parent / KV_FILE_NAME))
     # R4-S6: the driving act itself waits for the startup scan. The gated
     # store already orders every WRITE behind the scan, but prompt()'s
     # active-run busy check is a READ — a recovered session whose crashed run
