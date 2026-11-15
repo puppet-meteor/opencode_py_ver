@@ -26,6 +26,8 @@ from opencode.storage.repos import (
     MessagePage,
     NotFoundError,
     ReadRepositories,
+    SessionCreatedRow,
+    SessionListRow,
     SessionRecord,
 )
 from opencode.storage.store import EventBatch, Projector, SessionStore
@@ -59,6 +61,8 @@ __all__ = [
     "Projector",
     "ReadRepositories",
     "SessionClosedError",
+    "SessionCreatedRow",
+    "SessionListRow",
     "SessionReadOnlyError",
     "SessionRecord",
     "SessionStore",

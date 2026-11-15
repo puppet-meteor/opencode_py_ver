@@ -83,13 +83,14 @@ PINNED_COUNTS = {
 #: misses 10 subclass-only declarations -- both counts are reconciled in the
 #: inventory, the artifact covers all 65 actual pydantic models, +1
 #: SkillActivatedData at T-C1-052a, +1 ContextCompactedData at T-C1-060, +10
-#: jobs-family models at T-C1-076; cards.json opens with its 1 model; the
-#: pipelines.json with its 4 models (3 through T-C1-084, +1 FallbackToolSpec
-#: at T-C1-086); the worker trio (+WorkerReturn) at
+#: jobs-family models at T-C1-076, +2 session-resource models at T-C1-094
+#: (SessionDeletedData + MessageImportedData); cards.json opens with its 1
+#: model; the pipelines.json with its 4 models (3 through T-C1-084, +1
+#: FallbackToolSpec at T-C1-086); the worker trio (+WorkerReturn) at
 #: T-C1-078 opens workers.json with its 1 model).
 PINNED_MODEL_COUNTS = {
     "errors.json": 1,
-    "events.json": 46,
+    "events.json": 48,
     "llm.json": 17,
     "messages.json": 8,
     "tools.json": 3,

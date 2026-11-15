@@ -31,6 +31,15 @@ expected_seq source), :meth:`ReadRepositories.prompt_by_dedupe_key` /
 (the R1 run_status lookup). All of them fail closed on undecodable stored
 rows with the sanitized reason pattern below.
 
+T-C1-040 (R4-S6) appended the CLI session-selection faces
+(:meth:`ReadRepositories.session_created_by_id` /
+:meth:`ReadRepositories.latest_session_created_by_working_dir`); T-C1-094
+(P6-S1) appends the session resource faces (:meth:`ReadRepositories.session_summaries`
+-- the created-row-enumeration list base -- and :meth:`ReadRepositories.message_by_id`
+-- the single-message point query), all still read-only, bus-free and
+fail-closed; ``messages`` additionally answers NotFound for a ``deleted``
+session (the tombstone's projection filter).
+
 Fail-closed semantics (§3.2.1 "读取仍可用" boundary): a sessions row missing
 while the event log exists is NOT faked as an empty history -- it raises
 StorageCorrupt (``sessions_row_missing_with_log``); a message row whose data
@@ -174,6 +183,21 @@ _SELECT_SESSION_CREATED_ALL = sa.text(
     "SELECT session_id, version, created, data FROM events "
     "WHERE type = 'py.session.created' ORDER BY created DESC, session_id DESC"
 )
+# -- T-C1-094 (P6-S1): the session resource read faces. The list base is the
+# events table's created-row enumeration (the T-C1-040 pattern) LEFT JOINed
+# with the sessions row for the read-model faces -- the join direction
+# matters: a minimal diagnostic record (no created row) is legal §3.2.1
+# state and simply never appears, while a created row whose sessions row is
+# missing is read-model corruption raised below (never silently dropped).
+_SELECT_SESSION_CREATED_WITH_RECORD = sa.text(
+    "SELECT e.session_id AS session_id, s.status AS status, s.applied_seq AS applied_seq, "
+    "s.active_run_id AS active_run_id, e.created AS created FROM events e "
+    "LEFT JOIN sessions s ON s.session_id = e.session_id "
+    "WHERE e.type = 'py.session.created' ORDER BY e.created DESC, e.session_id DESC"
+)
+_SELECT_MESSAGE_BY_ID = sa.text(
+    "SELECT message_id, seq, data FROM messages WHERE session_id = :sid AND message_id = :mid"
+)
 
 
 class NotFoundError(StoreError):
@@ -302,6 +326,24 @@ class SessionCreatedRow:
     data: JsonObject
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListRow:
+    """One live session's list face (T-C1-094, P6-S1): the four get-wire faces + created.
+
+    The base of ``GET /session``: the sessions-row status/applied_seq/
+    active_run_id faces plus the created-row epoch-ms timestamp (the list
+    ordering key). ``deleted`` sessions never appear (the tombstone's
+    read-model projection filter); ``status`` is the raw stored text —
+    classifying unknown values is the caller's job (the session-layer gate).
+    """
+
+    session_id: str
+    status: str
+    applied_seq: int
+    active_run_id: str | None
+    created_epoch_ms: int
+
+
 def _corrupt(reason: str, message: str, details: JsonObject) -> StorageCorruptError:
     """Sanitized StorageCorrupt over already-stored read-model data (§3.2.1)."""
     return StorageCorruptError(message, isolate=True, details=details)
@@ -390,6 +432,12 @@ class ReadRepositories:
                     {"reason": REASON_READ_MODEL_MISSING, "session_id": session_id},
                 )
             raise NotFoundError(f"session {session_id} does not exist", details={"session_id": session_id})
+        if record.status == "deleted":
+            # T-C1-094: the delete tombstone hides the message face — the
+            # same NotFound a never-created session answers. ``'deleted'`` is
+            # the pinned sessions.status literal (the scan statements'
+            # pinned-vocabulary tradeoff: repos stays session-layer-free).
+            raise NotFoundError(f"session {session_id} is deleted", details={"session_id": session_id})
 
         async with self._engine.connect() as connection:
             after_seq = 0
@@ -423,6 +471,24 @@ class ReadRepositories:
         async with self._engine.connect() as connection:
             row = (await connection.execute(_SELECT_LOG_HIGH, {"sid": session_id})).first()
         return int(row.h) if row is not None else 0
+
+    async def message_by_id(self, session_id: str, message_id: str) -> SessionMessage | None:
+        """One projected message row by ``(session_id, message_id)``; ``None`` when absent.
+
+        The T-C1-094 single-message point query (the ④-3 probe precedent
+        shape): a single-row read over the messages unique(session_id,
+        message_id) key rather than a page walk. The decode is the page
+        face's fail-closed row decoder; the deleted-status gate stays with
+        the caller (the service's live-record read precedes this probe).
+        """
+        _require_session_id(session_id)
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("message_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            row = (await connection.execute(_SELECT_MESSAGE_BY_ID, {"sid": session_id, "mid": message_id})).first()
+        if row is None:
+            return None
+        return self._decode_message_row(session_id, row)
 
     def _decode_message_row(self, session_id: str, row: Any) -> SessionMessage:
         """Decode one projected message row, fail closed (§3.2.1 read boundary).
@@ -764,6 +830,54 @@ class ReadRepositories:
                 {"reason": REASON_CREATED_ROW_DECODE_FAILED, "session_id": session_id},
             )
         return SessionCreatedRow(session_id=session_id, version=version, created=int(row.created), data=data)
+
+    # -- T-C1-094 (P6-S1): the session resource read faces -----------------------
+
+    async def session_summaries(self) -> list[SessionListRow]:
+        """Every live session, newest-created first (the ``GET /session`` base).
+
+        The base is the events table's ``py.session.created`` enumeration
+        (the T-C1-040 selection-query pattern) joined with the sessions row
+        for the read-model faces. Fail-closed semantics: a created row whose
+        sessions row is missing is read-model corruption (§3.2.1), never
+        silently dropped from the list; one session appearing twice in the
+        created enumeration is the same duplicated-creation corruption the
+        by-id face raises. ``deleted`` sessions are excluded — the
+        tombstone's read-model projection filter — while their logs stay in
+        place. Minimal diagnostic records (a sessions row without a created
+        row) are not in the enumeration by construction and never appear.
+        """
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_SESSION_CREATED_WITH_RECORD)).fetchall()
+        listed: list[SessionListRow] = []
+        seen: set[str] = set()
+        for row in rows:
+            session_id = str(row.session_id)
+            if session_id in seen:
+                raise _corrupt(
+                    REASON_CREATED_ROW_DUPLICATED,
+                    f"session {session_id} has more than one py.session.created row",
+                    {"reason": REASON_CREATED_ROW_DUPLICATED, "session_id": session_id},
+                )
+            seen.add(session_id)
+            if row.status is None:
+                raise _corrupt(
+                    REASON_READ_MODEL_MISSING,
+                    f"session {session_id} has a py.session.created row but no sessions row",
+                    {"reason": REASON_READ_MODEL_MISSING, "session_id": session_id},
+                )
+            if str(row.status) == "deleted":
+                continue  # the tombstone: present in the log, absent from the list
+            listed.append(
+                SessionListRow(
+                    session_id=session_id,
+                    status=str(row.status),
+                    applied_seq=int(row.applied_seq),
+                    active_run_id=row.active_run_id,
+                    created_epoch_ms=int(row.created),
+                )
+            )
+        return listed
 
     def _decode_prompt_row(self, session_id: str, row: Any) -> AcceptedPrompt:
         """Decode one events row into AcceptedPrompt, fail closed (§3.2.1 read boundary).

@@ -70,16 +70,20 @@ from opencode.bus import VolatileBus
 from opencode.bus.eventlog import MAX_READ_LIMIT, EventCursor, EventLog
 from opencode.contracts import (
     EVENT_VERSION,
+    PY_MESSAGE_IMPORTED,
     PY_PROMPT_ACCEPTED,
     PY_SESSION_CREATED,
+    PY_SESSION_DELETED,
     ConfigSnapshot,
     ConfigSnapshotV2,
     CoreErrorCode,
     EventDraft,
     JsonObject,
+    MessageImportedData,
     PromptAcceptedData,
     SessionCreatedData,
     SessionCreatedDataV2,
+    SessionDeletedData,
     UserMessage,
     compute_snapshot_hash,
 )
@@ -93,6 +97,7 @@ from opencode.contracts.events import (
     SessionCreatedDataV3,
     SkillActivatedData,
 )
+from opencode.contracts.messages import AssistantMessage, IdleMessage, SessionMessage
 from opencode.session.compaction import (
     CompactionEngine,
     SettledHistoryView,
@@ -110,6 +115,8 @@ from opencode.storage import (
     NotFoundError,
     ReadRepositories,
     SessionClosedError,
+    SessionCreatedRow,
+    SessionListRow,
     SessionReadOnlyError,
     SessionRecord,
     SessionStore,
@@ -117,7 +124,8 @@ from opencode.storage import (
     StoreError,
     StoreValidationError,
 )
-from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError
+from opencode.storage.repos import MAX_PAGE_LIMIT
+from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError, from_epoch_ms
 
 if TYPE_CHECKING:
     # Runtime cycle guard (①): the tools package imports this module at
@@ -241,6 +249,72 @@ class SessionRef:
     """§7 L314: ``{session_id}`` -- the created session reference."""
 
     session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    """T-C1-094: the ``GET /session/{id}`` face — the four-field get wire.
+
+    Exactly the serialization whitelist of the session resource get face:
+    ``config_snapshot``/``snapshot_hash``/``diagnostic`` never leave the
+    service through this face (the export face carries the snapshot
+    explicitly instead). ``status`` is the raw stored wire text.
+    """
+
+    session_id: str
+    status: str
+    applied_seq: int
+    active_run_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    """T-C1-094: one ``GET /session`` list element — the get face plus the created stamp.
+
+    ``created_at_ms`` is the ``py.session.created`` event's epoch-ms
+    timestamp (the created-descending list ordering key); ``status`` is the
+    raw stored wire text.
+    """
+
+    session_id: str
+    status: str
+    applied_seq: int
+    active_run_id: str | None
+    created_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class SessionExport:
+    """T-C1-094: the ``GET /session/{id}/export`` face — a self-describing transfer.
+
+    The exact shape :meth:`SessionService.import_session` restores: identity
+    (``session_id``), the created-event fields (``working_dir`` /
+    ``config_snapshot`` / ``snapshot_hash`` — re-validated on import through
+    the §6.2 canonical hash — / ``created_at_ms``), the tombstone-relevant
+    ``status``, and the full projected message history in order. Messages
+    ride as the §2.1 wire JSONs (``model_dump(mode="json")``), so the round
+    trip never re-shapes them.
+    """
+
+    session_id: str
+    status: str
+    working_dir: str
+    config_snapshot: JsonObject
+    snapshot_hash: str
+    created_at_ms: int
+    messages: tuple[SessionMessage, ...]
+
+    def to_payload(self) -> JsonObject:
+        """The wire JSON object — the exact import face, shared by HTTP and SDK."""
+        return {
+            "session_id": self.session_id,
+            "status": self.status,
+            "working_dir": self.working_dir,
+            "config_snapshot": self.config_snapshot,
+            "snapshot_hash": self.snapshot_hash,
+            "created_at_ms": self.created_at_ms,
+            "messages": [message.model_dump(mode="json") for message in self.messages],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,6 +509,115 @@ def _coerce_config_snapshot(
         raise StoreValidationError(f"invalid config_snapshot: {error}") from error
 
 
+#: T-C1-094 (P6-S1): the exact import-payload key set — the export wire
+#: (:meth:`SessionService.export_session`) accepted back verbatim; a missing
+#: or extra key refuses the whole import (strict shape, no defaults guessed).
+_IMPORT_PAYLOAD_KEYS = frozenset(
+    {"session_id", "status", "working_dir", "config_snapshot", "snapshot_hash", "created_at_ms", "messages"}
+)
+
+#: T-C1-094 (P6-S1): the §2.1 message-union dispatch for the import payload
+#: (the same tag->model table the projected-row decoder uses; a local copy
+#: keeps the repos table private).
+_IMPORT_MESSAGE_MODELS: dict[str, type[SessionMessage]] = {
+    "user": UserMessage,
+    "assistant": AssistantMessage,
+    "idle": IdleMessage,
+}
+
+
+def _import_identity(raw: JsonObject) -> tuple[str, str, str]:
+    """Validate the import payload's exact key set + the string faces, fail closed.
+
+    Returns ``(session_id, status, working_dir)``. ``status`` is validated
+    for round-trip fidelity only — the restored session is ACTIVE whatever
+    the exported status said (boot-local marks are not transferable state;
+    disclosed in the ticket progress record).
+    """
+    if not isinstance(raw, dict):
+        raise StoreValidationError("import payload must be a JSON object")
+    missing = sorted(_IMPORT_PAYLOAD_KEYS - set(raw))
+    unknown = sorted(set(raw) - _IMPORT_PAYLOAD_KEYS)
+    if missing or unknown:
+        raise StoreValidationError(f"import payload key set mismatch (missing: {missing}, unknown: {unknown})")
+    session_id = raw["session_id"]
+    if not isinstance(session_id, str) or not session_id.startswith(_SES_PREFIX):
+        raise StoreValidationError("import payload field 'session_id' must be a ses_-prefixed string")
+    status = raw["status"]
+    if not isinstance(status, str):
+        raise StoreValidationError(f"import payload field 'status' must be a string, got {status!r}")
+    try:
+        SessionStatus(status)
+    except ValueError as error:
+        raise StoreValidationError(
+            f"import payload field 'status' is not a known session status: {status!r}"
+        ) from error
+    working_dir = raw["working_dir"]
+    if not isinstance(working_dir, str) or not working_dir:
+        raise StoreValidationError("import payload field 'working_dir' must be a non-empty string")
+    return session_id, status, working_dir
+
+
+def _verify_snapshot_hash(raw_hash: Any, snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3) -> str:
+    """Re-verify the §6.2 canonical snapshot digest of the import payload.
+
+    The same digest the created-event validator enforces on decode, checked
+    before any commit: a tampered or drifted snapshot never lands in the log.
+    """
+    if not isinstance(raw_hash, str) or not raw_hash:
+        raise StoreValidationError("import payload field 'snapshot_hash' must be a non-empty string")
+    computed = compute_snapshot_hash(snapshot)
+    if raw_hash != computed:
+        raise StoreValidationError(
+            f"import payload snapshot_hash does not match the canonical sha256 of config_snapshot "
+            f"({raw_hash} != {computed})"
+        )
+    return raw_hash
+
+
+def _require_epoch_ms(value: Any) -> int:
+    """The import payload's ``created_at_ms`` face: an integer, bools rejected."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise StoreValidationError("import payload field 'created_at_ms' must be an integer")
+    return value
+
+
+def _import_messages(session_id: str, raw_messages: Any) -> list[SessionMessage]:
+    """Decode the import payload's message list through the §2.1 wire union.
+
+    Fail closed (ticket §8): an entry that is not a JSON object, carries an
+    unknown type tag, or fails model validation refuses the whole import —
+    nothing is silently dropped, so an accepted import restores the message
+    count exactly. Duplicate message ids refuse here rather than at the
+    fold, so a malformed payload answers ValidationError, never a 500.
+    """
+    if not isinstance(raw_messages, list):
+        raise StoreValidationError("import payload field 'messages' must be a list")
+    messages: list[SessionMessage] = []
+    seen: set[str] = set()
+    for raw in raw_messages:
+        if not isinstance(raw, dict):
+            raise StoreValidationError(
+                f"import payload for session {session_id} has a message entry that is not a JSON object"
+            )
+        model = _IMPORT_MESSAGE_MODELS.get(str(raw.get("type")))
+        if model is None:
+            raise StoreValidationError(
+                f"import payload for session {session_id} has a message with unknown type tag {raw.get('type')!r}"
+            )
+        try:
+            message = model.model_validate(raw)
+        except PydanticValidationError as error:
+            raise StoreValidationError(
+                f"import payload for session {session_id} has a message that did not decode: {error}"
+            ) from error
+        if message.id in seen:
+            raise StoreValidationError(f"import payload for session {session_id} has duplicate message id {message.id}")
+        seen.add(message.id)
+        messages.append(message)
+    return messages
+
+
 def _decode_run_error(run_id: str, raw: Any) -> str | None:
     """Decode the ``runs.error`` column into the RunStatus error message.
 
@@ -595,50 +778,65 @@ class SessionService:
             raise SessionClosedError("service is closed")
         snapshot = _coerce_config_snapshot(config_snapshot)
         session_id = self._ids.session_id()
-        created_at = self._clock()
-        draft: EventDraft[SessionCreatedData] | EventDraft[SessionCreatedDataV2] | EventDraft[SessionCreatedDataV3]
+        draft = self._created_draft(session_id, self._working_dir, snapshot, self._clock())
+        committed = await self._store.commit(session_id, EventBatch(self._ids.batch_id(), (draft,)), 0)
+        self._bus.notify(session_id, committed)
+        return SessionRef(session_id=session_id)
+
+    def _created_draft(
+        self,
+        session_id: str,
+        working_dir: str,
+        snapshot: ConfigSnapshot | ConfigSnapshotV2 | ConfigSnapshotV3,
+        created_at: datetime,
+    ) -> EventDraft[SessionCreatedData] | EventDraft[SessionCreatedDataV2] | EventDraft[SessionCreatedDataV3]:
+        """One ``py.session.created`` draft with the wire version routed by the data shape.
+
+        The version path shared by create/fork/import (§8 L358: the wire
+        version follows the data shape): a v3 snapshot commits version 3
+        (checked first — a v3 snapshot is a standalone model, never a v2
+        subclass), a v2 snapshot version 2, a v1 snapshot version 1. The
+        snapshot hash is computed from the same model the draft carries, so
+        the §6.2 re-validation on decode can never disagree.
+        """
         if isinstance(snapshot, ConfigSnapshotV3):
-            draft = EventDraft[SessionCreatedDataV3](
+            return EventDraft[SessionCreatedDataV3](
                 id=self._ids.event_id(),
                 type=PY_SESSION_CREATED,
                 version=3,
                 session_id=session_id,
                 created_at=created_at,
                 data=SessionCreatedDataV3(
-                    working_dir=self._working_dir,
+                    working_dir=working_dir,
                     config_snapshot=snapshot,
                     snapshot_hash=compute_snapshot_hash(snapshot),
                 ),
             )
-        elif isinstance(snapshot, ConfigSnapshotV2):
-            draft = EventDraft[SessionCreatedDataV2](
+        if isinstance(snapshot, ConfigSnapshotV2):
+            return EventDraft[SessionCreatedDataV2](
                 id=self._ids.event_id(),
                 type=PY_SESSION_CREATED,
                 version=2,
                 session_id=session_id,
                 created_at=created_at,
                 data=SessionCreatedDataV2(
-                    working_dir=self._working_dir,
+                    working_dir=working_dir,
                     config_snapshot=snapshot,
                     snapshot_hash=compute_snapshot_hash(snapshot),
                 ),
             )
-        else:
-            draft = EventDraft[SessionCreatedData](
-                id=self._ids.event_id(),
-                type=PY_SESSION_CREATED,
-                version=EVENT_VERSION,
-                session_id=session_id,
-                created_at=created_at,
-                data=SessionCreatedData(
-                    working_dir=self._working_dir,
-                    config_snapshot=snapshot,
-                    snapshot_hash=compute_snapshot_hash(snapshot),
-                ),
-            )
-        committed = await self._store.commit(session_id, EventBatch(self._ids.batch_id(), (draft,)), 0)
-        self._bus.notify(session_id, committed)
-        return SessionRef(session_id=session_id)
+        return EventDraft[SessionCreatedData](
+            id=self._ids.event_id(),
+            type=PY_SESSION_CREATED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=created_at,
+            data=SessionCreatedData(
+                working_dir=working_dir,
+                config_snapshot=snapshot,
+                snapshot_hash=compute_snapshot_hash(snapshot),
+            ),
+        )
 
     # -- §7 session_status -------------------------------------------------
 
@@ -1353,6 +1551,361 @@ class SessionService:
         if outcome.event is not None:
             self._bus.notify(session_id, [outcome.event])
 
+    # -- T-C1-094 (P6-S1): the session resource faces ---------------------------
+
+    async def list_sessions(self) -> list[SessionSummary]:
+        """Every live session, newest-created first (the ``GET /session`` base).
+
+        The v1 face is the full list: no cursor pagination, no sort or
+        filter parameters (the TS SessionsQuery faces stay unported,
+        ticket §5 disclosures 1/2). ``deleted`` sessions never appear — the
+        tombstone's read-model projection filter lives in
+        :meth:`opencode.storage.ReadRepositories.session_summaries`, the
+        enumeration base — while their event logs stay in place (the
+        delete never erases data, §3 decision 4). A stored status outside
+        the §3.2 value set is corruption, classified fail-closed like the
+        by-id read instead of surfaced raw.
+        """
+        rows: list[SessionListRow] = await self._repos.session_summaries()
+        summaries: list[SessionSummary] = []
+        for row in rows:
+            try:
+                SessionStatus(row.status)
+            except ValueError as error:
+                raise StorageCorruptError(
+                    f"session {row.session_id} has unknown status {row.status!r}",
+                    isolate=True,
+                    details={"session_id": row.session_id, "status": row.status},
+                ) from error
+            summaries.append(
+                SessionSummary(
+                    session_id=row.session_id,
+                    status=row.status,
+                    applied_seq=row.applied_seq,
+                    active_run_id=row.active_run_id,
+                    created_at_ms=row.created_epoch_ms,
+                )
+            )
+        return summaries
+
+    async def get_session(self, session_id: str) -> SessionInfo:
+        """The four-field get wire of one live session (§3 decision 2).
+
+        The serialization whitelist is exactly ``{session_id, status,
+        applied_seq, active_run_id}`` — ``config_snapshot``/``snapshot_hash``
+        /``diagnostic`` are transport-internal faces that never leave the
+        service through this route (the export face carries the snapshot
+        explicitly instead). A missing or deleted session answers NotFound:
+        the tombstone is indistinguishable from never-created on the
+        resource face, which is the point of the delete.
+        """
+        _require_session_id_arg(session_id)
+        record = await self._read_live_record(session_id)
+        return SessionInfo(
+            session_id=record.session_id,
+            status=record.status,
+            applied_seq=record.applied_seq,
+            active_run_id=record.active_run_id,
+        )
+
+    async def message(self, session_id: str, message_id: str) -> SessionMessage:
+        """One projected message by ``(session_id, message_id)`` (§3 decision 6).
+
+        A single-row point probe over the messages unique key — not a page
+        walk. The session is read live first (missing or deleted ->
+        NotFound), then the message: a mismatched pair (the id exists in
+        another session, or nowhere) answers the same NotFound, never a
+        cross-session leak.
+        """
+        _require_session_id_arg(session_id)
+        if not isinstance(message_id, str) or not message_id:
+            raise StoreValidationError("message_id must be a non-empty string")
+        await self._read_live_record(session_id)
+        found = await self._repos.message_by_id(session_id, message_id)
+        if found is None:
+            raise NotFoundError(
+                f"message {message_id} does not exist in session {session_id}",
+                details={"session_id": session_id, "message_id": message_id},
+            )
+        return found
+
+    async def delete_session(self, session_id: str) -> None:
+        """Tombstone one session (§3 decision 4): one ``py.session.deleted`` commit.
+
+        The event-sourced delete: the tombstone event lands in the log
+        (nothing is erased) and the read model flips ``sessions.status`` to
+        ``deleted``, which hides every resource face — get/list/messages/
+        events all answer NotFound after it, and a repeated delete is the
+        same NotFound (the TS NoContent-then-NotFound form). The §7 gate
+        order runs under the per-session lock: existence first, then the
+        status classes (read_only / cleanup_failed / closed answer their
+        own codes), then the active-run gate — a session with an in-flight
+        run is SessionBusy (409: a live run is never deleted under; the
+        run settles first). No child sessions and no cascade exist to
+        delete (PY has no parent chain, DIFFERENT-BY-DESIGN, §5
+        disclosure 3).
+        """
+        _require_session_id_arg(session_id)
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            record = await self._read_live_record(session_id)
+            if record.status == SessionStatus.READ_ONLY_DIAGNOSTIC:
+                raise SessionReadOnlyError(
+                    f"session {session_id} is read_only_diagnostic", details={"session_id": session_id}
+                )
+            if record.status == SessionStatus.CLEANUP_FAILED:
+                raise LifecycleCleanupFailedError(
+                    f"session {session_id} failed resource cleanup", details={"session_id": session_id}
+                )
+            if record.status == SessionStatus.CLOSED:
+                raise SessionClosedError(f"session {session_id} is closed", details={"session_id": session_id})
+            if record.active_run_id is not None:
+                raise SessionBusyError(
+                    f"session {session_id} already holds an active run",
+                    details={"session_id": session_id, "active_run_id": record.active_run_id},
+                )
+            await self._commit_deleted(session_id)
+
+    async def _commit_deleted(self, session_id: str) -> None:
+        """Commit one ``py.session.deleted`` under the session lock (§3 decision 4).
+
+        Bounded ConflictError retries with the same batch (the scheduled
+        runner commits concurrently, so a stale expected_seq is retried);
+        there is no dedupe key — the repeated-delete fence is the
+        live-record read above (a deleted session answers NotFound before
+        this is ever reached).
+        """
+        draft = EventDraft[SessionDeletedData](
+            id=self._ids.event_id(),
+            type=PY_SESSION_DELETED,
+            version=EVENT_VERSION,
+            session_id=session_id,
+            created_at=self._clock(),
+            data=SessionDeletedData(),
+            metadata={},
+        )
+        batch = EventBatch(self._ids.batch_id(), (draft,))
+        conflict: ConflictError | None = None
+        for _ in range(_COMMIT_ATTEMPTS):
+            expected_seq = await self._repos.log_high(session_id)
+            try:
+                committed = await self._store.commit(session_id, batch, expected_seq)
+            except ConflictError as error:
+                conflict = error
+                continue
+            self._bus.notify(session_id, committed)
+            return
+        assert conflict is not None
+        raise conflict
+
+    async def fork_session(self, session_id: str, *, before: str | None = None) -> SessionRef:
+        """Copy one session's projected history into a fresh session (§3 decision 3).
+
+        The replay is message-level, not a raw event-row copy: ``events.id``
+        and ``runs.run_id`` are global primary keys (0001 schema), so rows
+        cannot be re-inserted verbatim. Instead the fork reads the source's
+        created snapshot (working_dir + config_snapshot ride verbatim; the
+        created wire version follows the source's created row) and its
+        projected messages, then commits ONE atomic batch under the new
+        id: ``py.session.created`` + one ``py.message.imported`` per copied
+        message (``expected_seq=0`` — the new session is new). ``before``
+        truncates the copy to the messages before that id (exclusive); an
+        omitted ``before`` copies the full history. The source is never
+        touched (a read-only copy — no event lands in its log, so fork
+        after fork is stable). A missing or deleted source, or a ``before``
+        message that does not exist in the source, answers NotFound.
+        """
+        _require_session_id_arg(session_id)
+        if before is not None and (not isinstance(before, str) or not before):
+            raise StoreValidationError("before must be None or a non-empty string")
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            await self._read_live_record(session_id)
+            data, _ = await self._session_creation(session_id)
+            history = await self._projected_messages(session_id, before=before)
+            fork_id = self._ids.session_id()
+            created_at = self._clock()
+            drafts: list[EventDraft[Any]] = [
+                self._created_draft(fork_id, data.working_dir, data.config_snapshot, created_at)
+            ]
+            drafts.extend(
+                EventDraft[MessageImportedData](
+                    id=self._ids.event_id(),
+                    type=PY_MESSAGE_IMPORTED,
+                    version=EVENT_VERSION,
+                    session_id=fork_id,
+                    created_at=created_at,
+                    data=MessageImportedData(message=message),
+                    metadata={},
+                )
+                for message in history
+            )
+            committed = await self._store.commit(fork_id, EventBatch(self._ids.batch_id(), tuple(drafts)), 0)
+            self._bus.notify(fork_id, committed)
+            return SessionRef(session_id=fork_id)
+
+    async def export_session(self, session_id: str) -> SessionExport:
+        """The self-describing transfer of one live session (§3 decision 5).
+
+        The exact shape :meth:`import_session` restores: identity + the
+        created-event faces (working_dir, config_snapshot as wire JSON,
+        snapshot_hash, created_at_ms) + the current status + the full
+        projected message history in order. Everything import needs rides
+        in the payload — no server-side state is consulted on the way back
+        in, so an export is portable across boots and hosts.
+        """
+        _require_session_id_arg(session_id)
+        record = await self._read_live_record(session_id)
+        data, created_epoch_ms = await self._session_creation(session_id)
+        history = await self._projected_messages(session_id, before=None)
+        return SessionExport(
+            session_id=session_id,
+            status=record.status,
+            working_dir=data.working_dir,
+            config_snapshot=data.config_snapshot.model_dump(mode="json"),
+            snapshot_hash=data.snapshot_hash,
+            created_at_ms=created_epoch_ms,
+            messages=tuple(history),
+        )
+
+    async def import_session(self, payload: SessionExport | JsonObject) -> SessionRef:
+        """Restore one exported payload as a session under its own id (§3 decision 5).
+
+        Strict fail-closed validation first (ticket §8: nothing is silently
+        dropped): the exact key set, the field types, the §6.2 canonical
+        snapshot-hash re-verification, and every message through the §2.1
+        wire union (an undecodable message is ValidationError; the message
+        count is conserved or the import refuses). The restore replays as
+        events like every write — no read-model writes: ONE atomic batch
+        of ``py.session.created`` (``created_at`` restored from the
+        payload, so the list ordering survives the round trip) plus one
+        ``py.message.imported`` per message, committed with
+        ``expected_seq=0`` under the payload's own session id. A session
+        already living at that id answers Conflict first — a deleted
+        tombstone included, since its sessions row survives the delete —
+        and the ``expected_seq=0`` CAS fences the check-to-commit race (no
+        retry loop: a conflict here means "the id is occupied", which is
+        the answer, not a retryable condition). The restored session is
+        ACTIVE regardless of the exported status (read_only /
+        cleanup_failed / closed are boot-local marks, not transferable
+        state; disclosed).
+        """
+        raw = payload.to_payload() if isinstance(payload, SessionExport) else payload
+        session_id, _status, working_dir = _import_identity(raw)
+        raw_snapshot = raw["config_snapshot"]
+        if not isinstance(raw_snapshot, dict):
+            raise StoreValidationError("import payload field 'config_snapshot' must be a JSON object")
+        snapshot = _coerce_config_snapshot(raw_snapshot)
+        _verify_snapshot_hash(raw["snapshot_hash"], snapshot)
+        created_at_ms = _require_epoch_ms(raw["created_at_ms"])
+        messages = _import_messages(session_id, raw["messages"])
+        if self._closed or self._closing:
+            raise SessionClosedError("service is closed")
+        if await self._repos.session(session_id) is not None:
+            raise ConflictError(f"session {session_id} already exists", details={"session_id": session_id})
+        created_at = from_epoch_ms(created_at_ms)
+        drafts: list[EventDraft[Any]] = [self._created_draft(session_id, working_dir, snapshot, created_at)]
+        drafts.extend(
+            EventDraft[MessageImportedData](
+                id=self._ids.event_id(),
+                type=PY_MESSAGE_IMPORTED,
+                version=EVENT_VERSION,
+                session_id=session_id,
+                created_at=created_at,
+                data=MessageImportedData(message=message),
+                metadata={},
+            )
+            for message in messages
+        )
+        committed = await self._store.commit(session_id, EventBatch(self._ids.batch_id(), tuple(drafts)), 0)
+        self._bus.notify(session_id, committed)
+        return SessionRef(session_id=session_id)
+
+    async def _session_creation(self, session_id: str) -> tuple[SessionCreatedData, int]:
+        """The decoded ``py.session.created`` data + its epoch-ms stamp, fail closed.
+
+        The resource faces that need the created faces (fork's verbatim
+        snapshot copy, export's transfer payload) route the wire model by
+        the row's version exactly like the CLI selection face; a stored row
+        outside 1/2/3 cannot appear (repos pins it) and still answers
+        corruption here rather than coercing through the nearest model. A
+        sessions row with no created row is read-model corruption: the
+        projector inserts the row in the same transaction as the event, so
+        the pair is atomic by construction.
+        """
+        row: SessionCreatedRow | None = await self._repos.session_created_by_id(session_id)
+        if row is None:
+            raise StorageCorruptError(
+                f"session {session_id} has a sessions row but no py.session.created row",
+                isolate=True,
+                details={"reason": REASON_READ_MODEL_MISSING, "session_id": session_id},
+            )
+        model: type[SessionCreatedData]
+        if row.version == 3:
+            model = SessionCreatedDataV3
+        elif row.version == 2:
+            model = SessionCreatedDataV2
+        elif row.version == 1:
+            model = SessionCreatedData
+        else:
+            raise StorageCorruptError(
+                f"session {session_id} has a py.session.created row of unexpected version {row.version}",
+                isolate=True,
+                details={"session_id": session_id, "version": row.version},
+            )
+        try:
+            return model.model_validate(row.data), row.created
+        except PydanticValidationError as error:
+            raise StorageCorruptError(
+                f"session {session_id} has an undecodable py.session.created row",
+                isolate=True,
+                details={"session_id": session_id},
+            ) from error
+
+    async def _projected_messages(self, session_id: str, *, before: str | None) -> list[SessionMessage]:
+        """Collect the projected messages in seq order, truncated before ``before``.
+
+        ``before`` is validated by point probe first (a message id that
+        exists nowhere in this session is NotFound — the TS MessageNotFound
+        face), then the pages walk until the probe id is hit (exclusive)
+        or the history ends. The walk runs under the caller's session
+        lock, so the collected history is a consistent snapshot against
+        concurrent prompt commits.
+        """
+        if before is not None and await self._repos.message_by_id(session_id, before) is None:
+            raise NotFoundError(
+                f"message {before} does not exist in session {session_id}",
+                details={"session_id": session_id, "message_id": before},
+            )
+        hit = False
+        collected: list[SessionMessage] = []
+        after: str | None = None
+        while not hit:
+            page = await self._repos.messages(session_id, after_message_id=after, limit=MAX_PAGE_LIMIT)
+            for item in page.items:
+                if before is not None and item.id == before:
+                    hit = True
+                    break
+                collected.append(item)
+            if not page.has_more:
+                break
+            after = page.next_after_message_id
+        if before is not None and not hit:
+            # Unreachable by construction (the probe found the row and the
+            # walk enumerates the whole projection) — fail closed anyway.
+            raise StorageCorruptError(
+                f"session {session_id} is missing the projected row of message {before}",
+                isolate=True,
+                details={"session_id": session_id, "message_id": before},
+            )
+        return collected
+
     # -- §7 close -------------------------------------------------------------
 
     async def close(self) -> None:
@@ -1541,6 +2094,21 @@ class SessionService:
                 isolate=True,
                 details={"session_id": session_id, "status": record.status},
             ) from error
+        return record
+
+    async def _read_live_record(self, session_id: str) -> SessionRecord:
+        """The live-record read of the resource faces: missing OR deleted -> NotFound.
+
+        The T-C1-094 delete tombstone is a data-preserving hide (§3
+        decision 4): after it, the session's resource faces answer exactly
+        like a never-created session. The folded log and the sessions row
+        survive (``rebuild`` still reaches them); only the resource faces
+        refuse. ``_read_record``'s corruption mapping applies unchanged
+        underneath.
+        """
+        record = await self._read_record(session_id)
+        if SessionStatus(record.status) is SessionStatus.DELETED:
+            raise NotFoundError(f"session {session_id} is deleted", details={"session_id": session_id})
         return record
 
     # -- R2-S7 internals: scheduling, cancel, cleanup ---------------------------

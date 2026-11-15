@@ -507,6 +507,13 @@ class TransactionWriter:
                 )
             if status == "closed":
                 raise SessionClosedError(f"session {session_id} is closed", details={"session_id": session_id})
+            if status == "deleted":
+                # T-C1-094: the delete tombstone also closes the write gate --
+                # the resource face answers NotFound on reads, and a commit
+                # against the tombstoned log is refused like every other
+                # non-active status (never silently accepted, never treated
+                # as the unknown-status corruption below).
+                raise SessionClosedError(f"session {session_id} is deleted", details={"session_id": session_id})
             if status != "active":
                 raise _corruption(
                     REASON_UNKNOWN_STATUS,

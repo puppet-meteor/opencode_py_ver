@@ -79,6 +79,7 @@ from opencode.contracts import (
 )
 from opencode.contracts.events import (
     PY_CONTEXT_COMPACTED,
+    PY_MESSAGE_IMPORTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
     PY_PERMISSION_REPLIED,
@@ -89,6 +90,7 @@ from opencode.contracts.events import (
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
     PY_RUN_STARTED,
+    PY_SESSION_DELETED,
     PY_SKILL_ACTIVATED,
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
@@ -98,6 +100,7 @@ from opencode.contracts.events import (
     PY_TOOL_REQUESTED,
     PY_TOOL_STARTED,
     ContextCompactedData,
+    MessageImportedData,
     PermissionClosedData,
     PermissionExpiredData,
     PermissionRepliedData,
@@ -108,6 +111,7 @@ from opencode.contracts.events import (
     RunCancelRequestedData,
     RunFinishedData,
     RunStartedData,
+    SessionDeletedData,
     SkillActivatedData,
     StepFinishedData,
     StepGeneratedData,
@@ -128,12 +132,13 @@ from opencode.contracts.messages import (
 
 
 class SessionStatus(StrEnum):
-    """The four §3.2 session statuses; ``.value`` is the stored wire text."""
+    """The §3.2 session statuses plus the T-C1-094 delete tombstone; ``.value`` is the stored wire text."""
 
     ACTIVE = "active"
     READ_ONLY_DIAGNOSTIC = "read_only_diagnostic"
     CLEANUP_FAILED = "cleanup_failed"
     CLOSED = "closed"
+    DELETED = "deleted"
 
 
 class RunStatus(StrEnum):
@@ -474,6 +479,10 @@ def apply(state: SessionState, event: DurableEvent[Any]) -> SessionState:
         return _apply_skill_activated(state, event)
     if event.type == PY_CONTEXT_COMPACTED:
         return _apply_context_compacted(state, event)
+    if event.type == PY_SESSION_DELETED:
+        return _apply_session_deleted(state, event)
+    if event.type == PY_MESSAGE_IMPORTED:
+        return _apply_message_imported(state, event)
     raise IllegalTransitionError(f"event type {event.type!r} is not foldable")
 
 
@@ -1227,6 +1236,61 @@ def _apply_context_compacted(state: SessionState, event: DurableEvent[Any]) -> S
             summary_hash=data.summary_hash,
             message_count=data.message_count,
         ),
+    )
+
+
+# -- T-C1-094 (P6-S1) session resource handlers --------------------------------
+
+
+def _apply_session_deleted(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.session.deleted``: active (with no in-flight run) -> deleted tombstone.
+
+    The delete is a fold-level terminal: only an ACTIVE session with an empty
+    ``active_run_id`` slot may fold the tombstone (the service's SessionBusy
+    gate is the §7 pre-check; the fold re-states it so a hand-crafted or
+    replayed log cannot delete a session that still owns a run). Everything
+    else (never created, read_only/cleanup_failed/closed, busy) is an illegal
+    transition. The tombstone keeps the folded history verbatim -- the read
+    faces start answering NotFound through the status, never through data
+    loss.
+    """
+    if not isinstance(event.data, SessionDeletedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected SessionDeletedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE or state.active_run_id is not None:
+        raise IllegalTransitionError(
+            f"py.session.deleted requires an active session with no in-flight run (event {event.id})"
+        )
+    return replace(state, status=SessionStatus.DELETED, applied_seq=event.seq)
+
+
+def _apply_message_imported(state: SessionState, event: DurableEvent[Any]) -> SessionState:
+    """``py.message.imported``: active -> active, one projected message appended verbatim.
+
+    The fork/import replay face (T-C1-094): the §2.1 message union rides the
+    event whole, so the fold appends exactly what the source session's
+    projection read. The message id must be fresh in this session -- a
+    replay that would collide with an already-folded id is an illegal
+    transition, never a silent overwrite (the same fail-closed direction as
+    the projector's duplicate-message-id detection).
+    """
+    if not isinstance(event.data, MessageImportedData):
+        raise IllegalTransitionError(
+            f"event {event.id} carries {type(event.data).__name__} data, expected MessageImportedData"
+        )
+    if not state.created or state.status is not SessionStatus.ACTIVE:
+        raise IllegalTransitionError(f"py.message.imported requires an active session (event {event.id})")
+    message = event.data.message
+    if any(existing.id == message.id for existing in state.messages):
+        raise IllegalTransitionError(
+            f"message id {message.id} is already folded for session {event.session_id} (event {event.id})"
+        )
+    return replace(
+        state,
+        applied_seq=event.seq,
+        messages=(*state.messages, message),
+        message_seqs=(*state.message_seqs, event.seq),
     )
 
 

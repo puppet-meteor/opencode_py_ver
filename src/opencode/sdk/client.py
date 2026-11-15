@@ -1,11 +1,12 @@
 """The Python client over the §7 HTTP face (P2-S5 / M5-C, PHASE2-MODULES §7).
 
-One :class:`OpencodeClient` mirrors the seven routes of the single-user
-server (the 054/056 faces) over the real wire — stdlib ``urllib`` only: no
-fastapi, no uvicorn, no ``opencode.httpapi`` import (a pure client stays on
-the core dependency surface; L101: the SDK directory is new and the runner is
-not rewritten; L112: with M5 alone an external UI attaches to the
-single-process service):
+One :class:`OpencodeClient` mirrors the routes of the single-user
+server (the 054/056 faces + the T-C1-094 session resource group) over the
+real wire — stdlib ``urllib`` only: no fastapi, no uvicorn, no
+``opencode.httpapi`` import (a pure client stays on the core dependency
+surface; L101: the SDK directory is new and the runner is not rewritten;
+L112: with M5 alone an external UI attaches to the single-process
+service):
 
 * ``POST /session``                          -> :meth:`OpencodeClient.create_session`
 * ``POST /session/{session_id}/prompt``      -> :meth:`OpencodeClient.prompt`
@@ -15,11 +16,23 @@ single-process service):
 * ``POST /permission/{permission_id}/reply`` -> :meth:`OpencodeClient.reply_permission`
 * ``GET  /session/{session_id}/events``      -> :meth:`OpencodeClient.stream_events`
 
+T-C1-094 (P6-S1) adds the seven session resource routes (the TS session
+group subset, same flat JSON wire):
+
+* ``GET    /session``                               -> :meth:`OpencodeClient.list_sessions`
+* ``GET    /session/{session_id}``                  -> :meth:`OpencodeClient.get_session`
+* ``DELETE /session/{session_id}``                  -> :meth:`OpencodeClient.delete_session`
+* ``POST   /session/{session_id}/fork``             -> :meth:`OpencodeClient.fork_session`
+* ``GET    /session/{session_id}/export``           -> :meth:`OpencodeClient.export_session`
+* ``POST   /session/import``                        -> :meth:`OpencodeClient.import_session`
+* ``GET    /session/{session_id}/message/{message_id}`` -> :meth:`OpencodeClient.get_message`
+
 Return types are the core models themselves (``service.RunRef`` /
-``RunStatus`` / ``DecisionReceipt`` / ``SessionRef``, ``repos.MessagePage``,
-``contracts.DurableEvent``) — the wire JSON is decoded here and never
-re-shaped into SDK-local types, so an SDK consumer sees exactly the session
-layer's vocabulary.
+``RunStatus`` / ``DecisionReceipt`` / ``SessionRef`` / ``SessionInfo`` /
+``SessionSummary`` / ``SessionExport``, ``repos.MessagePage``,
+``contracts.DurableEvent``, ``messages.SessionMessage``) — the wire JSON
+is decoded here and never re-shaped into SDK-local types, so an SDK
+consumer sees exactly the session layer's vocabulary.
 
 Transport (the 054/056 smoke forms): the bearer token rides every request,
 JSON bodies are UTF-8 ``application/json``, every call takes its own timeout
@@ -61,7 +74,16 @@ from opencode.contracts.messages import (
 )
 from opencode.sdk.errors import OpencodeApiError, OpencodeClientError, OpencodeConnectionError
 from opencode.sdk.sse import stream_durable_events
-from opencode.session.service import DecisionReceipt, RunRef, RunStatus, RunStatusValue, SessionRef
+from opencode.session.service import (
+    DecisionReceipt,
+    RunRef,
+    RunStatus,
+    RunStatusValue,
+    SessionExport,
+    SessionInfo,
+    SessionRef,
+    SessionSummary,
+)
 from opencode.storage.repos import MessagePage
 
 #: The default base URL — the loopback face of ``serving.DEFAULT_PORT``,
@@ -159,17 +181,7 @@ def _message_page(payload: Any) -> MessagePage:
     raw_items = fields["items"]
     if not isinstance(raw_items, list):
         raise OpencodeClientError(f"wire field 'items' must be a list, got {raw_items!r}")
-    items: list[SessionMessage] = []
-    for raw_item in raw_items:
-        if not isinstance(raw_item, dict):
-            raise OpencodeClientError(f"a message item must be a JSON object, got {raw_item!r}")
-        model = _MESSAGE_MODELS.get(str(raw_item.get("type")))
-        if model is None:
-            raise OpencodeClientError(f"unknown projected message type tag {raw_item.get('type')!r}")
-        try:
-            items.append(model.model_validate(raw_item))
-        except ValidationError as error:
-            raise OpencodeClientError(f"a message item did not decode: {error}") from error
+    items = [_wire_message(raw_item) for raw_item in raw_items]
     next_after = fields["next_after_message_id"]
     if next_after is not None and not isinstance(next_after, str):
         raise OpencodeClientError(f"wire field 'next_after_message_id' must be a string or null, got {next_after!r}")
@@ -177,6 +189,91 @@ def _message_page(payload: Any) -> MessagePage:
     if not isinstance(has_more, bool):
         raise OpencodeClientError(f"wire field 'has_more' must be a boolean, got {has_more!r}")
     return MessagePage(items=items, next_after_message_id=next_after, has_more=has_more)
+
+
+def _wire_message(raw: Any) -> SessionMessage:
+    """One §2.1 message wire object through the tag dispatch, fail closed.
+
+    Shared by the messages page and the single-message / export faces (the
+    server only emits decodable rows, so an undecodable item is a wire
+    contract break, never a skipped entry).
+    """
+    if not isinstance(raw, dict):
+        raise OpencodeClientError(f"a message item must be a JSON object, got {raw!r}")
+    model = _MESSAGE_MODELS.get(str(raw.get("type")))
+    if model is None:
+        raise OpencodeClientError(f"unknown projected message type tag {raw.get('type')!r}")
+    try:
+        return model.model_validate(raw)
+    except ValidationError as error:
+        raise OpencodeClientError(f"a message item did not decode: {error}") from error
+
+
+def _int_field(fields: dict[str, Any], key: str) -> int:
+    """A wire integer field, bools rejected (the codebase's numeric-arg guard)."""
+    value = fields[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise OpencodeClientError(f"wire field {key!r} must be an integer, got {value!r}")
+    return value
+
+
+def _nullable_string_field(fields: dict[str, Any], key: str) -> str | None:
+    """A wire string-or-null field (``active_run_id`` on the get/list faces)."""
+    value = fields[key]
+    if value is not None and not isinstance(value, str):
+        raise OpencodeClientError(f"wire field {key!r} must be a string or null, got {value!r}")
+    return value
+
+
+def _session_info(payload: Any) -> SessionInfo:
+    """The T-C1-094 four-field get wire, checked exactly."""
+    fields = _expect_object(payload, frozenset({"session_id", "status", "applied_seq", "active_run_id"}))
+    return SessionInfo(
+        session_id=_string_field(fields, "session_id"),
+        status=_string_field(fields, "status"),
+        applied_seq=_int_field(fields, "applied_seq"),
+        active_run_id=_nullable_string_field(fields, "active_run_id"),
+    )
+
+
+def _session_summary(payload: Any) -> SessionSummary:
+    """One T-C1-094 list element: the get wire plus the created stamp."""
+    fields = _expect_object(
+        payload,
+        frozenset({"session_id", "status", "applied_seq", "active_run_id", "created_at_ms"}),
+    )
+    return SessionSummary(
+        session_id=_string_field(fields, "session_id"),
+        status=_string_field(fields, "status"),
+        applied_seq=_int_field(fields, "applied_seq"),
+        active_run_id=_nullable_string_field(fields, "active_run_id"),
+        created_at_ms=_int_field(fields, "created_at_ms"),
+    )
+
+
+def _session_export(payload: Any) -> SessionExport:
+    """The T-C1-094 transfer payload, checked exactly (import's input shape)."""
+    fields = _expect_object(
+        payload,
+        frozenset(
+            {"session_id", "status", "working_dir", "config_snapshot", "snapshot_hash", "created_at_ms", "messages"}
+        ),
+    )
+    config_snapshot = fields["config_snapshot"]
+    if not isinstance(config_snapshot, dict):
+        raise OpencodeClientError(f"wire field 'config_snapshot' must be a JSON object, got {config_snapshot!r}")
+    raw_messages = fields["messages"]
+    if not isinstance(raw_messages, list):
+        raise OpencodeClientError(f"wire field 'messages' must be a list, got {raw_messages!r}")
+    return SessionExport(
+        session_id=_string_field(fields, "session_id"),
+        status=_string_field(fields, "status"),
+        working_dir=_string_field(fields, "working_dir"),
+        config_snapshot=config_snapshot,
+        snapshot_hash=_string_field(fields, "snapshot_hash"),
+        created_at_ms=_int_field(fields, "created_at_ms"),
+        messages=tuple(_wire_message(raw) for raw in raw_messages),
+    )
 
 
 def _api_error(error: urllib.error.HTTPError) -> OpencodeApiError:
@@ -200,11 +297,13 @@ def _api_error(error: urllib.error.HTTPError) -> OpencodeApiError:
 
 
 class OpencodeClient:
-    """The seven-route client over one single-user opencode server (§7 L110).
+    """The route-mapped client over one single-user opencode server (§7 L110).
 
     Construct with the server's base URL and its single-user token; every
-    method maps one §7 route, returns the core model, and takes an optional
-    ``timeout_s`` override of the constructor default.
+    method maps one route, returns the core model, and takes an optional
+    ``timeout_s`` override of the constructor default. T-C1-094 adds the
+    session resource group (list/get/delete/fork/export/import/message)
+    beside the original seven routes.
     """
 
     def __init__(self, base_url: str = DEFAULT_BASE_URL, *, token: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
@@ -276,7 +375,7 @@ class OpencodeClient:
             raise OpencodeConnectionError(f"GET {path} never answered") from error
         return response
 
-    # -- the seven routes ---------------------------------------------------
+    # -- the §7 routes ------------------------------------------------------
 
     def create_session(self, config: JsonObject, *, timeout_s: float | None = None) -> SessionRef:
         """``POST /session``: one new session under the §6.1 config snapshot.
@@ -335,6 +434,77 @@ class OpencodeClient:
         """
         path = f"/permission/{_path(permission_id)}/reply"
         return _decision_receipt(self._call("POST", path, body={"reply": reply}, timeout_s=timeout_s))
+
+    # -- T-C1-094 (P6-S1): the session resource routes ----------------------
+
+    def list_sessions(self, *, timeout_s: float | None = None) -> list[SessionSummary]:
+        """``GET /session`` — every live session, newest-created first.
+
+        The v1 face is the full list: no cursor pagination, no filter or
+        sort parameters; ``deleted`` sessions never appear (the tombstone's
+        projection filter).
+        """
+        payload = self._call("GET", "/session", timeout_s=timeout_s)
+        if not isinstance(payload, list):
+            raise OpencodeClientError(f"GET /session answered a non-list body: {payload!r}")
+        return [_session_summary(item) for item in payload]
+
+    def get_session(self, session_id: str, *, timeout_s: float | None = None) -> SessionInfo:
+        """``GET /session/{id}`` — the four-field get wire.
+
+        A missing or deleted session raises :class:`OpencodeApiError` with
+        the 404 §8 body.
+        """
+        return _session_info(self._call("GET", f"/session/{_path(session_id)}", timeout_s=timeout_s))
+
+    def delete_session(self, session_id: str, *, timeout_s: float | None = None) -> None:
+        """``DELETE /session/{id}`` — the tombstone commit; no body comes back (``None``).
+
+        A repeated delete answers 404 and a session with an in-flight run
+        answers 409 — both raise :class:`OpencodeApiError` here.
+        """
+        self._call("DELETE", f"/session/{_path(session_id)}", timeout_s=timeout_s)
+
+    def fork_session(self, session_id: str, *, before: str | None = None, timeout_s: float | None = None) -> SessionRef:
+        """``POST /session/{id}/fork`` — copy the projected history into a fresh session.
+
+        ``before`` truncates the copy to the messages before that id
+        (exclusive); an omitted ``before`` copies the full history. The
+        source session is never changed (a read-only copy); a missing
+        source or a ``before`` id that is not one of its messages answers
+        404.
+        """
+        body: JsonObject = {"before": before} if before is not None else {}
+        path = f"/session/{_path(session_id)}/fork"
+        return _session_ref(self._call("POST", path, body=body, timeout_s=timeout_s))
+
+    def export_session(self, session_id: str, *, timeout_s: float | None = None) -> SessionExport:
+        """``GET /session/{id}/export`` — the self-describing transfer payload.
+
+        The result feeds :meth:`import_session` unchanged (the round trip
+        is the contract: import restores exactly what export read).
+        """
+        return _session_export(self._call("GET", f"/session/{_path(session_id)}/export", timeout_s=timeout_s))
+
+    def import_session(self, payload: SessionExport | JsonObject, *, timeout_s: float | None = None) -> SessionRef:
+        """``POST /session/import`` — restore one export payload under its own id.
+
+        ``payload`` is the export wire — a :class:`SessionExport` straight
+        from :meth:`export_session`, or its JSON object form. A session
+        already living at the payload's id answers 409 Conflict
+        (:class:`OpencodeApiError`).
+        """
+        body = payload.to_payload() if isinstance(payload, SessionExport) else payload
+        return _session_ref(self._call("POST", "/session/import", body=body, timeout_s=timeout_s))
+
+    def get_message(self, session_id: str, message_id: str, *, timeout_s: float | None = None) -> SessionMessage:
+        """``GET /session/{id}/message/{message_id}`` — one projected message (§2.1 wire).
+
+        A message id that exists in another session, or nowhere, answers
+        the same 404 (never a cross-session leak).
+        """
+        path = f"/session/{_path(session_id)}/message/{_path(message_id)}"
+        return _wire_message(self._call("GET", path, timeout_s=timeout_s))
 
     def stream_events(
         self,

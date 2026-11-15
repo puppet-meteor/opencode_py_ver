@@ -27,6 +27,7 @@ from opencode.contracts.errors import CoreError
 from opencode.contracts.llm import ModelRef, Usage
 from opencode.contracts.messages import (
     AssistantMessage,
+    IdleMessage,
     JsonObject,
     ToolContent,
     ToolTextContent,
@@ -80,6 +81,14 @@ PY_SKILL_ACTIVATED = "py.skill.activated"
 # lands in P2-S8 slice one (T-C1-060); the registration below is contract
 # face only, like the skills precedent.
 PY_CONTEXT_COMPACTED = "py.context.compacted"
+
+# Session resource family (T-C1-094, P6-S1): ``py.session.deleted`` (the
+# delete tombstone) and ``py.message.imported`` (the fork/import projected-
+# history replay, one event per message). Both durable v1 and NOT run-scoped
+# (a resource face, not a §7 run, so ``metadata={}`` is legal); the fold,
+# projection and HTTP/SDK faces land with this ticket.
+PY_SESSION_DELETED = "py.session.deleted"
+PY_MESSAGE_IMPORTED = "py.message.imported"
 
 EVENT_VERSION = 1
 
@@ -823,6 +832,34 @@ class ContextCompactedData(BaseModel):
         return _reject_bool(info.field_name or "", value)
 
 
+class SessionDeletedData(BaseModel):
+    """``py.session.deleted`` v1 data (T-C1-094): the tombstone carries no payload.
+
+    The delete is fully described by the event itself -- the read model flips
+    ``sessions.status`` to ``deleted`` and every resource face (get/list/
+    messages/events) starts answering NotFound. An empty JSON object is the
+    exact wire shape; any field is a schema violation (extra=forbid).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MessageImportedData(BaseModel):
+    """``py.message.imported`` v1 data (T-C1-094): one projected message replayed verbatim.
+
+    The §2.1 message union rides whole (user/assistant/idle) so fork and
+    import restore the projected history exactly as it was read -- the event
+    IS the replay contract, which keeps import fail-closed on any message
+    that does not decode (no silent drops, ticket §8). Message ids are the
+    source session's ids verbatim; freshness against the target session is
+    the fold's job.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: UserMessage | AssistantMessage | IdleMessage
+
+
 def _require_run_metadata(event_type: str, metadata: JsonObject) -> None:
     """Run-scoped events must carry run_id in envelope metadata (§3.1).
 
@@ -1121,6 +1158,20 @@ COMPACTION_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 )
 
 
+#: Session resource family (T-C1-094, P6-S1): the delete tombstone plus the
+#: fork/import projected-message replay, two durable v1 types. Kept in a
+#: separate tuple so the frozen R2 boundary pins hold (no py.session.deleted
+#: / py.message.imported rows in R2) while ``default_event_registry``
+#: resolves the full table. NOT run-scoped: these are resource-face events,
+#: not §7 runs, so no envelope metadata.run_id is required (the jobs
+#: precedent); the whenever-present ^run_ guard below still applies to any
+#: metadata.run_id.
+SESSION_RESOURCE_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
+    EventDefinition(event_type=PY_SESSION_DELETED, durability="durable", data_model=SessionDeletedData),
+    EventDefinition(event_type=PY_MESSAGE_IMPORTED, durability="durable", data_model=MessageImportedData),
+)
+
+
 # ---------------------------------------------------------------------------
 # Jobs family (§3.1 py.job.* rows; PHASE3-ORCHESTRATOR §5.4/§7 A fork-3):
 # the orchestrator's job lifecycle events, committed to the synthesized
@@ -1357,7 +1408,8 @@ JOB_EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
 
 
 def default_event_registry() -> EventRegistry:
-    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4)."""
+    """Fresh registry over the R1+R2+R3+R4+skills+compaction+jobs+session-resource
+    event subsets (§3.1; §2.4, §6.3, PHASE3 §5.4, T-C1-094)."""
     return EventRegistry(
         (
             *R1_EVENT_DEFINITIONS,
@@ -1368,5 +1420,6 @@ def default_event_registry() -> EventRegistry:
             *SKILL_EVENT_DEFINITIONS,
             *COMPACTION_EVENT_DEFINITIONS,
             *JOB_EVENT_DEFINITIONS,
+            *SESSION_RESOURCE_EVENT_DEFINITIONS,
         )
     )

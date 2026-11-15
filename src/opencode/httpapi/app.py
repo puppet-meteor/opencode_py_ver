@@ -24,6 +24,27 @@ P3-S1 (T-C1-076) adds the five /jobs routes over
 * ``POST /jobs/{job_id}/gate/{gate_id}/reply`` -> the gate-reply receipt (approve/reject/revise;
   body enum validated first; 409 Conflict on every service-side rejection)
 
+T-C1-094 (P6-S1) adds the seven session resource routes — the TS session
+group subset over the resource read/write service faces. Responses keep the
+PY flat JSON discipline (``_json_response``, no TS ``{"data":...}`` wrapper,
+DIFFERENT-BY-DESIGN); delete is the event-sourced tombstone and every store
+error keeps its §8 mapping (NotFound 404, SessionBusy/Conflict 409,
+ValidationError 422):
+
+* ``GET    /session``                                      -> the created-descending live list
+  (v1: full list, no pagination, ``deleted`` never appears)
+* ``GET    /session/{session_id}``                         -> SessionInfo wire (exactly four fields)
+* ``DELETE /session/{session_id}``                         -> 204 No Content (the tombstone;
+  a repeated delete answers 404, an in-flight run answers 409)
+* ``POST   /session/{session_id}/fork``                    -> ``{session_id}`` (body ``{before?}``;
+  an absent body or ``{}`` copies the full history)
+* ``GET    /session/{session_id}/export``                 -> the self-describing transfer payload
+  (the exact ``POST /session/import`` input)
+* ``POST   /session/import``                               -> ``{session_id}`` (a session already
+  living at the payload id answers 409 Conflict)
+* ``GET    /session/{session_id}/message/{message_id}``    -> one projected message (§2.1 wire)
+
+
 Durable SSE (§7 L105, CORE-CONTRACTS §4): ``GET /session/{session_id}/events``
 streams the durable log through :meth:`opencode.bus.eventlog.EventLog.follow`,
 assembled here over ``app.database.engine`` + ``app.bus`` (the core
@@ -105,7 +126,15 @@ from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue
 from opencode.orchestrator.jobs import JobTransitionError
 from opencode.orchestrator.registration import register_pipelines
-from opencode.session.service import DecisionReceipt, RunRef, RunStatus, SessionRef
+from opencode.session.service import (
+    DecisionReceipt,
+    RunRef,
+    RunStatus,
+    SessionExport,
+    SessionInfo,
+    SessionRef,
+    SessionSummary,
+)
 from opencode.storage import StoreError
 from opencode.storage.jobs_store import JobRecord, job_stream_key
 from opencode.storage.repos import MessagePage
@@ -217,6 +246,27 @@ async def _read_json_object(request: Request) -> JsonObject:
     return payload
 
 
+async def _read_optional_json_object(request: Request) -> JsonObject:
+    """The request body as a JSON object; an absent or empty body is ``{}``.
+
+    The T-C1-094 fork face: the body is ``{before?}`` and an empty body is
+    the natural "copy the full history" form, so the transport accepts
+    both instead of inventing a required-shape fiction. A present body
+    still must be valid-JSON and an object (§8-shaped transport
+    rejections, same as the strict face).
+    """
+    raw = await _read_capped_body(request)
+    if not raw:
+        return {}
+    try:
+        payload: Any = json.loads(raw)
+    except ValueError:
+        raise _TransportError(422, _validation("request body is not valid JSON")) from None
+    if not isinstance(payload, dict):
+        raise _TransportError(422, _validation("request body must be a JSON object"))
+    return payload
+
+
 def _strict_string_fields(payload: JsonObject, keys: frozenset[str]) -> dict[str, str]:
     """Exact-shape extraction: every key present, no unknown keys, str values."""
     for key in sorted(keys):
@@ -252,6 +302,27 @@ def _messages_wire(page: MessagePage) -> JsonObject:
         "items": [item.model_dump(mode="json") for item in page.items],
         "next_after_message_id": page.next_after_message_id,
         "has_more": page.has_more,
+    }
+
+
+def _session_info_wire(info: SessionInfo) -> JsonObject:
+    """T-C1-094 §3 decision 2: the get wire — exactly the four-field whitelist."""
+    return {
+        "session_id": info.session_id,
+        "status": info.status,
+        "applied_seq": info.applied_seq,
+        "active_run_id": info.active_run_id,
+    }
+
+
+def _session_summary_wire(summary: SessionSummary) -> JsonObject:
+    """T-C1-094 §3 decision 7: the get wire plus the created stamp (one list element)."""
+    return {
+        "session_id": summary.session_id,
+        "status": summary.status,
+        "applied_seq": summary.applied_seq,
+        "active_run_id": summary.active_run_id,
+        "created_at_ms": summary.created_at_ms,
     }
 
 
@@ -664,6 +735,57 @@ def create_app(app: App, *, token: str) -> FastAPI:
                 "execution_id": receipt.execution_id,
             }
         )
+
+    # -- T-C1-094 (P6-S1): the session resource routes ---------------------------
+
+    @api.get("/session")
+    async def list_sessions() -> Response:
+        """§3 decision 7: every live session, created-descending (v1 full list, no pagination)."""
+        summaries = await service.list_sessions()
+        return _json_response([_session_summary_wire(summary) for summary in summaries])
+
+    @api.get("/session/{session_id}")
+    async def get_session(session_id: str) -> Response:
+        """§3 decision 2: the four-field get wire (a deleted session answers 404)."""
+        return _json_response(_session_info_wire(await service.get_session(session_id)))
+
+    @api.delete("/session/{session_id}")
+    async def delete_session(session_id: str) -> Response:
+        """§3 decision 4: one tombstone commit; 204 No Content (a repeat answers 404, a live run 409)."""
+        await service.delete_session(session_id)
+        return Response(status_code=204)
+
+    @api.post("/session/{session_id}/fork")
+    async def fork_session(session_id: str, request: Request) -> Response:
+        """§3 decision 3: copy the projected history; ``before`` truncates (exclusive), empty body copies all."""
+        payload = await _read_optional_json_object(request)
+        unknown = sorted(set(payload) - {"before"})
+        if unknown:
+            raise _TransportError(422, _validation(f"request body has unknown fields: {', '.join(unknown)}"))
+        before = payload.get("before")
+        if before is not None and (not isinstance(before, str) or not before):
+            raise _TransportError(422, _validation("request body field 'before' must be a non-empty string"))
+        ref: SessionRef = await service.fork_session(session_id, before=before)
+        return _json_response({"session_id": ref.session_id})
+
+    @api.get("/session/{session_id}/export")
+    async def export_session(session_id: str) -> Response:
+        """§3 decision 5: the self-describing transfer payload (import's exact input shape)."""
+        exported: SessionExport = await service.export_session(session_id)
+        return _json_response(exported.to_payload())
+
+    @api.post("/session/import")
+    async def import_session(request: Request) -> Response:
+        """§3 decision 5: restore one export payload under its own id; a living id answers 409."""
+        payload = await _read_json_object(request)
+        ref = await service.import_session(payload)
+        return _json_response({"session_id": ref.session_id})
+
+    @api.get("/session/{session_id}/message/{message_id}")
+    async def get_message(session_id: str, message_id: str) -> Response:
+        """§3 decision 6: one projected message (§2.1 wire); a mismatched pair answers 404."""
+        message = await service.message(session_id, message_id)
+        return _json_response(message.model_dump(mode="json"))
 
     # -- P3-S1 (T-C1-076): the five /jobs routes over app.jobs ---------------
 

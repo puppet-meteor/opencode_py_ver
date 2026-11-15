@@ -92,6 +92,7 @@ from opencode.contracts import (
 )
 from opencode.contracts.events import (
     PY_CONTEXT_COMPACTED,
+    PY_MESSAGE_IMPORTED,
     PY_PERMISSION_CLOSED,
     PY_PERMISSION_EXPIRED,
     PY_PERMISSION_REPLIED,
@@ -102,6 +103,7 @@ from opencode.contracts.events import (
     PY_RUN_CANCEL_REQUESTED,
     PY_RUN_FINISHED,
     PY_RUN_STARTED,
+    PY_SESSION_DELETED,
     PY_SKILL_ACTIVATED,
     PY_STEP_FINISHED,
     PY_STEP_GENERATED,
@@ -172,6 +174,7 @@ _INSERT_MESSAGE = sa.text(
 )
 _UPDATE_MESSAGE = sa.text("UPDATE messages SET data = :data WHERE session_id = :sid AND message_id = :message_id")
 _SET_ACTIVE_RUN = sa.text("UPDATE sessions SET active_run_id = :run_id WHERE session_id = :sid")
+_SET_SESSION_STATUS = sa.text("UPDATE sessions SET status = :status WHERE session_id = :sid")
 _ADVANCE_APPLIED_SEQ = sa.text("UPDATE sessions SET applied_seq = :applied_seq WHERE session_id = :sid")
 _SELECT_RUN = sa.text("SELECT session_id, request_id, status FROM runs WHERE session_id = :sid AND run_id = :run_id")
 _INSERT_RUN = sa.text(
@@ -368,6 +371,10 @@ class SessionProjector:
             await self._project_skill(connection, event)
         elif event.type == PY_CONTEXT_COMPACTED:
             await self._project_context_compacted(connection, event)
+        elif event.type == PY_SESSION_DELETED:
+            await self._project_session_deleted(connection, event)
+        elif event.type == PY_MESSAGE_IMPORTED:
+            await self._project_message_imported(connection, event)
         else:
             raise _corrupt(REASON_ILLEGAL_TRANSITION, event, f"event type {event.type!r} is not projectable")
 
@@ -525,6 +532,50 @@ class SessionProjector:
         """
         pre, digest = await self._pre_state(connection, event)
         post = _fold(pre, event)
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_session_deleted(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.session.deleted`` tombstone (T-C1-094) and flip the status.
+
+        The read-model footprint is exactly one column: ``sessions.status``
+        becomes the fold output's ``deleted`` (never an inlined literal -- the
+        transition-rule ownership stays in the state fold), then the
+        applied_seq advance keeps the A=H invariant. The folded history and
+        every messages/runs/tools/permissions row stay verbatim: the delete
+        is a resource-face tombstone, not a data purge (physical deletion is
+        the M1 archive design's face, the compaction precedent). Same cache
+        shape as the skills/compaction faces.
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        if post.status is None:
+            # Unreachable for a legal tombstone; kept so every projector
+            # failure surfaces as a StoreError (fail closed).
+            raise _corrupt(REASON_ILLEGAL_TRANSITION, event, "fold output lacks the deleted status")
+        result = await connection.execute(_SET_SESSION_STATUS, {"sid": event.session_id, "status": post.status.value})
+        if not result.rowcount:
+            raise _corrupt(
+                REASON_READ_MODEL_ROW_MISSING,
+                event,
+                f"sessions row {event.session_id} vanished before the delete projection",
+            )
+        await self._advance_applied_seq(connection, event)
+        await self._remember_fold_state(connection, event, post, digest)
+
+    async def _project_message_imported(self, connection: AsyncConnection, event: DurableEvent[Any]) -> None:
+        """Fold one ``py.message.imported`` event (T-C1-094) and append the message row.
+
+        The fork/import replay's read-model footprint is the same message
+        append the prompt face performs: the fold output's new message lands
+        as one messages row (``_write_message_diff`` -- the shared diff writer
+        keeps duplicate-id detection in one place), then the applied_seq
+        advance. Runs/tools/permissions and the active-run slot are never
+        touched: an imported history is settled by construction.
+        """
+        pre, digest = await self._pre_state(connection, event)
+        post = _fold(pre, event)
+        await self._write_message_diff(connection, event, pre, post)
         await self._advance_applied_seq(connection, event)
         await self._remember_fold_state(connection, event, post, digest)
 

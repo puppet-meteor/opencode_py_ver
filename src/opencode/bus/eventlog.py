@@ -103,6 +103,12 @@ MAX_POLL_INTERVAL = 1.0
 #: The §4 wire literal for a quarantined session (sessions.status column).
 STATUS_READ_ONLY_DIAGNOSTIC = "read_only_diagnostic"
 
+#: The §4-side literal for the T-C1-094 delete tombstone (sessions.status
+#: column). The durable feed of a deleted session answers NotFound like
+#: every other resource face -- the tombstone hides the log, it does not
+#: quarantine it.
+STATUS_DELETED = "deleted"
+
 #: Sanitized reasons owned by this module (txn owns the decode-failure reason).
 REASON_SESSION_READ_ONLY = "session_read_only_diagnostic"
 REASON_NON_INCREASING_SEQ = "non_increasing_seq"
@@ -281,6 +287,10 @@ class EventLog:
                 raise NotFoundError(f"session {session_id} does not exist", details={"session_id": session_id})
             if record is not None and record.status == STATUS_READ_ONLY_DIAGNOSTIC:
                 raise self._gate_error(session_id, cursor)
+            if record is not None and record.status == STATUS_DELETED:
+                # T-C1-094: the tombstone hides the durable feed too — the
+                # same NotFound a never-created session answers.
+                raise NotFoundError(f"session {session_id} is deleted", details={"session_id": session_id})
             if cursor.seq > high:
                 raise InvalidCursorError(
                     f"cursor seq {cursor.seq} is beyond the current high watermark {high}",
@@ -481,6 +491,10 @@ class _Follow(AbstractAsyncContextManager[AsyncIterator[LogItem]]):
                 )
             if record is not None and record.status == STATUS_READ_ONLY_DIAGNOSTIC:
                 raise self._log._gate_error(self._session_id, self._cursor)
+            if record is not None and record.status == STATUS_DELETED:
+                # T-C1-094: the tombstone hides the durable feed too — the
+                # same NotFound a never-created session answers.
+                raise NotFoundError(f"session {self._session_id} is deleted", details={"session_id": self._session_id})
             if self._cursor.seq > high:
                 raise InvalidCursorError(
                     f"cursor seq {self._cursor.seq} is beyond the current high watermark {high}",
