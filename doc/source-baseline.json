@@ -60,5 +60,9 @@
   {"path":"packages/core/src/tool/plugin/webfetch.ts","sha256":"475bc8599044327ed857e04f8e12e3a9a787a020133ae47e7fe86c5ea6141860"},
   {"path":"packages/core/src/tool/html-markdown.ts","sha256":"49333c55bc9d7a3612300d59aface4cf33cb05c0cf581678a27b815eaf9a6507"},
   {"path":"packages/core/src/tool/http-body.ts","sha256":"63720687468b9d0d83a64f74f00ab8060d535c29f2a056f500c346901f33f858"},
-  {"path":"packages/core/src/mime.ts","sha256":"2161b5ba2539cfb8b12107c61deff376a4b6a73d50c0515693a0d2a4fdd46090"}
+  {"path":"packages/core/src/mime.ts","sha256":"2161b5ba2539cfb8b12107c61deff376a4b6a73d50c0515693a0d2a4fdd46090"},
+  {"path":"packages/core/src/tool/plugin/websearch.ts","sha256":"d5fc034bb669a1c334524ee3a5ae16ff3fb6e4fcd2f3b583bcd3908d4bcf0120"},
+  {"path":"packages/core/src/websearch.ts","sha256":"858ee79abba8a76c781c2e752e179c173ce913a186d672959f1ec53c200357e9"},
+  {"path":"packages/schema/src/websearch.ts","sha256":"109e2829087ca5652b4d394dce50fd8dfaef75ee1012489f836e87d38838a199"},
+  {"path":"packages/core/src/config/plugin/websearch.ts","sha256":"e1a4d52788c737c6f79ea18ffe4e057036286b0356bab0cc62b4973bed9d2436"}
 ]
