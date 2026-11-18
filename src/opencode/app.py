@@ -171,6 +171,7 @@ class App:
         pipeline_engine: PipelineEngine | None = None,
         skills_dir: str | Path | None = None,
         workflow_tools: bool = False,
+        auto_approve: bool = False,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
@@ -278,6 +279,9 @@ class App:
                 # the defaults but never outrank the host tier (§5.2 L266).
                 rules=rules,
                 clock=clock,
+                # T-C1-PT-001 (parity D1): the TS `--auto` face — an ask the
+                # defaults would surface becomes allow; deny faces unchanged.
+                auto_approve=auto_approve,
             )
             committer = EventCommitter(repos, store, self._bus, ids=shared_ids, clock=clock)
             registry = ToolRegistry(sink=committer.sink, clock=clock, ids=shared_ids, policy=policy)

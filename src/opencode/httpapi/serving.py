@@ -144,12 +144,21 @@ def _maas_env() -> tuple[str, str]:
 #: opts the serving host in, mirroring the CLI's ``--workflow-tools`` flag.
 _WORKFLOW_TOOLS_ENV = "OPENCODE_PY_WORKFLOW_TOOLS"
 
+#: The auto-approve face of the server host (T-C1-PT-001, parity D1): the
+#: TS `opencode run --auto` parity — ask-tier defaults return allow; deny
+#: faces still deny. Same truthy vocabulary as the workflow-tools env.
+_AUTO_APPROVE_ENV = "OPENCODE_PY_AUTO_APPROVE"
 
-def _workflow_tools_env() -> bool:
-    raw = os.environ.get(_WORKFLOW_TOOLS_ENV)
+
+def _truthy_env(name: str) -> bool:
+    raw = os.environ.get(name)
     if raw is None:
         return False
     return raw.strip().lower() in ("1", "true", "yes")
+
+
+def _workflow_tools_env() -> bool:
+    return _truthy_env(_WORKFLOW_TOOLS_ENV)
 
 
 def _alembic_root() -> Path:
@@ -408,6 +417,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         pipeline_engine=pipeline_engine,
         skills_dir=skills_dir,
         workflow_tools=_workflow_tools_env(),
+        auto_approve=_truthy_env(_AUTO_APPROVE_ENV),
     )
     # P6-S5 (T-C1-098): late-bind before the server starts taking requests
     # (an unbound adapter would fail closed as a wiring defect at first

@@ -594,6 +594,7 @@ class PermissionPolicy:
         host_deny_actions: Iterable[str] = (),
         rules: Sequence[PermissionRule] = (),
         clock: Callable[[], datetime] | None = None,
+        auto_approve: bool = False,
     ) -> None:
         if not isinstance(boot_id, str) or not boot_id:
             raise ValueError("boot_id must be a non-empty string")
@@ -605,6 +606,13 @@ class PermissionPolicy:
         self._minter = _IdMinter(self._clock)
         self._decisions: dict[str, SavedDecision] = {}
         self._unknown_retries: set[tuple[str, str, str]] = set()
+        # T-C1-PT-001 (parity D1): the TS `opencode run --auto` face —
+        # "auto-approve permissions that are not explicitly denied". When the
+        # host opts in, every ask the strict evaluation would surface returns
+        # as allow (source="auto_approve"); deny faces (host deny, root
+        # containment, deny rules) are untouched, and an approval channel is
+        # still wired for the faces that keep asking without it.
+        self._auto_approve = bool(auto_approve)
         # R4-S3 (§5.2 L268): the current MCP binding per action (wire name).
         # Empty until the wiring calls bind_mcp_tools — with no binding an
         # action keeps its pre-R4-S3 saved-decision semantics (zero
@@ -630,6 +638,41 @@ class PermissionPolicy:
         return self._minter.next("dec_")
 
     def evaluate(
+        self,
+        *,
+        session_id: str,
+        action: str,
+        resources: tuple[str, ...],
+        input_hash: str,
+        working_dir: str,
+        side_effects: bool,
+    ) -> PermissionDecision:
+        """Evaluate one call, then apply the host's auto-approve opt-in (T-C1-PT-001).
+
+        The strict §5.2 L265 decision runs first, unchanged; an ``ask`` it
+        would surface converts to ``allow`` under the host's ``auto_approve``
+        opt-in (the TS ``--auto`` parity face: auto-approve everything that
+        is not explicitly denied). Every deny face and every allow stays
+        exactly as the strict evaluation produced it.
+        """
+        decision = self._evaluate_strict(
+            session_id=session_id,
+            action=action,
+            resources=resources,
+            input_hash=input_hash,
+            working_dir=working_dir,
+            side_effects=side_effects,
+        )
+        if decision.effect == "ask" and self._auto_approve:
+            return replace(
+                decision,
+                effect="allow",
+                reason=f"auto-approve (strict decision: {decision.reason})",
+                source="auto_approve",
+            )
+        return decision
+
+    def _evaluate_strict(
         self,
         *,
         session_id: str,

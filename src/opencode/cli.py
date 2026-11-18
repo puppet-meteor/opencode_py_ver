@@ -289,6 +289,13 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         "session's registry and expose the resident BrainDriver (default: off)",
     )
     parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="auto-approve permissions that are not explicitly denied (TS `opencode run --auto` parity): "
+        "every ask-tier default returns allow; deny faces (host deny, workspace-root escape, deny rules) "
+        "still deny (default: off)",
+    )
+    parser.add_argument(
         "--model",
         default=None,
         help="model name (required unless a config/product layer supplies it; CLI overrides config, §6 L283)",
@@ -761,6 +768,7 @@ def main(
                 pipeline_engine=pipeline_engine,
                 skills_dir=loader.skills_directory(),
                 workflow_tools=args.workflow_tools,
+                auto_approve=args.auto,
             )
         )
     except _SelectionError as error:
@@ -927,6 +935,7 @@ async def _drive(
     pipeline_engine: PipelineEngine,
     skills_dir: Path,
     workflow_tools: bool = False,
+    auto_approve: bool = False,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -1035,6 +1044,7 @@ async def _drive(
         mcp_refs=mcp_refs,
         pipeline_engine=pipeline_engine,
         workflow_tools=workflow_tools,
+        auto_approve=auto_approve,
     )
     # P6-S5 (T-C1-098): late-bind the App's session service to the named
     # subagent instance before any run can reach the tool (an unbound

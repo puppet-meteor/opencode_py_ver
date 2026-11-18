@@ -429,3 +429,58 @@ async def test_expiry_watchdog_resolves_expired() -> None:
     late = await coordinator.resolve_reply("prm_000001", "once")
     assert late.status == "late"
     assert late.outcome is not None and late.outcome.outcome == "expired"
+
+
+# ---------------------------------------------------------------------------
+# T-C1-PT-001 (parity D1): the auto-approve opt-in (TS `--auto` parity face)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoApprove:
+    """``auto_approve=True`` converts ask to allow; every deny face survives."""
+
+    def test_ask_tier_default_becomes_allow_with_auto_approve(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(boot_id="boot_auto", clock=_clock, auto_approve=True)
+        decision = _evaluate(policy, action="fs__edit", resources=(str(tmp_path / "a.txt"),), working_dir=str(tmp_path))
+        assert decision.effect == "allow"
+        assert decision.source == "auto_approve"
+        assert "auto-approve" in decision.reason
+        assert "default permission" in decision.reason  # the strict decision is disclosed
+
+    def test_side_effects_fallback_ask_also_becomes_allow(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(boot_id="boot_auto", clock=_clock, auto_approve=True)
+        decision = _evaluate(
+            policy, action="custom__mutate", resources=(), working_dir=str(tmp_path), side_effects=True
+        )
+        assert decision.effect == "allow"
+        assert decision.source == "auto_approve"
+
+    def test_host_deny_survives_auto_approve(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(
+            boot_id="boot_auto", clock=_clock, host_deny_actions=("fs__write",), auto_approve=True
+        )
+        decision = _evaluate(policy, action="fs__write", working_dir=str(tmp_path))
+        assert (decision.effect, decision.source) == ("deny", "host_deny")
+
+    def test_workspace_root_escape_survives_auto_approve(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(boot_id="boot_auto", clock=_clock, auto_approve=True)
+        outside = tmp_path.parent / "outside.txt"
+        decision = _evaluate(policy, action="fs__edit", resources=(str(outside),), working_dir=str(tmp_path))
+        assert (decision.effect, decision.source) == ("deny", "root_restriction")
+
+    def test_deny_rule_survives_auto_approve(self, tmp_path: Path) -> None:
+        rules = (PermissionRule(action="fs__edit", effect="deny", reason="pinned"),)
+        policy = PermissionPolicy(boot_id="boot_auto", clock=_clock, rules=rules, auto_approve=True)
+        decision = _evaluate(policy, action="fs__edit", resources=(str(tmp_path / "a.txt"),), working_dir=str(tmp_path))
+        assert (decision.effect, decision.source) == ("deny", "rule:host")
+
+    def test_allow_faces_keep_their_own_source(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(boot_id="boot_auto", clock=_clock, auto_approve=True)
+        decision = _evaluate(policy, action="fs__read", resources=(str(tmp_path / "a.txt"),), working_dir=str(tmp_path))
+        assert (decision.effect, decision.source) == ("allow", "default")
+
+    def test_default_off_keeps_ask(self, tmp_path: Path) -> None:
+        policy = PermissionPolicy(boot_id="boot_strict", clock=_clock)
+        decision = _evaluate(policy, action="fs__edit", resources=(str(tmp_path / "a.txt"),), working_dir=str(tmp_path))
+        assert decision.effect == "ask"
+        assert decision.source == "default"
