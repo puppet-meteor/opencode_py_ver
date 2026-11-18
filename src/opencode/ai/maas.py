@@ -7,8 +7,12 @@ pydantic ``ProviderChunk``. Behaviour anchors (doc/evidence/r0/provider.md):
 - ``packages/core/src/aisdk.ts:65-169``   SSE read loop, held-back logical finish
 - ``packages/ai/src/route/transport/http.ts:94-140`` header/chunk/total timeouts
 - ``packages/ai/src/route/executor.ts:22-35``  Retry-After parsing (ms first)
+- ``packages/core/src/model-retry.ts:25-59``   timeout retries on their own
+  budget (cap 3, exponential 2 s -> 10 s gaps; ported by T-C1-PT-003,
+  parity D6)
 - ``packages/core/src/model-retry.ts:62-103``  retry only before first content
-  (Python narrows this to 429 + connection-establishment failures, §8)
+  (Python narrows the retryable face to 429 + connection-establishment
+  failures + header timeouts on their own budget, §8 + T-C1-PT-003)
 
 Spike differences formally adopted here (provider.md §6 #2/#3/#4, OP-4):
 
@@ -32,11 +36,20 @@ Timeout model (provider.md §3 mapping table, unchanged from the spike):
   checked before every read and wrapped around each single read; it also bounds
   retry waits (``min(retry_after, remaining)``).
 
-Retry rules (§8, OP-7/OP-8 rulings of 2026-11-03):
+Retry rules (§8, OP-7/OP-8 rulings of 2026-11-03; T-C1-PT-003 amendment of
+2026-11-18, parity D6 — ports TS ``model-retry.ts`` L38-57's timeout arm):
 
 - SDK ``max_retries=0`` — this adapter is the single retry owner;
 - retry only when no content was produced yet AND the failure is clearly
   retryable: HTTP 429 or a connection-establishment failure; at most 2 retries;
+- header-timeout attempts (no headers within ``header_s``) retry on their own
+  budget — at most 3 retries (TS L38-40: a timed-out attempt already waited
+  the whole header budget, so the general allowance would let a dead provider
+  hold a call for most of an hour), waiting the TS schedule's exponential gaps
+  from 2 s capped at 10 s per gap (L25-27; deterministic per OP-7 — no jitter
+  — and always bounded by the total deadline); after the budget the terminal
+  face is byte-identical to the no-retry era (``timeout_kind="header"``,
+  ``retryable=False``);
 - wait is deterministic ``min(retry_after, remaining)`` — no Retry-After means
   0, no jitter is added, and the total deadline always bounds the sleep;
 - after partial content: no retry, no splicing (the stream ends in an
@@ -172,9 +185,30 @@ class _RetrySignal(Exception):
     error chunk.
     """
 
-    def __init__(self, retry_after_s: float | None) -> None:
+    def __init__(self, retry_after_s: float | None, *, timeout: bool = False) -> None:
         super().__init__("retryable provider failure before first content")
         self.retry_after_s = retry_after_s
+        #: T-C1-PT-003 (parity D6): the signal came from a header-timeout
+        #: attempt, so ``stream`` counts it against the separate timeout
+        #: budget (TS ``model-retry.ts`` L53/L57's ``timeouts`` counter),
+        #: never the general one.
+        self.timeout = timeout
+
+
+#: T-C1-PT-003 (parity D6, TS ``model-retry.ts`` L38-40): header-timeout
+#: attempts get their own retry budget — a timed-out attempt already waited
+#: the whole header budget, so the general allowance would let a dead
+#: provider hold a call for most of an hour. TS caps those retries at 3.
+_MAX_TIMEOUT_RETRIES = 3
+#: The TS schedule's gaps (L25-27): exponential from 2 s capped at 10 s per
+#: gap — deterministic here (OP-7: no jitter), always deadline-bounded.
+_TIMEOUT_RETRY_BASE_S = 2.0
+_TIMEOUT_RETRY_CAP_S = 10.0
+
+
+async def _sleep_retry(seconds: float) -> None:
+    """One retry wait (module-level seam: tests replace it to skip real waits)."""
+    await asyncio.sleep(seconds)
 
 
 class _StreamFailure(Exception):
@@ -371,6 +405,8 @@ class MaasAdapter:
         deadline = time.monotonic() + request.timeout_s
         sequencer = _Sequencer()
         attempt = 0
+        general_retries = 0
+        timeout_retries = 0
         while True:
             attempt += 1
             try:
@@ -380,7 +416,35 @@ class MaasAdapter:
             except _RetrySignal as signal:
                 # Raised only by the create() phase, so no content was yielded
                 # yet — see the _RetrySignal invariant note.
-                if attempt > self._max_retries:
+                if signal.timeout:
+                    # T-C1-PT-003 (parity D6): the timeout budget is separate
+                    # from the general one — TS model-retry.ts L53/L57 counts
+                    # Transport Timeout against MAX_TIMEOUT_RETRIES=3 while
+                    # the general recurs(10) budget keeps its own count.
+                    timeout_retries += 1
+                    exhausted = timeout_retries > _MAX_TIMEOUT_RETRIES
+                else:
+                    general_retries += 1
+                    exhausted = general_retries > self._max_retries
+                if exhausted:
+                    if signal.timeout:
+                        # The no-retry era's exact terminal header face
+                        # (retryable=False), enriched with the two counts.
+                        yield _error_chunk(
+                            request.request_id,
+                            sequencer,
+                            CoreError(
+                                code=CoreErrorCode.PROVIDER_UNAVAILABLE,
+                                message="timed out waiting for response headers",
+                                retryable=False,
+                                details={
+                                    "timeout_kind": "header",
+                                    "attempts": attempt,
+                                    "timeout_retries": timeout_retries,
+                                },
+                            ),
+                        )
+                        return
                     yield _error_chunk(
                         request.request_id,
                         sequencer,
@@ -405,11 +469,16 @@ class MaasAdapter:
                         ),
                     )
                     return
-                delay = signal.retry_after_s if signal.retry_after_s is not None else 0.0
-                # OP-7 (T-A-005, 2026-11-03): deterministic wait —
-                # min(retry_after, remaining), no Retry-After means 0, no
-                # jitter, always bounded by the total deadline.
-                await asyncio.sleep(min(delay, remaining))
+                if signal.timeout:
+                    # TS schedule L25-27: exponential from 2 s capped at 10 s
+                    # per gap (deterministic per OP-7 — no jitter).
+                    delay = min(_TIMEOUT_RETRY_BASE_S**timeout_retries, _TIMEOUT_RETRY_CAP_S)
+                else:
+                    # OP-7 (T-A-005, 2026-11-03): deterministic wait —
+                    # min(retry_after, remaining), no Retry-After means 0,
+                    # no jitter, always bounded by the total deadline.
+                    delay = signal.retry_after_s if signal.retry_after_s is not None else 0.0
+                await _sleep_retry(min(delay, remaining))
             except _StreamFailure as failure:
                 yield _error_chunk(request.request_id, sequencer, failure.error)
                 return
@@ -441,36 +510,29 @@ class MaasAdapter:
         # header_s) in __init__) share one base and start together, so on a
         # real connect timeout (server never accepts) either may fire first
         # and the winner picks the failure surface: asyncio.timeout ->
-        # TimeoutError -> header-timeout terminal (retryable=False, no
-        # retry) vs httpx2 connect -> APIConnectionError(cause=
-        # ConnectTimeout) -> _RetrySignal(None) -> up to 2 retries. Accepted
-        # because (1) both surfaces are contract-legal failure exits,
-        # terminally equivalent for the upper layer (each ends the request
-        # with one error chunk — fail, never splice, never restart); (2) the
-        # spike already had this structure (provider.md §3 L47 / §4 L56 —
-        # both branches coexist since R0, not introduced in R2-S3); (3)
-        # tested paths are unaffected (test_header_timeout's connection is
-        # established, so it deterministically maps to header; an
-        # immediately-refused ConnectError never waits on either timer).
-        # Possible follow-up: decouple the header-wrapper budget from the
-        # connect budget — annotated only, deliberately not implemented.
+        # TimeoutError -> timeout-budget retry vs httpx2 connect ->
+        # APIConnectionError(cause=ConnectTimeout) -> _RetrySignal(None) ->
+        # general-budget retry. T-C1-PT-003 (parity D6) made both surfaces
+        # retryable, so the race now only picks which budget the attempt is
+        # counted against; a budget exhausting either way ends the request
+        # with one error chunk (fail, never splice, never restart after
+        # content). Possible follow-up: decouple the header-wrapper budget
+        # from the connect budget — annotated only, deliberately not
+        # implemented.
         try:
             async with asyncio.timeout(self._timeouts.header_s):
                 stream = await self._client.chat.completions.create(**params)
         except openai.APITimeoutError as error:
-            raise _failure(
-                CoreErrorCode.PROVIDER_UNAVAILABLE,
-                "timed out waiting for response headers",
-                details={"timeout_kind": "header"},
-            ) from error
+            # T-C1-PT-003 (parity D6): a header-timeout attempt retries on
+            # its own budget — TS model-retry.ts L53/L57 counts Transport
+            # Timeout separately (cap 3), because a timed-out attempt
+            # already waited the whole header budget.
+            raise _RetrySignal(None, timeout=True) from error
         except TimeoutError as error:
             # asyncio.timeout(header_s) fired around create(): headers never
-            # arrived within the header budget (TS header-timer equivalent).
-            raise _failure(
-                CoreErrorCode.PROVIDER_UNAVAILABLE,
-                "timed out waiting for response headers",
-                details={"timeout_kind": "header"},
-            ) from error
+            # arrived within the header budget (TS header-timer equivalent)
+            # — timeout-budget retry (T-C1-PT-003, same rationale as above).
+            raise _RetrySignal(None, timeout=True) from error
         except openai.APIStatusError as error:
             if error.status_code == 429:
                 lowered = {key.lower(): value for key, value in error.response.headers.items()}

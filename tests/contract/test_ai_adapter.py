@@ -12,7 +12,11 @@ goldens here necessarily differ from ``doc/evidence/r0/fixtures/``:
 
 The deterministic-retry four points (OP-7) are pinned behaviourally:
 Retry-After respected, no header -> 0 wait, wait truncated to the remaining
-total deadline, and the two-retry cap.
+total deadline, and the two-retry cap. T-C1-PT-003 (parity D6) adds the
+timeout-budget pins: header-timeout attempts retry on their own 3-cap budget
+with 2 s -> 10 s exponential gaps (deterministic, deadline-bounded), counted
+independently of the general budget; the terminal face after exhaustion is
+the no-retry era's exact header error.
 """
 
 from __future__ import annotations
@@ -604,8 +608,16 @@ async def test_error_chunk_is_the_sole_terminal() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_header_timeout() -> None:
-    async with fake_server([ScriptedResponse(hang_headers=True)]) as server:
+async def test_header_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T-C1-PT-003: header timeouts retry on their own 3-cap budget, then
+    surface the unchanged terminal header face (retryable=False)."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("opencode.ai.maas._sleep_retry", fake_sleep)
+    async with fake_server([ScriptedResponse(hang_headers=True) for _ in range(4)]) as server:
         chunks = await consume(
             make_adapter(server, MaasTimeouts(header_s=0.3, chunk_s=5.0)),
             make_request(timeout_s=10.0),
@@ -617,8 +629,84 @@ async def test_header_timeout() -> None:
     assert isinstance(terminal, ErrorChunk)
     assert terminal.error.code == CoreErrorCode.PROVIDER_UNAVAILABLE
     assert terminal.error.retryable is False
-    assert terminal.error.details == {"timeout_kind": "header"}
-    assert len(server.requests) == 1
+    assert terminal.error.details["timeout_kind"] == "header"
+    assert terminal.error.details["timeout_retries"] == 4  # 1 initial + 3 retries
+    assert len(server.requests) == 4
+    # TS schedule gaps (model-retry.ts L25-27): exponential from 2 s capped at
+    # 10 s — deterministic (OP-7: no jitter), truncated to the remaining budget.
+    assert sleeps == [2.0, 4.0, 8.0]
+
+
+async def test_header_timeout_retry_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient header timeout recovers on the retry — the parity D6
+    target: R2 first-collection p4/p5 died exactly here (timed out waiting
+    for response headers; rerun always passed)."""
+
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr("opencode.ai.maas._sleep_retry", fake_sleep)
+    async with fake_server(
+        [
+            ScriptedResponse(hang_headers=True),
+            ScriptedResponse(frames=[Frame(text_delta_frame("ok")), Frame(finish_frame("stop"))]),
+        ]
+    ) as server:
+        chunks = await consume(
+            make_adapter(server, MaasTimeouts(header_s=0.3, chunk_s=5.0)),
+            make_request(timeout_s=10.0),
+        )
+
+    validate_sequence(chunks, "req-1")
+    assert [chunk.type for chunk in chunks] == ["text_delta", "finish"]
+    assert len(server.requests) == 2
+
+
+async def test_timeout_budget_independent_of_general_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout cap (3) and the general cap (2) count separately: a mixed
+    sequence that exhausts neither alone still succeeds (TS model-retry.ts
+    L44-57 keeps independent counters in one loop)."""
+
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr("opencode.ai.maas._sleep_retry", fake_sleep)
+    async with fake_server(
+        [
+            ScriptedResponse(status=429, headers={"retry-after-ms": "1"}),
+            ScriptedResponse(hang_headers=True),
+            ScriptedResponse(hang_headers=True),
+            ScriptedResponse(hang_headers=True),
+            ScriptedResponse(frames=[Frame(text_delta_frame("ok")), Frame(finish_frame("stop"))]),
+        ]
+    ) as server:
+        chunks = await consume(
+            make_adapter(server, MaasTimeouts(header_s=0.3, chunk_s=5.0)),
+            make_request(timeout_s=10.0),
+        )
+
+    validate_sequence(chunks, "req-1")
+    assert [chunk.type for chunk in chunks] == ["text_delta", "finish"]
+    assert len(server.requests) == 5  # general_retries=1 + timeout_retries=3: neither cap hit
+
+
+async def test_timeout_backoff_bounded_by_total_deadline() -> None:
+    """The timeout gap sleeps only the remaining total budget (OP-7 bound)."""
+    async with fake_server([ScriptedResponse(hang_headers=True) for _ in range(2)]) as server:
+        started = time.monotonic()
+        chunks = await consume(
+            make_adapter(server, MaasTimeouts(header_s=0.2, chunk_s=5.0)),
+            make_request(timeout_s=0.5),
+        )
+        elapsed = time.monotonic() - started
+
+    validate_sequence(chunks, "req-1")
+    terminal = chunks[-1]
+    assert isinstance(terminal, ErrorChunk)
+    assert terminal.error.code == CoreErrorCode.PROVIDER_UNAVAILABLE
+    assert terminal.error.details["timeout_kind"] == "total"
+    assert len(server.requests) == 2  # the 2 s gap truncated to ~0.3 s: one retry issued
+    assert elapsed < 1.5
 
 
 async def test_chunk_timeout() -> None:
