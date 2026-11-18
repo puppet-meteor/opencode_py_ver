@@ -138,6 +138,20 @@ def _maas_env() -> tuple[str, str]:
     return base_url, api_key
 
 
+#: The workflow-tools face of the server host (T-C1-LG-001): the native
+#: workflow pair (workflow__run/workflow__status) and the resident
+#: BrainDriver stay off by default; "1"/"true"/"yes" (case-insensitive)
+#: opts the serving host in, mirroring the CLI's ``--workflow-tools`` flag.
+_WORKFLOW_TOOLS_ENV = "OPENCODE_PY_WORKFLOW_TOOLS"
+
+
+def _workflow_tools_env() -> bool:
+    raw = os.environ.get(_WORKFLOW_TOOLS_ENV)
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
 def _alembic_root() -> Path:
     """alembic.ini discovery: cwd upward first, then the package location."""
     for candidate in (Path.cwd(), *Path.cwd().parents):
@@ -393,6 +407,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         mcp_refs=mcp_refs,
         pipeline_engine=pipeline_engine,
         skills_dir=skills_dir,
+        workflow_tools=_workflow_tools_env(),
     )
     # P6-S5 (T-C1-098): late-bind before the server starts taking requests
     # (an unbound adapter would fail closed as a wiring defect at first
