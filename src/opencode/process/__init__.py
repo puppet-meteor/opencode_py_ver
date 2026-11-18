@@ -21,6 +21,7 @@ subprocess (the plan §3 item 25 read-loop-timeout consolidation).
 from opencode.process.interpreter import (
     DEFAULT_TIMEOUT_S,
     PROBE_TIMEOUT_S,
+    SHELL_ENV,
     Interpreter,
     resolve_interpreter,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "KILL_GRACE_S",
     "POLL_INTERVAL_S",
     "PROBE_TIMEOUT_S",
+    "SHELL_ENV",
     "Interpreter",
     "RunResult",
     "resolve_interpreter",

@@ -862,3 +862,90 @@ async def test_bash_reject_denies_without_execution(tmp_path: Path) -> None:
             (session.session_id, PY_TOOL_STARTED),
         )
         assert started == []
+
+
+# ---------------------------------------------------------------------------
+# T-C1-PT-002 (parity D5): the explicit shell-selection face (OPENCODE_PY_SHELL)
+# ---------------------------------------------------------------------------
+
+
+def test_infer_family_covers_the_ts_meta_arms() -> None:
+    """select.ts meta()/args() families from the executable name."""
+    from opencode.process.interpreter import _infer_family
+
+    assert _infer_family("pwsh") == "powershell"
+    assert _infer_family(r"C:\Program Files\PowerShell\7\pwsh.EXE") == "powershell"
+    assert _infer_family(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe") == "powershell"
+    assert _infer_family("cmd") == "cmd"
+    assert _infer_family(r"C:\WINDOWS\system32\cmd.exe") == "cmd"
+    assert _infer_family(r"C:\Program Files\Git\bin\bash.exe") == "bash"
+    assert _infer_family("/bin/sh") == "bash"
+
+
+def test_cmd_family_argv_is_the_ts_args_shape() -> None:
+    """select.ts args() L166: the cmd arm is [exe, /c, command]."""
+    from opencode.process.interpreter import Interpreter
+
+    cmd = Interpreter(executable=r"C:\WINDOWS\system32\cmd.exe", family="cmd")
+    assert cmd.argv("echo hi") == [r"C:\WINDOWS\system32\cmd.exe", "/c", "echo hi"]
+    ps = Interpreter(executable="pwsh", family="powershell")
+    assert ps.argv("echo hi") == ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "echo hi"]
+    sh = Interpreter(executable="bash", family="bash")
+    assert sh.argv("echo hi") == ["bash", "-c", "echo hi"]
+
+
+async def test_shell_env_selects_the_configured_interpreter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The config-priority face: OPENCODE_PY_SHELL pins the executable.
+
+    sys.executable is the honest cross-platform probe target: its name infers
+    the sh-like family, so the command runs as ``python -c <command>`` -- a
+    real spawn through the real selection face, no platform dependency.
+    """
+    import opencode.process.interpreter as interpreter_module
+
+    monkeypatch.setattr(interpreter_module, "_INTERPRETER_CACHE", {})
+    monkeypatch.setenv("OPENCODE_PY_SHELL", sys.executable)
+
+    outcome = await _run(tmp_path, {"command": "print('selected-ok-77')"})
+
+    assert outcome.state == "succeeded", _texts(outcome)
+    assert _structured_exit(outcome) == 0
+    assert "selected-ok-77" in _one_text(outcome)
+
+
+async def test_shell_env_unavailable_value_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured value that does not resolve is an explicit diagnostic, never a fallback."""
+    from types import SimpleNamespace
+
+    import opencode.process.interpreter as interpreter_module
+
+    monkeypatch.setattr(interpreter_module, "_INTERPRETER_CACHE", {})
+    monkeypatch.setattr(interpreter_module, "shutil", SimpleNamespace(which=lambda name: None))
+    monkeypatch.setenv("OPENCODE_PY_SHELL", "definitely-missing-shell-xyz")
+
+    outcome = await _run(tmp_path, {"command": _echo_command("never")})
+
+    assert outcome.state == "failed"
+    assert outcome.effect_status == "unknown"  # frozen-Invoker mapping (disclosure above)
+    assert outcome.error is not None and outcome.error.code is CoreErrorCode.TOOL_FAILED
+    text = _one_text(outcome)
+    assert "OPENCODE_PY_SHELL" in text
+    assert "definitely-missing-shell-xyz" in text
+    assert "no silent fallback" in text
+
+
+def test_default_resolution_unchanged_without_the_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset (or blank) OPENCODE_PY_SHELL keeps the platform default chain byte-identical."""
+    import opencode.process.interpreter as interpreter_module
+
+    monkeypatch.delenv("OPENCODE_PY_SHELL", raising=False)
+    monkeypatch.setattr(interpreter_module, "_INTERPRETER_CACHE", {})
+    interpreter, problem = resolve_interpreter()
+    assert problem is None
+    assert interpreter is not None
+    if _PLATFORM == "win32":
+        assert interpreter.family == "powershell"
+        assert interpreter.argv("c")[-2:] == ["-Command", "c"]
+    else:
+        assert interpreter.family == "bash"
+        assert interpreter.argv("c")[-2:] == ["-c", "c"]

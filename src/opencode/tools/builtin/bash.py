@@ -63,6 +63,7 @@ from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.process import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT_S,
+    SHELL_ENV,
     RunResult,
     resolve_interpreter,
     run_command,
@@ -85,7 +86,9 @@ BASH_MAX_OUTPUT_BYTES = DEFAULT_MAX_OUTPUT_BYTES
 
 BASH_DESCRIPTION = (
     "Execute a shell command and return its output. Commands run on the explicit "
-    "interpreter of the host platform (bash on Unix, PowerShell on Windows). "
+    "interpreter of the host platform (bash on Unix, PowerShell on Windows), or the one "
+    "pinned by the host's OPENCODE_PY_SHELL setting (a name on PATH or an absolute path; "
+    "bash, PowerShell and cmd command shapes are inferred from the executable name). "
     "Quote file paths containing spaces or special characters. The command runs "
     "with a default timeout of 120 seconds; pass a larger timeout for long-running "
     "commands or 0 to disable the timeout. Output above the limit is truncated. "
@@ -262,7 +265,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
     timeout_s = cast("int | float", input.get("timeout", BASH_DEFAULT_TIMEOUT_S))
     deny_label = _deny_label(command)
 
-    interpreter, problem = resolve_interpreter()
+    interpreter, problem = resolve_interpreter(os.environ.get(SHELL_ENV, "").strip() or None)
     if interpreter is None:
         assert problem is not None  # the discovery always states a problem on failure
         return _failure(
