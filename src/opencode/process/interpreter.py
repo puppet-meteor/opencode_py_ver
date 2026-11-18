@@ -47,7 +47,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import PurePath
 from typing import Literal
 
 #: TS ``tool/plugin/shell.ts`` L24 ``DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000`` --
@@ -108,8 +107,15 @@ def _infer_family(executable: str) -> Literal["bash", "powershell", "cmd"]:
     entries), ``cmd`` is its own family (``args()``'s first arm), and every
     other name (bash, sh, zsh, dash, ...) is the sh-like ``-c`` family --
     TS ``args()``'s final arm, which covers them all identically.
+
+    The basename is separator-agnostic (both ``/`` and ``\\`` strip the
+    directory) -- a deliberate robustness superset over TS ``name()``'s
+    platform branch (win32 windowsPath vs posix basename): a Windows-style
+    configured path infers the same family on any host, so the inference is
+    platform-independent by construction (CI-linux follow-up to T-C1-PT-002:
+    ``PurePath`` on POSIX does not treat ``\\`` as a separator).
     """
-    name = PurePath(executable).name.lower()
+    name = executable.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if name.endswith(".exe"):
         name = name[: -len(".exe")]
     if name in ("pwsh", "powershell"):
