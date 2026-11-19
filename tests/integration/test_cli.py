@@ -138,6 +138,66 @@ def test_single_shot_e2e_exit_0_and_projection_rows(tmp_path: Path, capsys: pyte
     asyncio.run(_assert_union_projection(db_path, session_row[0]))
 
 
+def test_format_json_emits_the_ts_shaped_jsonl_stream(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """T-C1-PT-009 (parity D2): ``--format json`` replaces the preview/[final]/
+    [run] text faces with one JSON object per line — the TS noninteractive
+    JSONL shape {type, timestamp(ms), sessionID, part} (anchor:
+    cli/src/run/noninteractive.ts emit); success is silent at the terminal
+    (the exit code carries it, exactly like TS)."""
+    host = _ServerHost([_ok_response("hel", "lo")])
+    base_url = host.start()
+    try:
+        db_path = tmp_path / "cli-json.db"
+        code = main([*_argv(db_path, f"{base_url}/v1", "say", "hello"), "--format", "json"])
+    finally:
+        host.stop()
+    assert code == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines, "the json stream must not be empty"
+    events = [json.loads(line) for line in lines]
+    types = [event["type"] for event in events]
+    # the step lifecycle + the finalized text part; no tool in this script
+    assert "step_start" in types
+    assert "text" in types
+    assert "step_finish" in types
+    text_event = next(event for event in events if event["type"] == "text")
+    assert text_event["part"]["text"] == "hello"
+    assert text_event["part"]["type"] == "text"
+    # every line carries the TS envelope: type + epoch-ms timestamp + sessionID
+    for event in events:
+        assert isinstance(event["timestamp"], int)
+        assert event["sessionID"]
+    # the default-mode faces are silent in json mode (structure, never both)
+    assert not any("[run]" in line or "[final]" in line for line in lines)
+    assert code == 0  # success rides the exit code, no terminal json line
+
+
+def test_format_json_failed_run_emits_the_ts_error_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The failed-run face mirrors TS reportRunError: one {"type": "error", ...,
+    "error": {type, message}} line + exit 1."""
+    host = _ServerHost([])
+    base_url = host.start()
+    try:
+        db_path = tmp_path / "cli-json-failed.db"
+        code = main(
+            [
+                *_argv(db_path, f"{base_url}/v1", "hello", context_limit="4097"),
+                "--format",
+                "json",
+            ]
+        )
+    finally:
+        host.stop()
+    assert code == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    error_events = [json.loads(line) for line in lines if '"error"' in line]
+    assert error_events, "a failed run must emit the error json line"
+    event = error_events[-1]
+    assert event["type"] == "error"
+    assert event["error"]["type"] == "unknown"
+    assert event["error"]["message"]
+
+
 def test_failed_run_maps_to_exit_1(tmp_path: Path) -> None:
     """②a: a context-budget failure (§7 L339 host-configured:
     ``--context-limit 4097`` leaves 1 available token after the default 4096

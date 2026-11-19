@@ -66,11 +66,13 @@ import contextlib
 import ctypes
 import importlib.metadata
 import io
+import json
 import os
 import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
@@ -91,6 +93,8 @@ from opencode.contracts.events import (
     PY_PERMISSION_REQUESTED,
     PY_REASONING_DELTA,
     PY_REASONING_FINALIZED,
+    PY_STEP_FINISHED,
+    PY_STEP_STARTED,
     PY_TEXT_DELTA,
     PY_TEXT_FINALIZED,
     PY_TOOL_FINISHED,
@@ -218,6 +222,11 @@ _PREVIEW_TYPES = frozenset(
     }
 )
 
+#: T-C1-PT-009 (parity D2): ``--format json`` widens the preview subscription
+#: with the step lifecycle — the TS JSONL stream (cli/src/run/noninteractive.ts)
+#: emits step_start/step_finish alongside text/reasoning/tool_use/error.
+_JSON_TYPES = _PREVIEW_TYPES | frozenset({PY_STEP_STARTED, PY_STEP_FINISHED})
+
 # §5.3: every C0 control except \t and \n, DEL, and C1 become U+FFFD; the
 # ESC replacement also dissolves CSI sequences. Deterministic, side-effect free.
 _REPLACEMENT = "\ufffd"
@@ -282,6 +291,17 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
             "database file path (default: the global data dir, "
             "$XDG_DATA_HOME/opencode/opencode.db else ~/.local/share/opencode/opencode.db; "
             "the OPENCODE_PY_DB env overrides the default the same way)"
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("default", "json"),
+        default="default",
+        help=(
+            "output format (T-C1-PT-009, parity D2): 'json' emits one JSON object per line "
+            "{type, timestamp(ms), sessionID, part|error} for text/reasoning/step_start/"
+            "tool_use/step_finish/error — the TS noninteractive JSONL face; the exit code "
+            "carries the terminal (no [run] line)"
         ),
     )
     parser.add_argument(
@@ -814,6 +834,7 @@ def main(
                 skills_dir=loader.skills_directory(),
                 workflow_tools=args.workflow_tools,
                 auto_approve=args.auto,
+                json_output=args.format == "json",
             )
         )
     except _SelectionError as error:
@@ -981,6 +1002,7 @@ async def _drive(
     skills_dir: Path,
     workflow_tools: bool = False,
     auto_approve: bool = False,
+    json_output: bool = False,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -1131,12 +1153,20 @@ async def _drive(
                 request_id=f"{request_base}_1",
                 wait_hook=wait_hook,
                 repl_input=repl_input,
+                json_output=json_output,
             )
             if status is None:
                 return _CLEANUP_EXIT_CODE
-            _print_terminal(status)
+            _print_terminal(status, json_output=json_output, session_id=session_id)
             return _ROUND_EXIT_CODES[status.status]
-        return await _repl(app, session_id, repl_input=repl_input, wait_hook=wait_hook, request_base=request_base)
+        return await _repl(
+            app,
+            session_id,
+            repl_input=repl_input,
+            wait_hook=wait_hook,
+            request_base=request_base,
+            json_output=json_output,
+        )
     finally:
         # Dropped before close: a SIGINT during the graceful close falls back
         # to the default raise (the 130 face) instead of vanishing in-band.
@@ -1151,6 +1181,7 @@ async def _repl(
     repl_input: _ReplInput,
     wait_hook: Callable[[], None] | None,
     request_base: str,
+    json_output: bool = False,
 ) -> int:
     """The REPL face: commands first (/exit, /history, /approve, /reject),
     any other line is one round; the prompt echoes only on real stdin."""
@@ -1188,10 +1219,11 @@ async def _repl(
             request_id=f"{request_base}_{counter}",
             wait_hook=wait_hook,
             repl_input=repl_input,
+            json_output=json_output,
         )
         if status is None:
             return _CLEANUP_EXIT_CODE
-        _print_terminal(status)
+        _print_terminal(status, json_output=json_output, session_id=session_id)
 
 
 async def _reply_permission(app: App, command: str, *, default_reply: str) -> None:
@@ -1245,6 +1277,7 @@ async def _run_round(
     request_id: str,
     wait_hook: Callable[[], None] | None,
     repl_input: _ReplInput,
+    json_output: bool = False,
 ) -> RunStatus | None:
     """One run: subscribe first (no early events lost), prompt, then poll the
     durable terminal; the bus printer is preview-only, never authoritative.
@@ -1252,9 +1285,13 @@ async def _run_round(
     R3-S7: a parallel input pump keeps reading while the run waits, so an
     approval can complete mid-run (§7 L316 independence from the run locks);
     /approve//reject dispatch immediately, any other line defers to the next
-    prompt, and a SIGINT becomes the (idempotent) cancel intent."""
-    async with app.bus.subscribe(session_id, _PREVIEW_TYPES) as events:
-        printer = asyncio.create_task(_print_events(events))
+    prompt, and a SIGINT becomes the (idempotent) cancel intent.
+
+    T-C1-PT-009 (parity D2): ``json_output`` widens the subscription to the
+    step lifecycle and switches the printer to the TS JSONL face."""
+    subscription_types = _JSON_TYPES if json_output else _PREVIEW_TYPES
+    async with app.bus.subscribe(session_id, subscription_types) as events:
+        printer = asyncio.create_task(_print_events(events, json_output=json_output, session_id=session_id))
         pump = asyncio.create_task(_pump_input(app, repl_input))
         try:
             ref = await app.service.prompt(session_id, text, request_id)
@@ -1334,17 +1371,60 @@ async def _cancel_run(service: SessionService, run_id: str) -> bool:
     return True
 
 
-async def _print_events(events: AsyncIterator[Event]) -> None:
+def _emit_json_line(session_id: str, type_: str, payload: dict[str, object]) -> None:
+    """One JSONL event line (T-C1-PT-009, parity D2).
+
+    The TS anchor (cli/src/run/noninteractive.ts ``emit``) writes
+    ``JSON.stringify({type, timestamp, sessionID, ...data}) + EOL`` per event
+    on stdout; the timestamp is epoch milliseconds. The py face mirrors the
+    six TS event types — text/reasoning/step_start/tool_use/step_finish/error
+    — so downstream consumers (scripts, pipelines, the parity harness) read
+    the same stream shape across implementations.
+    """
+    line = {"type": type_, "timestamp": int(time.time() * 1000), "sessionID": session_id, **payload}
+    sys.stdout.write(json.dumps(line, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+async def _print_events(events: AsyncIterator[Event], *, json_output: bool = False, session_id: str = "") -> None:
     """Live preview printer: deltas inline, the durable finalized value on its
     own ``[final]`` line (§4 L244/L246 preview -> override, distinguishable in
     the output), tool events single-line, and one pending-approval notice per
     ``py.permission.requested`` (R3-S7: the prompt face of the approval
     channel). A SlowConsumerError disconnect is display-only: the terminal
-    stays with run_status polling."""
+    stays with run_status polling.
+
+    T-C1-PT-009 (parity D2): ``json_output=True`` switches the face to the TS
+    JSONL stream — finalized part events only (the TS json face has no
+    delta-level events), plus step_start/step_finish/tool_use; the preview
+    delta/permission/``[final]`` lines are silent in this mode (a non-TTY
+    default-mode consumer already gets the plain text; the json consumer gets
+    structure, never both interleaved).
+    """
     inline_open = False
     try:
         async for event in events:
             data = event.data
+            if json_output:
+                if event.type == PY_TEXT_FINALIZED:
+                    _emit_json_line(
+                        session_id,
+                        "text",
+                        {"part": {"type": "text", "part_id": data.part_id, "text": data.text}},
+                    )
+                elif event.type == PY_REASONING_FINALIZED:
+                    _emit_json_line(
+                        session_id,
+                        "reasoning",
+                        {"part": {"type": "reasoning", "part_id": data.part_id, "text": data.text}},
+                    )
+                elif event.type == PY_STEP_STARTED:
+                    _emit_json_line(session_id, "step_start", {"part": data.model_dump(mode="json")})
+                elif event.type == PY_STEP_FINISHED:
+                    _emit_json_line(session_id, "step_finish", {"part": data.message.model_dump(mode="json")})
+                elif event.type == PY_TOOL_FINISHED:
+                    _emit_json_line(session_id, "tool_use", {"part": data.model_dump(mode="json")})
+                continue
             if event.type in (PY_TEXT_DELTA, PY_REASONING_DELTA):
                 sys.stdout.write(escape_for_display(data.delta))
                 sys.stdout.flush()
@@ -1415,7 +1495,15 @@ def _print_message(message: SessionMessage) -> None:
         print(f"[idle] {message.outcome}{escape_for_display(suffix)}")
 
 
-def _print_terminal(status: RunStatus) -> None:
+def _print_terminal(status: RunStatus, *, json_output: bool = False, session_id: str = "") -> None:
+    """The terminal face: default mode prints one ``[run]`` line; json mode
+    (T-C1-PT-009, parity D2) stays silent on success — the TS json stream has
+    no success line, the exit code carries the terminal — and emits the TS
+    ``reportRunError`` shape on failure."""
+    if json_output:
+        if status.error is not None:
+            _emit_json_line(session_id, "error", {"error": {"type": "unknown", "message": status.error}})
+        return
     line = f"[run] {status.status.value}"
     if status.error is not None:
         line += f" error: {escape_for_display(status.error)}"
