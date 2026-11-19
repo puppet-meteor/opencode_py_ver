@@ -33,7 +33,14 @@ adapter). P7-S4 (T-C1-103) adds the websearch tool
 the one consent-flow builtin -- hosts bind a WebSearchService (the
 provider registry + KV selection seam) to the named instance after
 construction (``WebSearchAdapter.bind``), so host faces carry 19
-adapters (18 base + the platform-gated PTY adapter).
+adapters (18 base + the platform-gated PTY adapter). T-C1-PT-012 adds
+the read-only memory trio ``memory__search`` /
+``memory__conversation_search`` / ``memory__read_scene`` (same
+dual-host ride): the fail-soft builtins -- a host passes the gateway
+client at construction and an unconfigured client is the expected
+headless state (plan §4.2/§4.3), rendered as the structured
+service-unavailable payload, never a raise -- so host faces carry 22
+adapters (21 base + the platform-gated PTY adapter).
 """
 
 from opencode.tools.builtin.bash import (
@@ -108,6 +115,21 @@ from opencode.tools.builtin.ls import (
     LS_SPEC,
     LS_VERSION,
     FsLsAdapter,
+)
+from opencode.tools.builtin.memory import (
+    MEMORY_CONVERSATION_SEARCH_NAME,
+    MEMORY_CONVERSATION_SEARCH_SPEC,
+    MEMORY_NAMESPACE,
+    MEMORY_NO_RESULTS,
+    MEMORY_READ_SCENE_NAME,
+    MEMORY_READ_SCENE_SPEC,
+    MEMORY_SEARCH_NAME,
+    MEMORY_SEARCH_SPEC,
+    MEMORY_UNAVAILABLE,
+    MEMORY_VERSION,
+    MemoryConversationSearchAdapter,
+    MemoryReadSceneAdapter,
+    MemorySearchAdapter,
 )
 from opencode.tools.builtin.patch import (
     PATCH_DESCRIPTION,
@@ -268,6 +290,16 @@ __all__ = [
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
+    "MEMORY_CONVERSATION_SEARCH_NAME",
+    "MEMORY_CONVERSATION_SEARCH_SPEC",
+    "MEMORY_NAMESPACE",
+    "MEMORY_NO_RESULTS",
+    "MEMORY_READ_SCENE_NAME",
+    "MEMORY_READ_SCENE_SPEC",
+    "MEMORY_SEARCH_NAME",
+    "MEMORY_SEARCH_SPEC",
+    "MEMORY_UNAVAILABLE",
+    "MEMORY_VERSION",
     "NO_TEXT_RESPONSE",
     "PATCH_DESCRIPTION",
     "PATCH_INPUT_SCHEMA",
@@ -352,6 +384,9 @@ __all__ = [
     "GitWorktreeAddAdapter",
     "GitWorktreeListAdapter",
     "GitWorktreeRemoveAdapter",
+    "MemoryConversationSearchAdapter",
+    "MemoryReadSceneAdapter",
+    "MemorySearchAdapter",
     "PatchApplyAdapter",
     "PtyRunAdapter",
     "QuestionAskAdapter",

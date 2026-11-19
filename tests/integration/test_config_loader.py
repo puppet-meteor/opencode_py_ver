@@ -797,3 +797,60 @@ def test_malformed_global_headers_is_a_config_error(tmp_path: Path, monkeypatch:
     global_path = _write_json(tmp_path / "global.json", {"headers": {"X-Auth-Token": 123}})
     with pytest.raises(ConfigError, match="'headers'"):
         ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+# ---------------------------------------------------------------------------
+# T-C1-PT-012: the ``memory`` host-tier key (the Agent-Memory gateway block).
+# ---------------------------------------------------------------------------
+
+
+def test_global_layer_memory_block_rides_the_merged_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    block = {"base_url": "https://mem.example", "service_id": "svc-1", "api_key": "mem-key"}
+    global_path = _write_json(tmp_path / "global.json", {"memory": block})
+    layered = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+    assert layered.values["memory"] == block
+
+
+def test_an_empty_memory_block_is_not_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Incomplete reads as unconfigured (the tools' fail-soft face); only a
+    # wrong-typed PRESENT key fails.
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"memory": {}})
+    layered = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+    assert layered.values["memory"] == {}
+
+
+def test_an_unknown_memory_subkey_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"memory": {"base_url": "https://m", "port": 9}})
+    with pytest.raises(ConfigError, match=r"unknown config field 'memory\.port'"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+def test_a_non_string_memory_value_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(
+        tmp_path / "global.json", {"memory": {"base_url": "https://m", "service_id": "s", "api_key": 5}}
+    )
+    with pytest.raises(ConfigError, match=r"'memory\.api_key' in .* must be a non-empty string"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+def test_an_empty_string_memory_value_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"memory": {"base_url": ""}})
+    with pytest.raises(ConfigError, match=r"'memory\.base_url' in .* must be a non-empty string"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+def test_a_non_object_memory_block_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"memory": ["svc"]})
+    with pytest.raises(ConfigError, match=r"'memory' in .* must be an object"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+
+
+# The project-layer rejection of the host-only ``memory`` key is covered by
+# the sorted(HOST_ONLY_KEYS) parametrization above (acceptance C) -- adding
+# the key to the frozenset added the case automatically.

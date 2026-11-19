@@ -708,16 +708,17 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
     """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073; the
     linux branch added by the T2 authorization T-C1-074).
 
-    Every unverified platform (darwin etc.) asserts the eighteen-name tuple
-    (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098 subagent
-    tool plus the T-C1-102 webfetch tool plus the T-C1-103 websearch tool)
-    unchanged; win32 (the T1 winpty-agent face) and linux (the T2 stdlib
-    face) assert the eighteen plus the appended ``PtyRunAdapter`` (19
-    names), the ``*pty_adapters()`` splice in ``_builtin_adapters``. The
-    trio census bump is the additive expected-minimum-update face (the
-    T-C1-096 route-census precedent); the T-C1-098 subagent bump, the
-    T-C1-102 webfetch bump and the T-C1-103 websearch bump are the same
-    additive shape.
+    Every unverified platform (darwin etc.) asserts the twenty-one-name
+    tuple (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098
+    subagent tool plus the T-C1-102 webfetch tool plus the T-C1-103
+    websearch tool plus the T-C1-PT-012 memory trio) unchanged; win32 (the
+    T1 winpty-agent face) and linux (the T2 stdlib face) assert the
+    twenty-one plus the appended ``PtyRunAdapter`` (22 names), the
+    ``*pty_adapters()`` splice in ``_builtin_adapters``. The trio census
+    bump is the additive expected-minimum-update face (the T-C1-096
+    route-census precedent); the T-C1-098 subagent bump, the T-C1-102
+    webfetch bump, the T-C1-103 websearch bump and the T-C1-PT-012 memory
+    bump are the same additive shape.
     """
     names = tuple(type(adapter).__name__ for adapter in _builtin_adapters(("C:/work",)))
     expected = (
@@ -739,6 +740,9 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
         "SubagentRunAdapter",
         "WebFetchAdapter",
         "WebSearchAdapter",
+        "MemorySearchAdapter",
+        "MemoryConversationSearchAdapter",
+        "MemoryReadSceneAdapter",
     )
     if sys.platform == "win32" or sys.platform == "linux":
         assert names == (*expected, "PtyRunAdapter")

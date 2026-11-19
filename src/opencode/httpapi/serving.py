@@ -41,6 +41,7 @@ from opencode.config.product import default_db_path
 from opencode.contracts.events import ConfigSnapshotV3, JobBudget
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
+from opencode.memory import MemoryGatewayClient, memory_config_from_values
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
 from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
@@ -59,6 +60,9 @@ from opencode.tools.builtin import (
     GitWorktreeAddAdapter,
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
+    MemoryConversationSearchAdapter,
+    MemoryReadSceneAdapter,
+    MemorySearchAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
     SubagentRunAdapter,
@@ -226,6 +230,7 @@ def _builtin_adapters(
     subagent: SubagentRunAdapter | None = None,
     webfetch: WebFetchAdapter | None = None,
     websearch: WebSearchAdapter | None = None,
+    memory_client: MemoryGatewayClient | None = None,
 ) -> tuple[ToolAdapter, ...]:
     """The builtin tool adapters (the CLI ``_drive`` list, same order).
 
@@ -258,6 +263,14 @@ def _builtin_adapters(
     WebSearchService right after construction (the provider registry +
     KV selection seam); a caller that omits it gets a fresh unbound
     instance, so the census face keeps composing the complete host set.
+
+    T-C1-PT-012 (plan §4): the read-only memory trio rides the same twin
+    compositions (22 adapters per host face = 21 base + the platform-
+    gated PTY adapter). The fail-soft inversion of the named-instance
+    pattern: the trio takes the gateway client at CONSTRUCTION (a
+    ``None`` client -- unconfigured -- is the expected headless state of
+    plan §4.2, not a wiring defect), every call answered with the
+    structured service-unavailable payload, never a raise (§4.3).
     """
     if subagent is None:
         subagent = SubagentRunAdapter()
@@ -284,6 +297,12 @@ def _builtin_adapters(
         subagent,
         webfetch,
         websearch,
+        # T-C1-PT-012 (plan §4): the memory trio -- construction-injected
+        # client (None = unconfigured = the fail-soft face, §4.2/§4.3),
+        # same order as the CLI ``_drive`` twin.
+        MemorySearchAdapter(memory_client),
+        MemoryConversationSearchAdapter(memory_client),
+        MemoryReadSceneAdapter(memory_client),
         *pty_adapters(),
     )
 
@@ -339,6 +358,12 @@ def serve(db_path: str | Path | None = None) -> None:
         "dict[str, str] | None",
         headers_value if isinstance(headers_value, dict) and headers_value else None,
     )
+    # T-C1-PT-012 (plan §4): the memory gateway client from the same host
+    # tiers (the ``memory`` block) -- None when absent/incomplete, the
+    # fail-soft face the trio answers with as the structured
+    # service-unavailable payload.
+    memory_config = memory_config_from_values(loader.load().values)
+    memory_client = MemoryGatewayClient(memory_config) if memory_config is not None else None
     mcp_manager = _compose_mcp_manager(loader)
     if isinstance(runtime.snapshot, ConfigSnapshotV3):
         mcp_refs = list(runtime.snapshot.mcp_servers)
@@ -431,7 +456,11 @@ def serve(db_path: str | Path | None = None) -> None:
         resolved_db,
         provider=provider,
         tools=_builtin_adapters(
-            runtime.roots, subagent=subagent_run, webfetch=webfetch_fetch, websearch=websearch_search
+            runtime.roots,
+            subagent=subagent_run,
+            webfetch=webfetch_fetch,
+            websearch=websearch_search,
+            memory_client=memory_client,
         ),
         settings=runtime.settings,
         max_steps=runtime.snapshot.limits.max_steps,

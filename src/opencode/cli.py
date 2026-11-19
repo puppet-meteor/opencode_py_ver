@@ -114,6 +114,7 @@ from opencode.contracts.messages import (
     UserMessage,
 )
 from opencode.mcp import McpManager, StdioServerDefinition
+from opencode.memory import MemoryGatewayClient, memory_config_from_values
 from opencode.orchestrator.engine import EngineCheckpointer, PipelineEngine
 from opencode.orchestrator.gates import GateBroker
 from opencode.orchestrator.llm_call import MaasLlmCall, checkpointer_path_for
@@ -149,6 +150,9 @@ from opencode.tools.builtin import (
     GitWorktreeAddAdapter,
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
+    MemoryConversationSearchAdapter,
+    MemoryReadSceneAdapter,
+    MemorySearchAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
     SubagentRunAdapter,
@@ -825,6 +829,13 @@ def main(
             )
         runtime = recovery.runtime if recovery is not None else host_runtime
         mcp_manager = _compose_mcp_manager(loader)
+        # T-C1-PT-012 (plan §4): the memory gateway client from the host
+        # tiers' ``memory`` block -- None (the fail-soft face) when the
+        # block is absent or incomplete; the trio answers every call with
+        # the structured service-unavailable payload in that state. The
+        # loader.load() face mirrors the serving host's headers read.
+        memory_config = memory_config_from_values(loader.load().values)
+        memory_client = MemoryGatewayClient(memory_config) if memory_config is not None else None
         return asyncio.run(
             _drive(
                 db_path,
@@ -837,6 +848,7 @@ def main(
                 working_dir=recovery.working_dir if recovery is not None else None,
                 mcp_manager=mcp_manager,
                 mcp_refs=host_mcp_refs,
+                memory_client=memory_client,
                 pipeline_engine=pipeline_engine,
                 skills_dir=loader.skills_directory(),
                 workflow_tools=args.workflow_tools,
@@ -1010,6 +1022,7 @@ async def _drive(
     workflow_tools: bool = False,
     auto_approve: bool = False,
     json_output: bool = False,
+    memory_client: MemoryGatewayClient | None = None,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -1108,6 +1121,14 @@ async def _drive(
             # P7-S4 (T-C1-103): the websearch tool rides the same twin
             # compositions (18 base adapters per host face).
             websearch_search,
+            # T-C1-PT-012 (plan §4): the read-only memory trio rides the
+            # same twin compositions (21 base adapters per host face) --
+            # fail-soft builtins: an unconfigured client is the expected
+            # headless state (§4.2), answered as the structured
+            # service-unavailable payload, never a raise (§4.3).
+            MemorySearchAdapter(memory_client),
+            MemoryConversationSearchAdapter(memory_client),
+            MemoryReadSceneAdapter(memory_client),
             *pty_adapters(),
         ),
         settings=runtime.settings,

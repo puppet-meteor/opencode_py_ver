@@ -137,6 +137,12 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "subagent__run": "ask",
     "webfetch__fetch": "ask",
     "websearch__search": "ask",
+    # T-C1-PT-012 (plan §4.1): the read-only memory trio defaults to ask.
+    # The headless ask=deny contradiction stays registered (§4.2) -- no
+    # candidate direction is preselected here.
+    "memory__search": "ask",
+    "memory__conversation_search": "ask",
+    "memory__read_scene": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

@@ -83,6 +83,10 @@ from opencode.tools.builtin import (
     GREP_NAMESPACE,
     LS_NAME,
     LS_NAMESPACE,
+    MEMORY_CONVERSATION_SEARCH_NAME,
+    MEMORY_NAMESPACE,
+    MEMORY_READ_SCENE_NAME,
+    MEMORY_SEARCH_NAME,
     PATCH_NAME,
     PATCH_NAMESPACE,
     PTY_NAME,
@@ -456,6 +460,9 @@ _BASE_WIRE_NAMES: frozenset[str] = frozenset(
         f"{SUBAGENT_NAMESPACE}__{SUBAGENT_NAME}",
         f"{WEBFETCH_NAMESPACE}__{WEBFETCH_NAME}",
         f"{WEBSEARCH_NAMESPACE}__{WEBSEARCH_NAME}",
+        f"{MEMORY_NAMESPACE}__{MEMORY_SEARCH_NAME}",
+        f"{MEMORY_NAMESPACE}__{MEMORY_CONVERSATION_SEARCH_NAME}",
+        f"{MEMORY_NAMESPACE}__{MEMORY_READ_SCENE_NAME}",
     }
 )
 
@@ -466,9 +473,10 @@ _PTY_PLATFORMS: tuple[str, ...] = ("win32", "linux")
 
 
 def _expected_worker_wire_names() -> frozenset[str]:
-    """The worker catalog's full expected enum: the eighteen base names (the
-    twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098 subagent tool
-    plus the T-C1-102 webfetch tool plus the T-C1-103 websearch tool) plus
+    """The worker catalog's full expected enum: the twenty-one base names
+    (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098 subagent
+    tool plus the T-C1-102 webfetch tool plus the T-C1-103 websearch tool
+    plus the T-C1-PT-012 memory trio) plus
     the pty wire name on the verified platforms only."""
     names = set(_BASE_WIRE_NAMES)
     if sys.platform in _PTY_PLATFORMS:
@@ -541,10 +549,10 @@ class TestRegistryIsolation:
         """The platform branch (T-B-087 ruling 2 / T-C1-073, T-C1-074): the
         ``pty__run`` wire name rides the composition only on the verified
         platforms (win32 the T1 winpty face, linux the T2 stdlib face);
-        every other platform enumerates exactly the eighteen base names
+        every other platform enumerates exactly the twenty-one base names
         (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098
         subagent tool plus the T-C1-102 webfetch tool plus the T-C1-103
-        websearch tool)."""
+        websearch tool plus the T-C1-PT-012 memory trio)."""
         registry = ToolRegistry()
         for adapter in _builtin_adapters(("C:/work",)):
             registry.register(adapter)
@@ -552,10 +560,10 @@ class TestRegistryIsolation:
         wire_name = f"{PTY_NAMESPACE}__{PTY_NAME}"
         if sys.platform in _PTY_PLATFORMS:  # present arm
             assert catalog.resolve(wire_name) is not None
-            assert len(catalog.specs) == 19
+            assert len(catalog.specs) == 22
         else:  # absent arm
             assert catalog.resolve(wire_name) is None
-            assert len(catalog.specs) == 18
+            assert len(catalog.specs) == 21
 
     def test_the_composition_and_the_builtin_export_surface_are_bijective(self) -> None:
         """The export-surface completeness double pin (T-B-094 R4 §3-3 (5)).

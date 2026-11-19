@@ -100,7 +100,7 @@ MAX_TOTAL_INSTRUCTION_BYTES = 256 * 1024
 #: trust exactly like ``api_key``; it merges across host tiers key-by-key
 #: (maps recurse in ``_merge_json``), so the product tier can carry one header
 #: and the global tier supplement others.
-HOST_ONLY_KEYS: frozenset[str] = frozenset({"roots", "endpoint", "mcp", "api_key", "credentials", "headers"})
+HOST_ONLY_KEYS: frozenset[str] = frozenset({"roots", "endpoint", "mcp", "api_key", "credentials", "headers", "memory"})
 
 #: Every structural key a config file may carry (unknown keys are a config
 #: error, §6 L285). Host-only keys are listed separately for the tier check.
@@ -126,6 +126,13 @@ _APPEND_LIST_PATHS: frozenset[tuple[str, ...]] = frozenset({("instructions",), (
 
 #: Known sub-keys of the ``permission`` map (anything else is a config error).
 _PERMISSION_KEYS: frozenset[str] = frozenset({"rules"})
+
+#: Known sub-keys of the ``memory`` block (T-C1-PT-012): the Agent-Memory
+#: gateway channel -- base URL, serviceId isolation, Bearer token. All
+#: three are optional individually (an absent/incomplete block simply
+#: leaves the memory tools unconfigured = the fail-soft face); a PRESENT
+#: key must be a non-empty string. Values are never echoed in errors.
+_MEMORY_KEYS: frozenset[str] = frozenset({"base_url", "service_id", "api_key"})
 
 #: Known sub-keys of the ``pipeline`` map (P5-S6, T-C1-090; the nested-guard
 #: precedent is ``_PERMISSION_KEYS`` — anything else is a config error). The
@@ -479,6 +486,22 @@ def _validate_layer_keys(path: Path, values: JsonObject, *, host_tier: bool) -> 
                 raise ConfigError(
                     f"'headers' entries in {path} must be non-empty string names mapping to string values"
                 )
+    memory = values.get("memory")
+    if memory is not None:
+        # T-C1-PT-012: the memory gateway block rides host tiers only
+        # (credentials inside, the api_key discipline); shape discipline
+        # mirrors headers -- named errors, zero value echo. An empty or
+        # incomplete block is NOT an error: it reads as unconfigured (the
+        # tools' fail-soft face); only a wrong-typed present key fails.
+        if not isinstance(memory, dict):
+            raise ConfigError(f"'memory' in {path} must be an object")
+        for key in memory:
+            if key not in _MEMORY_KEYS:
+                raise ConfigError(f"unknown config field 'memory.{key}' in {path} (CORE-CONTRACTS §6 L285)")
+        for key in _MEMORY_KEYS:
+            value = memory.get(key)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ConfigError(f"'memory.{key}' in {path} must be a non-empty string")
     permission = values.get("permission")
     if permission is not None:
         if not isinstance(permission, dict):
