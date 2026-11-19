@@ -660,8 +660,34 @@ class Runner:
                 ],
             )
             if not any(isinstance(part, AssistantToolPart) for part in parts):
-                # No tool calls -> the run completes (TS step.ts Outcome:
-                # every finish reason completes the step; continuation is
+                # T-C1-PT-007: a length finish with zero net content is
+                # NEVER a success terminal. TS runner/step.ts L280 routes
+                # finish=length to Outcome.OutputLimit (not Completed -- the
+                # old comment overclaimed); the TS loop then auto-continues
+                # twice and fails 'output-limit' (runner/llm.ts
+                # continueOutputLimit, 3-length streak). The py port has no
+                # continuation loop, so the zero-yield face -- no tool calls
+                # and no non-empty text/reasoning -- fails the run directly:
+                # a model that burns its whole output budget on hidden
+                # reasoning and sends zero deltas must not be recorded as
+                # succeeded (the GLM-seat silent-success incident).
+                if (
+                    result.finish is not None
+                    and result.finish.reason is FinishReason.LENGTH
+                    and all(
+                        part.text == ""
+                        for part in parts
+                        if isinstance(part, (AssistantTextPart, AssistantReasoningPart))
+                    )
+                ):
+                    limit_error = self._output_limit_error(run_id)
+                    await self._committer.commit(
+                        session_id,
+                        [self._run_finished_draft(session_id, run_id, "failed", limit_error)],
+                    )
+                    return RunResult(outcome="failed", steps=steps, error=limit_error)
+                # No tool calls -> the run completes (TS step.ts Outcome: the
+                # non-length finishes complete the step; continuation is
                 # tool-part driven).
                 try:
                     await self._committer.commit(
@@ -1251,6 +1277,24 @@ class Runner:
             ),
             retryable=False,
             details={"violation": "max_steps", "max_steps": self._max_steps},
+        )
+
+    def _output_limit_error(self, run_id: str) -> CoreError:
+        """T-C1-PT-007: zero-net-content finish=length (the silent-success guard).
+
+        TS runner/step.ts L280 routes finish=length to Outcome.OutputLimit
+        (never Completed); the TS loop auto-continues twice and then fails
+        'output-limit' (runner/llm.ts continueOutputLimit). The py port has
+        no continuation loop, so the zero-yield face fails the run directly.
+        """
+        return CoreError(
+            code=CoreErrorCode.VALIDATION_ERROR,
+            message=(
+                f"run {run_id} step ended finish=length with no content parts (the model exhausted "
+                "its output budget without emitting content; TS OutputLimit anchor, runner/step.ts L280)"
+            ),
+            retryable=False,
+            details={"violation": "output_limit", "finish_reason": "length"},
         )
 
 

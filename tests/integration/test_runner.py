@@ -1170,6 +1170,65 @@ async def test_step_ceiling_fails_the_run(tmp_path: Path) -> None:
         assert run_error.details == {"violation": "max_steps", "max_steps": 1}
 
 
+async def test_length_finish_with_no_content_fails_the_run(tmp_path: Path) -> None:
+    """T-C1-PT-007: zero-net-content finish=length is never a success terminal.
+
+    TS runner/step.ts L280 routes finish=length to Outcome.OutputLimit (the
+    TS loop auto-continues twice then fails 'output-limit'); the py port has
+    no continuation loop, so the zero-yield face fails the run directly --
+    the GLM-seat incident: 16384 output tokens burned on hidden reasoning,
+    zero deltas, finish=length, and the run was recorded succeeded.
+    """
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    script = _Script().usage(output_tokens=16384).finish(FinishReason.LENGTH)
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, _ScriptedProvider([script.items]))
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result.outcome == "failed"
+        assert result.steps == 1
+        assert result.error is not None
+        assert result.error.code is CoreErrorCode.VALIDATION_ERROR
+        assert result.error.details == {"violation": "output_limit", "finish_reason": "length"}
+        assert len(harness.provider.requests) == 1
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.FAILED
+        run_error = state.runs[_RUN_ID].error
+        assert run_error is not None
+        assert run_error.details == {"violation": "output_limit", "finish_reason": "length"}
+        # the step itself completed normally (the stream terminated cleanly;
+        # the failure is the run-level terminal ruling, not a stream fault)
+        assert state.steps["step_r2s6_0001"].status is StepStatus.COMPLETED
+
+
+async def test_length_finish_with_text_still_succeeds(tmp_path: Path) -> None:
+    """T-C1-PT-007 counterpart: length with visible text is NOT the zero-yield face.
+
+    TS auto-continues a truncated-but-visible response (the TS synthetic
+    continue-after-output-limit event); the py port has no continuation loop, and a truncated answer the
+    user can see is not a silent failure -- it stays a success. Only the
+    zero-net-content face (no tool calls, no non-empty text/reasoning) fails.
+    """
+    db_path = tmp_path / "runner.db"
+    _require_success(_upgrade_head(db_path))
+    script = _Script().text("p1", "partial answer truncated").finish(FinishReason.LENGTH)
+    async with open_database(db_path, mode="create") as database:
+        harness = _wire(database, _ScriptedProvider([script.items]))
+        await _bootstrap(harness)
+
+        result = await harness.runner.run(_SESSION_ID, _RUN_ID)
+
+        assert result == RunResult(outcome="succeeded", steps=1)
+        state = await _fold(harness)
+        assert state.runs[_RUN_ID].status is RunStatus.SUCCEEDED
+        assert state.runs[_RUN_ID].error is None
+        message = _assistant(state, state.steps["step_r2s6_0001"].message_id)
+        assert message.finish is FinishReason.LENGTH  # the truncation stays visible on the message
+
+
 async def test_context_limit_fails_run_without_step_footprint(tmp_path: Path) -> None:
     db_path = tmp_path / "runner.db"
     _require_success(_upgrade_head(db_path))
