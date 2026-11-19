@@ -446,7 +446,7 @@ def _inject_product_config(
     xdg_home = tmp_path / "xdg-home"
     config_dir = xdg_home / "opencode"
     config_dir.mkdir(parents=True)
-    models = {} if model is None else {model: {}}
+    models: dict[str, dict[str, object]] = {} if model is None else {model: {}}
     (config_dir / "opencode.json").write_text(
         json.dumps({"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": models}}}),
         encoding="utf-8",
