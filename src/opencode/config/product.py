@@ -145,6 +145,36 @@ def _block_field(block: dict[str, Any], key: str) -> str | None:
     return None
 
 
+def _block_headers(block: dict[str, Any], provider_name: str) -> dict[str, str] | None:
+    """The provider block's custom request headers (T-C1-PT-006 MAAS auth).
+
+    ``headers`` rides flat or under ``options`` like ``baseURL``/``apiKey``.
+    A present-but-malformed value (not an object, non-string keys/values) is
+    a named :class:`ConfigError` with zero value echo — same discipline as
+    the credential fields; an EMPTY map reads as absent (no headers channel).
+    """
+    options = block.get("options")
+    sources: tuple[dict[str, Any], ...] = (block, options if isinstance(options, dict) else {})
+    for source in sources:
+        if "headers" not in source:
+            continue
+        value = source["headers"]
+        if not isinstance(value, dict):
+            raise ConfigError(
+                f"provider block {provider_name!r} in the product config has a non-object 'headers' value"
+            )
+        headers: dict[str, str] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or not isinstance(item, str):
+                raise ConfigError(
+                    f"provider block {provider_name!r} in the product config has invalid 'headers' entries "
+                    "(string keys and string values required)"
+                )
+            headers[key] = item
+        return headers or None
+    return None
+
+
 def resolve_product_values(config_dir: Path) -> dict[str, object] | None:
     """The product tier values from a TS opencode config directory, or None.
 
@@ -153,8 +183,11 @@ def resolve_product_values(config_dir: Path) -> dict[str, object] | None:
     ``OPENCODE_PY_PROVIDER`` block (default ``gateway``) must exist and carry
     ``baseURL``/``apiKey`` (flat or under ``options``) and a non-empty
     ``models`` map — every failure is a named :class:`ConfigError` with zero
-    value echo. The result is exactly ``{"endpoint", "api_key", "model"}``;
-    every other foreign key is ignored, and ``auth.json`` is never read.
+    value echo. The result is exactly ``{"endpoint", "api_key", "model"}``
+    plus ``"headers"`` when the block carries a non-empty ``headers`` map
+    (T-C1-PT-006: the MAAS custom-auth-header channel, flat or under
+    ``options``); every other foreign key is ignored, and ``auth.json`` is
+    never read.
     """
     config_dir = Path(config_dir)
     merged: dict[str, Any] = {}
@@ -186,4 +219,8 @@ def resolve_product_values(config_dir: Path) -> dict[str, object] | None:
     model = next(iter(models))
     if not model:
         raise ConfigError(f"provider block {provider_name!r} in the product config has an empty models key")
-    return {"endpoint": base_url, "api_key": api_key, "model": model}
+    values: dict[str, object] = {"endpoint": base_url, "api_key": api_key, "model": model}
+    headers = _block_headers(block, provider_name)
+    if headers is not None:
+        values["headers"] = headers
+    return values

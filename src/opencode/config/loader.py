@@ -95,8 +95,12 @@ MAX_TOTAL_INSTRUCTION_BYTES = 256 * 1024
 
 #: Host-tier keys (§6 L285): legal only in the global (host) config. A project
 #: layer carrying any of them is a config error — project config cannot extend
-#: host trust (PHASE1-SLIM L93 acceptance C).
-HOST_ONLY_KEYS: frozenset[str] = frozenset({"roots", "endpoint", "mcp", "api_key", "credentials"})
+#: host trust (PHASE1-SLIM L93 acceptance C). T-C1-PT-006: ``headers`` joins
+#: the set — the MAAS custom-auth-header channel (X-Auth-Token & co) is host
+#: trust exactly like ``api_key``; it merges across host tiers key-by-key
+#: (maps recurse in ``_merge_json``), so the product tier can carry one header
+#: and the global tier supplement others.
+HOST_ONLY_KEYS: frozenset[str] = frozenset({"roots", "endpoint", "mcp", "api_key", "credentials", "headers"})
 
 #: Every structural key a config file may carry (unknown keys are a config
 #: error, §6 L285). Host-only keys are listed separately for the tier check.
@@ -463,6 +467,18 @@ def _validate_layer_keys(path: Path, values: JsonObject, *, host_tier: bool) -> 
                 f"config field {key!r} in {path} is host-tier configuration; a project layer cannot "
                 "extend host trust (CORE-CONTRACTS §6 L285)"
             )
+    headers = values.get("headers")
+    if headers is not None:
+        # T-C1-PT-006: the MAAS auth-header channel rides host tiers only;
+        # shape discipline mirrors the product bridge — string keys, string
+        # values, named error with zero value echo on any violation.
+        if not isinstance(headers, dict):
+            raise ConfigError(f"'headers' in {path} must be an object of header name to string value")
+        for name, value in headers.items():
+            if not isinstance(name, str) or not name or not isinstance(value, str):
+                raise ConfigError(
+                    f"'headers' entries in {path} must be non-empty string names mapping to string values"
+                )
     permission = values.get("permission")
     if permission is not None:
         if not isinstance(permission, dict):

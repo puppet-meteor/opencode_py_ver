@@ -170,10 +170,17 @@ def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
 
 @dataclass(frozen=True)
 class MaasTimeouts:
-    """Header/chunk budgets (provider.md §3); the total budget rides the request."""
+    """Header/chunk budgets (provider.md §3); the total budget rides the request.
 
-    header_s: float = 10.0
-    chunk_s: float = 30.0
+    T-C1-PT-006 defaults (user ruling 2026-11-19, TS anchor): 10 s/30 s proved
+    fatal for real MAAS gateways — large auth-header handshakes routinely
+    exceed a 10 s first-byte budget and long inferences a 30 s chunk gap —
+    so both defaults move to the TS-aligned 300 s header / 900 s chunk. The
+    budgets stay per-request overridable (tests pass small explicit values).
+    """
+
+    header_s: float = 300.0
+    chunk_s: float = 900.0
 
 
 class _RetrySignal(Exception):
@@ -311,6 +318,7 @@ class MaasAdapter:
         base_url: str,
         api_key: str,
         *,
+        default_headers: Mapping[str, str] | None = None,
         timeouts: MaasTimeouts | None = None,
         max_retries: int = 2,
     ) -> None:
@@ -320,6 +328,12 @@ class MaasAdapter:
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
+            # T-C1-PT-006: the MAAS auth-header channel. Gateways like
+            # InferHub authenticate via custom headers (X-Auth-Token /
+            # app-id / plugin-version) instead of (or alongside) the Bearer
+            # token; ``default_headers`` rides every SDK request and coexists
+            # with the api_key Bearer line — None keeps the SDK default.
+            default_headers=dict(default_headers) if default_headers else None,
             max_retries=0,  # retry policy belongs to this adapter, not the SDK (§8)
             timeout=httpx2.Timeout(
                 connect=effective.header_s,

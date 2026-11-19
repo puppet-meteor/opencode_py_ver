@@ -1210,3 +1210,29 @@ async def test_5xx_error_surfaced_without_retry() -> None:
     assert terminal.error.code == CoreErrorCode.PROVIDER_UNAVAILABLE
     assert terminal.error.retryable is True
     assert len(server.requests) == 1  # surfaced, never auto-retried (OP-8)
+
+
+class TestAuthHeaderChannelAndTimeoutDefaults:
+    """T-C1-PT-006: the MAAS custom-auth-header channel + TS-aligned defaults."""
+
+    def test_default_headers_ride_the_sdk_client(self) -> None:
+        adapter = MaasAdapter(
+            "http://127.0.0.1:9/v1",
+            "k",
+            default_headers={"X-Auth-Token": "r0-maas-token", "app-id": "app", "plugin-version": "1.0"},
+        )
+        merged = adapter._client.default_headers
+        assert merged["X-Auth-Token"] == "r0-maas-token"
+        assert merged["app-id"] == "app"
+        assert merged["plugin-version"] == "1.0"
+
+    def test_without_headers_the_sdk_default_holds(self) -> None:
+        adapter = MaasAdapter("http://127.0.0.1:9/v1", "k")
+        assert "X-Auth-Token" not in adapter._client.default_headers
+
+    def test_timeout_defaults_are_the_ts_aligned_budgets(self) -> None:
+        """10 s/30 s proved fatal for real MAAS gateways; the user ruling
+        (2026-11-19) moves both defaults to the TS anchor 300 s/900 s."""
+        defaults = MaasTimeouts()
+        assert defaults.header_s == 300.0
+        assert defaults.chunk_s == 900.0

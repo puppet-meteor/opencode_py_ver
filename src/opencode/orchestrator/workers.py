@@ -52,7 +52,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,7 +244,7 @@ def render_task_brief(brief: TaskBrief) -> str:
     return "\n".join(lines)
 
 
-def host_config_document(worktree: Path) -> dict[str, Any]:
+def host_config_document(worktree: Path, headers: Mapping[str, str] | None = None) -> dict[str, Any]:
     """The worker's global config (the proactive-interception trio, PHASE3 §5.3).
 
     Passed to the CLI as ``--config`` (the global tier): ``roots`` pins the
@@ -254,9 +254,12 @@ def host_config_document(worktree: Path) -> dict[str, Any]:
     allow on the file-mutation actions (the register-saved preset equivalent:
     without it the worker's writes would hang on an approval nobody grants).
     ``source`` is deliberately absent (loader validated; a config-file rule is
-    project tier by construction, §5.2 L266).
+    project tier by construction, §5.2 L266). T-C1-PT-006: ``headers``
+    (host-only key) carries the MAAS custom-auth channel when the host has
+    one -- the worker CLI reads it from this tier and injects the headers
+    into its own MaasAdapter, so the auth travels without a CLI flag.
     """
-    return {
+    document: dict[str, Any] = {
         "roots": [str(worktree)],
         "permission": {
             "rules": [
@@ -283,6 +286,9 @@ def host_config_document(worktree: Path) -> dict[str, Any]:
             ]
         },
     }
+    if headers:
+        document["headers"] = dict(headers)
+    return document
 
 
 def whitelist_allows(authorized: Sequence[str], path: str) -> bool:
@@ -553,6 +559,7 @@ class WorkerManager:
         model: str,
         context_limit: int,
         worker_command: Sequence[str] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         if default_budget.timeout_s is None:
             raise ValueError(
@@ -561,10 +568,17 @@ class WorkerManager:
         self._repo_root = Path(repo_root)
         self._runs_root = Path(runs_root)
         self._default_budget = default_budget
+        # T-C1-PT-006: base_url is the host's COMPLETE base URL (identical to
+        # what MaasAdapter consumes — including any /v1 suffix the gateway
+        # requires); the worker argv passes it through verbatim, no /v1
+        # appending (the old splice double-appended when the host endpoint
+        # already carried /v1). headers is the MAAS custom-auth channel —
+        # never a CLI flag, it rides the worker's --config host document.
         self._base_url = base_url
         self._api_key = api_key
         self._model = model
         self._context_limit = context_limit
+        self._headers: dict[str, str] | None = dict(headers) if headers else None
         self._worker_command: tuple[str, ...] = (
             tuple(worker_command) if worker_command is not None else (sys.executable, "-m", "opencode")
         )
@@ -625,7 +639,7 @@ class WorkerManager:
         try:
             (worktree / BRIEF_FILENAME).write_text(render_task_brief(brief), encoding="utf-8", newline="\n")
             config_path.write_text(
-                json.dumps(host_config_document(worktree), indent=2, sort_keys=True) + "\n",
+                json.dumps(host_config_document(worktree, headers=self._headers), indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
                 newline="\n",
             )
@@ -642,8 +656,12 @@ class WorkerManager:
                 *self._worker_command,
                 "--db",
                 str(db_path),
+                # T-C1-PT-006: pass through the host's COMPLETE base URL —
+                # the old "{base}/v1" splice double-appended when the host
+                # endpoint already carried /v1; the worker CLI consumes the
+                # same URL shape MaasAdapter does.
                 "--base-url",
-                f"{self._base_url}/v1",
+                self._base_url,
                 "--api-key",
                 self._api_key,
                 "--model",

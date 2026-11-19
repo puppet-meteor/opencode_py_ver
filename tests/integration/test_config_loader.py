@@ -778,3 +778,22 @@ def test_pipeline_tiers_folds_undeclared_forms_to_none(tmp_path: Path, monkeypat
         _write_json(tmp_path / "opencode.json", values)
         loader = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product")
         assert loader.pipeline_tiers() is None
+
+
+# ---------------------------------------------------------------------------
+# T-C1-PT-006: the ``headers`` host-tier key (MAAS custom auth).
+# ---------------------------------------------------------------------------
+
+
+def test_global_layer_headers_ride_the_merged_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"headers": {"X-Auth-Token": "r0-maas-token"}})
+    layered = ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()
+    assert layered.values["headers"] == {"X-Auth-Token": "r0-maas-token"}
+
+
+def test_malformed_global_headers_is_a_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    global_path = _write_json(tmp_path / "global.json", {"headers": {"X-Auth-Token": 123}})
+    with pytest.raises(ConfigError, match="'headers'"):
+        ConfigLoader(global_config=global_path, product_config_dir=tmp_path / "no-product").load()

@@ -393,3 +393,101 @@ def test_v3_snapshot_carries_no_api_key_and_a_sanitized_endpoint_ref(tmp_path: P
     assert "leak-candidate" not in serialized and "token=leaked" not in serialized
     assert runtime.snapshot.endpoint_ref == "https://gw.example.test:8443/v1"  # _sanitize_endpoint discipline
     assert runtime.settings.model.model == "product-model"  # the product tier supplied the model
+
+
+# ---------------------------------------------------------------------------
+# T-C1-PT-006: the headers channel (MAAS custom auth on the TS config face).
+# ---------------------------------------------------------------------------
+
+
+def test_product_headers_under_options_ride_the_layer(tmp_path: Path) -> None:
+    config_dir = tmp_path / "product"
+    _write(
+        config_dir,
+        "opencode.json",
+        {
+            "provider": {
+                "gateway": {
+                    "options": {
+                        "baseURL": "https://product-gw.test/v1",
+                        "apiKey": "r0-product-key",
+                        "headers": {"X-Auth-Token": "r0-maas-token", "app-id": "app"},
+                    },
+                    "models": {"product-model": {}},
+                }
+            }
+        },
+    )
+    values = resolve_product_values(config_dir)
+    assert values is not None
+    assert values["headers"] == {"X-Auth-Token": "r0-maas-token", "app-id": "app"}
+
+
+def test_product_headers_flat_shape_is_equivalent(tmp_path: Path) -> None:
+    config_dir = tmp_path / "product"
+    _write(
+        config_dir,
+        "opencode.json",
+        {
+            "provider": {
+                "gateway": {
+                    "baseURL": "https://product-gw.test/v1",
+                    "apiKey": "r0-product-key",
+                    "headers": {"X-Auth-Token": "r0-maas-token"},
+                    "models": {"product-model": {}},
+                }
+            }
+        },
+    )
+    values = resolve_product_values(config_dir)
+    assert values is not None
+    assert values["headers"] == {"X-Auth-Token": "r0-maas-token"}
+
+
+def test_without_headers_the_result_stays_exactly_three_keys(tmp_path: Path) -> None:
+    config_dir = tmp_path / "product"
+    _write(
+        config_dir,
+        "opencode.json",
+        {
+            "provider": {
+                "gateway": {
+                    "options": {
+                        "baseURL": "https://product-gw.test/v1",
+                        "apiKey": "r0-product-key",
+                        # an EMPTY map reads as absent (no headers channel)
+                        "headers": {},
+                    },
+                    "models": {"product-model": {}},
+                }
+            }
+        },
+    )
+    values = resolve_product_values(config_dir)
+    assert values is not None
+    assert set(values) == {"endpoint", "api_key", "model"}
+
+
+def test_malformed_headers_is_a_named_config_error_with_zero_echo(tmp_path: Path) -> None:
+    config_dir = tmp_path / "product"
+    for payload in (
+        {"headers": "not-an-object"},
+        {"headers": {"X-Auth-Token": 123}},
+        {"headers": {"": "value"}},
+    ):
+        _write(
+            config_dir,
+            "opencode.json",
+            {
+                "provider": {
+                    "gateway": {
+                        "baseURL": "https://product-gw.test/v1",
+                        "apiKey": "r0-product-key",
+                        "models": {"product-model": {}},
+                        **payload,
+                    }
+                }
+            },
+        )
+        with pytest.raises(ConfigError, match=r"product config has .{0,40}'headers'"):
+            resolve_product_values(config_dir)

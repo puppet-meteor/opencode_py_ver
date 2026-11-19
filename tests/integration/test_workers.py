@@ -356,7 +356,11 @@ class TestRealWorkerSession:
             ]
         )
         host = _ServerHost([response])
-        base_url = host.start()
+        # T-C1-PT-006: the manager passes the host's COMPLETE base URL through
+        # verbatim (no /v1 splicing), so the fake gateway's endpoint carries
+        # the /v1 suffix itself — the real MAAS shape (FakeOpenAIServer serves
+        # /v1/chat/completions; its bare base_url has no suffix).
+        base_url = host.start() + "/v1"
         try:
             # No worker_command override: the manager's default is the real CLI.
             async with _WorkerStack(tmp_path, base_url=base_url) as stack:

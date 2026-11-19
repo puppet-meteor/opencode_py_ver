@@ -393,6 +393,12 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     args.base_url = args.base_url or (endpoint if isinstance(endpoint, str) and endpoint else None)
     layer_api_key = values.get("api_key")
     args.api_key = args.api_key or (layer_api_key if isinstance(layer_api_key, str) and layer_api_key else None)
+    # T-C1-PT-006: the MAAS auth-header channel (X-Auth-Token / app-id /
+    # plugin-version and friends). Host-tier layers only (product bridge from
+    # the TS config's provider options.headers, or the -py global config's
+    # ``headers`` map); never echoed in any error, exactly like the key.
+    layer_headers = values.get("headers")
+    args.headers = layer_headers if isinstance(layer_headers, dict) and layer_headers else None
     if not args.base_url:
         parser.error(
             "--base-url is required (or set OPENCODE_PY_BASE_URL, or supply 'endpoint' in the product/global config)"
@@ -672,7 +678,7 @@ def main(
         # context_limit <= output_reserve via the RuntimeSettings invariant)
         # lands on the 70 face — a traceback + exit 70 per #94, never a raw
         # escape the shell would render as the failed-run exit 1.
-        provider = MaasAdapter(args.base_url, args.api_key)
+        provider = MaasAdapter(args.base_url, args.api_key, default_headers=args.headers)
         loader = ConfigLoader(global_config=args.config, project_root=args.project_root)
         # R4-S6: the host resolves its CURRENT v3 face first — it carries the
         # MCP refs the App scan and the recovered session's drift check both
@@ -722,6 +728,7 @@ def main(
             api_key=args.api_key,
             model=host_runtime.settings.model.model,
             context_limit=host_runtime.settings.context_limit,
+            headers=args.headers,
         )
         # P4-S1 (T-C1-082): the production pipeline engine. The real llm_call
         # body runs over this process's own MAAS provider (P5-S6, T-C1-090:

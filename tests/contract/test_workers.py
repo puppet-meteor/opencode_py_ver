@@ -403,3 +403,16 @@ class TestWorkerPromptWords:
         words = worker_prompt_words()
         assert "TASK-BRIEF.md" in words
         assert all("/" not in word and "\\" not in word for word in words)
+
+
+class TestHostConfigDocumentHeaders:
+    """T-C1-PT-006: the MAAS auth-header channel rides the worker's --config."""
+
+    def test_without_headers_the_key_is_absent(self, tmp_path: Path) -> None:
+        document = host_config_document(tmp_path)
+        assert document["roots"] == [str(tmp_path)]
+        assert "headers" not in document
+
+    def test_headers_ride_the_host_document_verbatim(self, tmp_path: Path) -> None:
+        document = host_config_document(tmp_path, headers={"X-Auth-Token": "r0-maas-token", "app-id": "app"})
+        assert document["headers"] == {"X-Auth-Token": "r0-maas-token", "app-id": "app"}

@@ -608,3 +608,23 @@ def test_cli_runs_e2e_three_flag_free_on_product_config(
     payload = json.loads(raw) if isinstance(raw, str | bytes) else raw
     assert payload["config_snapshot"]["model"]["model"] == "fake-model"  # the product tier's model, durably
     assert "r0-e2e-product-key" not in json.dumps(payload)  # zero-echo on the durable face too
+
+
+def test_global_layer_headers_reach_the_parsed_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+) -> None:
+    """T-C1-PT-006: the MAAS auth-header channel rides the host tiers into
+    ``args.headers`` — present when a layer carries it, None otherwise."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENCODE_PY_BASE_URL", "https://env-url.test/v1")
+    monkeypatch.setenv("OPENCODE_PY_API_KEY", "r0-env-key")
+    global_path = _global_with(tmp_path, {"headers": {"X-Auth-Token": "r0-maas-token", "app-id": "app"}})
+    args = _parse_arguments(["--db", str(tmp_path / "x.db"), "--model", "m", "--config", str(global_path)])
+    assert args.headers == {"X-Auth-Token": "r0-maas-token", "app-id": "app"}
+    # and the no-channel face stays None (machine-independent: empty XDG pin)
+    (tmp_path / "bare").mkdir()
+    bare = _global_with(tmp_path / "bare", {})
+    args_none = _parse_arguments(["--db", str(tmp_path / "y.db"), "--model", "m", "--config", str(bare)])
+    assert args_none.headers is None

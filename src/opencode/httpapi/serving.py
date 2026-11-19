@@ -30,7 +30,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 
@@ -316,12 +316,24 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     _run_migrations(resolved_db)
     loader = ConfigLoader()
     runtime = loader.resolve_runtime_v3(endpoint_url=base_url)
+    # T-C1-PT-006: the MAAS custom-auth-header channel. The provider base
+    # URL/key stay env-only (this host chain is a frozen face); headers ride
+    # the config layers instead (product bridge from the TS config's provider
+    # options.headers, or the -py global config's ``headers`` map) — the
+    # same host-tier discipline and validation the CLI path walks.
+    headers_value = loader.load().values.get("headers")
+    # The loader's layer validation already pinned the shape (string keys and
+    # string values, host tiers only); this cast is pure type narrowing.
+    auth_headers = cast(
+        "dict[str, str] | None",
+        headers_value if isinstance(headers_value, dict) and headers_value else None,
+    )
     mcp_manager = _compose_mcp_manager(loader)
     if isinstance(runtime.snapshot, ConfigSnapshotV3):
         mcp_refs = list(runtime.snapshot.mcp_servers)
     else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
         mcp_refs = []
-    provider = MaasAdapter(base_url, api_key)
+    provider = MaasAdapter(base_url, api_key, default_headers=auth_headers)
     # P5-S7 (T-C1-091): workers capability closure -- the production
     # WorkerManager face behind ``opencode_agent`` nodes, composed here
     # isomorphically to the CLI's assembly (deliberately not a shared
@@ -351,6 +363,7 @@ def serve(db_path: str | Path = "opencode.db") -> None:
         api_key=api_key,
         model=runtime.settings.model.model,
         context_limit=runtime.settings.context_limit,
+        headers=auth_headers,
     )
     # P4-S1 (T-C1-082): the production pipeline engine, composed here
     # isomorphically to the CLI's assembly (deliberately not a shared

@@ -213,6 +213,7 @@ class MaasLlmCall:
         provider: Provider | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
+        default_headers: Mapping[str, str] | None = None,
         default_model: ModelRef,
         tiers: Mapping[str, str] | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
@@ -225,7 +226,10 @@ class MaasLlmCall:
                 raise ValueError("pass either an assembled provider or (base_url, api_key), not both")
             resolved: Provider = provider
         elif base_url is not None and api_key is not None:
-            owned = MaasAdapter(base_url, api_key)
+            # T-C1-PT-006: default_headers rides the self-assembled adapter
+            # (the MAAS custom-auth channel); the provider= composition form
+            # inherits whatever its caller already injected.
+            owned = MaasAdapter(base_url, api_key, default_headers=default_headers)
             resolved = owned
         else:
             raise ValueError("either an assembled provider or both base_url and api_key are required")
