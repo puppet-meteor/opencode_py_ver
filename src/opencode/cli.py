@@ -86,6 +86,7 @@ from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.bus import Event, SlowConsumerError
 from opencode.config import CliOverrides, ConfigError, ConfigLoader, RecoveryStoppedError, ResolvedRuntime
+from opencode.config.product import default_db_path
 from opencode.contracts.events import (
     PY_PERMISSION_REQUESTED,
     PY_REASONING_DELTA,
@@ -274,7 +275,15 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Single-shot prompt or interactive REPL over the MAAS provider (stdlib-only host).",
     )
     parser.add_argument("prompt", nargs="*", help="single-shot prompt words (space-joined); omit for the REPL")
-    parser.add_argument("--db", default="opencode.db", help="database file path (default ./opencode.db)")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help=(
+            "database file path (default: the global data dir, "
+            "$XDG_DATA_HOME/opencode/opencode.db else ~/.local/share/opencode/opencode.db; "
+            "the OPENCODE_PY_DB env overrides the default the same way)"
+        ),
+    )
     parser.add_argument(
         "--base-url",
         default=None,
@@ -367,6 +376,11 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         help="resume one specific session by id instead of creating a new one",
     )
     args = parser.parse_args(argv)
+    # T-C1-PT-008 (parity D4): the db default leaves the CWD — flag >
+    # OPENCODE_PY_DB env > the global data directory (TS util/global-roots.ts
+    # + cli/src/database-path.ts anchor), so ./opencode.db, ./opencode-workers
+    # and ./writer.lock stop appearing in every working directory.
+    args.db = args.db or os.environ.get("OPENCODE_PY_DB") or str(default_db_path())
     args.base_url = args.base_url or os.environ.get("OPENCODE_PY_BASE_URL")
     args.api_key = args.api_key or os.environ.get("OPENCODE_PY_API_KEY")
     # §6 L283 layer-aware completeness (R3-S6): --model/--context-limit are no
@@ -669,6 +683,10 @@ def main(
     try:
         args = _parse_arguments(argv)
         db_path = Path(args.db).resolve()
+        # T-C1-PT-008 (D4): the global-data-dir default may not exist yet
+        # (pure path math in default_db_path); the migration subprocess
+        # needs the parent directory present. Harmless for explicit paths.
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         migration_code = _run_migrations(db_path)
         if migration_code != 0:
             return migration_code

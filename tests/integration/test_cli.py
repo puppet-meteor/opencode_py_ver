@@ -628,3 +628,48 @@ def test_global_layer_headers_reach_the_parsed_args(
     bare = _global_with(tmp_path / "bare", {})
     args_none = _parse_arguments(["--db", str(tmp_path / "y.db"), "--model", "m", "--config", str(bare)])
     assert args_none.headers is None
+
+
+def test_db_default_lands_in_the_global_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+) -> None:
+    """T-C1-PT-008 (parity D4): the db default leaves the CWD — flag >
+    OPENCODE_PY_DB env > the global data dir (TS util/global-roots.ts anchor:
+    $XDG_DATA_HOME else ~/.local/share, joined with the app name)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENCODE_PY_DB", raising=False)
+    monkeypatch.setenv("OPENCODE_PY_BASE_URL", "https://env-url.test/v1")
+    monkeypatch.setenv("OPENCODE_PY_API_KEY", "r0-env-key")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    args = _parse_arguments(["--model", "m"])
+    assert args.db == str(tmp_path / "xdg-data" / "opencode" / "opencode.db")
+
+
+def test_db_env_overrides_default_and_flag_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("OPENCODE_PY_BASE_URL", "https://env-url.test/v1")
+    monkeypatch.setenv("OPENCODE_PY_API_KEY", "r0-env-key")
+    monkeypatch.setenv("OPENCODE_PY_DB", str(tmp_path / "env.db"))
+    args = _parse_arguments(["--model", "m"])
+    assert args.db == str(tmp_path / "env.db")  # env beats the global-dir default
+    args = _parse_arguments(["--model", "m", "--db", str(tmp_path / "flag.db")])
+    assert args.db == str(tmp_path / "flag.db")  # the flag beats the env
+
+
+def test_default_db_path_is_pure_path_math(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """default_db_path never reads the filesystem: XDG wins, else the home
+    ~/.local/share root; ``explicit`` is the test injection point."""
+    from opencode.config.product import default_db_path
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    assert default_db_path() == tmp_path / "xdg" / "opencode" / "opencode.db"
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert default_db_path() == Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+    assert default_db_path(explicit=tmp_path / "pin.db") == tmp_path / "pin.db"

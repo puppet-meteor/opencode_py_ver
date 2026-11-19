@@ -37,6 +37,7 @@ import uvicorn
 from opencode.ai.maas import MaasAdapter
 from opencode.app import App
 from opencode.config import ConfigLoader
+from opencode.config.product import default_db_path
 from opencode.contracts.events import ConfigSnapshotV3, JobBudget
 from opencode.httpapi.app import create_app
 from opencode.mcp import McpManager, StdioServerDefinition
@@ -297,8 +298,13 @@ def _server_config(api: Callable[..., Any], *, port: int) -> uvicorn.Config:
     return uvicorn.Config(api, host=HOST, port=port, lifespan="on")
 
 
-def serve(db_path: str | Path = "opencode.db") -> None:
+def serve(db_path: str | Path | None = None) -> None:
     """Run the local single-user server until shutdown (the module entry).
+
+    ``db_path`` None (the new default, T-C1-PT-008 parity D4) resolves to the
+    global data directory — the same ``default_db_path()`` the CLI walks —
+    so the server stops dropping ``opencode.db``/``opencode-workers``/
+    ``writer.lock`` into whatever directory it was started from.
 
     ``python -m opencode.httpapi`` lands here. The env face is validated
     first (token, port, provider credentials — fail-closed before anything
@@ -312,7 +318,8 @@ def serve(db_path: str | Path = "opencode.db") -> None:
     token = _token_from_env()
     port = _port_from_env()
     base_url, api_key = _maas_env()
-    resolved_db = Path(db_path).resolve()
+    resolved_db = (default_db_path() if db_path is None else Path(db_path)).resolve()
+    resolved_db.parent.mkdir(parents=True, exist_ok=True)  # T-C1-PT-008: the global default may not exist yet
     _run_migrations(resolved_db)
     loader = ConfigLoader()
     runtime = loader.resolve_runtime_v3(endpoint_url=base_url)

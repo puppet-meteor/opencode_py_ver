@@ -73,6 +73,26 @@ def product_config_dir(explicit: Path | None = None) -> Path:
     return Path(xdg) / "opencode" if xdg else Path.home() / ".config" / "opencode"
 
 
+def default_db_path(explicit: Path | None = None) -> Path:
+    """The default database path in the global data directory (T-C1-PT-008, D4).
+
+    TS anchor ``util/global-roots.ts``: the data root is ``$XDG_DATA_HOME``
+    else ``~/.local/share``, joined with the app name; the CLI then resolves
+    the db filename inside it (``cli/src/database-path.ts``). The py port had
+    the db land in the CWD (``./opencode.db`` plus the sibling
+    ``opencode-workers`` tree and ``writer.lock``) — a CWD side effect TS
+    never makes. The default now lands in the global data directory; an
+    explicit ``--db``/``OPENCODE_PY_DB`` keeps total control. Pure path
+    math like :func:`product_config_dir` — no filesystem reads (the parent
+    mkdir belongs to the caller that opens the database).
+    """
+    if explicit is not None:
+        return Path(explicit)
+    xdg = os.environ.get("XDG_DATA_HOME")
+    root = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return root / "opencode" / "opencode.db"
+
+
 def _strip_jsonc(text: str) -> str:
     """Strip ``//`` line comments and trailing commas, both string-aware.
 
