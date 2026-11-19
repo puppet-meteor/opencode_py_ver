@@ -448,9 +448,7 @@ def _inject_product_config(
     config_dir.mkdir(parents=True)
     models = {} if model is None else {model: {}}
     (config_dir / "opencode.json").write_text(
-        json.dumps(
-            {"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": models}}}
-        ),
+        json.dumps({"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": models}}}),
         encoding="utf-8",
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
@@ -562,9 +560,7 @@ def test_product_credentials_never_echo_on_the_error_face(
     """The zero-echo pin: the bridge READ the credentials and a later
     validation error fires — nothing read may appear anywhere in the output."""
     monkeypatch.chdir(tmp_path)
-    _inject_product_config(
-        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-never-echo"
-    )
+    _inject_product_config(monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-never-echo")
     # model=None writes an empty models map: the bridge is all-or-nothing
     # (product.py L183-185), so the named validation error fires AFTER the
     # credentials were read — exactly the zero-echo surface this test pins.

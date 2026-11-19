@@ -519,10 +519,14 @@ def test_cli_missing_model_without_config_exits_2(tmp_path: Path, monkeypatch: p
     empty_global.write_text("{}", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     argv = [
-        "--db", str(tmp_path / "x.db"),
-        "--config", str(empty_global),
-        "--base-url", "http://127.0.0.1:9",
-        "--api-key", "k",
+        "--db",
+        str(tmp_path / "x.db"),
+        "--config",
+        str(empty_global),
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "k",
     ]
     with pytest.raises(SystemExit) as exc_info:
         main(argv)
