@@ -52,6 +52,10 @@ class MaasRealConfig:
     api_key: str
     model: str
     source: Literal["env", "config"]
+    #: T-C1-048 rerun face: the provider block's custom auth headers
+    #: (T-C1-PT-006 channel — custom-header MAAS gateways 401/403 a bare
+    #: Bearer). File mode only; the env triple keeps its three-key contract.
+    headers: dict[str, str] | None = None
 
 
 def _strip_jsonc(text: str) -> str:
@@ -129,6 +133,25 @@ def _block_field(block: dict[str, Any], key: str) -> str | None:
     return None
 
 
+def _block_headers(block: dict[str, Any]) -> dict[str, str] | None:
+    """The provider block's custom auth headers (T-C1-048 rerun face).
+
+    Same two-source read as :func:`_block_field` (flat or under ``options``,
+    the T-C1-PT-006 product-bridge shape); a non-object value or an empty
+    result reads as absent, non-string entries are dropped (the test bridge
+    is lenient — the loader's strict validation is the production face).
+    """
+    options = block.get("options")
+    sources: tuple[dict[str, Any], ...] = (block, options if isinstance(options, dict) else {})
+    for source in sources:
+        value = source.get("headers")
+        if isinstance(value, dict):
+            picked = {str(k): v for k, v in value.items() if isinstance(v, str) and v}
+            if picked:
+                return picked
+    return None
+
+
 def _resolve_from_files() -> MaasRealConfig:
     """File mode: merge the local opencode config files and pick the block."""
     config_dir = _config_dir()
@@ -163,7 +186,9 @@ def _resolve_from_files() -> MaasRealConfig:
         model = next(iter(models))
         if not model:
             raise MaasRealConfigUnavailable(f"provider block {provider_name!r} has an empty models key")
-    return MaasRealConfig(base_url=base_url, api_key=api_key, model=model, source="config")
+    return MaasRealConfig(
+        base_url=base_url, api_key=api_key, model=model, source="config", headers=_block_headers(block)
+    )
 
 
 def resolve_maas_real_config() -> MaasRealConfig:

@@ -43,6 +43,7 @@ endpoint/model/key (only ``[final]``/``[tool]``/``[run]`` lines).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -81,7 +82,13 @@ def _gated_config() -> MaasRealConfig:
 
 
 def _argv(config: MaasRealConfig, db_path: Path, *, project_root: Path | None = None) -> list[str]:
-    """Assemble the in-process CLI argv from the resolved bridge values."""
+    """Assemble the in-process CLI argv from the resolved bridge values.
+
+    T-C1-048 rerun face: the custom auth headers (when the bridge resolved
+    them) ride a tmp global config via ``--config`` — the same host-only-key
+    channel production CLI users have (there is no ``--headers`` flag);
+    nothing is echoed, the file lives under the per-test tmp path.
+    """
     argv = [
         "--db",
         str(db_path),
@@ -96,6 +103,10 @@ def _argv(config: MaasRealConfig, db_path: Path, *, project_root: Path | None = 
         "--timeout-s",
         _TIMEOUT_S,
     ]
+    if config.headers:
+        headers_config = db_path.parent / "maas-real-headers.json"
+        headers_config.write_text(json.dumps({"headers": config.headers}), encoding="utf-8")
+        argv.extend(["--config", str(headers_config)])
     if project_root is not None:
         argv.extend(["--project-root", str(project_root)])
     return argv
