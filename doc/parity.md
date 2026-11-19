@@ -1,6 +1,6 @@
 # TS 行为对照与已知差异
 
-> Python 实现已落地：R0-R4 全链+R5 S1-S4 在库（src/opencode 53 .py+tests 51 .py+fixtures 92 JSON，现读枚举亲证）。§2 表原 9 行 planned 中 **8 行已按实测翻 verified**；provider 1 行**待 MAAS smoke 终翻**（OP-R5-2 已裁：T-C1-048 独立票）；deferred 5 行维持。本文件为实测态对照记录（R5-S5 T-C1-047 逐行翻新），不再是 R0 期规划面。
+> Python 实现已落地：R0-R4 全链+R5 S1-S4 在库（src/opencode 53 .py+tests 51 .py+fixtures 92 JSON，现读枚举亲证）。§2 表原 9 行 planned 中 8 行已按实测翻 verified；provider 1 行于 2026-11-19 经 T-C1-048 真实端点短会话双场景绿终翻——**9/9 全 verified**；deferred 5 行维持。本文件为实测态对照记录（R5-S5 T-C1-047 逐行翻新），不再是 R0 期规划面。
 > 参考目录：`D:\26_code\opencode_py_ver\opencode-2.2.2`。该目录没有 Git 元数据，不能伪造 upstream commit/tag。
 > [source-baseline.json](source-baseline.json) 记录读取的关键文件 SHA-256——现册 **58 条**（R0 期首册 12 条经 R1-R4 逐次扩册，现读计数 58）；它锁定审查依据，不代表锁定整个上游仓库。
 
@@ -11,7 +11,7 @@
 - verified：只有记录了 Python 测试路径、源码基线和实际结果才使用——六列证据逐行落在 §2.1。
 - 设计差异单独列出，不把“有意不同”标成测试已通过。
 
-本册现态：verified 8 行+待 MAAS smoke 终翻 1 行（provider）+deferred 5 行。新增参考文件先补 SHA-256；源码变化先比较行为/契约，再更新基线和 fixture。获得完整 Git 版本后可追加 commit/tag，仍保留已有指纹。源码锁定与运行时 MAAS fixture 分开管理，fixture 必须脱敏。
+本册现态：verified 9 行（provider 行 2026-11-19 T-C1-048 终翻）+deferred 5 行。新增参考文件先补 SHA-256；源码变化先比较行为/契约，再更新基线和 fixture。获得完整 Git 版本后可追加 commit/tag，仍保留已有指纹。源码锁定与运行时 MAAS fixture 分开管理，fixture 必须脱敏。
 
 ## 2. 能力对照
 
@@ -25,7 +25,7 @@ TS 路径相对参考目录（前缀 `packages/`，见表后注）——表内 T
 | core/src/session/projector.ts | session/projector.py | verified | 单事务同步投影；纯重放 + 单独恢复协调；不执行外部副作用 |
 | schema/src/tool.ts；core/src/tool.ts | tools/registry.py + invoker.py | verified | 唯一 invoke、严格校验、catalog 快照；text + bounded structured result |
 | schema/src/permission.ts | tools/policy.py | verified | Phase 1 本 session saved 决定；重启后重新确认，Python 审批审计 durable |
-| ai/src/schema/messages.ts、events.ts | ai/provider.py + maas.py | **待 MAAS smoke 终翻**（OP-R5-2 已裁：T-C1-048 独立票，端点供给后 S6 前执行） | 一个 OpenAI-compatible MAAS；SDK 类型不外泄；缺失 usage/cost 为 null。fake server 无网络面已测（§2.1 provider 行），真实端点短会话证据未落——不虚过不冒充 verified |
+| ai/src/schema/messages.ts、events.ts | ai/provider.py + maas.py | verified（T-C1-048 终翻 2026-11-19：真实端点短会话双场景绿——bigmodel coding PAAS 直连 glm-5.3，当前代码面=PT-006 鉴权通道+PT-007 守卫全量在环，2 passed 14.54s，证据=[maas-real-session.md](evidence/maas-real-session.md) §5 复跑记录） | 一个 OpenAI-compatible MAAS；SDK 类型不外泄；缺失 usage/cost 为 null。fake server 无网络面已测+真实端点短会话证据已落（§2.1 provider 行）——双面齐 |
 | core/src/config/discovery.ts | config/loader.py | verified | 只做规定 JSON/AGENTS 来源及快照，不复制 MDM/完整 discovery |
 | MCP stdio 行为 | mcp/manager.py + bridge.py + stdio.py | verified | 自研最小 JSON-RPC stdio client（OP-R4-1 用户裁决，零 SDK 依赖）；环境变量最小集原样传、不 merge host env；行为对拍非结构同构；协议面子集与 POSIX 腿承载面=已知限制（platform-support §9 逐件引注） |
 | HTTP/client | M5 | deferred | Python 本地单用户协议；不是 TS server 的替代地址 |
@@ -50,7 +50,7 @@ TS 路径相对参考目录（前缀 `packages/`，见表后注）——表内 T
 | policy | tests/contract/test_policy.py（21）+ tests/contract/test_permission_events.py（41）+ tests/integration/test_approval.py（12）+ tests/integration/test_permission_projector.py（11） | events_permission_* 6 事件家族×3 形态=18 JSON fixture（valid/missing_field/bad_extension，目录现读） | 通用口径；pydantic 2.14.2 | 全量 1134 绿内含本行 85 测（②对账） | 本 session saved 决定；重启后重新确认；审批审计 durable |
 | config loader | tests/integration/test_config_loader.py（30）+ tests/contract/test_config.py（16） | 测试内联 v1/v2/v3 快照+JSON/AGENTS 来源正反例+启动指纹/漂移停住面 | 通用口径；pydantic 2.14.2 | 全量 1134 绿内含本行 46 测（②对账） | 规定 JSON/AGENTS 来源及快照（v3 snapshot+MCP refs+启动指纹）；不复制 MDM/完整 discovery |
 | MCP stdio | tests/integration/test_mcp_stdio.py（13）+ tests/integration/test_mcp_catalog.py（3）+ tests/contract/test_mcp_naming.py（44）+ tests/integration/test_e2e_r4.py（7） | tests/integration/mcp_stdio_server.py 真子进程+9 模式（ok/startup_hang/catalog_hang/tools_list_error/big_frame/exit_during_call/crash_once/ignore_eof_with_child/crash_with_child） | 通用口径；client 面纯标准库（OP-R4-1 零 SDK）；POSIX 腿=CI 承载非本机实测（platform-support §9） | 全量 1134 绿内含本行 67 测（②对账） | 自研 client；env 最小集原样传；协议面子集+POSIX 腿承载面=已知限制逐件引注（platform-support §9） |
-| provider（未翻 verified） | tests/contract/test_ai_adapter.py（36）+ tests/contract/test_llm.py（63）+ tests/r0/test_provider_spike.py（24，R0-A spike） | tests/r0/fake_openai_server.py 无网络 fake server（多轮文本+流式工具调用面已测） | 通用口径；openai 3.42.0+httpx2 2.16.0（pyproject/uv.lock 现读口径，④ 注记） | fake server 面在全量 1134 绿内（123 测）；**真实端点短会话未执行** | **待 MAAS smoke 终翻**（OP-R5-2 已裁：T-C1-048 独立票，端点供给后 S6 前执行）——SDK 类型不外泄、缺失 usage/cost 为 null 维持原述，不虚过不冒充 |
+| provider（T-C1-048 终翻 2026-11-19） | tests/contract/test_ai_adapter.py（36）+ tests/contract/test_llm.py（63）+ tests/r0/test_provider_spike.py（24，R0-A spike）+ tests/integration/test_maas_real_session.py（2，`maas_real` opt-in 双门默认 skip CI 零影响） | tests/r0/fake_openai_server.py 无网络 fake server（多轮文本+流式工具调用面已测）+ 真实端点=本机 bigmodel coding PAAS 直连（provider.bigmodel 块，凭据经 lb-config 转持不入库） | 通用口径；openai 3.42.0+httpx2 2.16.0（pyproject/uv.lock 现读口径，④ 注记）；真实端点腿=2026-11-19 Windows 11 本机实测 | fake server 面在全量绿内（123 测）；**真实端点短会话已执行**：2 passed in 14.54s（text 6.29s+tool 6.63s，glm-5.3，[maas-real-session.md](../evidence/maas-real-session.md) §5） | SDK 类型不外泄、缺失 usage/cost 为 null 维持原述；usage/finish 不落库（RunFinishedData 无 metering，事件足迹+runs.status 为准——11-11 首跑注记延续复跑面） |
 
 ## 3. 事件语义映射
 

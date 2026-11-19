@@ -73,3 +73,12 @@ $env:OPENCODE_PY_MAAS_MODEL    = "<REDACTED_MODEL>"
 ```
 
 缺省走本机 opencode gateway 配置文件（`~/.config/opencode/opencode.json` + `opencode.jsonc`，provider 块默认 `gateway`）。测试断言只看 exit code / `runs.status` / events 计数 / text part 结构与固定标记词；stdout 在 `main()` 返回后立即消费，不入断言。
+
+## 7. 复跑记录（T-C1-048 终翻，2026-11-19）
+
+- **背景**：§4 首跑（2026-11-11）后代码面三度大改（T-C1-PT-006 鉴权通道 11-18、PT-007 finish=length 守卫、PT-008/009 CLI 面）——旧证据不再代表当前面，本复跑=当前代码面的终翻证据。
+- **端点改道**：原 gateway 块走本机 lb 代理（`127.0.0.1:17861`→volceapi），复跑当日其后端凭据被网关拒绝（裸 HTTP 直打同 403「Consumer is forbidden」，非 py 代码罪——三段诊断链：smoke 403→headers 补通道后仍 403→urllib 直打铁证）。经用户定向改为 **bigmodel coding PAAS 直连**（`provider.bigmodel` 块新增入 opencode.json，gateway 块零动，原配置备份 `.bak-20261119-pt048`；凭据从 lb-config `bigmodel-coding` 条目经内存转持，零回显）。
+- **bridge 增强**（part 1 提交 `8393f56`）：`_maas_real_config` 增 headers 通道（file 模式 flat/options 两源读，PT-006 同型）；测试 `_argv` 经 tmp 全局 config+`--config` 注入（生产 CLI 用户的 host-only-key 通道，无 `--headers` flag）。bigmodel 腿实际未用 headers（Bearer 即可），通道为 custom-header 网关备。
+- **复跑结果**：`OPENCODE_PY_MAAS_REAL=1 OPENCODE_PY_MAAS_PROVIDER=bigmodel` → **2 passed in 14.54s**（text 回合 6.29s / 工具回路 6.63s；glm-5.3；`--context-limit 100000` builtin output_reserve 4096）。断言面=exit 0+`runs.status`=succeeded+事件足迹+标记词/工具终态（场景结构同 §4，数值为测试内断言，tmp 目录随测清撤不留存——与 §4 首跑的差别如实注记：本次无正文 SHA-256 落档）。
+- **结论**：provider 行就此翻 verified（parity.md §2+§2.1 同步）；§2 表 9/9 全 verified。
+
