@@ -70,6 +70,35 @@ TS 路径相对参考目录（前缀 `packages/`，见表后注）——表内 T
 
 后续如需 TS wire/server 兼容，单独实现映射 adapter 并用两端 JSON fixture 验证；同名字符串不能作为“行为一致”的证据。不直接共享 TS SQLite 文件，不按 TS 迁移链建 Python 库。
 
+### 3.1 工具命名映射（D3，T-C1-PT-010）
+
+TS 工具名与 py wire 名（`namespace__name`）不重合——跨版 prompt/技能/记忆引用工具名不可移植。本节即 D3 的「稳定映射文档」裁决落地（权威定义：`doc/reports/py-ts-parity-2026-11-18.md` §二 D3 条）。双侧清单为 2026-11-19 现读：TS 侧=`packages/core/src/tool/plugin/` 18 枚（根面 html-markdown/http-body/mcp/read-filesystem/runtime 为机制面，无 `export const name` 工具声明，不计）；py 侧=`cli.py _drive` 组合面 19 枚常驻+2 枚 `--workflow-tools` flag 门控（serving `_builtin_adapters` 同型孪生）。
+
+共享工具映射（TS 名 → py wire 名，12 枚）：
+
+| TS 名（tool/plugin/） | py wire 名 | 备注 |
+|---|---|---|
+| read | fs__read | py 带 roots 沙箱 |
+| edit | fs__edit | 同上 |
+| write | fs__write | 同上 |
+| glob | fs__glob | 同上 |
+| grep | fs__grep | 同上 |
+| shell | bash__run | TS Windows 同显式选 PowerShell（D5/T-C1-PT-002 已闭合）；报告口径的 execute→宿主 lean-ctx 路径，非 core 工具 |
+| patch | patch__apply | P6-S4 |
+| todo | todo__write | P6-S4 |
+| question | question__ask | P6-S4 |
+| subagent | subagent__run | P6-S5 |
+| webfetch | webfetch__fetch | P7-S3 |
+| websearch | websearch__search | P7-S4；TS name 即 `websearch`，py 保留 webfetch 族前缀 |
+
+py 独有（TS 无同名工具，9 枚）：`fs__ls`、`git__status`、`git__diff`、`git__worktree_add`、`git__worktree_list`、`git__worktree_remove`、`pty__run`、`workflow__run`*、`workflow__status`*（* = flag 门控）。
+
+TS 独有（py 无对应，6 枚）：`file-diff`、`image-generate`、`mcp-resource`、`opencode`、`schedule`、`skill`。
+
+计数口径注：报告 D3 条「py 独有 19 枚/TS 独有 13 枚」系 R2 探针期读数（19 实为 py 常驻组合面总数口径）；本表现读口径=共享 12+py 独有 9+TS 独有 6。MCP 桥接工具双侧均运行时动态注入（TS `tool/mcp.ts` namespace 工厂/py registry `wire_name` 同型），不入静态表。
+
+**别名层不采纳（评估结论）**：曾评估为 TS 名注册别名层（使跨版 prompt 零改写）。否决理由：①py `namespace__name` 前缀=防冲突命名空间+审批/审计显示的设计位（`[approve]` 行、policy `_DEFAULT_EFFECTS` 键、durable 审计全按 wire 名索引），别名层引入双名归一化面=全线动骨；②映射面已收敛（12 枚共享），跨版消费者按本表一次性改写成本远低于维护别名层的语义漂移风险；③TS 独有 6 枚（skill/schedule 等）本就无 py 落点，别名层治不了根。D3 就此闭合于文档面。
+
 ## 4. 每次实现后填写的证据
 
 将对应 planned 项改 verified 前，必须补实际的 Python 测试路径、正常/失败 fixture、运行平台/依赖版本、验证结果和仍有差异——现行承载=§2.1 六列证据子表（R5-S5 T-C1-047 逐行落）。故意不兼容的变化更新 ADR 和事件版本；不改旧事件内容来掩盖差异。后续翻新行（provider 待 MAAS smoke 终翻=T-C1-048）同纪律。
