@@ -708,12 +708,13 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
     """Platform-conditional adapter census (T-B-087 ruling 2 / T-C1-073; the
     linux branch added by the T2 authorization T-C1-074).
 
-    Every unverified platform (darwin etc.) asserts the twenty-one-name
+    Every unverified platform (darwin etc.) asserts the twenty-three-name
     tuple (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098
     subagent tool plus the T-C1-102 webfetch tool plus the T-C1-103
-    websearch tool plus the T-C1-PT-012 memory trio) unchanged; win32 (the
+    websearch tool plus the T-C1-PT-012 memory trio plus the T-C1-PT-013
+    memory enumeration pair) unchanged; win32 (the
     T1 winpty-agent face) and linux (the T2 stdlib face) assert the
-    twenty-one plus the appended ``PtyRunAdapter`` (22 names), the
+    twenty-three plus the appended ``PtyRunAdapter`` (24 names), the
     ``*pty_adapters()`` splice in ``_builtin_adapters``. The trio census
     bump is the additive expected-minimum-update face (the T-C1-096
     route-census precedent); the T-C1-098 subagent bump, the T-C1-102
@@ -743,6 +744,8 @@ def test_builtin_adapters_are_the_cli_tools_in_order_per_platform() -> None:
         "MemorySearchAdapter",
         "MemoryConversationSearchAdapter",
         "MemoryReadSceneAdapter",
+        "MemoryListSpacesAdapter",
+        "MemoryListScenesAdapter",
     )
     if sys.platform == "win32" or sys.platform == "linux":
         assert names == (*expected, "PtyRunAdapter")

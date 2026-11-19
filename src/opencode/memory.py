@@ -127,7 +127,7 @@ def _page_from_payload(payload: JsonValue) -> MemorySearchPage:
 
 
 class MemoryGatewayClient:
-    """The three-method read-only gateway client (plan §4.1 tool set).
+    """The read-only gateway client (§4.1 trio + the U-6a enumeration pair).
 
     Stateful in nothing: every method opens one short-lived
     ``httpx2.AsyncClient`` pinned to the block's auth headers (Bearer token
@@ -143,7 +143,14 @@ class MemoryGatewayClient:
     def config(self) -> MemoryGatewayConfig:
         return self._config
 
-    async def _request(self, method: str, path: str, *, json_body: JsonObject | None = None) -> JsonValue:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: JsonObject | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> JsonValue:
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "X-Service-Id": self._config.service_id,
@@ -157,7 +164,7 @@ class MemoryGatewayClient:
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
-                response = await client.request(method, path, json=json_body)
+                response = await client.request(method, path, json=json_body, params=params)
         except httpx2.TimeoutException:
             raise MemoryUnavailableError("timeout") from None
         except httpx2.HTTPError:
@@ -206,13 +213,45 @@ class MemoryGatewayClient:
             body["cursor"] = cursor
         return _page_from_payload(await self._request("POST", "/v3/memory/conversation/search", json_body=body))
 
-    async def read_scene(self, scene_id: str) -> JsonObject:
+    async def read_scene(self, scene_id: str, *, cursor: str | None = None) -> JsonObject:
         """``memory__read_scene``: one scene's full context (L2/L3 by reference).
 
-        Granularity/pagination stays the plan's open U-6 slot; the base face
-        fetches the whole scene document.
+        The U-6a ruling's face: the full scene document, with an optional
+        continuation cursor when the gateway paginates a long scene.
         """
-        payload = await self._request("GET", f"/v3/memory/scene/{quote(scene_id, safe='')}")
+        params: dict[str, str] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        payload = await self._request(
+            "GET",
+            f"/v3/memory/scene/{quote(scene_id, safe='')}",
+            params=params or None,
+        )
         if not isinstance(payload, dict):
             raise MemoryUnavailableError("malformed") from None
         return payload
+
+    async def list_spaces(self, *, cursor: str | None = None) -> MemorySearchPage:
+        """``memory__list_spaces``: enumerate the service's memory spaces.
+
+        The U-6a ruling's enumeration primitive: the spaces behind the
+        serviceId/spaceId isolation boundary (plan §2.3).
+        """
+        params: dict[str, str] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return _page_from_payload(await self._request("GET", "/v3/memory/spaces", params=params or None))
+
+    async def list_scenes(
+        self,
+        *,
+        space_id: str | None = None,
+        cursor: str | None = None,
+    ) -> MemorySearchPage:
+        """``memory__list_scenes``: enumerate scenes (optionally one space's)."""
+        params: dict[str, str] = {}
+        if space_id is not None:
+            params["space_id"] = space_id
+        if cursor is not None:
+            params["cursor"] = cursor
+        return _page_from_payload(await self._request("GET", "/v3/memory/scenes", params=params or None))

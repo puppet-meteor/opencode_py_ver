@@ -6,7 +6,10 @@ Three adapters over :mod:`opencode.memory`'s gateway client, one module
 - ``memory__search`` -- cross-tier semantic recall (L1-forward fusion);
 - ``memory__conversation_search`` -- session/scene-scoped recall (L0);
 - ``memory__read_scene`` -- one scene's full context (L2/L3 by reference;
-  granularity/pagination stays the plan's open U-6 slot, base face only).
+  the U-6a ruling: the full scene document plus an optional continuation
+  cursor);
+- ``memory__list_spaces`` / ``memory__list_scenes`` -- the U-6a ruling's
+  read-only enumeration pair (cursor-paginated throughout).
 
 Fail-soft is the PINNED contract (plan §4.3), and it inverts the websearch
 fail-closed precedent on purpose: an unbound websearch adapter is a host
@@ -47,10 +50,18 @@ MEMORY_VERSION = 1
 MEMORY_SEARCH_NAME = "search"
 MEMORY_CONVERSATION_SEARCH_NAME = "conversation_search"
 MEMORY_READ_SCENE_NAME = "read_scene"
+MEMORY_LIST_SPACES_NAME = "list_spaces"
+MEMORY_LIST_SCENES_NAME = "list_scenes"
 
 #: The empty face's model-visible sentence (distinct from the unavailable
 #: sentence below by design -- §4.3-2 forbids any folding of the two).
 MEMORY_NO_RESULTS = "No relevant memories found for this query."
+
+#: The enumeration empty faces -- noun-explicit sentences so an empty
+#: listing cannot be read as anything else (the §4.3-2 anti-fold
+#: discipline; one distinct sentence per face).
+MEMORY_NO_SPACES = "No memory spaces found."
+MEMORY_NO_SCENES = "No memory scenes found."
 
 #: The unavailable face's model-visible sentence: states the outage AND the
 #: distinction explicitly, so a model cannot read it as an empty result.
@@ -135,6 +146,10 @@ MEMORY_READ_SCENE_SPEC = ToolSpec(
                 "type": "string",
                 "description": "The scene id to read",
             },
+            "cursor": {
+                "type": "string",
+                "description": "Continuation cursor from a previous read of a long scene (optional)",
+            },
         },
         "required": ["scene_id"],
         "additionalProperties": False,
@@ -145,22 +160,89 @@ MEMORY_READ_SCENE_SPEC = ToolSpec(
     idempotency_support=True,
 )
 
+MEMORY_LIST_SPACES_SPEC = ToolSpec(
+    namespace=MEMORY_NAMESPACE,
+    name=MEMORY_LIST_SPACES_NAME,
+    version=MEMORY_VERSION,
+    description=(
+        "List the memory spaces visible to this service (the top-level "
+        "memory isolation units). Use this to discover what spaces exist "
+        "before searching or listing scenes."
+    ),
+    input_schema={
+        "type": "object",
+        "description": "List the memory spaces.",
+        "properties": {
+            "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response",
+            },
+        },
+        "additionalProperties": False,
+    },
+    supported_content_types=["text"],
+    side_effects=False,
+    # The space set is time-varying (spaces are created and retired): an
+    # identical retry is honestly non-convergent.
+    idempotency_support=False,
+)
 
-def _ok_search(page_results: tuple[JsonObject, ...], next_cursor: str | None) -> ToolResult:
-    """The ok face for both search tools (results possibly empty)."""
+MEMORY_LIST_SCENES_SPEC = ToolSpec(
+    namespace=MEMORY_NAMESPACE,
+    name=MEMORY_LIST_SCENES_NAME,
+    version=MEMORY_VERSION,
+    description=(
+        "List memory scenes -- optionally scoped to one space -- with their "
+        "ids, so they can be read with memory__read_scene."
+    ),
+    input_schema={
+        "type": "object",
+        "description": "List memory scenes.",
+        "properties": {
+            "space_id": {
+                "type": "string",
+                "description": "Only list scenes in this space (optional)",
+            },
+            "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response",
+            },
+        },
+        "additionalProperties": False,
+    },
+    supported_content_types=["text"],
+    side_effects=False,
+    # The scene set is time-varying like the spaces: honestly non-idempotent.
+    idempotency_support=False,
+)
+
+
+def _ok_page(
+    page_results: tuple[JsonObject, ...],
+    next_cursor: str | None,
+    *,
+    noun: str,
+    empty_sentence: str,
+) -> ToolResult:
+    """The shared ok face for every paged tool (results possibly empty)."""
     structured: JsonObject = {"status": "ok", "results": list(page_results)}
     if next_cursor is not None:
         structured["next_cursor"] = next_cursor
     if page_results:
         lines = "\n".join(f"- {json.dumps(item, ensure_ascii=False, separators=(',', ':'))}" for item in page_results)
-        text = f"Found {len(page_results)} memory result(s):\n{lines}"
+        text = f"Found {len(page_results)} {noun}:\n{lines}"
     else:
-        text = MEMORY_NO_RESULTS
+        text = empty_sentence
     return ToolResult(
         content=[ToolTextContent(type="text", text=text)],
         structured_output=structured,
         metadata={"availability": "ok"},
     )
+
+
+def _ok_search(page_results: tuple[JsonObject, ...], next_cursor: str | None) -> ToolResult:
+    """The ok face for both search tools (results possibly empty)."""
+    return _ok_page(page_results, next_cursor, noun="memory result(s)", empty_sentence=MEMORY_NO_RESULTS)
 
 
 def _ok_scene(scene: JsonObject) -> ToolResult:
@@ -287,10 +369,66 @@ class MemoryReadSceneAdapter:
         scene_id = _required_str(input, "scene_id")
         if scene_id is None:
             return _failure(CoreErrorCode.VALIDATION_ERROR, "scene_id is required and must be a non-empty string")
+        cursor = _optional_str(input, "cursor")
         try:
-            scene = await client.read_scene(scene_id)
+            scene = await client.read_scene(scene_id, cursor=cursor)
         except MemoryUnavailableError as error:
             return _unavailable(error.reason)
         except Exception:
             return _unavailable("unexpected")
         return _ok_scene(scene)
+
+
+class MemoryListSpacesAdapter:
+    """The ``memory__list_spaces`` builtin (the U-6a enumeration face)."""
+
+    def __init__(self, client: MemoryGatewayClient | None = None) -> None:
+        self._client = client
+
+    def bind(self, client: MemoryGatewayClient) -> None:
+        self._client = client
+
+    @property
+    def spec(self) -> ToolSpec:
+        return MEMORY_LIST_SPACES_SPEC
+
+    async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
+        client = self._client
+        if client is None:
+            return _unavailable("unconfigured")
+        cursor = _optional_str(input, "cursor")
+        try:
+            page = await client.list_spaces(cursor=cursor)
+        except MemoryUnavailableError as error:
+            return _unavailable(error.reason)
+        except Exception:
+            return _unavailable("unexpected")
+        return _ok_page(page.results, page.next_cursor, noun="memory space(s)", empty_sentence=MEMORY_NO_SPACES)
+
+
+class MemoryListScenesAdapter:
+    """The ``memory__list_scenes`` builtin (the U-6a enumeration face)."""
+
+    def __init__(self, client: MemoryGatewayClient | None = None) -> None:
+        self._client = client
+
+    def bind(self, client: MemoryGatewayClient) -> None:
+        self._client = client
+
+    @property
+    def spec(self) -> ToolSpec:
+        return MEMORY_LIST_SCENES_SPEC
+
+    async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
+        client = self._client
+        if client is None:
+            return _unavailable("unconfigured")
+        space_id = _optional_str(input, "space_id")
+        cursor = _optional_str(input, "cursor")
+        try:
+            page = await client.list_scenes(space_id=space_id, cursor=cursor)
+        except MemoryUnavailableError as error:
+            return _unavailable(error.reason)
+        except Exception:
+            return _unavailable("unexpected")
+        return _ok_page(page.results, page.next_cursor, noun="memory scene(s)", empty_sentence=MEMORY_NO_SCENES)

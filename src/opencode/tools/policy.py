@@ -143,6 +143,10 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     "memory__search": "ask",
     "memory__conversation_search": "ask",
     "memory__read_scene": "ask",
+    # T-C1-PT-013 (plan §4.1, the U-6a ruling's enumeration pair): the
+    # same ask default, the same registered §4.2 contradiction.
+    "memory__list_spaces": "ask",
+    "memory__list_scenes": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

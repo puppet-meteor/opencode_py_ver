@@ -151,6 +151,8 @@ from opencode.tools.builtin import (
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
     MemoryConversationSearchAdapter,
+    MemoryListScenesAdapter,
+    MemoryListSpacesAdapter,
     MemoryReadSceneAdapter,
     MemorySearchAdapter,
     PatchApplyAdapter,
@@ -1129,6 +1131,11 @@ async def _drive(
             MemorySearchAdapter(memory_client),
             MemoryConversationSearchAdapter(memory_client),
             MemoryReadSceneAdapter(memory_client),
+            # T-C1-PT-013 (plan §4.1, the U-6a ruling's enumeration pair):
+            # same twin compositions (23 base adapters per host face),
+            # same fail-soft face.
+            MemoryListSpacesAdapter(memory_client),
+            MemoryListScenesAdapter(memory_client),
             *pty_adapters(),
         ),
         settings=runtime.settings,

@@ -84,6 +84,8 @@ from opencode.tools.builtin import (
     LS_NAME,
     LS_NAMESPACE,
     MEMORY_CONVERSATION_SEARCH_NAME,
+    MEMORY_LIST_SCENES_NAME,
+    MEMORY_LIST_SPACES_NAME,
     MEMORY_NAMESPACE,
     MEMORY_READ_SCENE_NAME,
     MEMORY_SEARCH_NAME,
@@ -463,6 +465,8 @@ _BASE_WIRE_NAMES: frozenset[str] = frozenset(
         f"{MEMORY_NAMESPACE}__{MEMORY_SEARCH_NAME}",
         f"{MEMORY_NAMESPACE}__{MEMORY_CONVERSATION_SEARCH_NAME}",
         f"{MEMORY_NAMESPACE}__{MEMORY_READ_SCENE_NAME}",
+        f"{MEMORY_NAMESPACE}__{MEMORY_LIST_SPACES_NAME}",
+        f"{MEMORY_NAMESPACE}__{MEMORY_LIST_SCENES_NAME}",
     }
 )
 
@@ -549,10 +553,11 @@ class TestRegistryIsolation:
         """The platform branch (T-B-087 ruling 2 / T-C1-073, T-C1-074): the
         ``pty__run`` wire name rides the composition only on the verified
         platforms (win32 the T1 winpty face, linux the T2 stdlib face);
-        every other platform enumerates exactly the twenty-one base names
+        every other platform enumerates exactly the twenty-three base names
         (the twelve plus the T-C1-097 toolkit-A trio plus the T-C1-098
         subagent tool plus the T-C1-102 webfetch tool plus the T-C1-103
-        websearch tool plus the T-C1-PT-012 memory trio)."""
+        websearch tool plus the T-C1-PT-012 memory trio plus the
+        T-C1-PT-013 memory enumeration pair)."""
         registry = ToolRegistry()
         for adapter in _builtin_adapters(("C:/work",)):
             registry.register(adapter)
@@ -560,10 +565,10 @@ class TestRegistryIsolation:
         wire_name = f"{PTY_NAMESPACE}__{PTY_NAME}"
         if sys.platform in _PTY_PLATFORMS:  # present arm
             assert catalog.resolve(wire_name) is not None
-            assert len(catalog.specs) == 22
+            assert len(catalog.specs) == 24
         else:  # absent arm
             assert catalog.resolve(wire_name) is None
-            assert len(catalog.specs) == 21
+            assert len(catalog.specs) == 23
 
     def test_the_composition_and_the_builtin_export_surface_are_bijective(self) -> None:
         """The export-surface completeness double pin (T-B-094 R4 §3-3 (5)).

@@ -61,6 +61,8 @@ from opencode.tools.builtin import (
     GitWorktreeListAdapter,
     GitWorktreeRemoveAdapter,
     MemoryConversationSearchAdapter,
+    MemoryListScenesAdapter,
+    MemoryListSpacesAdapter,
     MemoryReadSceneAdapter,
     MemorySearchAdapter,
     PatchApplyAdapter,
@@ -303,6 +305,9 @@ def _builtin_adapters(
         MemorySearchAdapter(memory_client),
         MemoryConversationSearchAdapter(memory_client),
         MemoryReadSceneAdapter(memory_client),
+        # T-C1-PT-013 (the U-6a enumeration pair): same twin, same face.
+        MemoryListSpacesAdapter(memory_client),
+        MemoryListScenesAdapter(memory_client),
         *pty_adapters(),
     )
 

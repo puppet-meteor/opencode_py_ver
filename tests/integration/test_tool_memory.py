@@ -18,9 +18,9 @@ external network, the fake_openai_server precedent at plain-JSON scale):
   ``cursor`` ride the request body, and the conversation tool hits its own
   path;
 * the pins -- the ``_DEFAULT_EFFECTS`` ask rows (§4.1) and the spec faces
-  (read-only trio; the scene read honestly idempotent, the searches
-  honestly not). The deeper loader battery (host-tier/shape) lives in
-  test_config_loader.py.
+  (the read-only set -- trio + the U-6a enumeration pair; the scene read
+  honestly idempotent, the time-varying faces honestly not). The deeper
+  loader battery (host-tier/shape) lives in test_config_loader.py.
 """
 
 from __future__ import annotations
@@ -222,6 +222,63 @@ async def test_read_scene_returns_the_document(gateway: _FakeGateway, tmp_path: 
     assert recorded.path == "/v3/memory/scene/sc-1"
 
 
+async def test_list_spaces_enumerates_and_rides_the_cursor(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(200, {"results": [{"space_id": "sp-1", "title": "Work"}], "next_cursor": "pg-2"})
+    adapter = builtin.MemoryListSpacesAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"cursor": "pg-1"})
+    assert _payload(result) == {
+        "status": "ok",
+        "results": [{"space_id": "sp-1", "title": "Work"}],
+        "next_cursor": "pg-2",
+    }
+    assert result.metadata == {"availability": "ok"}
+    recorded = gateway.requests[0]
+    assert recorded.method == "GET"
+    assert recorded.path == "/v3/memory/spaces?cursor=pg-1"
+
+
+async def test_list_scenes_scopes_to_one_space(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(200, {"results": [{"scene_id": "sc-1", "title": "the deploy talk"}]})
+    adapter = builtin.MemoryListScenesAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"space_id": "sp-1"})
+    assert _payload(result)["status"] == "ok"
+    text = result.content[0].text if hasattr(result.content[0], "text") else ""
+    assert "1 memory scene(s)" in text
+    recorded = gateway.requests[0]
+    assert recorded.method == "GET"
+    assert recorded.path == "/v3/memory/scenes?space_id=sp-1"
+
+
+async def test_the_enumeration_empty_faces_are_distinct(gateway: _FakeGateway, tmp_path: Path) -> None:
+    # The empty-queue default answers 200 {"results": []}: both enumeration
+    # faces render their OWN noun-explicit sentence, never the unavailable
+    # face (§4.3-2: no folding, one sentence per face).
+    spaces = await builtin.MemoryListSpacesAdapter(_client(gateway)).execute(_context(tmp_path), {})
+    scenes = await builtin.MemoryListScenesAdapter(_client(gateway)).execute(_context(tmp_path), {})
+    for result, sentence in ((spaces, builtin.MEMORY_NO_SPACES), (scenes, builtin.MEMORY_NO_SCENES)):
+        assert _payload(result) == {"status": "ok", "results": []}
+        assert result.metadata == {"availability": "ok"}
+        assert result.error is None
+        text = result.content[0].text if hasattr(result.content[0], "text") else ""
+        assert sentence in text
+        assert "unavailable" not in text.lower()
+
+
+async def test_read_scene_accepts_a_continuation_cursor(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(200, {"scene_id": "sc-1", "messages": [], "next_cursor": "cur-9"})
+    adapter = builtin.MemoryReadSceneAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"scene_id": "sc-1", "cursor": "cur-8"})
+    assert _payload(result)["status"] == "ok"
+    assert gateway.requests[0].path == "/v3/memory/scene/sc-1?cursor=cur-8"
+
+
+async def test_list_spaces_500_answers_the_outage_payload(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(500, "down")
+    adapter = builtin.MemoryListSpacesAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {})
+    _assert_unavailable(result, "http_5xx")
+
+
 # ---------------------------------------------------------------------------
 # The wire faces.
 # ---------------------------------------------------------------------------
@@ -293,11 +350,18 @@ async def test_a_dead_endpoint_answers_the_transport_bucket(tmp_path: Path) -> N
         builtin.MemorySearchAdapter,
         builtin.MemoryConversationSearchAdapter,
         builtin.MemoryReadSceneAdapter,
+        builtin.MemoryListSpacesAdapter,
+        builtin.MemoryListScenesAdapter,
     ],
 )
 async def test_an_unconfigured_client_is_the_fail_soft_face(adapter_factory: type, tmp_path: Path) -> None:
     adapter = adapter_factory(None)
-    payload: JsonObject = {"query": "q"} if adapter_factory is not builtin.MemoryReadSceneAdapter else {"scene_id": "s"}
+    if adapter_factory is builtin.MemoryReadSceneAdapter:
+        payload: JsonObject = {"scene_id": "s"}
+    elif adapter_factory in (builtin.MemoryListSpacesAdapter, builtin.MemoryListScenesAdapter):
+        payload = {}
+    else:
+        payload = {"query": "q"}
     result = await adapter.execute(_context(tmp_path), payload)
     _assert_unavailable(result, "unconfigured")
 
@@ -321,17 +385,21 @@ async def test_a_missing_query_is_the_validation_double_face(gateway: _FakeGatew
 # ---------------------------------------------------------------------------
 
 
-def test_policy_defaults_pin_the_trio_to_ask() -> None:
+def test_policy_defaults_pin_the_memory_tools_to_ask() -> None:
     assert _DEFAULT_EFFECTS["memory__search"] == "ask"
     assert _DEFAULT_EFFECTS["memory__conversation_search"] == "ask"
     assert _DEFAULT_EFFECTS["memory__read_scene"] == "ask"
+    assert _DEFAULT_EFFECTS["memory__list_spaces"] == "ask"
+    assert _DEFAULT_EFFECTS["memory__list_scenes"] == "ask"
 
 
-def test_the_specs_pin_the_readonly_trio() -> None:
+def test_the_specs_pin_the_readonly_memory_tools() -> None:
     for spec in (
         builtin.MEMORY_SEARCH_SPEC,
         builtin.MEMORY_CONVERSATION_SEARCH_SPEC,
         builtin.MEMORY_READ_SCENE_SPEC,
+        builtin.MEMORY_LIST_SPACES_SPEC,
+        builtin.MEMORY_LIST_SCENES_SPEC,
     ):
         assert spec.namespace == "memory"
         assert spec.supported_content_types == ["text"]
@@ -339,10 +407,15 @@ def test_the_specs_pin_the_readonly_trio() -> None:
     assert builtin.MEMORY_SEARCH_SPEC.name == "search"
     assert builtin.MEMORY_CONVERSATION_SEARCH_SPEC.name == "conversation_search"
     assert builtin.MEMORY_READ_SCENE_SPEC.name == "read_scene"
-    # Honest idempotency: a stable scene document vs time-varying recall.
+    assert builtin.MEMORY_LIST_SPACES_SPEC.name == "list_spaces"
+    assert builtin.MEMORY_LIST_SCENES_SPEC.name == "list_scenes"
+    # Honest idempotency: a stable scene document vs time-varying faces
+    # (recall and the enumeration pair alike).
     assert builtin.MEMORY_READ_SCENE_SPEC.idempotency_support is True
     assert builtin.MEMORY_SEARCH_SPEC.idempotency_support is False
     assert builtin.MEMORY_CONVERSATION_SEARCH_SPEC.idempotency_support is False
+    assert builtin.MEMORY_LIST_SPACES_SPEC.idempotency_support is False
+    assert builtin.MEMORY_LIST_SCENES_SPEC.idempotency_support is False
 
 
 # ---------------------------------------------------------------------------
