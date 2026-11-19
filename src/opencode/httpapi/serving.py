@@ -319,7 +319,11 @@ def serve(db_path: str | Path | None = None) -> None:
     port = _port_from_env()
     base_url, api_key = _maas_env()
     resolved_db = (default_db_path() if db_path is None else Path(db_path)).resolve()
-    resolved_db.parent.mkdir(parents=True, exist_ok=True)  # T-C1-PT-008: the global default may not exist yet
+    if db_path is None:
+        # T-C1-PT-008: the global default's parent may not exist yet — and only
+        # that default may be created; an explicit path with a missing parent
+        # keeps the honest migration failure (the cli Row #15 exit-70 face).
+        resolved_db.parent.mkdir(parents=True, exist_ok=True)
     _run_migrations(resolved_db)
     loader = ConfigLoader()
     runtime = loader.resolve_runtime_v3(endpoint_url=base_url)

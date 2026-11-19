@@ -399,7 +399,11 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     # T-C1-PT-008 (parity D4): the db default leaves the CWD — flag >
     # OPENCODE_PY_DB env > the global data directory (TS util/global-roots.ts
     # + cli/src/database-path.ts anchor), so ./opencode.db, ./opencode-workers
-    # and ./writer.lock stop appearing in every working directory.
+    # and ./writer.lock stop appearing in every working directory. The marker
+    # (True = the chain fell through to the global default) rides along: only
+    # that path may mkdir its parent later — an explicit path with a missing
+    # parent still fails the migration honestly (the Row #15 exit-70 face).
+    args.db_from_global_default = args.db is None and not os.environ.get("OPENCODE_PY_DB")
     args.db = args.db or os.environ.get("OPENCODE_PY_DB") or str(default_db_path())
     args.base_url = args.base_url or os.environ.get("OPENCODE_PY_BASE_URL")
     args.api_key = args.api_key or os.environ.get("OPENCODE_PY_API_KEY")
@@ -704,9 +708,12 @@ def main(
         args = _parse_arguments(argv)
         db_path = Path(args.db).resolve()
         # T-C1-PT-008 (D4): the global-data-dir default may not exist yet
-        # (pure path math in default_db_path); the migration subprocess
-        # needs the parent directory present. Harmless for explicit paths.
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # (pure path math in default_db_path); the migration subprocess needs
+        # the parent directory present — but ONLY for that default. An
+        # explicit --db/env path with a missing parent keeps the honest
+        # migration failure (Row #15 exit-70 face, T-C1-PT-008 fixup).
+        if args.db_from_global_default:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
         migration_code = _run_migrations(db_path)
         if migration_code != 0:
             return migration_code

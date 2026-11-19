@@ -733,3 +733,33 @@ def test_default_db_path_is_pure_path_math(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     assert default_db_path() == Path.home() / ".local" / "share" / "opencode" / "opencode.db"
     assert default_db_path(explicit=tmp_path / "pin.db") == tmp_path / "pin.db"
+
+
+def test_global_default_db_creates_its_parent_explicit_keeps_honest_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_cli_env: None,
+) -> None:
+    """T-C1-PT-008 fixup: only the global-default db path may mkdir its parent
+    (the global data dir may not exist yet); an explicit path with a missing
+    parent keeps the honest migration failure — cli Row #15's exit-70 face,
+    which the unconditional mkdir had silently resurrected into a live run."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    monkeypatch.delenv("OPENCODE_PY_DB", raising=False)
+    monkeypatch.chdir(tmp_path)
+    code = main(
+        [
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--api-key",
+            "k",
+            "--model",
+            "m",
+            "--context-limit",
+            "100000",
+            "hello",
+        ]
+    )
+    assert code != 70  # the parent was created; the run reached the provider
+    assert (tmp_path / "xdg-data" / "opencode").is_dir()  # mkdir happened
+    assert not (tmp_path / "opencode.db").exists()  # the CWD stays clean (D4)
