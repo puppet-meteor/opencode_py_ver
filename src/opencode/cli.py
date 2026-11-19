@@ -171,6 +171,19 @@ _MIGRATION_EXIT_CODE = 70
 _CLEANUP_EXIT_CODE = 3
 #: Session-selection stop exit code (R4-S6, §6.2 L107; #94 "not 0/1/2" family).
 _SELECTION_EXIT_CODE = 4
+#: T-C1-PT-004 (parity D7): the builtin context-limit default, injected at
+#: the CLI completeness check when neither the flag nor any config layer
+#: supplies a value. CORE-CONTRACTS §7 L514 pins "R0 fetches the model
+#: context limit; when unknown require host configuration" — the override
+#: rationale (recorded here and in the ticket): TS ``opencode run`` needs no
+#: flag (the models catalogue supplies the window per model); py has no model
+#: catalogue, so the hard exit-2 wall priced a real usability gap (parity
+#: D7: every parity test needed ``--context-limit`` while TS never did). A
+#: static documented default — the conservative common denominator of the
+#: gateway model family — keeps every explicit path byte-identical
+#: (precedence unchanged: CLI flag > config layer > this builtin); only the
+#: bare-run case changes, from exit 2 to a running session.
+DEFAULT_CONTEXT_LIMIT = 128000
 #: Windows-required-variables minimal set (T-B-038 ⑥②): a stdio server's
 #: argv is exec'd with NO inherited host environment, so the composition
 #: must hand it at least these two or nearly every child binary dies at
@@ -304,7 +317,8 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         "--context-limit",
         default=None,
         type=_int_at_least_one("--context-limit"),
-        help="model context window in tokens (required unless a config layer supplies it; CLI overrides config)",
+        help="model context window in tokens (defaults to 128000 when neither this "
+        "flag nor a config layer supplies it; CLI flag > config layer > builtin default)",
     )
     parser.add_argument(
         "--output-reserve",
@@ -390,7 +404,13 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     if args.model is None and values.get("model") is None:
         parser.error('--model is required (or set "model" in a config file)')
     if args.context_limit is None and values.get("context_limit") is None:
-        parser.error('--context-limit is required (or set "context_limit" in a config file)')
+        # T-C1-PT-004 (parity D7): the builtin default replaces the exit-2
+        # wall (see DEFAULT_CONTEXT_LIMIT above for the recorded override of
+        # §7 L514's "when unknown require host configuration"). Precedence is
+        # unchanged: the flag and any config layer already returned by here;
+        # injecting at the CLI (the top config layer) keeps the merge order
+        # flag > layer > builtin in one place.
+        args.context_limit = DEFAULT_CONTEXT_LIMIT
     return args
 
 

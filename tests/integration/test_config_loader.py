@@ -505,8 +505,25 @@ def test_cli_end_to_end_config_supplied_runtime_and_v3_snapshot_in_db(
 
 
 def test_cli_missing_model_without_config_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # T-C1-PT-004 (D7): "without config" must hold against BOTH foreign layers
+    # on machines that carry them. (1) The product bridge dir (~/.config/opencode
+    # or $XDG_CONFIG_HOME/opencode) can supply a model; pin XDG_CONFIG_HOME to an
+    # empty dir (a missing product dir means no product layer, silently). (2) The
+    # -py global config gets pinned to an empty file via --config. Before D7 the
+    # builtin context-limit gap made this argv exit 2 through the context-limit
+    # wall (wrong reason); with the builtin default the wall is gone and an
+    # unpinned run resolves a full runtime, skips the prompt, and blocks on the
+    # REPL stdin under pytest.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    empty_global = tmp_path / "empty-global.json"
+    empty_global.write_text("{}", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    argv = ["--db", str(tmp_path / "x.db"), "--base-url", "http://127.0.0.1:9", "--api-key", "k"]
+    argv = [
+        "--db", str(tmp_path / "x.db"),
+        "--config", str(empty_global),
+        "--base-url", "http://127.0.0.1:9",
+        "--api-key", "k",
+    ]
     with pytest.raises(SystemExit) as exc_info:
         main(argv)
     assert exc_info.value.code == 2

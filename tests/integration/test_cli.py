@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from opencode.cli import _parse_arguments, escape_for_display, main
+from opencode.cli import DEFAULT_CONTEXT_LIMIT, _parse_arguments, escape_for_display, main
 from opencode.config import ConfigLoader
 from opencode.storage import open_database
 from opencode.storage.repos import ReadRepositories
@@ -339,26 +339,56 @@ def test_subprocess_entry_smoke(tmp_path: Path) -> None:
     assert "[run] succeeded" in result.stdout
 
 
-def test_argparse_missing_required_args_exit_2() -> None:
-    """⑧: missing --model or --context-limit is a standard argparse exit 2."""
+def test_argparse_missing_required_args_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None
+) -> None:
+    """⑧: missing --model is a standard argparse exit 2; missing
+    --context-limit no longer is (T-C1-PT-004/parity D7: builtin default)."""
+    monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         main(["hello", "--db", "unused.db", "--base-url", "http://127.0.0.1:9", "--api-key", "k"])
     assert excinfo.value.code == 2
-    with pytest.raises(SystemExit) as excinfo:
-        main(
-            [
-                "hello",
-                "--db",
-                "unused.db",
-                "--base-url",
-                "http://127.0.0.1:9",
-                "--api-key",
-                "k",
-                "--model",
-                "m",
-            ]
-        )
-    assert excinfo.value.code == 2
+    # T-C1-PT-004 (parity D7): the context-limit completeness wall is gone —
+    # a bare run parses through and carries the builtin default.
+    args = _parse_arguments(
+        [
+            "--db",
+            "unused.db",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "k",
+            "--model",
+            "m",
+        ]
+    )
+    assert args.context_limit == DEFAULT_CONTEXT_LIMIT
+
+
+def test_context_limit_builtin_default_and_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _hermetic_cli_env: None
+) -> None:
+    """T-C1-PT-004 (parity D7): CLI flag > config layer > builtin 128000.
+
+    TS ``opencode run`` needs no flag (the models catalogue supplies the
+    window); py had no model catalogue, so the exit-2 wall priced a usability
+    gap (parity D7). The override of §7 L514's "when unknown require host
+    configuration" is recorded at DEFAULT_CONTEXT_LIMIT.
+    """
+    monkeypatch.chdir(tmp_path)
+    base = ["--db", str(tmp_path / "x.db"), "--base-url", "http://127.0.0.1:9", "--api-key", "k", "--model", "m"]
+
+    # 1. bare: the builtin default is injected (the old face exited 2 here).
+    assert _parse_arguments(list(base)).context_limit == DEFAULT_CONTEXT_LIMIT
+
+    # 2. the flag beats the builtin.
+    assert _parse_arguments([*base, "--context-limit", "5000"]).context_limit == 5000
+
+    # 3. a config layer beats the builtin: the flag stays transparent (None)
+    #    and the layer value flows at resolve time — no exit 2, no injection.
+    global_path = _global_with(tmp_path, {"context_limit": 2000})
+    args = _parse_arguments([*base, "--config", str(global_path)])
+    assert args.context_limit is None  # the layer supplies 2000 downstream
 
 
 def test_version_flag_prints_ts_parity_line_and_exits_0(
@@ -390,24 +420,36 @@ def test_version_flag_prints_ts_parity_line_and_exits_0(
 
 
 @pytest.fixture()
-def _hermetic_cli_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _hermetic_cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Scrub the ambient credential/provider env so the bridge tests are deterministic."""
     monkeypatch.delenv("OPENCODE_PY_BASE_URL", raising=False)
     monkeypatch.delenv("OPENCODE_PY_API_KEY", raising=False)
     monkeypatch.delenv("OPENCODE_PY_PROVIDER", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    # T-C1-PT-004: deleting XDG_CONFIG_HOME falls BACK to ~/.config/opencode —
+    # on machines carrying a real product bridge there, that tier leaks into
+    # every test that relies on this fixture alone. Pin an empty tmp XDG home
+    # instead: a missing product dir reads as no product layer (loader L575),
+    # the machine-independent neutral state.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "hermetic-xdg-home"))
 
 
 def _inject_product_config(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, base_url: str, api_key: str, model: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, base_url: str, api_key: str, model: str | None = None
 ) -> Path:
-    """Inject a tmp TS product config (nested gateway shape) under a tmp XDG home."""
+    """Inject a tmp TS product config (nested gateway shape) under a tmp XDG home.
+
+    ``model=None`` (T-C1-PT-004) writes an EMPTY models map — the bridge is
+    all-or-nothing (product.py L183-185), so this yields a named validation
+    ConfigError that fires AFTER the credentials were read: the zero-echo
+    surface, not a credentials-only tier (that face cannot exist).
+    """
     xdg_home = tmp_path / "xdg-home"
     config_dir = xdg_home / "opencode"
     config_dir.mkdir(parents=True)
+    models = {} if model is None else {model: {}}
     (config_dir / "opencode.json").write_text(
         json.dumps(
-            {"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": {model: {}}}}}
+            {"provider": {"gateway": {"options": {"baseURL": base_url, "apiKey": api_key}, "models": models}}}
         ),
         encoding="utf-8",
     )
@@ -518,17 +560,21 @@ def test_product_credentials_never_echo_on_the_error_face(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The zero-echo pin: the bridge READ the credentials and a later
-    completeness error fires — nothing read may appear anywhere in the output."""
+    validation error fires — nothing read may appear anywhere in the output."""
     monkeypatch.chdir(tmp_path)
     _inject_product_config(
-        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-never-echo", model="product-model"
+        monkeypatch, tmp_path, base_url="https://product-gw.test/v1", api_key="r0-never-echo"
     )
-    # No context_limit anywhere: the context-limit completeness error fires AFTER
-    # the credentials resolved from the product tier.
+    # model=None writes an empty models map: the bridge is all-or-nothing
+    # (product.py L183-185), so the named validation error fires AFTER the
+    # credentials were read — exactly the zero-echo surface this test pins.
+    # (The original T-C1-PT-004 edit expected the --model completeness error
+    # here, a face the product tier can never reach.)
     with pytest.raises(SystemExit) as excinfo:
         _parse_arguments(["--db", str(tmp_path / "x.db")])
     assert excinfo.value.code == 2
     captured = capsys.readouterr()
+    assert "no non-empty models map" in captured.err
     assert "r0-never-echo" not in captured.out
     assert "r0-never-echo" not in captured.err
 
