@@ -17,10 +17,14 @@ external network, the fake_openai_server precedent at plain-JSON scale):
 * the wire faces -- the Bearer + X-Service-Id headers arrive, ``top_k`` /
   ``cursor`` ride the request body, and the conversation tool hits its own
   path;
+* the write faces -- ``memory__write`` (the U-5(a) Day-1 tool): the ok
+  face with the entry id, the NOT-written outage sentence, the validation
+  double face, and the unconfigured face;
 * the pins -- the ``_DEFAULT_EFFECTS`` ask rows (§4.1) and the spec faces
   (the read-only set -- trio + the U-6a enumeration pair; the scene read
-  honestly idempotent, the time-varying faces honestly not). The deeper
-  loader battery (host-tier/shape) lives in test_config_loader.py.
+  honestly idempotent, the time-varying faces honestly not; the write the
+  one honest side-effect face). The deeper loader battery (host-tier/
+  shape) lives in test_config_loader.py.
 """
 
 from __future__ import annotations
@@ -279,6 +283,59 @@ async def test_list_spaces_500_answers_the_outage_payload(gateway: _FakeGateway,
     _assert_unavailable(result, "http_5xx")
 
 
+async def test_write_stores_and_answers_the_entry_id(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(200, {"entry_id": "m-77"})
+    adapter = builtin.MemoryWriteAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"content": "prefer tabs", "space_id": "sp-1"})
+    assert _payload(result) == {"status": "ok", "written": True, "entry_id": "m-77"}
+    assert result.metadata == {"availability": "ok"}
+    assert result.error is None
+    text = result.content[0].text if hasattr(result.content[0], "text") else ""
+    assert builtin.MEMORY_WRITTEN in text
+    recorded = gateway.requests[0]
+    assert recorded.method == "POST"
+    assert recorded.path == "/v3/memory/write"
+    body = json.loads(recorded.body)
+    assert body == {"content": "prefer tabs", "space_id": "sp-1"}
+
+
+async def test_write_without_an_entry_id_is_still_ok(gateway: _FakeGateway, tmp_path: Path) -> None:
+    gateway.script(200, {"status": "accepted"})
+    adapter = builtin.MemoryWriteAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"content": "note"})
+    assert _payload(result) == {"status": "ok", "written": True}
+
+
+async def test_write_outage_answers_not_written(gateway: _FakeGateway, tmp_path: Path) -> None:
+    # The write-side anti-fold iron law: an outage must state the write
+    # did NOT happen -- never a silent or ambiguous success.
+    gateway.script(500, "down")
+    adapter = builtin.MemoryWriteAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"content": "note"})
+    assert _payload(result) == {"status": "unavailable", "reason": "http_5xx"}
+    assert result.metadata == {"availability": "unavailable"}
+    assert result.error is not None
+    assert result.error.retryable is True
+    text = result.content[0].text if hasattr(result.content[0], "text") else ""
+    assert "NOT written" in text
+
+
+async def test_a_missing_content_is_the_write_validation_double_face(gateway: _FakeGateway, tmp_path: Path) -> None:
+    adapter = builtin.MemoryWriteAdapter(_client(gateway))
+    result = await adapter.execute(_context(tmp_path), {"content": ""})
+    assert result.error is not None
+    assert result.error.code is CoreErrorCode.VALIDATION_ERROR
+    assert gateway.requests == []
+
+
+async def test_an_unconfigured_write_is_the_fail_soft_face(tmp_path: Path) -> None:
+    result = await builtin.MemoryWriteAdapter(None).execute(_context(tmp_path), {"content": "x"})
+    assert _payload(result) == {"status": "unavailable", "reason": "unconfigured"}
+    assert result.metadata == {"availability": "unavailable"}
+    text = result.content[0].text if hasattr(result.content[0], "text") else ""
+    assert "NOT written" in text
+
+
 # ---------------------------------------------------------------------------
 # The wire faces.
 # ---------------------------------------------------------------------------
@@ -391,6 +448,7 @@ def test_policy_defaults_pin_the_memory_tools_to_ask() -> None:
     assert _DEFAULT_EFFECTS["memory__read_scene"] == "ask"
     assert _DEFAULT_EFFECTS["memory__list_spaces"] == "ask"
     assert _DEFAULT_EFFECTS["memory__list_scenes"] == "ask"
+    assert _DEFAULT_EFFECTS["memory__write"] == "ask"
 
 
 def test_the_specs_pin_the_readonly_memory_tools() -> None:
@@ -416,6 +474,11 @@ def test_the_specs_pin_the_readonly_memory_tools() -> None:
     assert builtin.MEMORY_CONVERSATION_SEARCH_SPEC.idempotency_support is False
     assert builtin.MEMORY_LIST_SPACES_SPEC.idempotency_support is False
     assert builtin.MEMORY_LIST_SCENES_SPEC.idempotency_support is False
+    # The one honest side-effect face (U-5(a)): the write claims effects
+    # and disclaims idempotency.
+    assert builtin.MEMORY_WRITE_SPEC.name == "write"
+    assert builtin.MEMORY_WRITE_SPEC.side_effects is True
+    assert builtin.MEMORY_WRITE_SPEC.idempotency_support is False
 
 
 # ---------------------------------------------------------------------------

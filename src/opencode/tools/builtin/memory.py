@@ -9,7 +9,10 @@ Three adapters over :mod:`opencode.memory`'s gateway client, one module
   the U-6a ruling: the full scene document plus an optional continuation
   cursor);
 - ``memory__list_spaces`` / ``memory__list_scenes`` -- the U-6a ruling's
-  read-only enumeration pair (cursor-paginated throughout).
+  read-only enumeration pair (cursor-paginated throughout);
+- ``memory__write`` -- the U-5(a) ruling's Day-1 explicit write tool: a
+  real side effect riding the approval chain (ask), with a fail-soft face
+  of its own.
 
 Fail-soft is the PINNED contract (plan §4.3), and it inverts the websearch
 fail-closed precedent on purpose: an unbound websearch adapter is a host
@@ -52,6 +55,7 @@ MEMORY_CONVERSATION_SEARCH_NAME = "conversation_search"
 MEMORY_READ_SCENE_NAME = "read_scene"
 MEMORY_LIST_SPACES_NAME = "list_spaces"
 MEMORY_LIST_SCENES_NAME = "list_scenes"
+MEMORY_WRITE_NAME = "write"
 
 #: The empty face's model-visible sentence (distinct from the unavailable
 #: sentence below by design -- §4.3-2 forbids any folding of the two).
@@ -62,6 +66,18 @@ MEMORY_NO_RESULTS = "No relevant memories found for this query."
 #: discipline; one distinct sentence per face).
 MEMORY_NO_SPACES = "No memory spaces found."
 MEMORY_NO_SCENES = "No memory scenes found."
+
+#: The write ok face's model-visible sentence.
+MEMORY_WRITTEN = "Memory written."
+
+#: The write unavailable face: the outage must state the write did NOT
+#: happen -- a failed write folded into success (or silence) is the one
+#: distortion the anti-fold discipline cannot tolerate on the write side
+#: (§4.3-2's write-side twin).
+MEMORY_WRITE_UNAVAILABLE = (
+    "Memory service is currently unavailable ({reason}). The memory was "
+    "NOT written -- this is a service outage, NOT a successful write."
+)
 
 #: The unavailable face's model-visible sentence: states the outage AND the
 #: distinction explicitly, so a model cannot read it as an empty result.
@@ -216,6 +232,44 @@ MEMORY_LIST_SCENES_SPEC = ToolSpec(
     idempotency_support=False,
 )
 
+MEMORY_WRITE_SPEC = ToolSpec(
+    namespace=MEMORY_NAMESPACE,
+    name=MEMORY_WRITE_NAME,
+    version=MEMORY_VERSION,
+    description=(
+        "Store one explicit memory entry in the user's long-term memory. "
+        "Use this when the user asks to remember a fact, preference, or "
+        "decision. Stored entries are visible to future memory searches."
+    ),
+    input_schema={
+        "type": "object",
+        "description": "Store one explicit memory entry.",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The memory text to store",
+            },
+            "space_id": {
+                "type": "string",
+                "description": "The space to store into (optional, service default)",
+            },
+            "scene_id": {
+                "type": "string",
+                "description": "Attach to an existing scene (optional)",
+            },
+        },
+        "required": ["content"],
+        "additionalProperties": False,
+    },
+    supported_content_types=["text"],
+    # A real write (the U-5(a) ruling's Day-1 face): unlike the read-only
+    # set, this spec honestly claims side effects -- the ask default is
+    # the approval-chain face, not a courtesy.
+    side_effects=True,
+    # An identical retry may store a second entry: honestly non-idempotent.
+    idempotency_support=False,
+)
+
 
 def _ok_page(
     page_results: tuple[JsonObject, ...],
@@ -253,10 +307,10 @@ def _ok_scene(scene: JsonObject) -> ToolResult:
     )
 
 
-def _unavailable(reason: str) -> ToolResult:
+def _unavailable(reason: str, *, sentence: str = MEMORY_UNAVAILABLE) -> ToolResult:
     """The §4.3-1/2/3 face: structured outage payload, never a raise."""
     return ToolResult(
-        content=[ToolTextContent(type="text", text=MEMORY_UNAVAILABLE.format(reason=reason))],
+        content=[ToolTextContent(type="text", text=sentence.format(reason=reason))],
         structured_output={"status": "unavailable", "reason": reason},
         metadata={"availability": "unavailable"},
         error=CoreError(
@@ -432,3 +486,44 @@ class MemoryListScenesAdapter:
         except Exception:
             return _unavailable("unexpected")
         return _ok_page(page.results, page.next_cursor, noun="memory scene(s)", empty_sentence=MEMORY_NO_SCENES)
+
+
+class MemoryWriteAdapter:
+    """The ``memory__write`` builtin (the U-5(a) Day-1 explicit write face)."""
+
+    def __init__(self, client: MemoryGatewayClient | None = None) -> None:
+        self._client = client
+
+    def bind(self, client: MemoryGatewayClient) -> None:
+        self._client = client
+
+    @property
+    def spec(self) -> ToolSpec:
+        return MEMORY_WRITE_SPEC
+
+    async def execute(self, context: ToolContext, input: JsonObject) -> ToolResult:
+        client = self._client
+        if client is None:
+            return _unavailable("unconfigured", sentence=MEMORY_WRITE_UNAVAILABLE)
+        content = _required_str(input, "content")
+        if content is None:
+            return _failure(CoreErrorCode.VALIDATION_ERROR, "content is required and must be a non-empty string")
+        space_id = _optional_str(input, "space_id")
+        scene_id = _optional_str(input, "scene_id")
+        try:
+            payload = await client.write(content, space_id=space_id, scene_id=scene_id)
+        except MemoryUnavailableError as error:
+            return _unavailable(error.reason, sentence=MEMORY_WRITE_UNAVAILABLE)
+        except Exception:
+            # §4.3-1 write-side: an unexpected defect still renders as the
+            # outage payload -- and NEVER as a silent success.
+            return _unavailable("unexpected", sentence=MEMORY_WRITE_UNAVAILABLE)
+        structured: JsonObject = {"status": "ok", "written": True}
+        entry_id = payload.get("entry_id")
+        if isinstance(entry_id, str) and entry_id:
+            structured["entry_id"] = entry_id
+        return ToolResult(
+            content=[ToolTextContent(type="text", text=MEMORY_WRITTEN)],
+            structured_output=structured,
+            metadata={"availability": "ok"},
+        )

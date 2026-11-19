@@ -255,3 +255,27 @@ class MemoryGatewayClient:
         if cursor is not None:
             params["cursor"] = cursor
         return _page_from_payload(await self._request("GET", "/v3/memory/scenes", params=params or None))
+
+    async def write(
+        self,
+        content: str,
+        *,
+        space_id: str | None = None,
+        scene_id: str | None = None,
+    ) -> JsonObject:
+        """``memory__write``: store one explicit memory entry (U-5(a) Day-1).
+
+        The write path's own wire (this repo's contract like the read
+        faces): POST /v3/memory/write with the content plus the optional
+        space/scene scoping; the response carries the stored entry's id
+        when the gateway assigns one.
+        """
+        body: JsonObject = {"content": content}
+        if space_id is not None:
+            body["space_id"] = space_id
+        if scene_id is not None:
+            body["scene_id"] = scene_id
+        payload = await self._request("POST", "/v3/memory/write", json_body=body)
+        if not isinstance(payload, dict):
+            raise MemoryUnavailableError("malformed") from None
+        return payload

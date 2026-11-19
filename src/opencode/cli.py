@@ -155,6 +155,7 @@ from opencode.tools.builtin import (
     MemoryListSpacesAdapter,
     MemoryReadSceneAdapter,
     MemorySearchAdapter,
+    MemoryWriteAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
     SubagentRunAdapter,
@@ -1136,6 +1137,11 @@ async def _drive(
             # same fail-soft face.
             MemoryListSpacesAdapter(memory_client),
             MemoryListScenesAdapter(memory_client),
+            # T-C1-PT-014 (plan §2.2, the U-5(a) Day-1 write tool): the
+            # first side-effect memory face (24 base adapters per host
+            # face); ask rides the approval chain, outages answer the
+            # NOT-written payload.
+            MemoryWriteAdapter(memory_client),
             *pty_adapters(),
         ),
         settings=runtime.settings,

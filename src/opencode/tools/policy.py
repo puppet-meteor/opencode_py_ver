@@ -147,6 +147,9 @@ _DEFAULT_EFFECTS: dict[str, Literal["allow", "ask"]] = {
     # same ask default, the same registered §4.2 contradiction.
     "memory__list_spaces": "ask",
     "memory__list_scenes": "ask",
+    # T-C1-PT-014 (plan §2.2, the U-5(a) ruling's Day-1 write tool): a
+    # real side effect -- ask is the approval-chain face.
+    "memory__write": "ask",
 }
 
 #: Namespace-level default (§5.2 L266): every bash/MCP action asks.

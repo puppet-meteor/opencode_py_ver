@@ -65,6 +65,7 @@ from opencode.tools.builtin import (
     MemoryListSpacesAdapter,
     MemoryReadSceneAdapter,
     MemorySearchAdapter,
+    MemoryWriteAdapter,
     PatchApplyAdapter,
     QuestionAskAdapter,
     SubagentRunAdapter,
@@ -308,6 +309,9 @@ def _builtin_adapters(
         # T-C1-PT-013 (the U-6a enumeration pair): same twin, same face.
         MemoryListSpacesAdapter(memory_client),
         MemoryListScenesAdapter(memory_client),
+        # T-C1-PT-014 (the U-5(a) Day-1 write tool): same twin, the
+        # side-effect face (ask + the NOT-written outage payload).
+        MemoryWriteAdapter(memory_client),
         *pty_adapters(),
     )
 
