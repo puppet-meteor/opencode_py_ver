@@ -44,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from opencode.contracts import DurableEvent, EventRegistry, canonical_json, default_event_registry
 from opencode.contracts.events import EventDecodeError
 from opencode.contracts.messages import JsonObject, JsonValue
+from opencode.storage.failures import finalize_transaction
 from opencode.storage.store import EventBatch
 from opencode.storage.txn import (
     ConflictError,
@@ -257,8 +258,8 @@ class JobsStore:
                         events = await self._commit_sequence(connection, stream_key, batch, expected_seq)
                         await connection.commit()
                         return events
-                    except BaseException:
-                        await connection.rollback()
+                    except BaseException as error:
+                        await finalize_transaction(connection, error)
                         raise
 
     async def rebuild(self, stream_key: str) -> None:
@@ -280,8 +281,8 @@ class JobsStore:
                     try:
                         await self._rebuild_sequence(connection, stream_key)
                         await connection.commit()
-                    except BaseException:
-                        await connection.rollback()
+                    except BaseException as error:
+                        await finalize_transaction(connection, error)
                         raise
 
     async def _commit_sequence(

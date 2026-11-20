@@ -60,6 +60,7 @@ from opencode.contracts import (
     canonical_json,
 )
 from opencode.storage.db import StorageError
+from opencode.storage.failures import finalize_transaction
 
 if TYPE_CHECKING:
     from opencode.storage.store import EventBatch, Projector
@@ -487,8 +488,8 @@ class TransactionWriter:
                 events = await self._commit_sequence(connection, session_id, batch, expected_seq)
                 await connection.commit()
                 return events
-            except BaseException:
-                await connection.rollback()
+            except BaseException as error:
+                await finalize_transaction(connection, error)
                 raise
 
     async def _commit_sequence(
@@ -764,8 +765,8 @@ class TransactionWriter:
             try:
                 await self._rebuild_sequence(connection, session_id)
                 await connection.commit()
-            except BaseException:
-                await connection.rollback()
+            except BaseException as error:
+                await finalize_transaction(connection, error)
                 raise
 
     async def _rebuild_sequence(self, connection: AsyncConnection, session_id: str) -> None:
