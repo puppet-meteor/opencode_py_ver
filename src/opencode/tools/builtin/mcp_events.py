@@ -48,6 +48,7 @@ from collections.abc import Sequence
 from contextlib import aclosing
 from typing import Any, Protocol, cast
 
+from opencode import flags
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import JsonObject, JsonValue, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
@@ -59,9 +60,11 @@ from opencode.mcp.manager import (
 from opencode.tools.builtin.read import _failure
 from opencode.tools.invoker import ToolContext
 
-#: Decision 4: the TS ``Flag.enabled("mcp_events")`` gate as a module
-#: constant -- hosts read it when assembling the tool set.
-MCP_EVENTS_ENABLED = True
+#: The TS ``Flag.enabled("mcp_events")`` gate, resolved through the
+#: T-C3-007 flag chain at import time (channel "local": on by default,
+#: ``OPENCODE_FLAGS=-mcp_events`` turns it off) -- hosts read it when
+#: assembling the tool set.
+MCP_EVENTS_ENABLED = flags.resolve_from_environment()["mcp_events"]["enabled"]
 
 #: Upstream mcp-events.ts L13 ``DATA_LIMIT``: the event data cap.
 MCP_EVENTS_DATA_LIMIT = 16_384

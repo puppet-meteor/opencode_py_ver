@@ -7,7 +7,7 @@ the BEFORE baseline; the identical inputs afterwards give the AFTER column.
 The delta is the ticket's evidence against doc/GOAL.md's determinism-first
 gate (doc/plans/port-232-increments.md T-C3-007, decisions 1-6):
 
-* P0 capability -- the banked seam contract: module ``opencode.config.flags``
+* P0 capability -- the banked seam contract: module ``opencode.flags``
   (``resolve(entries, channel, overrides)`` pure function + ``REGISTRY``/
   ``OPT_IN_ONLY``/``ALIASES``/``WILDCARD``), module ``opencode.util.canonical_json``
   (``canonical_json(value) -> str``) and module ``opencode.shared_cache``
@@ -43,6 +43,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Injected timing (repo discipline: short values, anti-flake).
@@ -72,7 +74,7 @@ def _module(name: str) -> Any | None:
 
 
 def test_p0_capability_probe() -> None:
-    flags = _module("opencode.config.flags")
+    flags = _module("opencode.flags")
     canonical = _module("opencode.util.canonical_json")
     cache = _module("opencode.shared_cache")
     faces = {
@@ -182,7 +184,7 @@ def _expect(entry: dict[str, Any]) -> dict[str, tuple[bool, str]]:
 
 
 def test_m1_flag_resolution_matrix() -> None:
-    flags = _module("opencode.config.flags")
+    flags = _module("opencode.flags")
     status = "capability-absent"
     total = passed = 0
     worst: str | None = None
@@ -312,13 +314,15 @@ def _drive_cache(metric: str) -> dict[str, Any]:
             await asyncio.sleep(0.05)
             gate.set()
             a, b = await asyncio.gather(first, second)
+            loads_after_join = loads  # one gated load served both gets
             await cache.get("k", load)  # within interval: no load
+            loads_after_fresh = loads
             forced = await cache.get("k", load, force=True)
             out = {
                 "status": "single-flight",
-                "concurrent_loads": loads == 1,
+                "concurrent_loads": loads_after_join == 1,
                 "joined_same_value": a == b == "value-1",
-                "fresh_no_load": loads == 1,
+                "fresh_no_load": loads_after_fresh == 1,
                 "force_reloads": loads == 2 and forced == "value-2",
                 "loads": loads,
             }
@@ -335,7 +339,7 @@ def _drive_cache(metric: str) -> dict[str, Any]:
             async def bad() -> str:
                 nonlocal loads
                 loads += 1
-                raise RuntimeError("remote is down")
+                raise httpx.TransportError("remote is down")
 
             first = await cache.get("k", good)
             await asyncio.sleep(_INTERVAL_S + 0.1)  # age out the good value
@@ -343,7 +347,7 @@ def _drive_cache(metric: str) -> dict[str, Any]:
             out = {
                 "status": "stale-served",
                 "kept_last_good": first == "good" and after == "good",
-                "retried_then_kept": loads == 1 + 3,
+                "retried_then_kept": loads == 1 + 1 + len(_RETRY_DELAYS_S),
                 "loads": loads,
             }
             out["status"] = "stale-served" if out["kept_last_good"] and out["retried_then_kept"] else "error-surfaced"
