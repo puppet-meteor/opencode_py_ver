@@ -53,8 +53,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _PROJECT = "prj_autotest"
 _SESSION_ID = "ses_autotest"
-#: a fixed epoch-ms base: 2026-10-25T00:00:00Z (the Berlin fall-back night).
-_BASE_MS = 1_793_414_400_000
+#: a fixed epoch-ms base: 2026-10-25T00:00:00Z exactly (the Berlin fall-back
+#: night -- the instant is derived, never hand-computed).
+_BASE_MS = 1_792_886_400_000
 _EVERY_MS = 30_000
 _LATE_AFTER_S = 60.0
 _FAILED_RETRY_S = 5.0
@@ -174,18 +175,20 @@ class _Sessions:
         return self.always_pending
 
 
-async def _make(db_path: Path, sessions: _Sessions, clock: _Clock, **overrides: Any) -> tuple[Any, Any]:
+async def _make(
+    db_path: Path, sessions: _Sessions, clock: _Clock, database: Any = None, **overrides: Any
+) -> tuple[Any, Any]:
     module = _service_module()
-    database = await open_database(db_path, mode="create").__aenter__()
+    handle = database if database is not None else await open_database(db_path, mode="create").__aenter__()
     kwargs: dict[str, Any] = {
-        "database": database,
+        "database": handle,
         "sessions": sessions,
         "now_ms": clock,
         "late_after_s": _LATE_AFTER_S,
         "failed_retry_s": _FAILED_RETRY_S,
     }
     kwargs.update(overrides)
-    return module.AutomationService(**kwargs), database
+    return module.AutomationService(**kwargs), handle
 
 
 def _create_payload(**overrides: Any) -> dict[str, Any]:
@@ -330,7 +333,8 @@ def test_every_phase_keep_exact(tmp_path: Path) -> None:
     row = _execute(_scenario())
     assert row["run_count"] == 1
     assert row["next_due_at"] == due + 4 * _EVERY_MS
-    assert row["last_outcome"] == "fired"
+    # the run is 90s past its slot (>= late_after 60s): upstream marks it late
+    assert row["last_outcome"] == "late"
 
 
 def test_cron_strict_next_slot(tmp_path: Path) -> None:
@@ -418,12 +422,13 @@ def test_lease_single_flight_across_services(tmp_path: Path) -> None:
     async def _scenario() -> int:
         sessions_a = _Sessions()
         sessions_b = _Sessions()
-        service_a, database_a = await _make(db_path, sessions_a, _Clock())
-        service_b, database_b = await _make(db_path, sessions_b, _Clock())
+        # One engine, two services: the lease is what must keep them single
+        # flight (same-owner re-claim ok, cross-owner blocked).
+        service_a, database = await _make(db_path, sessions_a, _Clock())
+        service_b, _ = await _make(db_path, sessions_b, _Clock(), database=database)
         await service_a.tick()
         await service_b.tick()
-        await database_a.close()
-        await database_b.close()
+        await database.close()
         return len(sessions_a.sends) + len(sessions_b.sends)
 
     assert _execute(_scenario()) == 1

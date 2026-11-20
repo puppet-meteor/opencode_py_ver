@@ -1,0 +1,778 @@
+"""Automation service: scheduled prompt actions (T-C3-003).
+
+Upstream 2.3.2 ``core/src/automation.ts`` first-period slice (prompt
+actions, at/every/cron triggers) per doc/plans/port-232-increments.md:
+
+- ``following()`` -- the first slot strictly after ``now`` per trigger: an
+  ``at`` has none (one shot); an ``every`` keeps its phase (missed slots
+  are skipped, never caught up in a burst: ``due + (floor((now-due)/every)
+  + 1) * every``); a cron is the next matching slot, DST fall-back safe;
+- ``tick()`` -- selects eligible rows (active + due<=now + retry gate)
+  ordered by ``next_due_at``, then re-reads each single row under the same
+  filter before running it (selection is not admission: the row may have
+  been paused, removed or rescheduled while queued);
+- single flight -- every run claims the ``automation_lease`` row first (a
+  lease, not a lock: ownership decays with time so a crashed scheduler
+  never wedges the table), so two services over one database never
+  double-fire a slot;
+- settlement -- optimistic concurrency: every run's UPDATE is guarded by
+  ``id + run_count + status``, so a completion settle never resurrects a
+  removed row and a failure settle never overwrites a concurrent pause;
+- outcomes -- ``fired``/``late`` (past ``late_after_s``) on delivery,
+  ``skipped`` when the previous prompt is still pending in the target's
+  inbox (coalesce: no send, but the timer still advances), ``failed`` with
+  a ``retry_at`` backoff that does NOT count the run, ``expired`` for a
+  slot that only came up after ``expires_at`` and past ``late_after_s``;
+  an unresolvable target pauses the automation with the reason;
+- subagent targets -- the child session id is derived from the run
+  (``ses_aut_<id>_<run>``) so a retried run adopts the child it already
+  started instead of leaking another.
+
+Deviations from upstream (banked in the plan doc): no per-directory
+``experimental.automations`` flag face (py has no flag service this
+period; the capability is on), no event triggers and no code actions (the
+``trigger``/``action`` JSON columns keep room for them), no KV table (the
+lease lives in ``automation_lease``), and the sessions port is a
+structural protocol wired from the app so tests run without an LLM.
+
+Timestamps are epoch-ms integers. Timing parameters are constructor-
+injectable (repo discipline: short values in tests, anti-flake).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import math
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy import text
+
+from opencode.automation.cron import InvalidCronError, next_after, parse
+from opencode.storage.db import Database
+
+TABLE = "automation"
+LEASE_TABLE = "automation_lease"
+LEASE_KEY = "leader"
+
+#: Upstream constants (automation.ts L119-135); timing params stay injectable.
+DEFAULT_MIN_PROMPT_INTERVAL_S = 60.0
+DEFAULT_LATE_AFTER_S = 60.0
+DEFAULT_FAILED_RETRY_S = 300.0
+DEFAULT_LEADER_TTL_S = 60.0
+DEFAULT_TICK_CONCURRENCY = 4
+
+_AT_TRIGGER = "at"
+_EVERY_TRIGGER = "every"
+_CRON_TRIGGER = "cron"
+
+_RELATIVE = re.compile(r"^in\s+(\d+)\s+(seconds?|minutes?|hours?)$")
+_UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600}
+
+
+class InvalidAutomationError(Exception):
+    """A create request (or a run's target) failed validation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AutomationNotFoundError(Exception):
+    """No automation has this id."""
+
+    def __init__(self, automation_id: str) -> None:
+        super().__init__(f"Automation {automation_id} not found")
+        self.automation_id = automation_id
+
+
+class AutomationSession:
+    """What the service needs to know about a resolved session."""
+
+    id: str
+    project_id: str
+
+
+class AutomationSessions(Protocol):
+    """The delivery port: wired from the app over SessionService/SessionInbox,
+    faked in tests (no LLM, no store)."""
+
+    def resolve_session(self, session_id: str) -> AutomationSession | None: ...
+
+    async def send_prompt(self, session_id: str, text: str, message_id: str) -> str: ...
+
+    def create_child(self, parent_session_id: str, agent: str, child_session_id: str) -> None: ...
+
+    def prompt_pending(self, session_id: str, message_id: str) -> bool: ...
+
+
+@dataclass(slots=True)
+class _Row:
+    """One automation row; JSON columns already decoded."""
+
+    id: str
+    project_id: str
+    session_id: str | None
+    directory: str
+    name: str
+    trigger: dict[str, Any]
+    tz: str
+    action: dict[str, Any]
+    status: str
+    next_due_at: int | None
+    expires_at: int | None
+    run_count: int
+    failures: int
+    last_run_at: int | None
+    last_message_id: str | None
+    last_outcome: str | None
+    last_output: str | None
+    retry_at: int | None
+    time_created: int
+    time_updated: int
+
+
+_COLUMNS = (
+    "id, project_id, session_id, directory, name, trigger, tz, action, status, "
+    "next_due_at, expires_at, run_count, failures, last_run_at, last_message_id, "
+    "last_outcome, last_output, retry_at, time_created, time_updated"
+)
+
+
+def _decode_row(fetched: Any) -> _Row:
+    (
+        row_id,
+        project_id,
+        session_id,
+        directory,
+        name,
+        trigger,
+        tz,
+        action,
+        status,
+        next_due_at,
+        expires_at,
+        run_count,
+        failures,
+        last_run_at,
+        last_message_id,
+        last_outcome,
+        last_output,
+        retry_at,
+        time_created,
+        time_updated,
+    ) = fetched
+    return _Row(
+        id=row_id,
+        project_id=project_id,
+        session_id=session_id,
+        directory=directory,
+        name=name,
+        trigger=json.loads(trigger) if isinstance(trigger, str) else trigger,
+        tz=tz,
+        action=json.loads(action) if isinstance(action, str) else action,
+        status=status,
+        next_due_at=next_due_at,
+        expires_at=expires_at,
+        run_count=run_count,
+        failures=failures,
+        last_run_at=last_run_at,
+        last_message_id=last_message_id,
+        last_outcome=last_outcome,
+        last_output=last_output,
+        retry_at=retry_at,
+        time_created=time_created,
+        time_updated=time_updated,
+    )
+
+
+def run_session_id(automation_id: str, run: int) -> str:
+    """The child session a subagent run starts: derived from the run so a
+    retry adopts it instead of starting another (upstream runSessionID)."""
+    return f"ses_aut_{automation_id}_{run}"
+
+
+def is_run_session(session_id: str) -> bool:
+    """Whether a session is an automation run's child (upstream isRunSession)."""
+    return session_id.startswith("ses_aut_")
+
+
+def _parse_duration_ms(value: str) -> int:
+    match = _RELATIVE.match(value.strip())
+    if match is None:
+        raise InvalidAutomationError(f"Invalid time: {value}")
+    amount = int(match.group(1))
+    unit = match.group(2).rstrip("s")
+    return amount * _UNIT_SECONDS[unit] * 1000
+
+
+def _parse_time(raw: str, tz_name: str, now_ms: int) -> int:
+    """An instant with an offset, a wall-clock time in tz, or 'in N unit'."""
+    value = raw.strip()
+    relative = _RELATIVE.match(value)
+    if relative is not None:
+        delay = _parse_duration_ms(value)
+        if delay <= 0:
+            raise InvalidAutomationError(f"Invalid time: {raw}")
+        return now_ms + delay
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise InvalidAutomationError(f"Invalid time: {raw}") from error
+    if parsed.tzinfo is None:
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(tz_name))
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise InvalidAutomationError(f"Unknown time zone: {tz_name}") from error
+    return int(parsed.timestamp() * 1000)
+
+
+class AutomationService:
+    """CRUD + scheduler face over the ``automation`` table."""
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        sessions: AutomationSessions | None = None,
+        now_ms: Any = None,
+        min_prompt_interval_s: float = DEFAULT_MIN_PROMPT_INTERVAL_S,
+        late_after_s: float = DEFAULT_LATE_AFTER_S,
+        failed_retry_s: float = DEFAULT_FAILED_RETRY_S,
+        leader_ttl_s: float = DEFAULT_LEADER_TTL_S,
+        tick_concurrency: int = DEFAULT_TICK_CONCURRENCY,
+    ) -> None:
+        self._database = database
+        self._sessions = sessions
+        self._now_ms = now_ms
+        self._min_prompt_interval_ms = int(min_prompt_interval_s * 1000)
+        self._late_after_ms = int(late_after_s * 1000)
+        self._failed_retry_ms = int(failed_retry_s * 1000)
+        self._leader_ttl_ms = int(leader_ttl_s * 1000)
+        self._tick_concurrency = max(1, tick_concurrency)
+        self._owner = uuid.uuid4().hex
+        # The scheduler's doorbell: create/resume ring it so a fresh slot is
+        # picked up at once instead of after max_sleep.
+        self._doorbell = asyncio.Event()
+
+    # -- plumbing -----------------------------------------------------------
+
+    def _now(self) -> int:
+        if self._now_ms is not None:
+            return int(self._now_ms())
+        return int(time.time() * 1000)
+
+    def wake(self) -> None:
+        """Ring the doorbell (upstream ``doorbell.open``)."""
+        self._doorbell.set()
+
+    async def doorbell_wait(self, timeout_s: float) -> None:
+        self._doorbell.clear()
+        try:
+            await asyncio.wait_for(self._doorbell.wait(), timeout_s)
+        except TimeoutError:
+            pass
+
+    async def _fetch(self, automation_id: str) -> _Row:
+        async with self._database.engine.connect() as connection:
+            found = await connection.execute(
+                text(f"select {_COLUMNS} from {TABLE} where id = :id"), {"id": automation_id}
+            )
+        row = found.fetchone()
+        if row is None:
+            raise AutomationNotFoundError(automation_id)
+        return _decode_row(row)
+
+    @staticmethod
+    def _info(row: _Row) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "name": row.name,
+            "project_id": row.project_id,
+            "session_id": row.session_id,
+            "directory": row.directory,
+            "trigger": row.trigger,
+            "tz": row.tz,
+            "action": row.action,
+            "status": row.status,
+            "next_due_at": row.next_due_at,
+            "expires_at": row.expires_at,
+            "run_count": row.run_count,
+            "last_run_at": row.last_run_at,
+            "last_message_id": row.last_message_id,
+            "last_outcome": row.last_outcome,
+            "last_output": row.last_output,
+            "retry_at": row.retry_at,
+            "time_created": row.time_created,
+            "time_updated": row.time_updated,
+        }
+
+    # -- lease ----------------------------------------------------------------
+
+    async def claim_leader(self, now_ms: int | None = None, ttl_ms: int | None = None) -> bool:
+        """Claim the leader lease (upstream claimLeader): claimed per run, not
+        per tick, so leadership can pass between them."""
+        now = now_ms if now_ms is not None else self._now()
+        until = now + (ttl_ms if ttl_ms is not None else self._leader_ttl_ms)
+        statement = text(
+            f"""
+            insert into {LEASE_TABLE} (key, owner, until_ms)
+            values (:key, :owner, :until)
+            on conflict(key) do update set owner = :owner, until_ms = :until
+            where {LEASE_TABLE}.owner = :owner or {LEASE_TABLE}.until_ms <= :now
+            """
+        ).bindparams(key=LEASE_KEY, owner=self._owner, until=until, now=now)
+        async with self._database.engine.begin() as connection:
+            result = await connection.execute(statement)
+        return (result.rowcount or 0) > 0
+
+    # -- scheduling ------------------------------------------------------------
+
+    def following(self, row: _Row, now_ms: int) -> int | None:
+        """The first slot strictly after ``now``; None for a finished one-shot."""
+        trigger = row.trigger
+        kind = trigger.get("type")
+        if kind == _AT_TRIGGER:
+            return None
+        if kind == _EVERY_TRIGGER:
+            every_ms = int(float(trigger["every"]) * 1000)
+            due = row.next_due_at if row.next_due_at is not None else now_ms
+            return due + (math.floor((now_ms - due) / every_ms) + 1) * every_ms
+        if kind == _CRON_TRIGGER:
+            return next_after(parse(str(trigger["cron"])), row.tz, now_ms)
+        return None
+
+    def _finished(self, row: _Row, next_ms: int | None) -> bool:
+        return next_ms is None or (row.expires_at is not None and next_ms > row.expires_at)
+
+    def _advance(self, row: _Row, ended_ms: int) -> dict[str, Any]:
+        """The settle fragments that move a successful/skipped run's cursor."""
+        next_ms = self.following(row, ended_ms)
+        if self._finished(row, next_ms):
+            return {"status": "done", "next_due_at": None}
+        return {"next_due_at": next_ms}
+
+    async def _settle(self, row: _Row, values: dict[str, Any], *, even_if_paused: bool = False) -> bool:
+        """Optimistic settlement: the UPDATE only applies while the row still
+        has the run_count (and status) this run started from."""
+        assignments = ", ".join(f"{column} = :{column}" for column in values)
+        status_guard = "!= 'done'" if even_if_paused else "= 'active'"
+        statement = text(
+            f"""
+            update {TABLE} set {assignments}, time_updated = :time_updated
+            where id = :id and run_count = :expected_run_count and status {status_guard}
+            """
+        )
+        params: dict[str, Any] = dict(values)
+        params["time_updated"] = values.get("time_updated", self._now())
+        params["id"] = row.id
+        params["expected_run_count"] = row.run_count
+        async with self._database.engine.begin() as connection:
+            result = await connection.execute(statement.bindparams(**params))
+        return (result.rowcount or 0) > 0
+
+    async def _pause_with(self, row: _Row, now_ms: int, reason: str) -> None:
+        await self._settle(
+            row,
+            {
+                "status": "paused",
+                "last_outcome": "failed",
+                "last_output": reason,
+                "retry_at": None,
+                "time_updated": now_ms,
+            },
+            even_if_paused=True,
+        )
+
+    async def next_wake_after(self, now_ms: int) -> int | None:
+        """The earliest active due time past ``now`` (upstream nextWake face)."""
+        async with self._database.engine.connect() as connection:
+            found = await connection.execute(
+                text(f"select min(next_due_at) from {TABLE} where status = 'active' and next_due_at > :now"),
+                {"now": now_ms},
+            )
+        value = found.fetchone()
+        return int(value[0]) if value is not None and value[0] is not None else None
+
+    # -- tick ------------------------------------------------------------------
+
+    async def tick(self) -> int:
+        """Run every automation due now, at most once each (upstream tickAt)."""
+        now = self._now()
+        async with self._database.engine.connect() as connection:
+            due = await connection.execute(
+                text(
+                    f"select id from {TABLE} where status = 'active' "
+                    "and next_due_at is not null and next_due_at <= :now "
+                    "and (retry_at is null or retry_at <= :now) "
+                    "order by next_due_at asc"
+                ),
+                {"now": now},
+            )
+            ids = [str(row[0]) for row in due.fetchall()]
+        if not ids:
+            return 0
+        semaphore = asyncio.Semaphore(self._tick_concurrency if len(ids) > 1 else 1)
+        results: list[bool] = []
+
+        async def _one(automation_id: str) -> bool:
+            async with semaphore:
+                # Selection is not admission: re-read under the same filter.
+                current = self._now()
+                async with self._database.engine.connect() as connection:
+                    found = await connection.execute(
+                        text(
+                            f"select {_COLUMNS} from {TABLE} where id = :id "
+                            "and status = 'active' and next_due_at is not null "
+                            "and next_due_at <= :now and (retry_at is null or retry_at <= :now)"
+                        ),
+                        {"id": automation_id, "now": current},
+                    )
+                    row = found.fetchone()
+                if row is None:
+                    return False
+                return await self._run_due(_decode_row(row), current)
+
+        results = list(await asyncio.gather(*(_one(automation_id) for automation_id in ids)))
+        return sum(1 for ran in results if ran)
+
+    async def _run_due(self, row: _Row, now_ms: int) -> bool:
+        """Leadership, expiry, then the action (upstream runDue)."""
+        if row.next_due_at is None:
+            return False
+        if not await self.claim_leader(now_ms):
+            return False
+        expired = row.expires_at is not None and now_ms > row.expires_at
+        late = now_ms - row.next_due_at >= self._late_after_ms
+        if expired and late:
+            await self._settle(
+                row,
+                {
+                    "status": "done",
+                    "next_due_at": None,
+                    "last_outcome": "expired",
+                    "retry_at": None,
+                    "time_updated": now_ms,
+                },
+            )
+            return True
+        try:
+            await self._run_action(row, now_ms)
+        except InvalidAutomationError as error:
+            await self._pause_with(row, now_ms, error.reason)
+        except Exception as error:
+            await self._settle(
+                row,
+                {
+                    "last_outcome": "failed",
+                    "last_output": str(error),
+                    "retry_at": now_ms + self._failed_retry_ms,
+                    "time_updated": now_ms,
+                },
+            )
+        return True
+
+    async def _resolve_target(self, row: _Row, to: dict[str, Any]) -> tuple[str, str | None]:
+        """(target session id, subagent) for the action's ``to``."""
+        sessions = self._sessions
+        if sessions is None:
+            raise InvalidAutomationError("The automation service has no sessions port wired")
+        target_session = to.get("session")
+        if isinstance(target_session, str):
+            target = sessions.resolve_session(target_session)
+            if target is None:
+                raise InvalidAutomationError(f"Target session {target_session} no longer exists")
+            if target.project_id != row.project_id:
+                raise InvalidAutomationError(f"Target session {target_session} moved to another project")
+            return target_session, None
+        subagent = to.get("subagent")
+        if isinstance(subagent, str):
+            if row.session_id is None:
+                raise InvalidAutomationError("The session that created this automation no longer exists")
+            owner = sessions.resolve_session(row.session_id)
+            if owner is None:
+                raise InvalidAutomationError("The session that created this automation no longer exists")
+            if owner.project_id != row.project_id:
+                raise InvalidAutomationError("The session that created this automation moved to another project")
+            child = run_session_id(row.id, row.run_count + 1)
+            sessions.create_child(row.session_id, subagent, child)
+            return child, subagent
+        raise InvalidAutomationError("A prompt action has no target")
+
+    async def _run_action(self, row: _Row, now_ms: int) -> None:
+        """One prompt run (upstream runAction, prompt branch)."""
+        action = row.action
+        if action.get("type") != "prompt":
+            raise InvalidAutomationError(f"Unsupported action type: {action.get('type')!r}")
+        trigger = row.trigger
+        if trigger.get("type") not in (_AT_TRIGGER, _EVERY_TRIGGER, _CRON_TRIGGER):
+            raise InvalidAutomationError(f"Unsupported trigger type: {trigger.get('type')!r}")
+        run = row.run_count + 1
+        due_ms = row.next_due_at if row.next_due_at is not None else now_ms
+        late = now_ms - due_ms >= self._late_after_ms
+        message_id = f"msg_{row.id}_{run}"
+        to_option = action.get("to")
+        to = to_option if isinstance(to_option, dict) else {}
+        resolved = await self._resolve_target(row, to)
+        target_id: str = resolved[0]
+        subagent: str | None = resolved[1]
+        prompt_text = str(action.get("prompt", ""))
+        # Coalesce: only an unchanging timer prompt targeting a session, when
+        # its previous prompt is still pending in that session's inbox.
+        if (
+            to.get("session") is not None
+            and row.last_message_id is not None
+            and self._sessions is not None
+            and self._sessions.prompt_pending(str(to["session"]), row.last_message_id)
+        ):
+            await self._settle(
+                row,
+                {
+                    "last_outcome": "skipped",
+                    "retry_at": None,
+                    **self._advance(row, now_ms),
+                    "time_updated": now_ms,
+                },
+            )
+            return
+        assert self._sessions is not None  # _resolve_target already validated
+        await self._sessions.send_prompt(target_id, prompt_text, message_id)
+        summary = f"Started subagent {target_id}" if subagent is not None else f"Prompted {target_id}"
+        await self._settle(
+            row,
+            {
+                "last_output": summary,
+                "last_message_id": message_id,
+                "run_count": run,
+                "last_run_at": now_ms,
+                "last_outcome": "late" if late else "fired",
+                "retry_at": None,
+                **self._advance(row, self._now()),
+                "time_updated": now_ms,
+            },
+            even_if_paused=True,
+        )
+
+    # -- create ----------------------------------------------------------------
+
+    def _project_for(self, directory: str, owner: AutomationSession | None) -> str:
+        if owner is not None:
+            return owner.project_id
+        digest = hashlib.sha256(directory.encode("utf-8")).hexdigest()[:16]
+        return f"prj_{digest}"
+
+    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate and insert one automation (upstream create, first period)."""
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            raise InvalidAutomationError("A automation needs a name")
+        action = payload.get("action")
+        if not isinstance(action, dict):
+            raise InvalidAutomationError("A automation needs an action")
+        if action.get("type") != "prompt":
+            raise InvalidAutomationError(f"Unsupported action type: {action.get('type')!r}")
+        trigger = payload.get("trigger")
+        if not isinstance(trigger, dict):
+            raise InvalidAutomationError("A automation needs a trigger")
+        kind = trigger.get("type")
+        if kind not in (_AT_TRIGGER, _EVERY_TRIGGER, _CRON_TRIGGER):
+            raise InvalidAutomationError(f"Unsupported trigger type: {kind!r}")
+        sessions = self._sessions
+        owner: AutomationSession | None = None
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str):
+            if sessions is None:
+                raise InvalidAutomationError("The automation service has no sessions port wired")
+            owner = sessions.resolve_session(session_id)
+            if owner is None:
+                raise InvalidAutomationError(f"Session {session_id} no longer exists")
+        directory = str(payload.get("directory") or (owner.id if owner else "") or "")
+        if not directory:
+            raise InvalidAutomationError("A automation needs a directory")
+        project_id = str(payload.get("project_id") or self._project_for(directory, owner))
+        tz_option = trigger.get("tz")
+        tz_name = tz_option if isinstance(tz_option, str) else "UTC"
+        try:
+            ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise InvalidAutomationError(f"Unknown time zone: {tz_name}") from error
+        now = self._now()
+
+        stored = dict(trigger)
+        due_ms: int
+        if kind == _AT_TRIGGER:
+            at_ms = _parse_time(str(trigger.get("at", "")), tz_name, now)
+            if at_ms <= now:
+                raise InvalidAutomationError(f"Time is in the past: {trigger.get('at')}")
+            if _RELATIVE.match(str(trigger.get("at", "")).strip()):
+                stored = {
+                    "type": _AT_TRIGGER,
+                    "at": datetime.fromtimestamp(at_ms / 1000, UTC).isoformat(),
+                    **({"tz": tz_name} if trigger.get("tz") else {}),
+                }
+            due_ms = at_ms
+        elif kind == _EVERY_TRIGGER:
+            every_option = trigger.get("every")
+            if not isinstance(every_option, (int, float)) or isinstance(every_option, bool):
+                raise InvalidAutomationError(f"Invalid interval: {trigger.get('every')!r}")
+            every_s = float(every_option)
+            if every_s * 1000 < self._min_prompt_interval_ms:
+                raise InvalidAutomationError(f"every must be at least {self._min_prompt_interval_ms // 1000} seconds")
+            due_ms = now + int(every_s * 1000)
+        else:
+            expression = str(trigger.get("cron", ""))
+            try:
+                spec = parse(expression)
+                next_ms = next_after(spec, tz_name, now)
+            except InvalidCronError as error:
+                raise InvalidAutomationError(str(error)) from error
+            if next_ms is None:
+                raise InvalidAutomationError(f"cron never runs: {expression}")
+            due_ms = next_ms
+
+        expires_ms: int | None = None
+        if payload.get("expires") is not None:
+            expires_ms = _parse_time(str(payload["expires"]), tz_name, now)
+            if expires_ms < due_ms:
+                raise InvalidAutomationError("The automation expires before it first runs")
+
+        resolved_action = self._resolve_create_action(action, owner, project_id, session_id)
+        automation_id = f"aut_{uuid.uuid4().hex}"
+        statement = text(
+            f"""
+            insert into {TABLE} (
+                id, project_id, session_id, directory, name, trigger, tz, action,
+                status, next_due_at, expires_at, run_count, failures,
+                time_created, time_updated
+            ) values (
+                :id, :project_id, :session_id, :directory, :name, :trigger, :tz, :action,
+                'active', :next_due_at, :expires_at, 0, 0, :now, :now
+            )
+            """
+        ).bindparams(
+            id=automation_id,
+            project_id=project_id,
+            session_id=session_id,
+            directory=directory,
+            name=name,
+            trigger=json.dumps(stored),
+            tz=tz_name,
+            action=json.dumps(resolved_action),
+            next_due_at=due_ms,
+            expires_at=expires_ms,
+            now=now,
+        )
+        async with self._database.engine.begin() as connection:
+            await connection.execute(statement)
+        self.wake()
+        return self._info(await self._fetch(automation_id))
+
+    def _resolve_create_action(
+        self,
+        action: dict[str, Any],
+        owner: AutomationSession | None,
+        project_id: str,
+        session_id: str | None,
+    ) -> dict[str, Any]:
+        """Validate the prompt target (upstream resolveAction, prompt branch)."""
+        prompt = action.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise InvalidAutomationError("A prompt action needs a prompt")
+        to = action.get("to")
+        if to is None:
+            if owner is None:
+                raise InvalidAutomationError("A prompt action needs `to` when there is no session")
+            to = {"session": owner.id}
+        if not isinstance(to, dict):
+            raise InvalidAutomationError("A prompt target must be an object")
+        has_session = to.get("session") is not None
+        has_subagent = to.get("subagent") is not None
+        if has_session == has_subagent:
+            raise InvalidAutomationError("A prompt target needs exactly one of session/subagent")
+        if has_session:
+            target = self._sessions.resolve_session(str(to["session"])) if self._sessions is not None else None
+            if target is None:
+                raise InvalidAutomationError(f"Session {to['session']} no longer exists")
+            if target.project_id != project_id:
+                raise InvalidAutomationError(f"Session {to['session']} is in another project")
+        else:
+            if owner is None or session_id is None:
+                raise InvalidAutomationError("A prompt to a subagent needs a session to be its parent")
+        return {"type": "prompt", "prompt": prompt, "to": dict(to)}
+
+    # -- CRUD ------------------------------------------------------------------
+
+    async def list(self, *, project_id: str | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
+        clauses = []
+        params: dict[str, Any] = {}
+        if project_id is not None:
+            clauses.append("project_id = :project_id")
+            params["project_id"] = project_id
+        if session_id is not None:
+            clauses.append("session_id = :session_id")
+            params["session_id"] = session_id
+        where = f"where {' and '.join(clauses)}" if clauses else ""
+        async with self._database.engine.connect() as connection:
+            found = await connection.execute(
+                text(f"select {_COLUMNS} from {TABLE} {where} order by time_created asc, id asc"),
+                params,
+            )
+            rows = found.fetchall()
+        return [self._info(_decode_row(row)) for row in rows]
+
+    async def get(self, automation_id: str) -> dict[str, Any]:
+        return self._info(await self._fetch(automation_id))
+
+    async def pause(self, automation_id: str) -> dict[str, Any]:
+        row = await self._fetch(automation_id)
+        if row.status != "active":
+            return self._info(row)
+        async with self._database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"update {TABLE} set status = 'paused', time_updated = :now where id = :id and status = 'active'"
+                ).bindparams(now=self._now(), id=automation_id)
+            )
+        return self._info(await self._fetch(automation_id))
+
+    async def resume(self, automation_id: str) -> dict[str, Any]:
+        row = await self._fetch(automation_id)
+        if row.status != "paused":
+            return self._info(row)
+        now = self._now()
+        if row.next_due_at is None or row.next_due_at > now:
+            next_ms: int | None = row.next_due_at
+        else:
+            next_ms = self.following(row, now)
+            if next_ms is None:
+                next_ms = row.next_due_at
+        done = (row.trigger.get("type") != "event" and (next_ms is None or self._finished(row, next_ms))) or (
+            row.expires_at is not None and now > row.expires_at
+        )
+        async with self._database.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"update {TABLE} set status = :status, next_due_at = :next, "
+                    "failures = 0, retry_at = null, time_updated = :now "
+                    "where id = :id and status = 'paused'"
+                ).bindparams(
+                    status="done" if done else "active",
+                    next=None if done else next_ms,
+                    now=now,
+                    id=automation_id,
+                )
+            )
+        self.wake()
+        return self._info(await self._fetch(automation_id))
+
+    async def remove(self, automation_id: str) -> None:
+        await self._fetch(automation_id)
+        async with self._database.engine.begin() as connection:
+            await connection.execute(text(f"delete from {TABLE} where id = :id").bindparams(id=automation_id))

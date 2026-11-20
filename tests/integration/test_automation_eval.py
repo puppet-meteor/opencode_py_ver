@@ -165,6 +165,7 @@ class _RecordingSessions:
 
     def __init__(self, *, fail: bool = False, always_pending: bool = False) -> None:
         self.sends: list[tuple[str, str]] = []
+        self.attempts = 0
         self.children: list[tuple[str, str, str]] = []
         self.fail = fail
         self.always_pending = always_pending
@@ -174,7 +175,8 @@ class _RecordingSessions:
             return None
         return SimpleNamespace(id=_SESSION_ID, project_id=_PROJECT)
 
-    def send_prompt(self, session_id: str, text: str, request_id: str) -> str:
+    async def send_prompt(self, session_id: str, text: str, request_id: str) -> str:
+        self.attempts += 1
         if self.fail:
             raise RuntimeError("delivery failed (injected)")
         self.sends.append((session_id, request_id))
@@ -221,8 +223,7 @@ def test_p_capability_probe(tmp_path: Path) -> None:
             else:
                 from typing import cast
 
-                from opencode.tools.automation import AutomationAdapter  # type: ignore[import-untyped]
-
+                from opencode.tools.automation import AutomationAdapter
                 from opencode.tools.registry import ToolRegistry
 
                 async def _wired() -> list[str]:
@@ -421,14 +422,14 @@ def test_m4_failure_backoff(tmp_path: Path) -> None:
                             break
                         await service.tick()
                         await asyncio.sleep(0.05)
-                    after_failure = len(sessions.sends)
+                    after_failure = sessions.attempts
                     await service.tick()
-                    during_backoff = len(sessions.sends)
+                    during_backoff = sessions.attempts
                     await asyncio.sleep(_FAILED_RETRY_S + 0.3)
                     await service.tick()
                     await asyncio.sleep(0.1)
                     await service.tick()
-                    return after_failure, during_backoff, len(sessions.sends)
+                    return after_failure, during_backoff, sessions.attempts
 
             attempts, attempts_during_backoff, attempts_after_backoff = asyncio.run(_run())
             status = "probed"
