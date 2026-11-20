@@ -55,6 +55,7 @@ NOT done here; see the progress file for the reviewer note).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -203,6 +204,14 @@ _SELECT_PENDING_INBOX_SESSIONS = sa.text("SELECT session_id FROM inbox GROUP BY 
 _SELECT_SUBAGENT_BACKGROUNDED_SESSIONS = sa.text(
     "SELECT session_id FROM events WHERE type = 'py.subagent.backgrounded' GROUP BY session_id ORDER BY session_id"
 )
+# -- T-C3-006: the durable wake-idempotency scan. The 0004 inbox table is
+# pending-only (delivered/cancelled rows delete in the same commit), so a
+# replayed event's "admitted once" face must read the append-only log:
+# every synthetic admission commits one ``py.inbox.enqueued`` carrying the
+# caller's ``inbox_id`` verbatim. The literal type string restates the
+# contracts registry like every pinned statement above (repos must not
+# import the session layer).
+_SELECT_INBOX_ENQUEUED_DATA = sa.text("SELECT data FROM events WHERE session_id = :sid AND type = 'py.inbox.enqueued'")
 # -- T-C1-040 (R4-S6): the CLI session-selection statements. The sessions
 # table carries no working_dir column (0001_initial), so both selection
 # queries scan the events log by type; ``created`` is the INTEGER epoch-ms
@@ -846,6 +855,29 @@ class ReadRepositories:
         if row is None:
             return None
         return self._decode_inbox_row(session_id, row)
+
+    async def inbox_enqueued_seen(self, session_id: str, inbox_id: str) -> bool:
+        """True once ``inbox_id`` was EVER enqueued for the session (T-C3-006).
+
+        The durable replay face: the events log is append-only, so this
+        survives delivery/cancellation of the pending row (the 0004 table
+        is pending-only and deletes on commit). One JSON decode miss or
+        one malformed row is skipped, never an error -- a damaged row must
+        not wedge the wake port (the fail-open read-model discipline).
+        """
+        _require_session_id(session_id)
+        if not isinstance(inbox_id, str) or not inbox_id:
+            raise ValueError("inbox_id must be a non-empty string")
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(_SELECT_INBOX_ENQUEUED_DATA, {"sid": session_id})).fetchall()
+        for row in rows:
+            try:
+                decoded = json.loads(str(row[0]))
+            except ValueError:
+                continue
+            if isinstance(decoded, dict) and decoded.get("inbox_id") == inbox_id:
+                return True
+        return False
 
     async def pending_inbox_session_ids(self) -> list[str]:
         """Every session that still owns pending inbox rows (T-C1-100 R4).

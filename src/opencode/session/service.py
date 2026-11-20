@@ -1789,6 +1789,52 @@ class SessionService:
             if delivery == "queue":
                 await self._promote_next(parent_session_id, "input")
 
+    async def deliver_event_wake(
+        self,
+        session_id: str,
+        *,
+        inbox_id: str,
+        text: str,
+        metadata: JsonObject,
+    ) -> None:
+        """T-C3-006 ``watch_mcp_event`` wake: one synthetic event delivery.
+
+        The MCP-events watch tool's delivery port -- the same S1 synthetic
+        seam as :meth:`_deliver_subagent_completion` (steer into the active
+        run, or queue + immediate promote when idle), with the same
+        ``inbox_item`` idempotency keyed by the deterministic
+        ``msg_mcp_<hash>`` id: a server replaying an event maps to the same
+        message, admitted once. PY difference: the TS
+        ``sessions.synthetic`` carries a ``description``; the PY admission
+        has no description face, so provenance rides the ``metadata``
+        carrier (``{source, server, event, eventID}``). A missing or
+        deleted session raises here -- the watch caller treats a delivery
+        failure as its stop condition (a dead session has nowhere to
+        deliver, no stopped notice).
+
+        Idempotency is DURABLE (stronger than the subagent face's
+        pending-row check): the events log is append-only, so a server
+        replaying an event whose wake was already consumed admits nothing
+        -- the TS deterministic-message-id face ("a replayed event maps
+        to the same message, which is admitted once").
+        """
+        async with self._session_lock(session_id):
+            if self._closed or self._closing:
+                raise SessionClosedError("service is closed")
+            record = await self._read_live_record(session_id)
+            if await self._repos.inbox_enqueued_seen(session_id, inbox_id):
+                return
+            delivery: Literal["steer", "queue"] = "steer" if record.active_run_id is not None else "queue"
+            await self._inbox.admit_synthetic(
+                session_id,
+                inbox_id=inbox_id,
+                text=text,
+                message_metadata=metadata,
+                delivery=delivery,
+            )
+            if delivery == "queue":
+                await self._promote_next(session_id, "input")
+
     async def request_session_background(self, session_id: str) -> bool:
         """§3-5 ``session.background``: the wire face survives as a no-op.
 

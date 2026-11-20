@@ -42,13 +42,20 @@ Behavior is selected with ``MCP_FIXTURE_MODE``:
   ``notifications/tools/list_changed`` (``MCP_FIXTURE_NOTIFY_DELAY_S``
   later); from the second ``tools/list`` on, an extra ``late_tool`` appears
   (unless ``MCP_FIXTURE_LATE_TOOL=0``) -- the hot-refresh face.
+- ``bad_tool`` (T-C3-006): the catalog carries two malformed entries
+  (description not a string; name not a string) beside the healthy three
+  -- the per-tool skip face.
+- ``MCP_FIXTURE_STREAM_MODE=silent`` (T-C3-006): the stream sends
+  ``active`` and then nothing -- the client's idle timeout must fire (it
+  also sends one recoverable ``error`` notification after ``active`` in
+  the non-silent modes, the observe-without-deliver face).
 
 Every lifecycle fact is appended to ``$MCP_FIXTURE_LOG`` as one JSON
 object per line: ``{"event": "start"|"child"|"call"|"eof"|"eof_ignored"|
-"events_list"|"stream_request"|"stream_active"|"stream_event"|
-"stream_end"|"stream_terminated"|"stream_cancelled"|"tools_list"|
-"list_changed_sent", ...}`` -- the tests read it for pids, call counts,
-cursors and crash evidence.
+"initialize"|"events_list"|"stream_request"|"stream_active"|
+"stream_error"|"stream_event"|"stream_end"|"stream_terminated"|
+"stream_cancelled"|"tools_list"|"list_changed_sent", ...}`` -- the tests
+read it for pids, call counts, cursors and crash evidence.
 """
 
 from __future__ import annotations
@@ -206,7 +213,7 @@ def _answer_events_list(request_id: Any, params: dict[str, Any]) -> None:
     if EVENT_PAGES > 1 and cursor is None:
         _send({"jsonrpc": "2.0", "id": request_id, "result": {"events": page_one, "nextCursor": "page2"}})
     else:
-        events = page_one + page_two if cursor == "page2" else page_one
+        events = page_two if cursor == "page2" else page_one
         _send({"jsonrpc": "2.0", "id": request_id, "result": {"events": events}})
     _log({"event": "events_list", "cursor": cursor})
 
@@ -227,6 +234,19 @@ def _run_stream(request_id: Any, name: str) -> None:
     _notify("notifications/events/active", {"cursor": None, "_meta": meta})
     _log({"event": "stream_active", "id": request_id})
     stop = _STREAM_STOP.get(request_id)
+    if STREAM_MODE == "silent":
+        # Hold the stream with no further messages: the client's idle
+        # timeout (not a request timeout) must be what fires.
+        if stop is not None:
+            stop.wait()
+        return
+    # One recoverable error notification right after active: the client
+    # observes it without cursor updates or delivery, then keeps going.
+    _notify(
+        "notifications/events/error",
+        {"error": {"code": -32000, "message": "fixture transient"}, "_meta": meta},
+    )
+    _log({"event": "stream_error", "id": request_id})
     sent = 0
     next_event = time.monotonic() + EVENT_DELAY_S
     next_beat = time.monotonic() + HEARTBEAT_S
@@ -307,7 +327,7 @@ def _answer_tools_list(request_id: Any) -> None:
             }
         )
         return
-    tools = [dict(tool) for tool in _TOOLS]
+    tools: list[dict[str, object]] = [dict(tool) for tool in _TOOLS]
     if MODE == "list_changed":
         _TOOLS_LIST_CALLS += 1
         if _TOOLS_LIST_CALLS > 1 and os.environ.get("MCP_FIXTURE_LATE_TOOL", "1") == "1":
@@ -319,6 +339,25 @@ def _answer_tools_list(request_id: Any) -> None:
                 }
             )
         _log({"event": "tools_list", "call": _TOOLS_LIST_CALLS, "count": len(tools)})
+    if MODE == "bad_tool":
+        # Two malformed entries (description not a string; name not a
+        # string): the client must SKIP them per-tool and keep the healthy
+        # three (T-C3-006 decision 8), not fail the whole catalog. The
+        # element dicts are widened to ``object`` values on purpose --
+        # the wire payload is the malformed thing under test.
+        malformed_desc: dict[str, object] = {
+            "name": "broken_desc",
+            "description": 42,
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+        malformed_name: dict[str, object] = {
+            "name": 7,
+            "description": "name is not a string",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+        tools.append(malformed_desc)
+        tools.append(malformed_name)
+        _log({"event": "tools_list", "count": len(tools)})
     _send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}})
 
 
@@ -391,10 +430,11 @@ def _handle(message: dict[str, Any]) -> None:
         return  # a response or a bare object: nothing to answer
     request_id = message.get("id")
     if method == "initialize":
+        params = message.get("params")
+        _log({"event": "initialize", "params": params if isinstance(params, dict) else None})
         if MODE == "startup_hang":
             _log({"event": "initialize_received"})
             return  # hang: the manager's startup timeout must fire
-        params = message.get("params")
         _answer_initialize(request_id, params if isinstance(params, dict) else None)
         return
     if method == "notifications/initialized":

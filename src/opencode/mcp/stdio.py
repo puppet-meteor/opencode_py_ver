@@ -142,6 +142,7 @@ class StdioTransport:
         env: Mapping[str, str],
         server: str = "mcp",
         on_unexpected_exit: Callable[[Exception], None] | None = None,
+        on_notification: Callable[[str, dict[str, object] | None], None] | None = None,
         close_grace_s: float = CLOSE_GRACE_S,
         force_kill_after_s: float = FORCE_KILL_AFTER_S,
         max_frame_bytes: int = MAX_FRAME_BYTES,
@@ -153,6 +154,7 @@ class StdioTransport:
         self._env = dict(env)
         self._server = server
         self._on_unexpected_exit = on_unexpected_exit
+        self._on_notification = on_notification
         self._close_grace_s = close_grace_s
         self._force_kill_after_s = force_kill_after_s
         self._max_frame_bytes = max_frame_bytes
@@ -275,18 +277,29 @@ class StdioTransport:
         method: str,
         params: Mapping[str, object] | None = None,
         *,
-        timeout_s: float,
+        timeout_s: float | None,
+        on_id: Callable[[int], None] | None = None,
     ) -> object:
         """Send a JSON-RPC request and await its correlated response.
 
         A timeout cancels the wait only: the server may still be running
         the request, so the outcome is the caller's "unknown" (§6 L304) --
         the late response is discarded by the id correlation.
+        ``timeout_s=None`` waits unbounded (T-C3-006: an ``events/stream``
+        long-hold is bounded by heartbeats, not a request timeout -- TS
+        client.ts L595). ``on_id`` observes the assigned id before the
+        frame is sent, so notifications that overtake the response can be
+        routed (TS ``onRequestId`` precedent, client.ts L597).
         """
         if not self._open:
             raise McpNotConnectedError("MCP stdio transport is not connected")
         request_id = self._next_id
         self._next_id += 1
+        if on_id is not None:
+            try:
+                on_id(request_id)
+            except Exception:
+                pass  # a routing hook must not break the wire face
         frame: dict[str, object] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             frame["params"] = dict(params)
@@ -294,6 +307,8 @@ class StdioTransport:
         self._pending[request_id] = future
         try:
             await self._send_frame(frame)
+            if timeout_s is None:
+                return await future
             return await asyncio.wait_for(future, timeout_s)
         finally:
             self._pending.pop(request_id, None)
@@ -481,8 +496,20 @@ class StdioTransport:
             )
             return
         if "method" in message:
-            # Server notification (notifications/tools/list_changed etc.):
-            # no hot refresh in Phase 1 (r4-slices §4 difference 4) -- ignored.
+            # Server notification. T-C3-006: the notifications/tools/
+            # list_changed hot refresh and the notifications/events/* push
+            # face route through the caller's ``on_notification`` hook
+            # (best-effort: a hook failure never breaks the reader); every
+            # other notification stays a no-op for this minimal client.
+            method = message["method"]
+            if not isinstance(method, str):
+                raise McpProtocolError("notification method is not a string")
+            if self._on_notification is not None and self._open:
+                params = message.get("params")
+                try:
+                    self._on_notification(method, params if isinstance(params, dict) else None)
+                except Exception:
+                    pass
             return
         raise McpProtocolError("message is neither a response nor a request")
 

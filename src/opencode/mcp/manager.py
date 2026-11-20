@@ -1,4 +1,4 @@
-"""MCP server manager (R4-S2; CORE-CONTRACTS §6 L304, r4-slices §2.1).
+"""MCP server manager (R4-S2; CORE-CONTRACTS §6 L304, r4-slices §2.1; T-C3-006).
 
 Owns each stdio server's lifecycle: spawn -> ``initialize`` handshake ->
 ``tools/list`` -> ``tools/call``, with the three timeout faces of TS
@@ -18,17 +18,48 @@ definitions. "启动前宿主确认完整本机权限" (§6 L304) is the caller'
 explicit injection act; ConfigSnapshot/MCP refs are the S3 face
 (r4-slices §2.2) -- a server definition carries the complete minimal
 environment with secret refs already resolved.
+
+T-C3-006 (upstream 2.3.2 mcp cluster, stdio-only trim):
+
+- **Connection events**: the TS ``McpConnection.Events`` callback table
+  maps onto :meth:`McpManager.add_event_listener` -- ``connecting`` /
+  ``connected`` / ``failed`` / ``closed`` / ``changed`` fire inline, in
+  order, so an owner (the future event-trigger ticket) can keep its own
+  state in step with the connection. The TS pool/Location face is not
+  ported (single process, single directory -- every connection private).
+- **Protocol**: the client declares ``2026-07-28`` (decision 3: declare
+  + accept the server's reply as-is; the TS SDK's discover/pin legs stay
+  unported) and announces the MCP Events draft extension
+  (``io.modelcontextprotocol/events``); a server that answers the
+  capability is exposed through :meth:`events_supported`.
+- **Notification routing**: ``notifications/tools/list_changed`` re-lists
+  the catalog in place (the hot refresh); ``notifications/events/*``
+  notifications route by their ``io.modelcontextprotocol/subscriptionId``
+  meta (the stream request's JSON-RPC id) into
+  :meth:`McpManager.stream_events` queues -- late notifications (after
+  the stream ended) are dropped by id.
+- **MCP Events** (SEP-3415 draft, experimental):
+  :meth:`list_events` paginates ``events/list`` (up to
+  :data:`EVENT_LIST_PAGES` pages) and :meth:`stream_events` holds one
+  ``events/stream`` request open, yielding ``active`` / ``event`` /
+  ``heartbeat`` / ``error`` messages; :data:`EVENT_STREAM_IDLE_S` of
+  silence (no heartbeats) means the stream is dead. The two terminal
+  faces raise :class:`EventStreamRejectedError` (the request can never
+  succeed as sent) and :class:`EventStreamTerminatedError` (the server
+  ended the subscription) -- a clean stream END is not an error: the
+  generator returns and the caller may reopen from the last cursor.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import os
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from opencode.contracts.messages import JsonObject, JsonValue
-from opencode.mcp.stdio import McpTransportError, StdioTransport
+from opencode.mcp.stdio import McpRemoteError, McpTransportError, StdioTransport
 
 #: OP-R4-5 (TS client.ts L35 ``DEFAULT_STARTUP_TIMEOUT = 30_000``): the
 #: ``initialize`` handshake deadline. Kept at the TS value.
@@ -44,16 +75,61 @@ DEFAULT_CATALOG_TIMEOUT_S = 30.0
 #: legitimate tools, so the sheer length is a backstop, not a policy.
 DEFAULT_EXECUTION_TIMEOUT_S = 12 * 60 * 60.0
 
-#: The MCP protocol revision this minimal client speaks. Fixed, not
-#: negotiated: the server's reply is accepted as-is (the TS SDK's era
-#: negotiation is SDK-internal and not ported -- ④ disclosure).
-MCP_PROTOCOL_VERSION = "2025-06-18"
+#: T-C3-006 decision 3: the protocol revision this client DECLARES. The
+#: server's reply is accepted as-is (the TS SDK's era negotiation --
+#: discover/pin -- is SDK-internal and not ported, ④ disclosure).
+MCP_PROTOCOL_VERSION = "2026-07-28"
+
+#: The MCP Events draft extension (SEP-3415, upstream client.ts L72-73):
+#: the capability key announced in ``initialize`` and the notification
+#: routing meta key (the stream request's JSON-RPC id).
+EVENTS_EXTENSION = "io.modelcontextprotocol/events"
+SUBSCRIPTION_ID_META = "io.modelcontextprotocol/subscriptionId"
+
+#: Upstream client.ts L74-76: servers heartbeat at least every 30s; twice
+#: that in silence means the stream is dead.
+EVENT_STREAM_IDLE_S = 60.0
+
+#: Upstream client.ts L76: the ``events/list`` pagination bound.
+EVENT_LIST_PAGES = 100
+
+#: Upstream client.ts L135: JSON-RPC error codes that mean an
+#: ``events/stream`` request can never succeed as sent.
+EVENT_STREAM_REJECTED_CODES = frozenset({-32601, -32602, -32023, -32024, -32026})
 
 #: The client identity announced in the ``initialize`` handshake.
 CLIENT_NAME = "opencode-py"
 CLIENT_VERSION = "0.0.1"
 
 McpServerStatus = Literal["pending", "connected", "failed", "stopped"]
+
+#: One message on an event stream (upstream client.ts L117-131
+#: ``EventMessage``): a plain dict with a ``type`` key of ``active`` /
+#: ``event`` / ``heartbeat`` / ``error``.
+MCPEventMessage = dict[str, Any]
+
+#: A connection callback: ``(server, event, payload)`` with event one of
+#: ``connecting`` / ``connected`` / ``failed{error}`` / ``closed{reason}``
+#: / ``changed{kind}`` (TS connection.ts Events, tools-only trim).
+McpEventListener = Callable[[str, str, dict[str, Any]], None]
+
+
+def resolve_cwd(cwd: str | None, base: str | None = None) -> str | None:
+    """Resolve a definition's ``cwd`` (T-C3-006 decision 7, TS stdio.ts).
+
+    ``~``/``~user`` expand first; a relative path resolves against
+    ``base`` (the host's working directory) when one is given, else it
+    passes through unchanged (the subprocess resolves it against the
+    process cwd). Absolute paths normalize only.
+    """
+    if cwd is None:
+        return None
+    expanded = os.path.expanduser(cwd)
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    if base is not None:
+        return os.path.normpath(os.path.join(base, expanded))
+    return expanded
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,10 +197,38 @@ class McpUnknownOutcomeError(Exception):
     """
 
 
+class EventStreamRejectedError(Exception):
+    """The server refused the subscription (unknown event, bad arguments, no access).
+
+    The request can never succeed as sent; the terminal "rejected" face
+    (upstream event-errors.ts, experimental draft extension).
+    """
+
+    def __init__(self, server: str, code: int, message: str) -> None:
+        super().__init__(f"MCP server {server!r} rejected the event stream ({code}): {message}")
+        self.server = server
+        self.code = code
+        self.message = message
+
+
+class EventStreamTerminatedError(Exception):
+    """The server ended the subscription (access revoked, event type removed).
+
+    The terminal "terminated" face: a watch that receives it must not
+    reopen (upstream event-errors.ts, experimental draft extension).
+    """
+
+    def __init__(self, server: str, code: int, message: str) -> None:
+        super().__init__(f"MCP server {server!r} terminated the event stream ({code}): {message}")
+        self.server = server
+        self.code = code
+        self.message = message
+
+
 class _ServerEntry:
     """Per-server bookkeeping (the status faces mirror TS index.ts ServerEntry)."""
 
-    __slots__ = ("definition", "error", "status", "tools", "transport")
+    __slots__ = ("definition", "error", "events", "status", "tools", "transport")
 
     def __init__(self, definition: StdioServerDefinition) -> None:
         self.definition = definition
@@ -132,6 +236,7 @@ class _ServerEntry:
         self.tools: tuple[MCPRemoteTool, ...] | None = None
         self.status: McpServerStatus = "pending"
         self.error: Exception | None = None
+        self.events = False
 
 
 class McpManager:
@@ -148,6 +253,7 @@ class McpManager:
         startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S,
         catalog_timeout_s: float = DEFAULT_CATALOG_TIMEOUT_S,
         execution_timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S,
+        base_dir: str | None = None,
     ) -> None:
         for label, value in (
             ("startup_timeout_s", startup_timeout_s),
@@ -159,9 +265,14 @@ class McpManager:
         self._startup_timeout_s = float(startup_timeout_s)
         self._catalog_timeout_s = float(catalog_timeout_s)
         self._execution_timeout_s = float(execution_timeout_s)
+        self._base_dir = base_dir
         self._servers: dict[str, _ServerEntry] = {}
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._listeners: list[McpEventListener] = []
+        #: Open event streams keyed by (server, str(request id)) -- the
+        #: routing table the notifications/events/* notifications hit.
+        self._event_queues: dict[tuple[str, str], asyncio.Queue[Any]] = {}
 
     # -- registration ------------------------------------------------------
 
@@ -176,6 +287,10 @@ class McpManager:
         if definition.name in self._servers:
             raise ValueError(f"MCP server {definition.name!r} is already defined")
         self._servers[definition.name] = _ServerEntry(definition)
+
+    def add_event_listener(self, listener: McpEventListener) -> None:
+        """Observe connection events (TS McpConnection.Events, tools-only trim)."""
+        self._listeners.append(listener)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -260,10 +375,131 @@ class McpManager:
         """The server's catalog; None unless a start succeeded (no empty-table fiction)."""
         return self._require_entry(name).tools
 
+    def server_names(self) -> tuple[str, ...]:
+        """Every registered server, registration order."""
+        return tuple(self._servers)
+
+    def events_supported(self, name: str) -> bool:
+        """True once a server's ``initialize`` answer declared the events extension."""
+        return self._require_entry(name).events
+
     @property
     def closed(self) -> bool:
         """True once :meth:`close` finished."""
         return self._closed
+
+    # -- MCP events (T-C3-006) ---------------------------------------------
+
+    async def list_events(self, server: str) -> tuple[dict[str, Any], ...]:
+        """Every event type the server offers (``events/list``, paginated).
+
+        Follows ``nextCursor`` up to :data:`EVENT_LIST_PAGES` pages (more
+        pages than read logs-and-stops, the upstream face). Raises
+        :class:`McpConnectError` when the server is not connected or did
+        not declare the extension.
+        """
+        entry = self._require_entry(server)
+        transport = entry.transport
+        if entry.status != "connected" or transport is None or not entry.events:
+            raise McpConnectError(f"MCP server {server!r} is not connected or offers no events")
+        events: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _page in range(EVENT_LIST_PAGES):
+            params: dict[str, object] = {} if cursor is None else {"cursor": cursor}
+            result = await transport.request("events/list", params, timeout_s=self._catalog_timeout_s)
+            page = _parse_event_list(result)
+            events.extend(page["events"])
+            cursor = page["nextCursor"]
+            if cursor is None:
+                return tuple(events)
+        return tuple(events)  # more pages than read: stop, as upstream does
+
+    async def stream_events(
+        self,
+        server: str,
+        event_name: str,
+        *,
+        arguments: JsonObject | None = None,
+        cursor: str | None = None,
+        idle_timeout_s: float = EVENT_STREAM_IDLE_S,
+    ) -> AsyncGenerator[MCPEventMessage, None]:
+        """Hold one ``events/stream`` request open, yielding its messages.
+
+        ``active`` / ``event`` / ``heartbeat`` / ``error`` messages arrive
+        as ``notifications/events/*`` routed by the subscription id; a
+        quiet stream dies after ``idle_timeout_s`` (heartbeats, not a
+        request timeout, tell quiet from dead -- TS client.ts L594-595).
+        The server closing the stream ENDS the iterator cleanly (reopen
+        from the last cursor is the caller's call); the two terminal
+        faces raise :class:`EventStreamRejectedError` (request can never
+        succeed) and :class:`EventStreamTerminatedError` (subscription
+        ended; do not reopen).
+        """
+        entry = self._require_entry(server)
+        transport = entry.transport
+        if entry.status != "connected" or transport is None or not entry.events:
+            raise McpConnectError(f"MCP server {server!r} is not connected or offers no events")
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        params: dict[str, object] = {"name": event_name}
+        if arguments is not None:
+            params["arguments"] = dict(arguments)
+        if cursor is not None:
+            params["cursor"] = cursor
+        assigned: dict[str, int] = {}
+
+        def on_id(request_id: int) -> None:
+            assigned["id"] = request_id
+            self._event_queues[(server, str(request_id))] = queue
+
+        request_task = asyncio.create_task(transport.request("events/stream", params, timeout_s=None, on_id=on_id))
+
+        def _request_done(task: asyncio.Task[object]) -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            queue.put_nowait(error if error is not None else None)
+
+        request_task.add_done_callback(_request_done)
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=idle_timeout_s)
+                except TimeoutError as error:
+                    raise McpTransportError(
+                        f"MCP server {server!r} sent nothing on the event stream for {idle_timeout_s}s"
+                    ) from error
+                if isinstance(item, BaseException):
+                    if isinstance(item, McpRemoteError) and item.code in EVENT_STREAM_REJECTED_CODES:
+                        raise EventStreamRejectedError(server, item.code, item.message) from item
+                    raise item
+                if item is None:
+                    return  # the server closed the stream: a clean end
+                kind, payload = item
+                try:
+                    message = _event_message(kind, payload)
+                except _TerminatedSignal as signal:
+                    # The terminal face leaves the generator as its public
+                    # exception (the consumer never sees the internal class).
+                    raise EventStreamTerminatedError(server, signal.code, signal.message) from None
+                if message is not None:
+                    yield message
+        finally:
+            request_id = assigned.get("id")
+            if request_id is not None:
+                self._event_queues.pop((server, str(request_id)), None)
+            if not request_task.done():
+                request_task.cancel()
+                try:
+                    await request_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                # The server may keep pushing on an abandoned stream: tell it
+                # the request is gone (JSON-RPC cancelled notification).
+                if not transport.closed:
+                    try:
+                        await transport.notify("notifications/cancelled", {"id": request_id})
+                    except McpTransportError:
+                        pass  # the pipe died with the stream: nothing to tell
 
     # -- internals ---------------------------------------------------------
 
@@ -272,6 +508,14 @@ class McpManager:
         if entry is None:
             raise ValueError(f"unknown MCP server {name!r}")
         return entry
+
+    def _emit(self, server: str, event: str, payload: dict[str, Any] | None = None) -> None:
+        """Run the listeners inline, in order (TS Events callback contract)."""
+        for listener in tuple(self._listeners):
+            try:
+                listener(server, event, payload or {})
+            except Exception:
+                pass  # one listener's failure never breaks the connection face
 
     def _mark_lost(self, name: str, error: Exception) -> None:
         """Unexpected-exit callback: a connected server is demoted to failed.
@@ -285,20 +529,68 @@ class McpManager:
             return
         entry.status = "failed"
         entry.error = error
+        entry.events = False
+        self._emit(name, "closed", {"reason": str(error)})
+
+    def _make_notification_handler(self, server: str) -> Callable[[str, dict[str, object] | None], None]:
+        """One transport's notification router (hot refresh + stream queues)."""
+
+        def handler(method: str, params: dict[str, object] | None) -> None:
+            if method == "notifications/tools/list_changed":
+                asyncio.get_running_loop().create_task(self._refresh_tools(server))
+                return
+            if not method.startswith("notifications/events/"):
+                return
+            kind = method[len("notifications/events/") :]
+            subscription: object = None
+            if params is not None:
+                meta = params.get("_meta")
+                if isinstance(meta, dict):
+                    subscription = meta.get(SUBSCRIPTION_ID_META)
+            queue = self._event_queues.get((server, str(subscription)))
+            if queue is not None:
+                queue.put_nowait((kind, params))
+            # No queue (or a late notification after the stream ended):
+            # dropped by id, as the correlation discards late responses.
+
+        return handler
+
+    async def _refresh_tools(self, server: str) -> None:
+        """``notifications/tools/list_changed``: re-list the catalog in place.
+
+        A failed refresh keeps the old catalog (the connection is not
+        torn down for a straggler list -- the next explicit call decides);
+        a successful one swaps the catalog and emits ``changed``.
+        """
+        entry = self._servers.get(server)
+        transport = entry.transport if entry is not None else None
+        if entry is None or transport is None or entry.status != "connected":
+            return
+        try:
+            listing = await transport.request("tools/list", {}, timeout_s=self._catalog_timeout_s)
+            tools = _parse_tools(listing)
+        except (TimeoutError, McpTransportError, ValueError):
+            return  # keep the last known catalog; no reconnect (§6 L304)
+        entry.tools = tools
+        self._emit(server, "changed", {"kind": "tools"})
 
     async def _connect(self, entry: _ServerEntry) -> StdioTransport:
         """Spawn + initialize + initialized + tools/list (the TS connect chain)."""
         definition = entry.definition
+        server = definition.name
         entry.status = "pending"
         entry.error = None
         entry.tools = None
+        entry.events = False
+        self._emit(server, "connecting")
         transport = StdioTransport(
             command=definition.command,
             args=definition.args,
-            cwd=definition.cwd,
+            cwd=resolve_cwd(definition.cwd, self._base_dir),
             env=definition.env,
-            server=definition.name,
-            on_unexpected_exit=lambda error: self._mark_lost(definition.name, error),
+            server=server,
+            on_unexpected_exit=lambda error: self._mark_lost(server, error),
+            on_notification=self._make_notification_handler(server),
         )
         try:
             await transport.start()
@@ -306,13 +598,14 @@ class McpManager:
                 "initialize",
                 {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "capabilities": {"extensions": {EVENTS_EXTENSION: {}}},
                     "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
                 },
                 timeout_s=self._startup_timeout_s,
             )
             if not isinstance(initialize_result, dict) or not isinstance(initialize_result.get("serverInfo"), dict):
                 raise McpTransportError("initialize result has no serverInfo object")
+            entry.events = _declares_events(initialize_result)
             await transport.notify("notifications/initialized")
             listing = await transport.request("tools/list", {}, timeout_s=self._catalog_timeout_s)
             tools = _parse_tools(listing)
@@ -320,27 +613,105 @@ class McpManager:
             await transport.close()
             entry.status = "failed"
             entry.error = error
-            raise McpConnectError(f"MCP server {definition.name!r} failed to start: {error}") from error
+            self._emit(server, "failed", {"error": str(error)})
+            raise McpConnectError(f"MCP server {server!r} failed to start: {error}") from error
         entry.transport = transport
         entry.tools = tools
         entry.status = "connected"
+        self._emit(server, "connected")
         return transport
 
 
+def _declares_events(initialize_result: dict[str, object]) -> bool:
+    """The server answered the events extension (capabilities.extensions)."""
+    capabilities = initialize_result.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    extensions = capabilities.get("extensions")
+    return isinstance(extensions, dict) and EVENTS_EXTENSION in extensions
+
+
+def _parse_event_list(result: object) -> dict[str, Any]:
+    """Validate one ``events/list`` page (``{events, nextCursor?}``)."""
+    if not isinstance(result, dict) or not isinstance(result.get("events"), list):
+        raise ValueError("events/list result has no events array")
+    events: list[dict[str, Any]] = []
+    for item in result["events"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]:
+            continue  # a malformed entry lists nothing (skip, never fail the page)
+        events.append(item)
+    cursor = result.get("nextCursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ValueError("events/list nextCursor is not a string")
+    return {"events": events, "nextCursor": cursor}
+
+
+def _event_message(kind: str, params: dict[str, object] | None) -> MCPEventMessage | None:
+    """Normalize one ``notifications/events/<kind>`` into an EventMessage.
+
+    Unknown kinds return None (ignored, the upstream SDK-handler trim);
+    ``terminated`` is NOT a message -- it is the terminal exception the
+    stream machine raises (the caller of :meth:`McpManager.stream_events`
+    sees :class:`EventStreamTerminatedError`).
+    """
+    payload: dict[str, object] = params or {}
+    if kind == "terminated":
+        error = payload.get("error")
+        detail = error if isinstance(error, dict) else {}
+        raise _TerminatedSignal(
+            int(detail.get("code", 0)) if isinstance(detail.get("code"), int) else 0,
+            str(detail.get("message", "")),
+        )
+    if kind == "active":
+        return {
+            "type": "active",
+            "cursor": payload.get("cursor"),
+            "truncated": bool(payload.get("truncated", False)),
+        }
+    if kind == "event":
+        return {
+            "type": "event",
+            "eventId": str(payload.get("eventId", "")),
+            "name": str(payload.get("name", "")),
+            "timestamp": str(payload.get("timestamp", "")),
+            "data": payload.get("data"),
+            "cursor": payload.get("cursor"),
+        }
+    if kind == "heartbeat":
+        return {"type": "heartbeat", "cursor": payload.get("cursor")}
+    if kind == "error":
+        return {"type": "error", "error": payload.get("error")}
+    return None
+
+
+class _TerminatedSignal(Exception):
+    """Internal: a terminated notification surfaces as the terminal exception."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(f"terminated ({code}): {message}")
+        self.code = code
+        self.message = message
+
+
 def _parse_tools(listing: object) -> tuple[MCPRemoteTool, ...]:
-    """Validate a ``tools/list`` result into remote-tool descriptors."""
+    """Validate a ``tools/list`` result into remote-tool descriptors.
+
+    T-C3-006 decision 8 (upstream client.ts L633-639): per-tool -- one
+    malformed entry is SKIPPED, it no longer fails the whole list (a
+    broken tool must not take the server's healthy tools down).
+    """
     if not isinstance(listing, dict) or not isinstance(listing.get("tools"), list):
         raise ValueError("tools/list result has no tools array")
     tools: list[MCPRemoteTool] = []
     for item in listing["tools"]:
         if not isinstance(item, dict) or isinstance(item.get("name"), bool) or not isinstance(item.get("name"), str):
-            raise ValueError("tools/list entry has no string name")
+            continue  # skip + keep going: one bad entry is not the server's fault
         description = item.get("description", "")
         if not isinstance(description, str):
-            raise ValueError(f"tools/list entry {item['name']!r} description is not a string")
+            continue
         schema = item.get("inputSchema", {"type": "object"})
         if not isinstance(schema, dict):
-            raise ValueError(f"tools/list entry {item['name']!r} inputSchema is not an object")
+            continue
         tools.append(MCPRemoteTool(name=item["name"], description=description, input_schema=schema))
     return tuple(tools)
 

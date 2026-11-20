@@ -116,6 +116,24 @@ from opencode.tools.builtin.ls import (
     LS_VERSION,
     FsLsAdapter,
 )
+
+# T-C3-006: the watch tool's naming surface rides this export set, but its
+# ADAPTER class does not -- the builtin export surface is the census double
+# pin (every exported ``*Adapter`` must compose into the host
+# ``_builtin_adapters`` face), and the watch adapter takes manager/sessions
+# runtime handles, so it composes at the host layer by hand (the automation
+# precedent) until the S3 namespace-mapping ticket.
+from opencode.tools.builtin.mcp_events import (
+    MCP_EVENTS_DATA_LIMIT,
+    MCP_EVENTS_ENABLED,
+    MCP_EVENTS_REOPEN_DELAYS_S,
+    WATCH_MCP_EVENT_DESCRIPTION,
+    WATCH_MCP_EVENT_INPUT_SCHEMA,
+    WATCH_MCP_EVENT_NAME,
+    WATCH_MCP_EVENT_NAMESPACE,
+    WATCH_MCP_EVENT_SPEC,
+    WATCH_MCP_EVENT_VERSION,
+)
 from opencode.tools.builtin.memory import (
     MEMORY_CONVERSATION_SEARCH_NAME,
     MEMORY_CONVERSATION_SEARCH_SPEC,
@@ -299,6 +317,9 @@ __all__ = [
     "MAX_LINE_LENGTH",
     "MAX_LINE_SUFFIX",
     "MAX_READ_LINES",
+    "MCP_EVENTS_DATA_LIMIT",
+    "MCP_EVENTS_ENABLED",
+    "MCP_EVENTS_REOPEN_DELAYS_S",
     "MEMORY_CONVERSATION_SEARCH_NAME",
     "MEMORY_CONVERSATION_SEARCH_SPEC",
     "MEMORY_LIST_SCENES_NAME",
@@ -364,6 +385,12 @@ __all__ = [
     "TODO_SPEC",
     "TODO_STATUSES",
     "TODO_VERSION",
+    "WATCH_MCP_EVENT_DESCRIPTION",
+    "WATCH_MCP_EVENT_INPUT_SCHEMA",
+    "WATCH_MCP_EVENT_NAME",
+    "WATCH_MCP_EVENT_NAMESPACE",
+    "WATCH_MCP_EVENT_SPEC",
+    "WATCH_MCP_EVENT_VERSION",
     "WEBFETCH_DEFAULT_TIMEOUT_SECONDS",
     "WEBFETCH_DESCRIPTION",
     "WEBFETCH_INPUT_SCHEMA",
