@@ -10,7 +10,7 @@
 
 | 簇 | 内容 | 助益 | 移植量 | 票号 | 优先级 |
 |---|---|---|---|---|---|
-| 13 | 工具输出截断保头+全文落盘+tail 尾窗读 | High（token 双门直接手段） | S-M | **T-C3-001** | **P0** |
+| 13 | 工具输出截断保头+全文落盘+tail 尾窗读 | High（token 双门直接手段） | S-M | **T-C3-001**（✅ 已落地 `4a80ab1`） | **P0** |
 | 2 | 后台 job 持久化+重启重投（shell/subagent 后台化） | High（长变更执行不丢结果） | M | **T-C3-002** | **P0** |
 | 1 | automation（every/cron/at+event 触发+租约调度+退避） | High（无人值守执行载体） | L→裁剪 M | **T-C3-003**(prompt 动作)/004(event) | **P0**/P1 |
 | 5 | 子代理完成回执 outbox+synthetic+深度链 | Med-High | M | T-C3-005 | P1 |
@@ -27,7 +27,9 @@
 
 ## P0 三票要点（上游机制摘要，源码为证）
 
-### T-C3-001 工具输出截断（簇13）
+### T-C3-001 工具输出截断（簇13）——✅ 已落地（`4a80ab1`，2026-11-20，CI 44668671726 绿）
+- **壳余面**：shell tail 尾窗读+bash 全文落盘归 T-C3-002 连带；上游 read 帽统一化（2000 行/50KiB，py 暂 64KiB 自管帽）随 T-C3-002 评估——豁免契约下无碰撞。
+- **层间契约**（本轮新增发现）：上游 L76 `metadata?.truncated !== undefined` = 自管截断豁免；py 7 适配器设旗、缝读旗跳过——后续新增自管帽工具必须遵守此契约。
 - 上游：`packages/core/src/tool-output.ts` truncate()——保开头（行/字节限制先到者切一次，预览不以换行结尾）；全文写 `<data>/tool-output/`；marker `[showing lines 1-N of M (last line cut); full output saved to <file>]`；metadata.truncated+outputPath；多 content part 按序保结构；已截断幂等跳过。
 - shell tail 尾窗：`shell.ts` L822-880——`sizeOf`+`readRange(size-maxBytes)` 尾窗读+utf8 边界对齐，保尾 maxLines，行中起窗丢半行保行号，超大单行「最后 N 字节(共 Y)」。
 - py 落点：invoker 归一化面（现 64KiB structured marker，丢结构化）→ 升级为保结构截断+落盘+outputPath；bash/pty 大输出同策略。
