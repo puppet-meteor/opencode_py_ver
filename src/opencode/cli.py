@@ -322,6 +322,26 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         help="MAAS API key (flag > env OPENCODE_PY_API_KEY > the product/global config 'api_key' layer)",
     )
     parser.add_argument(
+        "--client-tls-cert",
+        default=None,
+        metavar="PEM",
+        help="mTLS client certificate for gateways that require one (T-C3-010): PEM text, a file "
+        "path, or {file:path}; pairs with --client-tls-key (flag > env OPENCODE_PY_TLS_CERT > "
+        "the config 'tls' layer)",
+    )
+    parser.add_argument(
+        "--client-tls-key",
+        default=None,
+        metavar="PEM",
+        help="mTLS client private key: PEM text, a file path, or {file:path} (env OPENCODE_PY_TLS_KEY)",
+    )
+    parser.add_argument(
+        "--client-tls-passphrase",
+        default=None,
+        metavar="SECRET",
+        help="passphrase for an encrypted mTLS private key (env OPENCODE_PY_TLS_PASSPHRASE)",
+    )
+    parser.add_argument(
         "--config",
         default=None,
         help="explicit global config file path (default ~/.config/opencode-py/opencode.json, §6 L283)",
@@ -444,6 +464,32 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     # ``headers`` map); never echoed in any error, exactly like the key.
     layer_headers = values.get("headers")
     args.headers = layer_headers if isinstance(layer_headers, dict) and layer_headers else None
+    # T-C3-010: the mTLS client certificate walks the same layer-aware
+    # fallback as the credentials — per field flag > env > merged layers
+    # (the layers carry the upstream-shaped ``tls`` map {cert, key,
+    # passphrase?}). An empty cert or key leaves the certificate unset
+    # (upstream Provider.tls semantics); a {file:...} reference to a
+    # missing file still fails fast at adapter construction.
+    layer_tls = values.get("tls")
+    layer_map = layer_tls if isinstance(layer_tls, dict) else {}
+
+    def _tls_field(flag: str | None, env: str, layer_key: str) -> str | None:
+        if flag is not None:
+            return flag
+        env_value = os.environ.get(env)
+        if isinstance(env_value, str) and env_value:
+            return env_value
+        layer_value = layer_map.get(layer_key)
+        return layer_value if isinstance(layer_value, str) and layer_value else None
+
+    _cert = _tls_field(args.client_tls_cert, "OPENCODE_PY_TLS_CERT", "cert")
+    _key = _tls_field(args.client_tls_key, "OPENCODE_PY_TLS_KEY", "key")
+    _passphrase = _tls_field(args.client_tls_passphrase, "OPENCODE_PY_TLS_PASSPHRASE", "passphrase")
+    args.client_tls = None
+    if _cert and _key:
+        from opencode.ai.maas import ClientTls
+
+        args.client_tls = ClientTls(cert=_cert, key=_key, passphrase=_passphrase)
     if not args.base_url:
         parser.error(
             "--base-url is required (or set OPENCODE_PY_BASE_URL, or supply 'endpoint' in the product/global config)"
@@ -730,7 +776,12 @@ def main(
         # context_limit <= output_reserve via the RuntimeSettings invariant)
         # lands on the 70 face — a traceback + exit 70 per #94, never a raw
         # escape the shell would render as the failed-run exit 1.
-        provider = MaasAdapter(args.base_url, args.api_key, default_headers=args.headers)
+        provider = MaasAdapter(
+            args.base_url,
+            args.api_key,
+            default_headers=args.headers,
+            client_tls=getattr(args, "client_tls", None),
+        )
         loader = ConfigLoader(global_config=args.config, project_root=args.project_root)
         # R4-S6: the host resolves its CURRENT v3 face first — it carries the
         # MCP refs the App scan and the recovered session's drift check both

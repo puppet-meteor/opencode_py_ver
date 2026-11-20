@@ -219,6 +219,7 @@ class MaasLlmCall:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         temperature: float | None = None,
+        client_tls: Any = None,
     ) -> None:
         owned: MaasAdapter | None = None
         if provider is not None:
@@ -228,8 +229,9 @@ class MaasLlmCall:
         elif base_url is not None and api_key is not None:
             # T-C1-PT-006: default_headers rides the self-assembled adapter
             # (the MAAS custom-auth channel); the provider= composition form
-            # inherits whatever its caller already injected.
-            owned = MaasAdapter(base_url, api_key, default_headers=default_headers)
+            # inherits whatever its caller already injected. T-C3-010:
+            # client_tls rides the same way (the mTLS certificate).
+            owned = MaasAdapter(base_url, api_key, default_headers=default_headers, client_tls=client_tls)
             resolved = owned
         else:
             raise ValueError("either an assembled provider or both base_url and api_key are required")

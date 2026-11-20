@@ -99,8 +99,13 @@ MAX_TOTAL_INSTRUCTION_BYTES = 256 * 1024
 #: the set — the MAAS custom-auth-header channel (X-Auth-Token & co) is host
 #: trust exactly like ``api_key``; it merges across host tiers key-by-key
 #: (maps recurse in ``_merge_json``), so the product tier can carry one header
-#: and the global tier supplement others.
-HOST_ONLY_KEYS: frozenset[str] = frozenset({"roots", "endpoint", "mcp", "api_key", "credentials", "headers", "memory"})
+#: and the global tier supplement others. T-C3-010: ``tls`` joins the set —
+#: the mTLS client certificate is host trust (it names the gateway's
+#: credential material) with the upstream ``Provider.Tls`` shape
+#: {cert, key, passphrase?}.
+HOST_ONLY_KEYS: frozenset[str] = frozenset(
+    {"roots", "endpoint", "mcp", "api_key", "credentials", "headers", "memory", "tls"}
+)
 
 #: Every structural key a config file may carry (unknown keys are a config
 #: error, §6 L285). Host-only keys are listed separately for the tier check.

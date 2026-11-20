@@ -98,6 +98,38 @@ _WIN32_MINIMAL_ENV_KEYS = ("SystemRoot", "PATH")
 
 _BASE_URL_ENV = "OPENCODE_PY_BASE_URL"
 _API_KEY_ENV = "OPENCODE_PY_API_KEY"
+_TLS_CERT_ENV = "OPENCODE_PY_TLS_CERT"
+_TLS_KEY_ENV = "OPENCODE_PY_TLS_KEY"
+_TLS_PASSPHRASE_ENV = "OPENCODE_PY_TLS_PASSPHRASE"
+
+
+def _client_tls_from_env(loader: Any) -> Any:
+    """T-C3-010: the mTLS certificate for the serving host (env > layer).
+
+    Same per-field fallback as the CLI chain minus the flags (this host
+    chain is a frozen face): env first, then the config layers' upstream-
+    shaped ``tls`` map. Empty cert or key leaves it unset (upstream
+    Provider.tls semantics); a missing {file:...} fails fast at adapter
+    construction.
+    """
+    from opencode.ai.maas import ClientTls
+
+    layer_tls = loader.load().values.get("tls")
+    layer_map = layer_tls if isinstance(layer_tls, dict) else {}
+
+    def _field(env: str, layer_key: str) -> str | None:
+        env_value = os.environ.get(env)
+        if isinstance(env_value, str) and env_value:
+            return env_value
+        layer_value = layer_map.get(layer_key)
+        return layer_value if isinstance(layer_value, str) and layer_value else None
+
+    cert = _field(_TLS_CERT_ENV, "cert")
+    key = _field(_TLS_KEY_ENV, "key")
+    passphrase = _field(_TLS_PASSPHRASE_ENV, "passphrase")
+    if cert and key:
+        return ClientTls(cert=cert, key=key, passphrase=passphrase)
+    return None
 
 
 class ServerConfigurationError(RuntimeError):
@@ -378,7 +410,7 @@ def serve(db_path: str | Path | None = None) -> None:
         mcp_refs = list(runtime.snapshot.mcp_servers)
     else:  # unreachable: resolve_runtime_v3 always assembles the v3 face
         mcp_refs = []
-    provider = MaasAdapter(base_url, api_key, default_headers=auth_headers)
+    provider = MaasAdapter(base_url, api_key, default_headers=auth_headers, client_tls=_client_tls_from_env(loader))
     # P5-S7 (T-C1-091): workers capability closure -- the production
     # WorkerManager face behind ``opencode_agent`` nodes, composed here
     # isomorphically to the CLI's assembly (deliberately not a shared

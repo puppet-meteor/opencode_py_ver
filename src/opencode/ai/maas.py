@@ -62,9 +62,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import ssl
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import httpx2
@@ -181,6 +185,74 @@ class MaasTimeouts:
 
     header_s: float = 300.0
     chunk_s: float = 900.0
+
+
+@dataclass(frozen=True)
+class ClientTls:
+    """T-C3-010: the mTLS client certificate (upstream ``Provider.Tls``).
+
+    PEM text for cert and key; ``passphrase`` unlocks an encrypted key. The
+    ``{file:...}`` value form (upstream expands it through the config-wide
+    substitution chain) expands per-value here — py has no config-wide
+    chain, and a missing file raises at construction instead of upstream's
+    unfold-to-empty-then-drop (recorded deviation: fail fast, never
+    silently connect without the certificate an intranet gateway demands).
+    """
+
+    cert: str
+    key: str
+    passphrase: str | None = None
+
+
+_FILE_REF = re.compile(r"^\{file:(.+)\}$")
+
+
+def _materialize_tls_value(value: str, target: Path) -> str:
+    """One tls value -> a filesystem path ``load_cert_chain`` accepts.
+
+    Three forms: ``{file:path}`` uses the referenced file (missing -> the
+    explicit ValueError of the recorded deviation); bare PEM text lands in
+    ``target`` (the adapter-owned temp directory); anything else passes
+    through as a path and ``load_cert_chain`` fails fast when it is wrong.
+    """
+    matched = _FILE_REF.match(value)
+    if matched is not None:
+        path = Path(matched.group(1))
+        if not path.is_file():
+            raise ValueError(f"client-TLS file not found: {path}")
+        raw = path.read_bytes()
+        if b"\r\n" in raw:
+            # Same CRLF normalization as the inline-PEM branch: a Windows
+            # tool writing CRLF PEM would otherwise die in python's ssl
+            # reader with an inscrutable "[SSL] PEM lib".
+            target.write_bytes(raw.replace(b"\r\n", b"\n"))
+            return str(target)
+        return str(path)
+    if "-----BEGIN" in value:
+        # write_bytes keeps LF: Path.write_text would translate LF->CRLF on
+        # Windows and python's ssl PEM reader rejects a CRLF private key
+        # ("[SSL] PEM lib"). CRLF in the value itself normalizes away too.
+        target.write_bytes(value.replace("\r\n", "\n").encode("ascii"))
+        return str(target)
+    return value
+
+
+def _client_tls_context(client_tls: ClientTls, temp_dir: Path) -> ssl.SSLContext:
+    """One TLS context presenting the client certificate chain.
+
+    Fail fast: a malformed pair (garbage PEM, an encrypted key without its
+    passphrase) raises here — at composition time, never mid-request. The
+    password is always a str ("" when unset): ``load_cert_chain`` with
+    password=None on a *valid* encrypted PEM makes OpenSSL prompt for the
+    passphrase on stdin, which hangs a headless process for good.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_cert_chain(
+        certfile=_materialize_tls_value(client_tls.cert, temp_dir / "client-cert.pem"),
+        keyfile=_materialize_tls_value(client_tls.key, temp_dir / "client-key.pem"),
+        password=client_tls.passphrase or "",
+    )
+    return context
 
 
 class _RetrySignal(Exception):
@@ -321,10 +393,33 @@ class MaasAdapter:
         default_headers: Mapping[str, str] | None = None,
         timeouts: MaasTimeouts | None = None,
         max_retries: int = 2,
+        client_tls: ClientTls | None = None,
     ) -> None:
         effective = timeouts or MaasTimeouts()
         self._timeouts = effective
         self._max_retries = max_retries
+        timeout = httpx2.Timeout(
+            connect=effective.header_s,
+            read=effective.chunk_s,
+            write=effective.header_s,
+            pool=effective.header_s,
+        )
+        # T-C3-010: the mTLS client certificate (upstream provider
+        # ``settings.tls`` -> the model's ``http.tls`` -> the runtime's
+        # certificate-capable fetch). One ssl context per adapter, handed to
+        # an explicit httpx2 client injected into the SDK; None keeps the
+        # SDK's own default client untouched. httpx2 does not follow
+        # redirects by default, so the certificate never travels to a
+        # redirect target host (upstream forces redirect: "error" -- the
+        # same semantics without code).
+        self._tls_tempdir: TemporaryDirectory[str] | None = None
+        self._tls_context: ssl.SSLContext | None = None
+        http_client: httpx2.AsyncClient | None = None
+        if client_tls is not None:
+            self._tls_tempdir = TemporaryDirectory(prefix="opencode-client-tls-")
+            context = _client_tls_context(client_tls, Path(self._tls_tempdir.name))
+            self._tls_context = context
+            http_client = httpx2.AsyncClient(verify=context, timeout=timeout)
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -335,17 +430,16 @@ class MaasAdapter:
             # with the api_key Bearer line — None keeps the SDK default.
             default_headers=dict(default_headers) if default_headers else None,
             max_retries=0,  # retry policy belongs to this adapter, not the SDK (§8)
-            timeout=httpx2.Timeout(
-                connect=effective.header_s,
-                read=effective.chunk_s,
-                write=effective.header_s,
-                pool=effective.header_s,
-            ),
+            timeout=timeout,
+            http_client=http_client,
         )
 
     async def close(self) -> None:
         """Close the underlying SDK client (app lifecycle, §7 L337)."""
         await self._client.close()
+        if self._tls_tempdir is not None:
+            self._tls_tempdir.cleanup()
+            self._tls_tempdir = None
 
     # -- request assembly ---------------------------------------------------
 
