@@ -1,42 +1,44 @@
-"""Integration tests for the ``subagent__run`` background face (P7-S2; T-C1-101 §4).
+"""Integration tests for the ``subagent__run`` always-background face (T-C3-005).
 
-What is pinned here, per the ticket's §4 list:
+The upstream 2.3.2 semantics flip: the ``background`` input key is GONE
+and every call returns immediately with the running output. What is pinned
+here:
 
-* the background full chain (§4-1): ``background=true`` answers the exact
-  ``backgroundResult`` Output face (``status: "running"`` + the TS four-line
-  text VERBATIM), the child run is durable and in flight, the parent log
-  carries exactly one ``py.subagent.backgrounded`` marker, and the settled
-  child delivers through the S1 synthetic inbox seam -- the exact XML
-  wrapper, the ``{source, childID, agent, state}`` metadata carrier, the
-  ``kind="synthetic"`` / ``request_id=None`` admission, and the
-  enqueued/delivered event pair (idle parent: queue + immediate promote);
+* the always-background full chain (§4-1): every invocation answers the
+  ``backgroundResult`` Output face (``status: "running"`` + the TS
+  four-line text VERBATIM), the child run is durable and in flight, the
+  parent log carries exactly one ``py.subagent.backgrounded`` marker, and
+  the settled child delivers through the S1 synthetic inbox seam -- the
+  exact XML wrapper, the ``{source, childID, agent, state}`` metadata
+  carrier, the ``kind="synthetic"`` / ``request_id=None`` admission, and
+  the enqueued/delivered event pair (idle parent: queue + immediate
+  promote);
 * the three-state mapping (§4-2): completed with text, completed without
-  text (the TS sentence), error (the child's error text), and cancelled
-  (a cooperative interrupt -> ``Subagent cancelled``);
-* the foreground zero-delivery proof (§4-3): a foreground completion leaves
-  no marker and no synthetic inbox entry;
-* the block conversion (§4-4): a REAL parent run whose foreground
-  ``subagent__run`` wait converts when a queue item parks behind it -- the
-  tool call answers the running face, the marker falls, the parked item
-  survives, and the settled child still delivers exactly once;
-* the ``session.background`` faces (§4-5): the service conversion arm on a
-  live wait, the idle structural no-op, and the SDK round trip over a real
-  uvicorn carrier (204 no-content for both idle and active arms, 404 for a
-  missing session);
+  text (the TS sentence), error (the step-ceiling recipe -- the only
+  deterministic PY FAILED producer), and cancelled (a cooperative
+  interrupt -> ``Subagent cancelled``);
+* the ``session.background`` faces (§4-5): T-C3-005 deleted the foreground
+  wait the endpoint used to convert, so the wire face survives as the
+  structural no-op (204 no-content on idle and live arms alike, 404 for a
+  missing session; the later job-system port re-gives it teeth);
 * the restart faces (§4-6): a delivered marker never re-delivers after a
-  reopen, and an in-flight background child folds to interrupted on restart
-  and delivers the cancelled state exactly once;
-* the Spec/schema pins (§4-7): the ``background`` Input field with the TS
-  description verbatim, and the description renovation lines.
+  reopen (the delivery also deletes the outbox row), and an in-flight
+  background child folds to interrupted on restart and delivers the
+  cancelled state exactly once;
+* the Spec/schema pins (§4-7): NO ``background`` Input field (the flip),
+  the four v2 properties, and the always-background guidance lines.
+
+Deleted with the v1 faces (upstream 2.3.2 removed them): the foreground
+zero-delivery proof (no foreground arm exists) and the block-conversion
+chain (nothing blocks, so nothing converts).
 
 Harness note: the migration/sqlite/scripted-provider/app shapes are the
 ``test_tool_subagent.py`` (S5) forms COPIED here, and the SDK round-trip
 carrier is the ``test_sdk_client.py`` uvicorn-on-a-worker-thread form --
 the copies keep this file's failure surface self-contained. The recorded
 deviations (progress file): the idle delivery is queue+promote (PY has no
-TS ``resume:false`` suspension face), the final-text join is ``\\n`` (TS
-``\\n\\n``; the foreground path stays byte-identical), and the conversion
-probe is poll-based.
+TS ``resume:false`` suspension face) and the final-text join is ``\\n``
+(TS ``\\n\\n``).
 """
 
 from __future__ import annotations
@@ -82,8 +84,6 @@ from opencode.contracts.llm import (
     UsageChunk,
 )
 from opencode.contracts.messages import (
-    AssistantMessage,
-    AssistantToolPart,
     JsonObject,
     ToolTextContent,
     UserMessage,
@@ -92,7 +92,7 @@ from opencode.httpapi import create_app
 from opencode.httpapi.serving import _server_config
 from opencode.sdk import OpencodeApiError, OpencodeClient
 from opencode.session.runner import DEFAULT_MAX_STEPS
-from opencode.session.service import InboxRef, RunStatusValue, SessionService
+from opencode.session.service import RunStatusValue
 from opencode.tools.builtin.subagent import (
     NO_TEXT_RESPONSE,
     SUBAGENT_DESCRIPTION,
@@ -119,11 +119,9 @@ _PROVIDE_CHUNKS = (
     FinishChunk,
 )
 
-#: The happy-path invocation input (schema-complete, agent "task").
+#: The happy-path invocation input (schema-complete, agent "task"). T-C3-005:
+#: there is no ``background`` key anymore -- every call backgrounds.
 _INPUT: JsonObject = {"agent": "task", "description": "summarize the note", "prompt": "Read nothing; just answer."}
-
-#: The background invocation: the same input with the T-C1-101 flag on.
-_BACKGROUND_INPUT: JsonObject = {**_INPUT, "background": True}
 
 
 def _four_lines(child_id: str) -> str:
@@ -131,9 +129,8 @@ def _four_lines(child_id: str) -> str:
     return "\n".join(
         (
             f"The subagent is working in the background (sessionID: {child_id}). "
-            "You will be notified automatically when it finishes.",
-            "DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this "
-            "subagent's work; avoid working with the same files or topics it is using.",
+            "You will receive a <subagent> message when it goes idle, and again after each later round of work.",
+            "DO NOT sleep, poll, proactively check on its progress, or duplicate this subagent's work.",
             "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
             "To send it follow-ups or change its instructions while it runs, call subagent again with this sessionID.",
         )
@@ -233,16 +230,6 @@ async def _await_inbox_event(
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(f"no {event_type} under {inbox_id} in session {session_id}")
         await asyncio.sleep(0.02)
-
-
-async def _await_foreground_wait(service: SessionService, session_id: str, *, timeout_s: float = 10.0) -> None:
-    """Poll the service's single-slot wait record until this session holds it."""
-    waits: dict[str, str] = service._subagent_foreground_waits
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while session_id not in waits:
-        if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(f"no live foreground subagent wait for {session_id}")
-        await asyncio.sleep(0.01)
 
 
 def _await_inbox_event_sync(
@@ -451,9 +438,10 @@ async def _drive_background_chain(
     subagent: SubagentRunAdapter,
     tmp_path: Path,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Invoke ``background=true`` and settle the child; return (child_id, run_id,
-    the delivered enqueued payload). The caller supplies the provider scripts."""
-    result = await subagent.execute(_ctx(parent_id, tmp_path), _BACKGROUND_INPUT)
+    """Invoke the always-background call and settle the child; return (child_id,
+    run_id, the delivered enqueued payload). The caller supplies the provider
+    scripts (the child's, then the wake turn's)."""
+    result = await subagent.execute(_ctx(parent_id, tmp_path), _INPUT)
     assert result.error is None
     assert isinstance(result.structured_output, dict)
     child_id = str(result.structured_output["sessionID"])
@@ -487,7 +475,9 @@ async def _drive_background_chain(
 # ---------------------------------------------------------------------------
 
 
-async def test_background_true_returns_the_result_and_delivers_the_completion(tmp_path: Path) -> None:
+async def test_every_call_returns_the_result_and_delivers_the_completion(tmp_path: Path) -> None:
+    """§4-1 with the flag GONE: a plain invocation answers the running face,
+    and the settled child delivers through the S1 synthetic seam."""
     db_path = _migrated_db(tmp_path, "bg_chain.db")
     child_script = _Script().text("p2", "all done").usage().finish()
     parent_final = _Script().text("p1", "parent woke").usage().finish()
@@ -595,7 +585,7 @@ async def test_an_interrupted_child_delivers_the_cancelled_state(tmp_path: Path)
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
-        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _BACKGROUND_INPUT)
+        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
         assert result.error is None
         assert isinstance(result.structured_output, dict)
         child_id = str(result.structured_output["sessionID"])
@@ -619,43 +609,28 @@ async def test_an_interrupted_child_delivers_the_cancelled_state(tmp_path: Path)
         assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,)) == [("interrupted",)]
         enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
         assert enqueued["message"]["metadata"]["state"] == "cancelled"
-        assert enqueued["message"]["text"] == _wrapped(
-            child_id, "cancelled", "summarize the note", "Subagent cancelled"
-        )
+        # The TS cancelled three-tier, tier 1: the child's own last output
+        # wins -- the released stream finalized "never reached" before the
+        # boundary honored the intent (the tier-3 constant arm is pinned by
+        # the restart-fold test, whose child never produced text).
+        assert enqueued["message"]["text"] == _wrapped(child_id, "cancelled", "summarize the note", "never reached")
         await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{child_run_id}")
     assert provider.close_count == 1
 
 
 # ---------------------------------------------------------------------------
-# §4-3 the foreground zero-delivery proof
+# §4-3 the foreground zero-delivery proof -- DELETED with the v1 face: the
+# upstream 2.3.2 flip removed the foreground arm entirely, so every call
+# backgrounds and the zero-delivery row has no face left to pin.
 # ---------------------------------------------------------------------------
 
 
-async def test_a_foreground_completion_delivers_nothing(tmp_path: Path) -> None:
-    db_path = _migrated_db(tmp_path, "fg_no_delivery.db")
-    provider = _ScriptedProvider([[_Script().text("p1", "first answer").usage().finish()]])
-    subagent = SubagentRunAdapter()
-    async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
-        await app.recovery_gate.wait()
-        subagent.bind(app.service)
-        parent = await app.service.create(_SNAPSHOT)
-        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
-        assert result.error is None
-        assert result.structured_output == {
-            "sessionID": _child_ids(db_path, parent.session_id)[0],
-            "status": "completed",
-            "output": "first answer",
-        }
-        # No marker, no synthetic admission, no pending row: the foreground
-        # path never touches the inbox seam.
-        assert _event_data(db_path, parent.session_id, PY_SUBAGENT_BACKGROUNDED) == []
-        assert _event_data(db_path, parent.session_id, PY_INBOX_ENQUEUED) == []
-        assert _event_data(db_path, parent.session_id, PY_INBOX_DELIVERED) == []
-        assert await app.service.inbox_list(parent.session_id) == []
-        # And the parent history stays empty (no wake, no synthetic user row).
-        page = await app.service.messages(parent.session_id)
-        assert page.items == []
-    assert provider.close_count == 1
+# ---------------------------------------------------------------------------
+# §4-4 the block conversion -- DELETED with the v1 face: nothing blocks
+# anymore (the tool returns at once), so there is no foreground wait for a
+# parked queue item to convert. The parked-queue survival itself is the S1
+# inbox machinery, pinned in its own suite.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -663,102 +638,20 @@ async def test_a_foreground_completion_delivers_nothing(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_a_parked_queue_item_converts_the_foreground_wait(tmp_path: Path) -> None:
-    db_path = _migrated_db(tmp_path, "conversion.db")
-    sub_arguments = json.dumps({"agent": "task", "description": "read the note", "prompt": "Read the note and report."})
-    parent_step_1 = (
-        _Script()
-        .text("p1", "delegating now")
-        .call_start(0, tool_call_id="call_sub", name="subagent__run")
-        .call_args(sub_arguments, 0)
-        .call_end("call_sub", "subagent__run", sub_arguments, call_index=0)
-        .usage()
-        .finish()
-    )
-    child = _Script()
-    gate = child.gate()
-    child.text("c2", "child read done").usage().finish()
-    parent_step_2 = _Script().text("p2", "parent final").usage().finish()
-    provider = _ScriptedProvider([[parent_step_1], [child], [parent_step_2], [_final_script()], [_final_script()]])
-    subagent = SubagentRunAdapter()
-    async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
-        await app.recovery_gate.wait()
-        subagent.bind(app.service)
-        parent = await app.service.create(_SNAPSHOT)
-        run = await app.service.prompt(parent.session_id, "delegate the read", "req_conv_1")
-        await _await_foreground_wait(app.service, parent.session_id)
-        # A queue item parks behind the blocked parent run (the trigger).
-        parked = await app.service.prompt(parent.session_id, "steer: hurry up", "req_conv_park", delivery="queue")
-        assert isinstance(parked, InboxRef)
-        # The parent run settles: the tool call answered the running face.
-        await _await_runs_terminal(db_path, parent.session_id)
-        assert (await app.service.run_status(run.run_id)).status is RunStatusValue.SUCCEEDED
-        child_ids = _child_ids(db_path, parent.session_id)
-        assert len(child_ids) == 1
-        child_id = child_ids[0]
-        page = await app.service.messages(parent.session_id)
-        tool_parts = [
-            part
-            for message in page.items
-            if isinstance(message, AssistantMessage)
-            for part in message.parts
-            if isinstance(part, AssistantToolPart) and part.name == "subagent__run"
-        ]
-        assert len(tool_parts) == 1
-        assert tool_parts[0].state == "succeeded"
-        assert tool_parts[0].structured_output == {
-            "sessionID": child_id,
-            "status": "running",
-            "output": _four_lines(child_id),
-        }
-        # The conversion fell exactly one marker; the parked item survived it.
-        markers = _event_data(db_path, parent.session_id, PY_SUBAGENT_BACKGROUNDED)
-        assert len(markers) == 1
-        child_run_id = str(markers[0]["run_id"])
-        # The survival face is the item's own consumption record: the S1
-        # idle-wake (the run-settle doorbell) fires the moment the converted
-        # run settles and hands the parked queue item to its own successor
-        # run, and inbox.promote commits the accepted+delivered pair with the
-        # promotion itself -- a fast host can have that whole leg done before
-        # a bare inbox_list read lands here. Await the delivery first (both
-        # timing arms converge on it), then read the inbox: it holds nothing
-        # else before the child's completion lands.
-        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, parked.inbox_id)
-        remaining = await app.service.inbox_list(parent.session_id)
-        assert [item.inbox_id for item in remaining] == []
-        # Release the child: the observer delivers into the parent. The
-        # delivery arm is racy by design -- if the parked item's wake run is
-        # still active the synthetic lands as a pending STEER (consumed at a
-        # successor run's first step boundary); if the parent is already idle
-        # it lands as QUEUE and the inline promote delivers it outright.
-        gate.open()
-        await _await_runs_terminal(db_path, child_id)
-        enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
-        assert enqueued["delivery"] in {"steer", "queue"}
-        assert enqueued["message"]["text"] == _wrapped(child_id, "completed", "read the note", "child read done")
-        if enqueued["delivery"] == "steer":
-            # The steer arm parks the synthetic against the still-active
-            # wake run; the successor run consumes it at its first step
-            # boundary (the S1 contract), so the drive waits for the wake
-            # run to settle before prompting the now-idle session.
-            await _await_runs_terminal(db_path, parent.session_id)
-            await app.service.prompt(parent.session_id, "continue the work", "req_conv_3")
-        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{child_run_id}")
-        assert len(_inbox_event_data(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")) == 1
-    assert provider.close_count == 1
-
-
 # ---------------------------------------------------------------------------
 # §4-5 the session.background faces (service arm)
 # ---------------------------------------------------------------------------
 
 
-async def test_session_background_converts_a_live_wait_and_idles_a_no_op(tmp_path: Path) -> None:
+async def test_session_background_is_the_structural_no_op_now(tmp_path: Path) -> None:
+    """T-C3-005: the always-background flip deleted the foreground wait the
+    endpoint used to convert -- the wire face survives (upstream 2.3.2 keeps
+    the endpoint over the job system's ``backgroundAll``), but both arms
+    answer ``False`` and commit nothing: idle, and a session with a LIVE
+    always-background child (its call already returned; nothing waits)."""
     db_path = _migrated_db(tmp_path, "endpoint.db")
-    child = _Script()
-    gate = child.gate()
-    child.text("c2", "child read done").usage().finish()
-    provider = _ScriptedProvider([[child], [_final_script()], [_final_script()]])
+    child = _Script().text("c2", "child read done").usage().finish()
+    provider = _ScriptedProvider([[child], [_final_script()]])
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
         await app.recovery_gate.wait()
@@ -768,20 +661,17 @@ async def test_session_background_converts_a_live_wait_and_idles_a_no_op(tmp_pat
         # The idle arm: structurally nothing is registered, nothing commits.
         assert await app.service.request_session_background(idle.session_id) is False
         assert _event_data(db_path, idle.session_id, PY_SUBAGENT_BACKGROUNDED) == []
-        # The live wait converts through the endpoint's service face.
-        task = asyncio.create_task(subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT))
-        await _await_foreground_wait(app.service, parent.session_id)
-        assert await app.service.request_session_background(parent.session_id) is True
-        result = await task
+        # The live-child arm: the spawn's own marker is all there ever is --
+        # the endpoint adds nothing on top of it.
+        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
         assert result.error is None
         assert isinstance(result.structured_output, dict)
         child_id = str(result.structured_output["sessionID"])
-        assert result.structured_output["status"] == "running"
+        assert await app.service.request_session_background(parent.session_id) is False
         markers = _event_data(db_path, parent.session_id, PY_SUBAGENT_BACKGROUNDED)
         assert len(markers) == 1
         child_run_id = str(markers[0]["run_id"])
-        # Release the child; the delivery chain runs to completion.
-        gate.open()
+        # The delivery chain still runs to completion, untouched by the call.
         await _await_runs_terminal(db_path, child_id)
         enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
         assert enqueued["message"]["text"] == _wrapped(child_id, "completed", "summarize the note", "child read done")
@@ -834,7 +724,7 @@ async def test_an_inflight_background_child_folds_and_delivers_cancelled_once(tm
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
-        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _BACKGROUND_INPUT)
+        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
         assert result.error is None
         assert isinstance(result.structured_output, dict)
         child_id = str(result.structured_output["sessionID"])
@@ -860,6 +750,9 @@ async def test_an_inflight_background_child_folds_and_delivers_cancelled_once(tm
         await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, notification_id)
         await asyncio.sleep(0.3)
         assert len(_inbox_event_data(db_path, parent.session_id, PY_INBOX_ENQUEUED, notification_id)) == 1
+        # T-C3-005: the outbox row died with its delivery (the replay arm
+        # has nothing to retry either).
+        assert _fetch_all(db_path, "SELECT 1 FROM background_job WHERE notification_id = ?", (notification_id,)) == []
     assert provider2.close_count == 1
 
 
@@ -868,29 +761,22 @@ async def test_an_inflight_background_child_folds_and_delivers_cancelled_once(tm
 # ---------------------------------------------------------------------------
 
 
-def test_the_input_schema_carries_the_background_field() -> None:
+def test_the_input_schema_has_no_background_field_now() -> None:
+    """The T-C3-005 flip: the opt-in key is gone and its absence is strict."""
     properties = SUBAGENT_INPUT_SCHEMA["properties"]
     assert isinstance(properties, dict)
-    field = properties["background"]
-    assert isinstance(field, dict)
-    assert field["type"] == "boolean"
-    assert field["description"] == (
-        "Run the subagent in the background and return immediately. You will be notified "
-        "when it completes. DO NOT sleep, poll, or proactively check on its progress."
-    )
+    assert set(properties) == {"agent", "description", "prompt", "sessionID"}
     assert SUBAGENT_INPUT_SCHEMA["required"] == ["agent", "description", "prompt"]
     assert SUBAGENT_INPUT_SCHEMA["additionalProperties"] is False
 
 
-def test_the_spec_description_carries_the_background_guidance() -> None:
-    assert (
-        "- Background mode (`background=true`) launches it asynchronously and returns\n"
-        "  immediately; you are notified when it finishes" in SUBAGENT_DESCRIPTION
-    )
-    assert "- Use background only for independent work that can run while you continue" in SUBAGENT_DESCRIPTION
+def test_the_spec_description_carries_the_always_background_guidance() -> None:
+    assert "- Subagents always run in the background: the call returns immediately with" in SUBAGENT_DESCRIPTION
+    assert "a sessionID, and you receive a `<subagent>` message each time the child" in SUBAGENT_DESCRIPTION
     schema_description = SUBAGENT_INPUT_SCHEMA["description"]
     assert isinstance(schema_description, str)
-    assert schema_description.endswith("background=true returns immediately and delivers a completion notification.")
+    assert "always run in the background" in schema_description
+    assert "each time the child goes idle" in schema_description
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +906,11 @@ def test_the_sdk_background_face_covers_idle_noop_and_missing(client: OpencodeCl
     assert info.value.status_code == 404
 
 
-def test_the_sdk_background_face_converts_a_live_wait_over_the_wire(client: OpencodeClient, running: _Running) -> None:
+def test_the_sdk_background_face_is_a_no_op_over_the_wire(client: OpencodeClient, running: _Running) -> None:
+    """T-C3-005 over the wire: the endpoint survives as the structural
+    no-op -- a delegating run whose tool call already returned (nothing
+    waits anymore) answers 204 and commits nothing beyond the spawn's own
+    marker, the run settles untouched, and the receipt still lands once."""
     provider = running.provider
     sub_arguments = json.dumps({"agent": "task", "description": "read the note", "prompt": "Read the note and report."})
     parent_key = "delegate the read over the wire"
@@ -1041,14 +931,8 @@ def test_the_sdk_background_face_converts_a_live_wait_over_the_wire(client: Open
     provider.register("Read the note and report.", child)
     session = client.create_session(_SNAPSHOT_BODY)
     run = client.prompt(session.session_id, parent_key, "req_wire_bg_1")
-    # The parent run holds a live foreground subagent wait on the server.
-    service = running.app.service
-    waits: dict[str, str] = service._subagent_foreground_waits
-    deadline = time.monotonic() + 10.0
-    while session.session_id not in waits:
-        assert time.monotonic() < deadline, "the foreground wait never registered over the wire"
-        time.sleep(0.02)
-    # The conversion round trip: 204 no-content over the real wire.
+    # The no-op round trip: 204 no-content over the real wire, mid-flight or
+    # settled -- both arms are the same nothing now.
     client.background(session.session_id)
     status = client.run_status(run.run_id)
     deadline = time.monotonic() + 10.0
@@ -1056,7 +940,7 @@ def test_the_sdk_background_face_converts_a_live_wait_over_the_wire(client: Open
         assert time.monotonic() < deadline, f"the parent run did not settle: {status.status}"
         time.sleep(0.02)
         status = client.run_status(run.run_id)
-    # The conversion fell the marker; the tool call answered the running face.
+    # The spawn's own marker is all there is -- the endpoint added nothing.
     markers = _event_data(running.db_path, session.session_id, PY_SUBAGENT_BACKGROUNDED)
     assert len(markers) == 1
     child_ids = _child_ids(running.db_path, session.session_id)

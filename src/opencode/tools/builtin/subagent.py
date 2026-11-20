@@ -1,77 +1,61 @@
-"""Builtin ``subagent__run`` tool (P6-S5; T-C1-098, ticket §3-4).
+"""Builtin ``subagent__run`` tool (T-C3-005: the always-background face).
 
-Foreground subagent runs, adapted from TS
-``packages/core/src/tool/plugin/subagent.ts``: the model delegates a
-self-contained task to a child session -- the adapter creates (or
-resumes) the child, submits the prompt, WAITS IN THE FOREGROUND until
-the child run settles, and returns the subagent's final assistant text
-(ticket §1).
+Always-background subagent runs, adapted from the upstream 2.3.2
+``packages/core/src/tool/plugin/subagent.ts`` semantics flip (diffed
+against 2.2.2): the model delegates a self-contained task to a child
+session -- the adapter creates (or resumes) the child, submits the
+prompt, and RETURNS IMMEDIATELY with the running face; every settled
+generation delivers its own ``<subagent>`` receipt into the parent's
+inbox. The v1 foreground wait chain (poll to terminal, ToolTimeout,
+cooperative cancel, block conversion) is deleted with the upstream.
 
-TS mapping / deviations, quantified (progress file):
+TS mapping / deviations, quantified (progress file + plan T-C3-005):
 
 - The TS plugin runs over a full agent directory: ``agents.resolve``
-  with unknown-agent and ``primary``-mode rejections, per-agent model
-  resolution (``Model.Ref.parse`` + chat-type/variant checks) and the
-  three config-plugin auto-agents (explore/title/summary). PY has no
-  agent directory and a single provider composition, so ``agent``
-  converges to the single builtin agent ``"task"``
-  (``SUBAGENT_AGENTS``), the model face is not ported (the child
-  inherits the host provider through its inherited config snapshot,
-  the fork precedent) and the primary-mode rejection arm is N/A.
-  DIFFERENT-BY-DESIGN (progress file §5-1/§5-2/§5-3), pinned by
-  tests.
-- ``background: true`` is the T-C1-101 (P7-S2) face: the child runs on
-  and the call returns immediately with the TS four-line guidance
-  (``backgroundResult``); the service's background observer watches the
-  durable run and delivers the completion into the parent's S1 inbox
-  (the synthetic seam) exactly once per generation, restart included.
-  The TS ``SubagentJob``/``Job.Service`` in-memory registry maps onto
-  the durable ``py.subagent.backgrounded`` marker + the process-local
-  observer arm on the service (the TS per-generation Set becomes the
-  deterministic ``subagent:{run_id}`` notification id).
-- The TS plugin's new-child+background ``resume:false`` prompt option has
-  no PY counterpart: the PY ``prompt`` face admits and starts
-  atomically and there is no suspension face to suppress, so the
-  background child simply starts (N/A, recorded in the progress file).
-- The parent link is the ticket §3-3 mechanism ①: the optional
-  ``parent_id`` on the durable ``py.session.created`` payload. It
-  carries NO lifecycle -- no delete cascade, no status coupling (the
-  service.py no-cascade record stands verbatim); the child is a fully
-  independent session that merely remembers its origin for the depth
-  guard.
-- The depth guard walks the durable parent chain
-  (``SessionService.session_created_data``) against the
-  ``SUBAGENT_MAX_DEPTH`` constant (default 1 = nesting forbidden, the
-  TS ``experimental.subagent_depth`` default as a constant because PY
-  has no experimental config face). DIFFERENT-BY-DESIGN (progress
-  file §5-7).
+  with unknown-agent and ``primary``-mode rejections. PY has no agent
+  directory and a single provider composition, so ``agent`` converges to
+  the single builtin agent ``"task"`` (``SUBAGENT_AGENTS``); the model
+  face is not ported (the child inherits the host provider through its
+  inherited config snapshot, the fork precedent) and the primary-mode
+  rejection arm is N/A. DIFFERENT-BY-DESIGN, pinned by tests.
+- Spec v2: the ``background`` input key is GONE (upstream 2.3.2 drops
+  it), the Output face carries ``status: "running"`` only, and the
+  four-line guidance names the per-round receipt contract verbatim
+  ("when it goes idle, and again after each later round of work").
+- The ALWAYS-background handoff is the T-C1-101 marker+observer
+  mechanism, now unconditional and per-round: the durable
+  ``py.subagent.backgrounded`` marker commits per generation, the
+  process-local observer arms over it (keyed by the deterministic
+  ``subagent:{run_id}`` notification id), and a follow-up round hands a
+  NEW generation to the observer -- one receipt per settled run,
+  restart included.
+- Follow-ups steer (the upstream "a follow-up to a running child joins
+  its current run"): the prompt rides ``delivery="steer"`` -- an idle
+  child admits-and-starts, a running child parks in the current run's
+  tail. The v1 SessionBusy rejection on a mid-run follow-up is gone
+  (the upstream flip); the TS ``resume:false`` option still has no PY
+  counterpart (T-C1-101 recorded: no suspension face to suppress).
+- The parent link is the durable ``parent_id`` on the
+  ``py.session.created`` payload (no lifecycle coupling); the depth
+  guard walks that chain against ``SUBAGENT_MAX_DEPTH`` (default 1, the
+  TS ``experimental.subagent_depth`` default as a constant -- the S4
+  ruling, the TS config face stays unported).
 - TS ``sessions.create({title: description, ...})`` names the child
-  session; the PY ``create`` face has no title parameter, so the
-  description stays a model-side label only (N/A, progress file).
-- The TS completion delivery imports the final text into the parent
-  session (``subagent-completion.deliver``); the FOREGROUND delivery
-  keeps its S5 form (the tool result itself, no XML wrapper -- a
-  recorded S5 deviation, progress file §5-5), while the BACKGROUND
-  delivery is the T-C1-101 import (the S1 inbox synthetic seam; the XML
-  wrapper + metadata live on that path).
-- The TS tool's foreground ``content`` wraps the completed output in the
-  XML envelope too; PY keeps the S5 raw-text content face for the
-  foreground (zero back-change, ticket §3-8) and reserves the wrapper
-  for the background notification.
+  session; the PY ``create`` face has no title parameter (N/A,
+  progress file).
+- The delivery face (wrapper, metadata, outstanding keep-alive tail)
+  lives on the service (``_deliver_subagent_completion``) and is shared
+  with the restart replay construction.
 - The TS ``permission.assert`` subagent special case is not ported:
   the PY policy face carries the ask default (ticket §3-6, progress
   file §5-6).
-- The description text is seat-written (ticket §3-9): the TS
-  subagent.ts description adapted to the single-agent form, renovated
-  for the background face (T-C1-101).
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
-from opencode.contracts.errors import CoreError, CoreErrorCode
+from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.messages import (
     JsonObject,
     JsonValue,
@@ -80,10 +64,9 @@ from opencode.contracts.messages import (
 from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.session.service import (
     SUBAGENT_NO_TEXT_RESPONSE,
-    RunStatusValue,
-    SessionBusyError,
+    RunRef,
 )
-from opencode.storage import NotFoundError, StoreError
+from opencode.storage import NotFoundError
 from opencode.tools.builtin.read import _failure
 from opencode.tools.invoker import ToolInvokeError
 
@@ -95,7 +78,10 @@ if TYPE_CHECKING:
 
 SUBAGENT_NAMESPACE = "subagent"
 SUBAGENT_NAME = "run"
-SUBAGENT_VERSION = 1
+#: v2 (T-C3-005): the always-background face -- the ``background`` input key
+#: is GONE and every call returns immediately with the running output (the
+#: upstream 2.3.2 semantics flip; the v1 foreground wait chain is deleted).
+SUBAGENT_VERSION = 2
 
 #: The closed agent enumeration (ticket §3-2): the TS agent directory
 #: converges to one builtin agent; an ``agent`` outside the set is
@@ -107,28 +93,15 @@ SUBAGENT_AGENTS = frozenset({"task"})
 #: config face (the S4 constant-form ruling precedent).
 SUBAGENT_MAX_DEPTH = 1
 
-#: The total foreground-wait bound for one child run (ticket §3-4 ⑦): a run
-#: that outlives it surfaces the ToolTimeout face and KEEPS RUNNING (the
-#: orphan stays resumable by ``sessionID``; a prompt into it while active
-#: answers SessionBusy).
-SUBAGENT_TIMEOUT_S = 600.0
-
-#: The ``run_status`` poll cadence during the foreground wait.
-SUBAGENT_POLL_INTERVAL_S = 0.05
-
-#: The cooperative-cancel cleanup bound: ``SessionService.cancel`` awaits
-#: the child task's settle, which the cancel path must never do unbounded.
-SUBAGENT_CANCEL_WAIT_S = 5.0
-
 #: The TS subagent-completion.ts no-text sentence, verbatim (§3-4 ⑧). The
 #: canonical constant lives on the service (the T-C1-101 delivery face's
 #: three-state mapping shares it); this S5 name is the alias so the two
 #: faces can never drift.
 NO_TEXT_RESPONSE = SUBAGENT_NO_TEXT_RESPONSE
 
-#: Seat-written description (ticket §3-9): the TS subagent.ts description
-#: adapted to the single-agent form, renovated for the background face
-#: (T-C1-101 -- the TS "Background mode" lines restored in PY form).
+#: Seat-written description (T-C3-005): the upstream 2.3.2 always-background
+#: form -- subagents run in the background unconditionally and the parent
+#: receives a ``<subagent>`` receipt each time the child goes idle.
 SUBAGENT_DESCRIPTION = (
     "Run a subagent: a fresh agent session that executes a self-contained task and returns\n"
     "its final answer. This allows you to:\n"
@@ -141,13 +114,14 @@ SUBAGENT_DESCRIPTION = (
     "- `description` is a short (3-5 word) label of what the subagent does\n"
     "- `prompt` must be fully self-contained: the subagent starts with no prior\n"
     "  context and cannot ask you questions, so include every detail it needs\n"
-    "- Foreground (the default) waits for the subagent to settle and returns its\n"
-    "  final text\n"
-    "- Background mode (`background=true`) launches it asynchronously and returns\n"
-    "  immediately; you are notified when it finishes\n"
-    "- Use background only for independent work that can run while you continue\n"
-    "  elsewhere\n"
-    "- Pass `sessionID` to continue a subagent this session created earlier\n"
+    "- Subagents always run in the background: the call returns immediately with\n"
+    "  a sessionID, and you receive a `<subagent>` message each time the child\n"
+    "  goes idle, including after later work\n"
+    "- Keep working on non-overlapping tasks, or briefly tell the user what you\n"
+    "  launched and end your response. Do not sleep, poll, or proactively check\n"
+    "  on the child's progress\n"
+    "- Pass the returned `sessionID` to continue that specific child\n"
+    "  conversation. A follow-up to a running child joins its current run\n"
     "- The subagent inherits this session's provider and configuration and\n"
     "  cannot spawn further subagents itself"
 )
@@ -155,9 +129,10 @@ SUBAGENT_DESCRIPTION = (
 SUBAGENT_INPUT_SCHEMA: JsonObject = {
     "type": "object",
     "description": (
-        "Run a subagent: create (or resume) a child session and submit the prompt. The "
-        "foreground form waits for the child run to settle and returns its final text; "
-        "background=true returns immediately and delivers a completion notification."
+        "Run a subagent: create (or resume) a child session and submit the prompt. Subagents "
+        "always run in the background: the call returns immediately with a sessionID, and you "
+        "receive a `<subagent>` message each time the child goes idle, including after later "
+        "work."
     ),
     "properties": {
         "agent": {
@@ -177,16 +152,7 @@ SUBAGENT_INPUT_SCHEMA: JsonObject = {
         },
         "sessionID": {
             "type": "string",
-            "description": (
-                "Optional child session id to resume; it must be a subagent created by the current session."
-            ),
-        },
-        "background": {
-            "type": "boolean",
-            "description": (
-                "Run the subagent in the background and return immediately. You will be notified "
-                "when it completes. DO NOT sleep, poll, or proactively check on its progress."
-            ),
+            "description": ("Send a follow-up to an existing subagent, running or finished. Omit to start a new one."),
         },
     },
     "required": ["agent", "description", "prompt"],
@@ -210,45 +176,20 @@ SUBAGENT_SPEC = ToolSpec(
 )
 
 
-def _timeout_failure(message: str) -> ToolResult:
-    """A bounded foreground wait exhausted its deadline (§3-4 ⑦).
-
-    Retryable like the bash/pty timeout faces: the child run keeps going,
-    so a later invocation can still collect it by ``sessionID``.
-    """
-    return ToolResult(
-        content=[ToolTextContent(type="text", text=message)],
-        error=CoreError(code=CoreErrorCode.TOOL_TIMEOUT, message=message, retryable=True),
-    )
-
-
-async def _cancel_child_best_effort(service: SessionService, run_id: str) -> None:
-    """Bounded, best-effort cooperative cancel of the child run (never raises).
-
-    ``SessionService.cancel`` awaits the child task's settle, which the
-    cancel path must never do unbounded: the wait is capped and every
-    failure (deadline, store error) is swallowed -- an orphaned child
-    keeps its ``cancelling`` state for the R4 recovery coordinator.
-    """
-    try:
-        await asyncio.wait_for(service.cancel(run_id), timeout=SUBAGENT_CANCEL_WAIT_S)
-    except (TimeoutError, StoreError):
-        pass
-
-
 def _background_result(child_id: str) -> ToolResult:
-    """The TS ``backgroundResult`` (T-C1-101 §3-1): running + four-line guidance.
+    """The TS ``backgroundResult`` (2.3.2): running + the per-round guidance.
 
     The Output face carries ``{sessionID, status: "running", output}`` with
-    the TS four-line text VERBATIM (subagent.ts L19-28, joined by newlines),
-    structured/metadata/content in the S5 same-carried form.
+    the upstream 2.3.2 four-line text VERBATIM (the idle/each-later-round
+    receipt contract), structured/metadata/content in the S5 same-carried
+    form. Every spawn answers this face now -- the call returns while the
+    child runs, unconditionally (the v1 opt-in arm is gone).
     """
     output = "\n".join(
         (
             f"The subagent is working in the background (sessionID: {child_id}). "
-            "You will be notified automatically when it finishes.",
-            "DO NOT sleep, poll for progress, ask the subagent for status, or duplicate this "
-            "subagent's work; avoid working with the same files or topics it is using.",
+            "You will receive a <subagent> message when it goes idle, and again after each later round of work.",
+            "DO NOT sleep, poll, proactively check on its progress, or duplicate this subagent's work.",
             "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
             "To send it follow-ups or change its instructions while it runs, call subagent again with this sessionID.",
         )
@@ -342,24 +283,32 @@ async def _run_subagent(service: SessionService, context: ToolContext, input: Js
         #    has no title parameter (DIFFERENT-BY-DESIGN, progress file).
         child = await service.create(parent_created.config_snapshot, parent_id=context.session_id)
         child_id = child.session_id
-    # -- §3-4 ⑥: submit the prompt. The request id is unique per
-    #    invocation, so a resumed child never collides with its earlier
-    #    accepted prompts; a retried identical call re-dedupes to the
-    #    original RunRef.
+    # -- §3-4 ⑥ (T-C3-005): submit the prompt through the steer admission.
+    #    The request id is unique per invocation, so a resumed child never
+    #    collides with its earlier accepted prompts; a retried identical
+    #    call re-dedupes to the original RunRef. ``delivery="steer"`` is the
+    #    upstream 2.3.2 "a follow-up to a running child joins its current
+    #    run" face (T-C1-100): an idle child -- new spawn or settled
+    #    follow-up -- admits-and-starts atomically, a running child parks in
+    #    the current run's tail. The busy rejection is structural now: the
+    #    v1 SessionBusy face on a mid-run follow-up is gone (the TS flip).
+    #    The TS ``resume:false`` option has no PY counterpart (T-C1-101
+    #    recorded): PY has no suspension face to suppress, the child starts.
     request_id = f"req_subagent_{context.message_id}_{context.tool_call_id}"
-    try:
-        run = await service.prompt(child_id, prompt, request_id)
-    except SessionBusyError:
-        return _failure(
-            CoreErrorCode.SESSION_BUSY,
-            f"Session {child_id} already holds an active run; let it settle before resuming the subagent",
-        )
-    # -- §3-4 ⑥ (T-C1-101) the background arm: the durable per-generation
-    #    marker commits to the PARENT's log and the observer arms on the
-    #    service (TS: recovery -> subagents.start -> background -> notify),
-    #    then the call returns immediately with the TS backgroundResult.
-    #    The child keeps running -- its durable run IS the background work.
-    if input.get("background") is True:
+    run = await service.prompt(child_id, prompt, request_id, delivery="steer")
+    # -- §3-4 ⑥ (T-C3-005) the ALWAYS-background handoff: the durable
+    #    per-generation marker commits to the PARENT's log and the observer
+    #    arms on the service (TS 2.3.2: recovery -> subagents.start, one
+    #    job per generation, background: true unconditionally), then the
+    #    call returns immediately with the running face. The child keeps
+    #    running -- its durable run IS the background work; each settled
+    #    generation delivers its own receipt under subagent:{run_id}.
+    #    ONLY a started generation arms one (idle child: admit-and-start,
+    #    a RunRef): a follow-up that PARKED behind the child's current run
+    #    (an InboxRef) arms nothing -- that run's existing observer owns
+    #    the single receipt for the whole generation (the TS "job's resume
+    #    owns the start" face).
+    if isinstance(run, RunRef):
         await service.commit_subagent_background(
             context.session_id,
             child_session_id=child_id,
@@ -367,81 +316,7 @@ async def _run_subagent(service: SessionService, context: ToolContext, input: Js
             agent=agent,
             description=description,
         )
-        return _background_result(child_id)
-    # -- §3-4 ⑦: the foreground wait. Poll the durable run_status (never an
-    #    in-memory task) to a terminal status, throttled, bounded by
-    #    SUBAGENT_TIMEOUT_S. Cancellation is cooperative and a started call
-    #    keeps its determined result, so the cancel arm only fires while
-    #    the run is still non-terminal.
-    #
-    #    T-C1-101 (§3-4) adds the BLOCK CONVERSION (the TS
-    #    ``jobs.block({id, sessionID: parent})`` PY mapping, poll-based --
-    #    the recorded seat form): each cycle also checks (a) the
-    #    session.background endpoint's armed request (the TS
-    #    ``backgrounded`` deferred) and (b) growth of the parent's pending
-    #    inbox (a new steer/queue arriving behind the blocked run -- the
-    #    seat-ruled PY trigger); either converts the wait: the same
-    #    marker+observer handoff as the background arm, then the same
-    #    backgroundResult. The registry's per-session serialization keeps
-    #    one live wait per parent, so the begin/end bookkeeping is a
-    #    single-slot record.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + SUBAGENT_TIMEOUT_S
-    baseline = len(await service.inbox_list(context.session_id))
-    service.subagent_foreground_wait_begin(context.session_id, run.run_id)
-    try:
-        status = await service.run_status(run.run_id)
-        while not status.status.is_terminal:
-            if context.cancel.is_set():
-                await _cancel_child_best_effort(service, run.run_id)
-                return _failure(
-                    CoreErrorCode.TOOL_FAILED,
-                    f"Subagent run {run.run_id} (session {child_id}) was cancelled before it settled",
-                )
-            if loop.time() >= deadline:
-                return _timeout_failure(
-                    f"Subagent run {run.run_id} (session {child_id}) did not settle within "
-                    f"{SUBAGENT_TIMEOUT_S:g} seconds; the run keeps going -- resume it with "
-                    "subagent__run once it settles"
-                )
-            if (
-                service.consume_subagent_background_request(context.session_id)
-                or len(await service.inbox_list(context.session_id)) > baseline
-            ):
-                await service.commit_subagent_background(
-                    context.session_id,
-                    child_session_id=child_id,
-                    run_id=run.run_id,
-                    agent=agent,
-                    description=description,
-                )
-                return _background_result(child_id)
-            await asyncio.sleep(SUBAGENT_POLL_INTERVAL_S)
-            status = await service.run_status(run.run_id)
-        # -- §3-4 ⑦ terminal: a failed/interrupted child is fail-closed (never
-        #    a silent completed; ticket §8).
-        if status.status is not RunStatusValue.SUCCEEDED:
-            detail = f" ({status.error})" if status.error else ""
-            return _failure(
-                CoreErrorCode.TOOL_FAILED,
-                f"Subagent run {run.run_id} (session {child_id}) ended in status {status.status.value}{detail}",
-            )
-        # -- §3-4 ⑧: the final assistant text (the shared service
-        #    extraction; foreground semantics byte-identical to S5).
-        output = await service.subagent_final_text(child_id)
-        # -- §3-4 ⑨: the Output face -- structured_output + metadata (the TS
-        #    Output object) plus the same text as the model-visible content.
-        payload: dict[str, JsonValue] = {"sessionID": child_id, "status": "completed", "output": output}
-        return ToolResult(
-            content=[ToolTextContent(type="text", text=output)],
-            structured_output=payload,
-            metadata=payload,
-        )
-    finally:
-        # Balanced with the begin above: a cancelled wait (the cooperative
-        # cancel arm or a hard task cancel) never leaves a stale
-        # conversion target behind.
-        service.subagent_foreground_wait_end(context.session_id)
+    return _background_result(child_id)
 
 
 class SubagentRunAdapter:

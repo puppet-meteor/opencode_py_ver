@@ -912,17 +912,17 @@ class OpencodeClient:
         path = f"/session/{_path(session_id)}/interrupt"
         return _interrupt_receipt(self._call("POST", path, query=query, timeout_s=timeout_s))
 
-    # -- T-C1-101 (P7-S2): the background conversion face ----------------------
+    # -- T-C1-101 (P7-S2): the background face (T-C3-005: no-op) ----------------
 
     def background(self, session_id: str, *, timeout_s: float | None = None) -> None:
-        """``POST /session/{id}/background`` — move the foreground subagent wait back.
+        """``POST /session/{id}/background`` — the wire face, structurally a no-op.
 
-        The live foreground wait converts on its next poll cycle (the
-        durable marker commits, the observer takes the completion
-        delivery, the run sees the background result). An idle request is
-        the no-op (both arms answer 204, no body — ``None``); a missing or
-        deleted session raises :class:`OpencodeApiError` with the 404 §8
-        body.
+        T-C3-005 deleted the subagent foreground wait this used to convert
+        (every subagent call backgrounds now); the face keeps its upstream
+        2.3.2 wire shape (the endpoint lives on over the job system's
+        ``backgroundAll``) but answers 204 with no body and commits
+        nothing on every arm — ``None``. A missing or deleted session
+        raises :class:`OpencodeApiError` with the 404 §8 body.
         """
         path = f"/session/{_path(session_id)}/background"
         self._call("POST", path, timeout_s=timeout_s)

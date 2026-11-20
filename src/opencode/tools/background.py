@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from opencode.contracts.messages import JsonObject
 from opencode.storage.db import Database
@@ -62,6 +63,73 @@ _RESTART_ERROR_TEXT = (
     "complete; its effect is unknown. Re-run it if the change window still "
     "needs the result."
 )
+
+#: The subagent recovery kind (T-C3-005; upstream ``kind: "subagent"``).
+KIND_SUBAGENT = "subagent"
+
+#: Row status -> the TS report ``state`` word. The ROW keeps the shell-word
+#: terminal vocabulary (the ``_TERMINAL`` set -- the status-literal discovery
+#: recorded in the plan: no "completed" row status exists); the REPORT the
+#: parent sees carries the TS vocabulary.
+SUBAGENT_REPORT_STATE = {
+    STATUS_SUCCEEDED: "completed",
+    STATUS_ERROR: "error",
+    STATUS_CANCELLED: "cancelled",
+}
+
+
+def _collapse(value: str) -> str:
+    """Whitespace-collapse one label (upstream ``clean``)."""
+    return " ".join(value.split())
+
+
+def _payload_dict(raw: Any) -> dict[str, Any]:
+    """Decode a raw payload column (JSON text or already-parsed) to a dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _payload_str(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def subagent_report_text(
+    *,
+    child_session_id: str,
+    state: str,
+    description: str,
+    body: str,
+    outstanding: Sequence[str] = (),
+) -> str:
+    """The TS ``SubagentCompletion`` report: XML wrapper + keep-alive tail.
+
+    ``state`` is the TRUE terminal state (the metadata carrier keeps it
+    verbatim). A COMPLETED child with outstanding background work reports
+    ``running`` in the wrapper attribute instead -- the TS keep-alive: the
+    parent must not treat the child as done while its background work runs
+    on -- and the tail names each outstanding line. Shared verbatim by the
+    in-process delivery and the restart replay so the two faces can never
+    drift.
+    """
+    keep_alive = state == "completed" and bool(outstanding)
+    report_state = "running" if keep_alive else state
+    report_body = body
+    if keep_alive:
+        report_body = f"{body}\n\nBackground work still running:\n" + "\n".join(outstanding)
+    return (
+        f'<subagent sessionID="{child_session_id}" state="{report_state}" '
+        f'description="{description}">\n'
+        f"{report_body}\n"
+        "</subagent>"
+    )
 
 
 def notification_id_for(tool_call_id: str) -> str:
@@ -183,6 +251,76 @@ async def delete_for_session(database: Database, session_id: str) -> int:
         return int(result.rowcount or 0)
 
 
+async def delete_row(database: Database, notification_id: str) -> int:
+    """Delete one row after its successful delivery (``completeBackground``).
+
+    The T-C3-005 subagent outbox close arm: settle upserts the row, the
+    successful delivery deletes it; a FAILED delivery leaves it standing
+    so the next boot's replay retries.
+    """
+    async with database.engine.begin() as connection:
+        result = await connection.execute(
+            text("delete from background_job where notification_id = :notification_id").bindparams(
+                notification_id=notification_id
+            )
+        )
+        return int(result.rowcount or 0)
+
+
+async def _live_session_ids(database: Database) -> set[str]:
+    """Sessions with any durable trace (parent-liveness for the subagent arm).
+
+    PY is event-sourced -- there is no sessions table, so the upstream
+    sessions-table liveness check maps onto the events log (any row under
+    the session id; recorded deviation).
+    """
+    async with database.engine.connect() as connection:
+        result = await connection.execute(text("select distinct session_id from events"))
+        return {str(row[0]) for row in result.fetchall()}
+
+
+async def outstanding_lines(database: Database, session_id: str) -> list[str]:
+    """The keep-alive tail lines: rows still running under ``session_id``.
+
+    TS ``SessionBackground.outstanding`` (the OutstandingItem face): shell
+    and subagent kinds render the upstream line forms, any other kind the
+    generic one; a row living under a DIFFERENT session (a descendant's
+    work) carries the cross-session location suffix. Codemode/image kinds
+    are unported tools (recorded deviation). Queried LIVE -- never
+    snapshotted -- so a settle racing a still-running row reads the truth.
+    """
+    async with database.engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                "select notification_id, kind, title, payload, session_id from background_job "
+                "where session_id = :session_id and status not in ('succeeded', 'error', 'cancelled') "
+                "order by created_at_ms, notification_id"
+            ).bindparams(session_id=session_id)
+        )
+        fetched = result.fetchall()
+    lines: list[str] = []
+    for notification_id, kind, title, payload, row_session in fetched:
+        data = _payload_dict(payload)
+        if kind == KIND_SHELL:
+            command = data.get("command")
+            label = command if isinstance(command, str) and command else title
+            line = f"- shell ({notification_id}): {_collapse(label)}"
+        elif kind == KIND_SUBAGENT:
+            agent = data.get("agent")
+            child = data.get("childSessionID")
+            description = data.get("description")
+            agent_word = agent if isinstance(agent, str) and agent else "task"
+            child_word = child if isinstance(child, str) and child else notification_id
+            desc_word = description if isinstance(description, str) and description else title
+            line = f"- subagent ({agent_word}, sessionID: {child_word}): {_collapse(desc_word)}"
+        else:
+            line = f"- {kind} ({notification_id}): {_collapse(title)}"
+        if row_session != session_id:
+            line = f"{line}, in {row_session}"
+        lines.append(line)
+    return lines
+
+
 async def _load_all(database: Database) -> list[_StoredRow]:
     async with database.engine.connect() as connection:
         result = await connection.execute(
@@ -205,11 +343,51 @@ async def replay_pending(database: Database) -> list[ReplayedNotification]:
     is deleted in the same transaction batch as its replay, so a crash
     mid-replay redelivers rather than loses (at-least-once, upstream's
     settled-replay semantics).
+
+    T-C3-005 adds the subagent arm (upstream ``deliverSubagentSafe``): a
+    settled subagent row replays as the wrapped ``<subagent>`` report built
+    from its recovery payload, outstanding work queried LIVE through the
+    same shared construction the in-process delivery uses; a row whose
+    parent left no durable trace is cleared silently; a row whose child
+    was still running at boot is KEPT -- PY has no ``execution.resume`` to
+    re-drive it (recorded deviation), so the row survives for the next
+    boot rather than faking a terminal receipt.
     """
     stored_rows = await _load_all(database)
+    live_parents = await _live_session_ids(database)
     replayed: list[ReplayedNotification] = []
+    keep: set[str] = set()
     for stored in stored_rows:
         row = stored.row
+        if row.kind == KIND_SUBAGENT:
+            if row.session_id not in live_parents:
+                # Deleted parent: silent clear (the sweep drops the row).
+                continue
+            if row.status not in _TERMINAL:
+                keep.add(row.notification_id)
+                continue
+            payload = row.payload if row.payload is not None else {}
+            child = _payload_str(payload, "childSessionID") or row.tool_call_id
+            description = _payload_str(payload, "description") or row.title
+            body = _payload_str(payload, "output") or ""
+            outstanding = await outstanding_lines(database, child)
+            replayed.append(
+                ReplayedNotification(
+                    notification_id=row.notification_id,
+                    session_id=row.session_id,
+                    tool_call_id=row.tool_call_id,
+                    kind=row.kind,
+                    status=row.status,
+                    text=subagent_report_text(
+                        child_session_id=child,
+                        state=SUBAGENT_REPORT_STATE[row.status],
+                        description=description,
+                        body=body,
+                        outstanding=outstanding,
+                    ),
+                )
+            )
+            continue
         if row.status in _TERMINAL:
             payload_text = ""
             if row.payload is not None:
@@ -239,7 +417,11 @@ async def replay_pending(database: Database) -> list[ReplayedNotification]:
                     text=_RESTART_ERROR_TEXT.format(title=row.title),
                 )
             )
-    if stored_rows:
+    doomed = [stored.row.notification_id for stored in stored_rows if stored.row.notification_id not in keep]
+    if doomed:
+        delete_statement = text("delete from background_job where notification_id in :notification_ids").bindparams(
+            bindparam("notification_ids", expanding=True)
+        )
         async with database.engine.begin() as connection:
-            await connection.execute(text("delete from background_job"))
+            await connection.execute(delete_statement, {"notification_ids": doomed})
     return replayed

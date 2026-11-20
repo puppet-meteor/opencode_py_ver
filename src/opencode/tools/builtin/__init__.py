@@ -189,15 +189,12 @@ from opencode.tools.builtin.read import (
 from opencode.tools.builtin.subagent import (
     NO_TEXT_RESPONSE,
     SUBAGENT_AGENTS,
-    SUBAGENT_CANCEL_WAIT_S,
     SUBAGENT_DESCRIPTION,
     SUBAGENT_INPUT_SCHEMA,
     SUBAGENT_MAX_DEPTH,
     SUBAGENT_NAME,
     SUBAGENT_NAMESPACE,
-    SUBAGENT_POLL_INTERVAL_S,
     SUBAGENT_SPEC,
-    SUBAGENT_TIMEOUT_S,
     SUBAGENT_VERSION,
     SubagentRunAdapter,
 )

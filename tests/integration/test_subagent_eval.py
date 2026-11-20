@@ -325,12 +325,20 @@ async def _spawn_gated_child(
     subagent: SubagentRunAdapter,
     tmp_path: Path,
     gate: Any,
+    *,
+    release: bool = True,
 ) -> dict[str, Any]:
-    """M1/M3 shared drive: spawn (no background key) against a gated child.
+    """M1/M3/M4 shared drive: spawn (no background key) against a gated child.
 
     The spawn call itself is bounded by ``_RETURN_DEADLINE_S``: a face that
     waits for the child answers ``returned_s=None`` (honest timeout), an
     always-background face returns immediately with the running output.
+    ``release=True`` (the M1/M3 form) opens the gate before returning so
+    the parked child settles deterministically for the teardown/receipt
+    observation; ``release=False`` (the M4 form) leaves the child PARKED
+    and mid-run -- the follow-up steer probe needs the run still live, and
+    a released child would race its own finalize commits against the
+    follow-up's admission (the ConflictError the BEFORE run surfaced).
     """
     started = time.perf_counter()
     returned: dict[str, Any] | None = None
@@ -352,9 +360,11 @@ async def _spawn_gated_child(
             "error": error,
         }
     # Let the parked child settle so the app teardown and the receipt face
-    # can be observed deterministically (the gate opens regardless).
+    # can be observed deterministically (the gate opens unless the caller
+    # needs the run still live).
     await _await_predicate(gate.entered.is_set, timeout_s=_SETTLE_DEADLINE_S, what="the gated child to park")
-    gate.open()
+    if release:
+        gate.open()
     return returned
 
 
@@ -519,7 +529,6 @@ async def test_m2_idle_receipt(tmp_path: Path) -> None:
 
 async def test_m3_outstanding_tail(tmp_path: Path) -> None:
     """A running shell row under the child keeps the receipt alive (state=running)."""
-    from opencode.storage import open_database
     from opencode.tools.background import BackgroundJobRow, upsert_row
 
     script = _Script()
@@ -538,20 +547,24 @@ async def test_m3_outstanding_tail(tmp_path: Path) -> None:
         if isinstance(child_id, str) and child_id.startswith("ses_"):
             await _await_predicate(gate.entered.is_set, timeout_s=_SETTLE_DEADLINE_S, what="the gated child to park")
             # The outstanding row must exist BEFORE the child settles: a shell
-            # command still running under the child at receipt time.
-            async with open_database(db_path) as database:
-                await upsert_row(
-                    database,
-                    BackgroundJobRow(
-                        notification_id="ntf_m3_shell",
-                        session_id=child_id,
-                        tool_call_id="call_m3_shell",
-                        kind="shell",
-                        status="running",
-                        title="long shell",
-                        payload={"command": "ping -t localhost"},
-                    ),
-                )
+            # command still running under the child at receipt time. Written
+            # through the APP'S database handle -- the writer lock is single
+            # owner, a second open_database inside the app context is
+            # WriterLockHeldError by design.
+            from opencode.tools.background import BackgroundJobRow, upsert_row
+
+            await upsert_row(
+                app.database,
+                BackgroundJobRow(
+                    notification_id="ntf_m3_shell",
+                    session_id=child_id,
+                    tool_call_id="call_m3_shell",
+                    kind="shell",
+                    status="running",
+                    title="long shell",
+                    payload={"command": "ping -t localhost"},
+                ),
+            )
             gate.open()
             await _child_settled(db_path, child_id)
             run_id = await _child_run_id(db_path, child_id)
@@ -579,7 +592,8 @@ async def test_m4_followup_steering(tmp_path: Path) -> None:
     gate = script.gate()
     child_first = script.text("p2", "partial").usage().finish()
     child_second = _Script().text("p2", " resumed answer").usage().finish()
-    provider = _ScriptedProvider([[child_first], [child_second]])
+    parent_wake = _Script().text("pw", "parent woken").usage().finish()
+    provider = _ScriptedProvider([[child_first], [child_second], [parent_wake]])
     subagent = SubagentRunAdapter()
     db_path = _migrated_db(tmp_path, "m4_steer.db")
     metrics: dict[str, Any] = {}
@@ -587,7 +601,9 @@ async def test_m4_followup_steering(tmp_path: Path) -> None:
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
-        spawn = await _spawn_gated_child(parent.session_id, subagent, tmp_path, gate)
+        # release=False: the child must STILL be parked mid-run when the
+        # follow-up lands (a released child races its finalize commits).
+        spawn = await _spawn_gated_child(parent.session_id, subagent, tmp_path, gate, release=False)
         child_id = spawn.get("sessionID")
         if not (isinstance(child_id, str) and child_id.startswith("ses_")):
             metrics = {"followup": "spawn-absent", "spawn_status": spawn.get("status")}
@@ -660,10 +676,11 @@ async def test_m5_depth_rejection(tmp_path: Path) -> None:
 async def test_m6_restart_replay(tmp_path: Path) -> None:
     """A settled subagent row replays once as the wrapped <subagent> report.
 
-    The pre-implementation replay is kind-agnostic: a settled row replays
-    ``payload["text"]`` verbatim (empty for a recovery-shaped payload). The
-    T-C3-005 face builds the ``<subagent sessionID state description>`` body
-    from the row's recovery snapshot, the upstream deliverSubagentSafe form.
+    The T-C3-005 face (upstream ``deliverSubagentSafe``): a TERMINAL row
+    (the shell-word vocabulary -- ``succeeded`` maps to the TS
+    ``completed`` report state) under a LIVE parent (a real session; PY
+    has no sessions table, liveness is the events row) replays as the
+    wrapped construction, keyed by notification id, destructively.
     """
     from opencode.storage import open_database
     from opencode.tools.background import BackgroundJobRow, replay_pending, upsert_row
@@ -674,11 +691,16 @@ async def test_m6_restart_replay(tmp_path: Path) -> None:
         rows = _fetch_all(db_path, "SELECT COUNT(*) FROM background_job WHERE notification_id = ?", (notification_id,))
         return int(rows[0][0] or 0)
 
+    provider = _ScriptedProvider([[]])
+    subagent = SubagentRunAdapter()
+    async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
+        await app.recovery_gate.wait()
+        parent = await app.service.create(_SNAPSHOT)
     async with open_database(db_path) as database:
         metrics: dict[str, Any] = {}
         recovery: dict[str, Any] = {
             "kind": "subagent",
-            "parentSessionID": "ses_m6_parent",
+            "parentSessionID": parent.session_id,
             "childSessionID": "ses_m6_child",
             "agent": "task",
             "description": "summarize the note",
@@ -687,10 +709,10 @@ async def test_m6_restart_replay(tmp_path: Path) -> None:
             database,
             BackgroundJobRow(
                 notification_id="subagent:run_m6",
-                session_id="ses_m6_parent",
+                session_id=parent.session_id,
                 tool_call_id="call_m6",
                 kind="subagent",
-                status="completed",
+                status="succeeded",
                 title="summarize the note",
                 payload={**recovery, "output": "all done"},
             ),

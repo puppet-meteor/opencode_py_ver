@@ -325,6 +325,9 @@ class App:
             approvals=approvals,
             policy=policy,
             close_timeout_s=close_timeout_s,
+            # T-C3-005: the subagent outbox rows share the App-owned
+            # database (settle upsert / delivery delete / keep-alive reads).
+            database=self._database,
         )
         # R4-S2 wiring: the MCP manager is App-owned but lifecycle-closed by
         # the service (§7 L339: MCP -> provider -> DB); the caller injects it

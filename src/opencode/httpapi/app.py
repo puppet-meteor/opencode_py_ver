@@ -1245,20 +1245,19 @@ def create_app(app: App, *, token: str) -> FastAPI:
         receipt = await service.interrupt(session_id, resume=resume)
         return _json_response(_interrupt_wire(receipt))
 
-    # -- T-C1-101 (P7-S2): the background conversion route ---------------------
+    # -- T-C1-101 (P7-S2): the background route (T-C3-005: structural no-op) ----
 
     @api.post("/session/{session_id}/background")
     async def session_background(session_id: str) -> Response:
-        """§3-5 background: move the session's foreground subagent wait back.
+        """§3-5 background: the wire face survives as the honest no-op.
 
-        The TS ``session.background`` face (``jobs.backgroundAll``): the
-        live foreground wait's next poll cycle consumes the armed request,
-        commits the durable per-generation marker, hands the child to the
-        observer and returns the background result to the run. An idle
-        session -- no live wait -- is the honest no-op (the TS "Idle
-        requests are a no-op" contract, structurally: nothing is
-        registered to convert); both arms answer 204 No Content, a missing
-        or deleted session answers 404. No request body.
+        The TS ``session.background`` face lives on over the job system's
+        ``backgroundAll``; T-C3-005 deleted the subagent foreground wait
+        the py port used to convert (every subagent call backgrounds now),
+        so there is structurally nothing to arm -- every arm answers 204
+        No Content and commits nothing, and a missing or deleted session
+        answers 404. The later job-system port re-gives this route teeth.
+        No request body.
         """
         await service.request_session_background(session_id)
         return Response(status_code=204)

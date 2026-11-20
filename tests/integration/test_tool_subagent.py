@@ -1,52 +1,51 @@
-"""Integration tests for the ``subagent__run`` builtin (P6-S5; T-C1-098 §4).
+"""Integration tests for the ``subagent__run`` builtin (P6-S5; T-C3-005 v2).
 
-What is pinned here, per the ticket's §4 list:
+What is pinned here:
 
-* the guard matrix (§4-1): an unbound adapter is a wiring defect
+* the guard matrix: an unbound adapter is a wiring defect
   (ToolInvokeError), a missing parent session answers ValidationError, an
   unknown agent is rejected, the depth guard refuses a session that is
   already a child (``SUBAGENT_MAX_DEPTH == 1``), and the resume face
-  refuses a non-child session id (``not a child``) and a missing one.
-  The pre-S2 ``background: true`` rejection row is GONE (the face is
-  T-C1-101's import -- the background acceptance chain lives in
-  ``test_subagent_background.py``);
-* the resume-reuse face (§4-2): a second invocation with ``sessionID``
-  reuses the same child session -- a second run, message growth, no
-  new session;
-* the foreground full chain (§4-3): a direct adapter invocation over a
-  real App (provider + runner + registry) returns the exact Output
-  face ``{sessionID, status: "completed", output}`` as
-  structured_output/metadata/content, with the durable evidence probed
-  in sqlite (the ``py.session.created`` payload carrying ``parent_id``,
-  the ``py.prompt.accepted`` chain event, the succeeded runs row) and
-  the parent link read back through the service face;
-* the registry-driven chain (the deadlock pin): a REAL parent run whose
-  scripted stream emits a ``subagent__run`` tool call, whose child run
-  itself calls ``fs__read`` -- two sessions inside one registry. This
-  pins the T-C1-098 mechanism correction (per-session serial locks in
-  ``ToolRegistry.invoke``): under the pre-correction registry-wide lock
-  this shape deadlocked deterministically, and a regression goes red
-  BOUNDED (the adapter's ``SUBAGENT_TIMEOUT_S`` foreground-wait face
-  fails the tool; ``close_timeout_s`` bounds the teardown) -- never an
-  unbounded hang;
-* the child-failure terminal (§4-4): a scripted provider error makes
-  the child run fail and the tool answers the fail-closed TOOL_FAILED
-  face (status + ids, never a silent ``completed``);
-* the no-text terminal (§4-5): a reasoning-only child run settles
-  successfully and the output is the TS sentence verbatim
-  (``Subagent completed without a text response.``);
-* the bounded wait faces (§3-4 ⑦, the recorded seat ruling): a gated
-  child run surfaces the ToolTimeout face (retryable, the child ids as
-  the resume hint, the run keeps going), and a cooperative cancel
-  surfaces the TOOL_FAILED face after a bounded best-effort
-  ``service.cancel``;
-* the policy/Spec pins (§4-6): the ``ask`` default row
-  (``PermissionPolicy.evaluate``), the eight Spec catalog fields, and
-  the wire-name registration on a real App registry.
+  refuses a non-child session id (``not a child``) and a missing one;
+* the always-background full chain: a direct adapter invocation over a
+  real App (provider + runner + registry) returns the exact
+  ``backgroundResult`` face ``{sessionID, status: "running", output}``
+  (the TS four-line text) as structured_output/metadata/content, with the
+  durable evidence probed in sqlite (the ``py.session.created`` payload
+  carrying ``parent_id``, the ``py.prompt.accepted`` chain event, the
+  succeeded runs row), the parent link read back through the service
+  face, and the settled child's ``<subagent>`` receipt landing in the
+  parent's inbox;
+* the resume-reuse face: a second invocation with ``sessionID`` reuses
+  the same child session -- a second run, message growth, no new session,
+  and a SECOND receipt under its own generation id;
+* the registry-driven chain (the deadlock pin, re-based): a REAL parent
+  run whose scripted stream emits a ``subagent__run`` tool call, whose
+  child run itself calls ``fs__read`` -- two sessions inside one registry
+  while the parent's run is live. This pins the T-C1-098 mechanism
+  correction (per-session serial locks in ``ToolRegistry.invoke``); under
+  the v2 semantics the parent's tool call returns at once and the parent
+  run CONTINUES while the child works -- the receipt for the child
+  generation still lands exactly once and is consumed by a successor
+  parent turn;
+* the terminal faces (v2): the tool itself never fail-closes on a child
+  terminal anymore (every call answers the running face; the terminal
+  moved into the receipt) -- a provider-error child settles interrupted
+  and the receipt reports the TS third state ``cancelled``, and a
+  reasoning-only child settles succeeded with the TS no-text sentence as
+  the receipt body;
+* the policy/Spec pins: the ``ask`` default row
+  (``PermissionPolicy.evaluate``), the eight Spec catalog fields (v2),
+  and the wire-name registration on a real App registry.
+
+Deleted with the v1 faces (upstream 2.3.2 removed the foreground wait):
+the bounded ToolTimeout face, the cooperative-cancel TOOL_FAILED face,
+and the foreground Output completion face (pinned in the receipt form
+above).
 
 Harness note (the S4 form): the scripted provider, script builder, and
-sqlite probes are the ``test_httpapi_server.py`` shapes COPIED here
-(the cross-file import of test helpers is legal but the copy keeps this
+sqlite probes are the ``test_httpapi_server.py`` shapes COPIED here (the
+cross-file import of test helpers is legal but the copy keeps this
 file's failure surface self-contained); everything else is real -- a
 real migrated database, the real App composition (provider, runner,
 registry, policy), and the real session service.
@@ -69,12 +68,13 @@ from pydantic import BaseModel
 from opencode.app import App
 from opencode.contracts import ConfigSnapshot, CoreErrorCode
 from opencode.contracts.errors import CoreError
-from opencode.contracts.events import PY_PROMPT_ACCEPTED, PY_SESSION_CREATED
+from opencode.contracts.events import PY_INBOX_DELIVERED, PY_INBOX_ENQUEUED, PY_PROMPT_ACCEPTED, PY_SESSION_CREATED
 from opencode.contracts.llm import (
     ErrorChunk,
     FinishChunk,
     FinishReason,
     GenerationRequest,
+    LLMTextPart,
     ModelRef,
     ProviderChunk,
     ReasoningDeltaChunk,
@@ -93,7 +93,6 @@ from opencode.contracts.messages import (
     ToolTextContent,
 )
 from opencode.session.service import RunStatus, RunStatusValue, SessionService
-from opencode.tools.builtin import subagent as subagent_module
 from opencode.tools.builtin.read import FsReadAdapter
 from opencode.tools.builtin.subagent import (
     NO_TEXT_RESPONSE,
@@ -125,6 +124,24 @@ _PROVIDER_CHUNKS = (
 
 #: The happy-path invocation input (schema-complete, agent "task").
 _INPUT: JsonObject = {"agent": "task", "description": "summarize the note", "prompt": "Read nothing; just answer."}
+
+
+def _four_lines(child_id: str) -> str:
+    """The TS ``backgroundResult`` text (v2), reconstructed for byte comparison."""
+    return "\n".join(
+        (
+            f"The subagent is working in the background (sessionID: {child_id}). "
+            "You will receive a <subagent> message when it goes idle, and again after each later round of work.",
+            "DO NOT sleep, poll, proactively check on its progress, or duplicate this subagent's work.",
+            "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
+            "To send it follow-ups or change its instructions while it runs, call subagent again with this sessionID.",
+        )
+    )
+
+
+def _wrapped(child_id: str, state: str, description: str, text: str) -> str:
+    """The TS XML wrapper, reconstructed for byte comparison."""
+    return f'<subagent sessionID="{child_id}" state="{state}" description="{description}">\n{text}\n</subagent>'
 
 
 # ---------------------------------------------------------------------------
@@ -165,15 +182,30 @@ def _child_ids(db_path: Path, parent_id: str) -> list[str]:
     return [session_id for session_id, data in rows if json.loads(str(data)).get("parent_id") == parent_id]
 
 
-async def _await_child(db_path: Path, parent_id: str, *, timeout_s: float = 5.0) -> str:
+def _event_data(db_path: Path, session_id: str, event_type: str) -> list[dict[str, Any]]:
+    """Every event payload of one type in one session's log, seq order."""
+    rows = _fetch_all(
+        db_path, "SELECT data FROM events WHERE session_id = ? AND type = ? ORDER BY seq", (session_id, event_type)
+    )
+    return [json.loads(str(row[0])) for row in rows]
+
+
+def _inbox_event_data(db_path: Path, session_id: str, event_type: str, inbox_id: str) -> list[dict[str, Any]]:
+    return [data for data in _event_data(db_path, session_id, event_type) if data.get("inbox_id") == inbox_id]
+
+
+async def _await_inbox_event(
+    db_path: Path, session_id: str, event_type: str, inbox_id: str, *, timeout_s: float = 15.0
+) -> dict[str, Any]:
+    """Poll until one event of the type lands under the inbox id; return its data."""
     deadline = asyncio.get_running_loop().time() + timeout_s
     while True:
-        ids = _child_ids(db_path, parent_id)
-        if ids:
-            return ids[0]
+        rows = _inbox_event_data(db_path, session_id, event_type, inbox_id)
+        if rows:
+            return rows[0]
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(f"no child session appeared for parent {parent_id}")
-        await asyncio.sleep(0.01)
+            raise AssertionError(f"no {event_type} under {inbox_id} in session {session_id}")
+        await asyncio.sleep(0.02)
 
 
 async def _await_runs_terminal(db_path: Path, session_id: str, *, timeout_s: float = 10.0) -> None:
@@ -342,6 +374,45 @@ def _final_script() -> _Script:
     return _Script().text("p2", "all done").usage().finish()
 
 
+def _user_text(request: GenerationRequest) -> str:
+    """The last user text of a generation request -- the keyed provider's key."""
+    for message in reversed(request.messages):
+        if message.role == "user":
+            for part in message.content:
+                if isinstance(part, LLMTextPart):
+                    return part.text
+    return ""
+
+
+class _KeyedProvider:
+    """Fake Provider for the concurrent-chain pin: scripts keyed by the
+    prompt's user text (order-independent -- the parent's continuation and
+    the child's steps interleave freely), and an unregistered key gets the
+    default finishing script (the receipt-consumed parent turn)."""
+
+    def __init__(self) -> None:
+        self._scripts: dict[str, list[list[BaseModel | _Gate]]] = {}
+        self.requests: list[GenerationRequest] = []
+        self.close_count = 0
+
+    def register(self, key: str, script: _Script) -> None:
+        self._scripts.setdefault(key, []).append(list(script.items))
+
+    async def stream(self, request: GenerationRequest) -> AsyncIterator[ProviderChunk]:
+        self.requests.append(request)
+        queue = self._scripts.get(_user_text(request))
+        items = queue.pop(0) if queue else list(_final_script().items)
+        for item in items:
+            if _is_chunk(item):
+                yield item
+            elif isinstance(item, _Gate):
+                item.entered.set()
+                await item.event.wait()
+
+    async def close(self) -> None:
+        self.close_count += 1
+
+
 # ---------------------------------------------------------------------------
 # app harness
 # ---------------------------------------------------------------------------
@@ -360,7 +431,7 @@ def _settings() -> Any:
 
 def _subagent_app(
     db_path: Path,
-    provider: _ScriptedProvider,
+    provider: _ScriptedProvider | _KeyedProvider,
     tmp_path: Path,
     subagent: SubagentRunAdapter,
     *,
@@ -473,28 +544,28 @@ async def test_the_guard_matrix_rejects_every_fail_closed_face(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
-# §4-3 the foreground full chain (direct invocation) + durable evidence
+# the always-background full chain (direct invocation) + durable evidence
 # ---------------------------------------------------------------------------
 
 
-async def test_the_foreground_chain_returns_the_output_face_with_durable_evidence(tmp_path: Path) -> None:
+async def test_the_first_call_returns_the_running_face_with_durable_evidence(tmp_path: Path) -> None:
     db_path = _migrated_db(tmp_path, "full_chain.db")
-    provider = _ScriptedProvider([[_final_script()]])
+    provider = _ScriptedProvider([[_final_script()], [_final_script()]])  # the child, then the receipt wake
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
         result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
-        # The Output face, exact shape (§3-4 ⑨).
+        # The backgroundResult face, exact shape (the v2 flip: no waiting).
         assert result.error is None
         assert isinstance(result.structured_output, dict)
         child_id = str(result.structured_output["sessionID"])
-        assert result.structured_output == {"sessionID": child_id, "status": "completed", "output": "all done"}
+        assert result.structured_output == {"sessionID": child_id, "status": "running", "output": _four_lines(child_id)}
         assert result.metadata == result.structured_output
-        assert len(result.content) == 1
-        assert isinstance(result.content[0], ToolTextContent)
-        assert result.content[0].text == "all done"
+        assert [content.text for content in result.content if isinstance(content, ToolTextContent)] == [
+            _four_lines(child_id)
+        ]
         # The child is a real child of THIS parent (mechanism ①, durable payload).
         assert child_id != parent.session_id
         assert _child_ids(db_path, parent.session_id) == [child_id]
@@ -504,10 +575,12 @@ async def test_the_foreground_chain_returns_the_output_face_with_durable_evidenc
         assert created["parent_id"] == parent.session_id
         # The service face reads the parent link back (the fork-precedent read).
         assert (await app.service.session_created_data(child_id)).parent_id == parent.session_id
-        # The prompt chain event is durable and the run settled succeeded.
+        # The prompt chain event is durable and the run settles succeeded
+        # (in the background now -- the call already returned).
         assert _fetch_all(
             db_path, "SELECT 1 FROM events WHERE session_id = ? AND type = ?", (child_id, PY_PROMPT_ACCEPTED)
         )
+        await _await_runs_terminal(db_path, child_id)
         assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,)) == [("succeeded",)]
         # The snapshot is inherited verbatim from the parent (the fork precedent).
         assert (await app.service.session_created_data(child_id)).snapshot_hash == (
@@ -517,8 +590,22 @@ async def test_the_foreground_chain_returns_the_output_face_with_durable_evidenc
         registry = app.registry
         assert registry is not None
         assert registry.snapshot(parent.session_id).resolve("subagent__run") is not None
-        # Exactly one child provider request, driven by the adapter's prompt.
-        assert len(provider.requests) == 1
+        # The settled child delivers exactly one receipt through the S1
+        # synthetic seam (idle parent: queue + promote -> the wake run).
+        child_run_id = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
+        enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
+        assert enqueued["kind"] == "synthetic"
+        assert enqueued["message"]["text"] == _wrapped(child_id, "completed", "summarize the note", "all done")
+        assert enqueued["message"]["metadata"] == {
+            "source": "subagent",
+            "childID": child_id,
+            "agent": "task",
+            "state": "completed",
+        }
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{child_run_id}")
+        await _await_runs_terminal(db_path, parent.session_id)
+        # Exactly two provider requests: the child's run and the wake turn.
+        assert len(provider.requests) == 2
     assert provider.close_count == 1
 
 
@@ -531,7 +618,9 @@ async def test_a_resume_with_session_id_reuses_the_same_child_session(tmp_path: 
     db_path = _migrated_db(tmp_path, "resume.db")
     first_answer = _Script().text("p1", "first answer").usage().finish()
     second_answer = _Script().text("p1", "second answer").usage().finish()
-    provider = _ScriptedProvider([[first_answer], [second_answer]])
+    wake = _final_script()
+    # Two generations, each: the child's turn, then the parent's wake turn.
+    provider = _ScriptedProvider([[first_answer], [wake], [second_answer], [_final_script()]])
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
         await app.recovery_gate.wait()
@@ -541,87 +630,120 @@ async def test_a_resume_with_session_id_reuses_the_same_child_session(tmp_path: 
         assert first.error is None
         assert isinstance(first.structured_output, dict)
         child_id = str(first.structured_output["sessionID"])
-        assert first.structured_output["output"] == "first answer"
-        # The resume: the same child id in, the same child id out.
+        assert first.structured_output == {
+            "sessionID": child_id,
+            "status": "running",
+            "output": _four_lines(child_id),
+        }
+        # Generation one settles and delivers its own receipt (the wake turn
+        # consumes the second script; awaiting it keeps the FIFO deterministic).
+        await _await_runs_terminal(db_path, child_id)
+        run_one = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
+        first_receipt = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{run_one}")
+        assert first_receipt["message"]["text"] == _wrapped(child_id, "completed", "summarize the note", "first answer")
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{run_one}")
+        await _await_runs_terminal(db_path, parent.session_id)
+        # The resume: the same child id in, the same child id out (running).
         second = await subagent.execute(
             _ctx(parent.session_id, tmp_path, tool_call_id="call_resume_1"),
             {**_INPUT, "sessionID": child_id, "prompt": "Go deeper."},
         )
         assert second.error is None
-        assert second.structured_output == {"sessionID": child_id, "status": "completed", "output": "second answer"}
+        assert second.structured_output == {
+            "sessionID": child_id,
+            "status": "running",
+            "output": _four_lines(child_id),
+        }
         # Reuse, not a new session: still exactly one child, now with two runs.
+        await _await_runs_terminal(db_path, child_id)
         assert _child_ids(db_path, parent.session_id) == [child_id]
         assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,)) == [
             ("succeeded",),
             ("succeeded",),
         ]
+        # Generation two delivers its OWN receipt under its own id.
+        run_two = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[1][0])
+        second_receipt = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{run_two}")
+        assert second_receipt["message"]["text"] == _wrapped(
+            child_id, "completed", "summarize the note", "second answer"
+        )
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{run_two}")
+        await _await_runs_terminal(db_path, parent.session_id)
         # The child's history grew: two settled runs, each with its idle row.
         page = await app.service.messages(child_id)
         kinds = [message.type for message in page.items]
         assert kinds == ["user", "assistant", "idle", "user", "assistant", "idle"]
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 4
     assert provider.close_count == 1
 
 
 # ---------------------------------------------------------------------------
-# the deadlock pin: a real parent run, a tool-using child, one registry
+# the concurrency pin: a real parent run, a tool-using child, one registry
 # ---------------------------------------------------------------------------
 
 
 async def test_a_parent_run_drives_a_tool_using_child_without_deadlock(tmp_path: Path) -> None:
-    """The registry-driven chain (the T-C1-098 mechanism-correction pin).
+    """The registry-driven chain (the T-C1-098 mechanism-correction pin,
+    re-based onto the v2 always-background semantics).
 
     The parent's scripted stream emits a ``subagent__run`` tool call; the
-    child's own run calls ``fs__read`` through the SAME registry while the
-    parent's invoke is still on the stack. Under the pre-correction
-    registry-wide serial lock this deadlocked deterministically (the child's
-    invoke could never take the lock the parent's adapter still held); with
-    the per-session locks both runs settle. A regression of the lock shape
-    turns this red BOUNDED -- the adapter's foreground-wait deadline answers
-    the parent's tool call with the ToolTimeout face and ``close_timeout_s``
-    bounds the teardown -- never an unbounded hang.
+    call returns at once and the parent run CONTINUES while the child's
+    own run calls ``fs__read`` through the SAME registry -- the child's
+    invoke can land while the parent session's invoke machinery is live.
+    Under the pre-correction registry-wide serial lock that shape
+    deadlocked; with the per-session locks both runs settle, the receipt
+    for the child generation lands in the parent's inbox exactly once,
+    and a successor parent turn (the steer into the still-active run, or
+    the idle wake) consumes it. The keyed provider keeps the interleaving
+    free (each turn's script is keyed by its prompt text) and
+    ``close_timeout_s`` bounds the teardown -- never an unbounded hang.
     """
     db_path = _migrated_db(tmp_path, "registry_chain.db")
     note = tmp_path / "note.txt"
     note.write_text("note body", encoding="utf-8")
     sub_arguments = json.dumps({"agent": "task", "description": "read the note", "prompt": "Read note.txt and report."})
     read_arguments = json.dumps({"path": str(note)})
-    parent_step_1 = (
+    parent_key = "delegate the read"
+    child_key = "Read note.txt and report."
+    provider = _KeyedProvider()
+    provider.register(
+        parent_key,
         _Script()
         .text("p1", "delegating now")
         .call_start(0, tool_call_id="call_sub", name="subagent__run")
         .call_args(sub_arguments, 0)
         .call_end("call_sub", "subagent__run", sub_arguments, call_index=0)
         .usage()
-        .finish()
+        .finish(),
     )
-    child_step_1 = (
+    provider.register(parent_key, _Script().text("p2", "parent final").usage().finish())
+    provider.register(
+        child_key,
         _Script()
         .text("c1", "reading the file")
         .call_start(0, tool_call_id="call_read", name="fs__read")
         .call_args(read_arguments, 0)
         .call_end("call_read", "fs__read", read_arguments, call_index=0)
         .usage()
-        .finish()
+        .finish(),
     )
-    child_step_2 = _Script().text("c2", "child read done").usage().finish()
-    parent_step_2 = _Script().text("p2", "parent final").usage().finish()
-    provider = _ScriptedProvider([[parent_step_1], [child_step_1], [child_step_2], [parent_step_2]])
+    provider.register(child_key, _Script().text("c2", "child read done").usage().finish())
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent, close_timeout_s=5.0) as app:
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
-        run = await app.service.prompt(parent.session_id, "delegate the read", "req_parent_chain")
+        run = await app.service.prompt(parent.session_id, parent_key, "req_parent_chain")
         status = await _await_terminal(app.service, run.run_id)
         assert status.status is RunStatusValue.SUCCEEDED
         # The child exists, is linked, and settled with its tool call done.
         child_ids = _child_ids(db_path, parent.session_id)
         assert len(child_ids) == 1
         child_id = child_ids[0]
+        await _await_runs_terminal(db_path, child_id)
         assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,)) == [("succeeded",)]
-        # The parent's durable tool part carries the child's final text and
-        # the structured Output face (the model-visible delivery).
+        # The parent's durable tool part carries the immediate running face
+        # (the v2 model-visible delivery: the receipt arrives separately).
         page = await app.service.messages(parent.session_id)
         tool_parts = [
             part
@@ -633,28 +755,39 @@ async def test_a_parent_run_drives_a_tool_using_child_without_deadlock(tmp_path:
         assert len(tool_parts) == 1
         part = tool_parts[0]
         assert part.state == "succeeded"
-        assert part.structured_output == {"sessionID": child_id, "status": "completed", "output": "child read done"}
+        assert part.structured_output == {"sessionID": child_id, "status": "running", "output": _four_lines(child_id)}
         # The parent run continued past the tool and produced its final text.
         assistants = [message for message in page.items if isinstance(message, AssistantMessage)]
-        final_texts = [
-            p.text
-            for message in assistants
-            for p in message.parts
-            if isinstance(p, AssistantTextPart) and message is assistants[-1]
-        ]
-        assert final_texts == ["parent final"]
-        # The strictly-sequential FIFO: four provider requests in run order.
-        assert len(provider.requests) == 4
+        texts = [p.text for message in assistants for p in message.parts if isinstance(p, AssistantTextPart)]
+        assert "parent final" in texts
+        # The receipt: exactly one enqueued+delivered pair under the child
+        # generation's id, consumed by a successor parent turn (steer into
+        # the active run or the idle wake -- the keyed default script).
+        child_run_id = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
+        notification_id = f"subagent:{child_run_id}"
+        enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, notification_id)
+        assert enqueued["message"]["text"] == _wrapped(child_id, "completed", "read the note", "child read done")
+        assert enqueued["message"]["metadata"]["state"] == "completed"
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, notification_id)
+        await _await_runs_terminal(db_path, parent.session_id)
+        await asyncio.sleep(0.2)
+        assert len(_inbox_event_data(db_path, parent.session_id, PY_INBOX_ENQUEUED, notification_id)) == 1
+        # Two parent turns + two child turns + the receipt-consumed turn.
+        assert len(provider.requests) == 5
     assert provider.close_count == 1
 
 
 # ---------------------------------------------------------------------------
-# §4-4 / §4-5 the fail-closed terminals
+# the terminal faces (v2): the terminal moved into the receipt
 # ---------------------------------------------------------------------------
 
 
-async def test_a_failed_child_run_answers_the_tool_failed_face(tmp_path: Path) -> None:
-    db_path = _migrated_db(tmp_path, "child_failed.db")
+async def test_a_provider_error_child_answers_running_then_a_cancelled_receipt(tmp_path: Path) -> None:
+    """The v2 fail-closed form: the tool NEVER fail-closes on a child
+    terminal (every call answers the running face), a provider stream
+    error settles the child ``interrupted`` (the PROVIDER_STREAM_INTERRUPTED
+    semantics), and the receipt reports the TS third state ``cancelled``."""
+    db_path = _migrated_db(tmp_path, "child_interrupted.db")
     failing = (
         _Script()
         .text("p1", "partial work")
@@ -666,35 +799,7 @@ async def test_a_failed_child_run_answers_the_tool_failed_face(tmp_path: Path) -
             )
         )
     )
-    provider = _ScriptedProvider([[failing]])
-    subagent = SubagentRunAdapter()
-    async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
-        await app.recovery_gate.wait()
-        subagent.bind(app.service)
-        parent = await app.service.create(_SNAPSHOT)
-        result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
-        # Fail-closed: the child's terminal status rides the face, never a
-        # silent completed (ticket §8). A provider stream error settles the
-        # run as ``interrupted`` (the PROVIDER_STREAM_INTERRUPTED semantics)
-        # -- the fail-closed arm is every non-succeeded terminal.
-        assert result.error is not None
-        assert result.error.code is CoreErrorCode.TOOL_FAILED
-        child_ids = _child_ids(db_path, parent.session_id)
-        assert len(child_ids) == 1
-        assert child_ids[0] in result.error.message
-        assert "ended in status interrupted" in result.error.message
-        assert "provider exploded" in result.error.message
-        assert result.structured_output is None
-        assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_ids[0],)) == [
-            ("interrupted",)
-        ]
-    assert provider.close_count == 1
-
-
-async def test_a_child_without_assistant_text_answers_the_ts_sentence(tmp_path: Path) -> None:
-    db_path = _migrated_db(tmp_path, "no_text.db")
-    reasoning_only = _Script().reasoning("r1", "thinking hard, saying nothing").usage().finish()
-    provider = _ScriptedProvider([[reasoning_only]])
+    provider = _ScriptedProvider([[failing], [_final_script()]])  # the child, then the wake
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
         await app.recovery_gate.wait()
@@ -702,96 +807,57 @@ async def test_a_child_without_assistant_text_answers_the_ts_sentence(tmp_path: 
         parent = await app.service.create(_SNAPSHOT)
         result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
         assert result.error is None
+        assert isinstance(result.structured_output, dict)
+        child_ids = _child_ids(db_path, parent.session_id)
+        assert len(child_ids) == 1
+        child_id = child_ids[0]
         assert result.structured_output == {
-            "sessionID": _child_ids(db_path, parent.session_id)[0],
-            "status": "completed",
-            "output": NO_TEXT_RESPONSE,
+            "sessionID": child_id,
+            "status": "running",
+            "output": _four_lines(child_id),
         }
+        await _await_runs_terminal(db_path, child_id)
+        assert _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,)) == [("interrupted",)]
+        child_run_id = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
+        enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
+        assert enqueued["message"]["metadata"]["state"] == "cancelled"
+        assert str(enqueued["message"]["text"]).startswith(f'<subagent sessionID="{child_id}" state="cancelled" ')
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{child_run_id}")
+        await _await_runs_terminal(db_path, parent.session_id)
     assert provider.close_count == 1
 
 
-# ---------------------------------------------------------------------------
-# §3-4 ⑦ the bounded wait faces (the recorded seat ruling)
-# ---------------------------------------------------------------------------
-
-
-async def test_an_unsettling_child_surfaces_the_bounded_timeout_face(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(subagent_module, "SUBAGENT_TIMEOUT_S", 0.05)
-    db_path = _migrated_db(tmp_path, "timeout.db")
-    slow = _Script().text("p1", "slow")
-    gate = slow.gate()
-    slow.usage().finish()
-    provider = _ScriptedProvider([[slow]])
+async def test_a_child_without_assistant_text_delivers_the_ts_sentence_in_the_receipt(tmp_path: Path) -> None:
+    db_path = _migrated_db(tmp_path, "no_text.db")
+    reasoning_only = _Script().reasoning("r1", "thinking hard, saying nothing").usage().finish()
+    provider = _ScriptedProvider([[reasoning_only], [_final_script()]])  # the child, then the wake
     subagent = SubagentRunAdapter()
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
         await app.recovery_gate.wait()
         subagent.bind(app.service)
         parent = await app.service.create(_SNAPSHOT)
         result = await subagent.execute(_ctx(parent.session_id, tmp_path), _INPUT)
-        # The bounded face: retryable (the run keeps going), with the child
-        # session id as the resume hint.
-        assert result.error is not None
-        assert result.error.code is CoreErrorCode.TOOL_TIMEOUT
-        assert result.error.retryable is True
-        child_id = await _await_child(db_path, parent.session_id)
-        assert child_id in result.error.message
-        assert result.structured_output is None
-        # The orphan is not cancelled: it keeps running (resume semantics).
-        statuses = _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,))
-        assert all(str(row[0]) not in _TERMINAL for row in statuses)
-        # Let the parked stream finish so the teardown settles honestly.
-        gate.open()
+        assert result.error is None
+        assert isinstance(result.structured_output, dict)
+        child_id = str(result.structured_output["sessionID"])
+        assert result.structured_output["status"] == "running"
         await _await_runs_terminal(db_path, child_id)
+        child_run_id = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
+        enqueued = await _await_inbox_event(db_path, parent.session_id, PY_INBOX_ENQUEUED, f"subagent:{child_run_id}")
+        assert enqueued["message"]["text"] == _wrapped(child_id, "completed", "summarize the note", NO_TEXT_RESPONSE)
+        assert enqueued["message"]["metadata"]["state"] == "completed"
+        await _await_inbox_event(db_path, parent.session_id, PY_INBOX_DELIVERED, f"subagent:{child_run_id}")
+        await _await_runs_terminal(db_path, parent.session_id)
     assert provider.close_count == 1
 
 
-async def test_a_cooperative_cancel_answers_tool_failed_after_a_bounded_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(subagent_module, "SUBAGENT_CANCEL_WAIT_S", 0.1)
-    db_path = _migrated_db(tmp_path, "cancel.db")
-    parked = _Script().text("p1", "working")
-    gate = parked.gate()
-    parked.usage().finish()
-    provider = _ScriptedProvider([[parked]])
-    subagent = SubagentRunAdapter()
-    async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
-        await app.recovery_gate.wait()
-        subagent.bind(app.service)
-        parent = await app.service.create(_SNAPSHOT)
-        cancel = asyncio.Event()
-        context = ToolContext(
-            session_id=parent.session_id,
-            run_id="run_cancel",
-            message_id="msg_cancel",
-            tool_call_id="call_cancel",
-            working_dir=str(tmp_path),
-            cancel=cancel,
-        )
-        task = asyncio.create_task(subagent.execute(context, _INPUT))
-        child_id = await _await_child(db_path, parent.session_id)
-        # The child run must be live on the loop before the signal fires.
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while True:
-            statuses = _fetch_all(db_path, "SELECT status FROM runs WHERE session_id = ?", (child_id,))
-            if statuses and str(statuses[0][0]) in {"accepted", "running"}:
-                break
-            if asyncio.get_running_loop().time() >= deadline:
-                raise AssertionError(f"the child run never went live: {statuses}")
-            await asyncio.sleep(0.01)
-        cancel.set()
-        result = await task
-        assert result.error is not None
-        assert result.error.code is CoreErrorCode.TOOL_FAILED
-        assert "cancelled before it settled" in result.error.message
-        assert result.structured_output is None
-        # The bounded best-effort cleanup left the child recoverable: let the
-        # parked stream finish so the teardown settles honestly.
-        gate.open()
-        await _await_runs_terminal(db_path, child_id)
-    assert provider.close_count == 1
+# ---------------------------------------------------------------------------
+# §3-4 ⑦ the bounded wait faces -- DELETED with the v1 foreground wait
+# (upstream 2.3.2 removed the arm): the ToolTimeout face and the
+# cooperative-cancel TOOL_FAILED face have no seat anymore; the cancel
+# terminal itself is pinned in the receipt form in
+# ``test_subagent_background.py`` (the interrupted -> cancelled state).
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +879,7 @@ def test_the_policy_default_table_asks_for_subagent_runs(tmp_path: Path) -> None
 
 
 def test_the_subagent_spec_pins_the_eight_catalog_fields() -> None:
-    assert (SUBAGENT_SPEC.namespace, SUBAGENT_SPEC.name, SUBAGENT_SPEC.version) == ("subagent", "run", 1)
+    assert (SUBAGENT_SPEC.namespace, SUBAGENT_SPEC.name, SUBAGENT_SPEC.version) == ("subagent", "run", 2)
     assert SUBAGENT_SPEC.description == SUBAGENT_DESCRIPTION
     assert SUBAGENT_SPEC.input_schema == SUBAGENT_INPUT_SCHEMA
     assert SUBAGENT_SPEC.supported_content_types == ["text"]

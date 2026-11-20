@@ -13,7 +13,7 @@
 | 13 | 工具输出截断保头+全文落盘+tail 尾窗读 | High（token 双门直接手段） | S-M | **T-C3-001**（✅ 已落地 `4a80ab1`） | **P0** |
 | 2 | 后台 job 持久化+重启重投（shell/subagent 后台化） | High（长变更执行不丢结果） | M | **T-C3-002**（✅ 已落地，含评估集先行） | **P0** |
 | 1 | automation（every/cron/at+event 触发+租约调度+退避） | High（无人值守执行载体） | L→裁剪 M | **T-C3-003**(prompt 动作)/004(event) | **P0**/P1 |
-| 5 | 子代理完成回执 outbox+synthetic+深度链 | Med-High | M | **T-C3-005**（侦察固化 2026-11-20：实为恒后台语义翻转+每轮回执+outstanding 保活，四文件 diff 为证） | P1 |
+| 5 | 子代理完成回执 outbox+synthetic+深度链 | Med-High | M | **T-C3-005**（✅ 已落地，含评估集先行；实为恒后台语义翻转+每轮回执+outstanding 保活） | P1 |
 | 6 | mcp connection 状态机+events（watch_mcp_event） | Med（事件触发前置） | M(L) | T-C3-006 | P1 |
 | 9 | flag 旗标解析链+shared-cache+canonical-json | Med | S-M | T-C3-007 | P1 |
 | 8 | db storage-failure 分类+batch 分批 | Med | S | T-C3-008 | P1 |
@@ -80,8 +80,15 @@
   6. **follow-up 递交**：running 子→`prompt(delivery="steer")` 加入当前 run（T-C1-100 face=TS「joins its current run」）；idle 子→默认起新 run；resume:false N/A 沿 T-C1-101 记档。
   7. **重投矩阵**：`background.py replay_pending` 扩 kind='subagent'——settled 行按记录态重投；parent session 删→删行清账；inbox 冲突→保行下届再投；他错→parent 不在删/在则告警保；子 run 非终态→保行不动（py 无 execution.resume，首期不自动续跑，偏差记档）。**status 词面**：subagent 行 settle 复用既有终态集（`succeeded`/`error`/`cancelled`），投递构面映射 TS 报文 state（`succeeded`→`completed`；BEFORE 实测证据：v1 `_TERMINAL` 不含 "completed"，裸造 completed 行走 running→error 分支）。
   8. **裁剪记档**：codemode/image OutstandingItem kind 暂缓（py 无对应工具）；`experimental.subagent_depth`→常量（S4）；Permission.invocation 统一重构 N/A（policy 面零改动）；agent 目录/换 agent→SUBAGENT_AGENTS={"task"} 不变（既有 DIFFERENT-BY-DESIGN）。
+  9. **lazy import（实现期钉）**：service.py 顶层 import `tools.background` 必成环（`opencode.tools.__init__`→registry→`session.service`）——outbox 行 helper 全部调用点 lazy import。
+  10. **parent 判活（实现期钉）**：py 无 sessions 表（event-sourced）→上游 sessions-table liveness 映射为 events 表 distinct session_id（replay 删行清账臂的判活依据）。
+  11. **failed 产线与 ErrorChunk 语义（实现期钉）**：provider ErrorChunk 落 run "interrupted"（PROVIDER_STREAM_INTERRUPTED 既有语义）→回执 state="cancelled"（三级串 tier-1=子末条 output，实测 "never reached" 生效；常数句臂由 restart-fold 测钉）；唯一确定性 FAILED 产线=步数天花板（max_steps=1+tool-call 轮，v1 配方）。v1 前台 TOOL_FAILED/ToolTimeout/协作 cancel 三面随前台链删除（上游删面）。
+  12. **InboxRef 不 arm（实现期钉）**：busy follow-up（parked steer）不 commit marker——该 run 既有 observer 持整代唯一回执（TS「job 的 resume owns the start」对位）；仅 RunRef（新起 run）arm+commit。
+  13. **session.background 收敛（实现期钉）**：上游 2.3.2 保留端点（语义挪到 job backgroundAll）→py 端点保留为**结构性 no-op**（恒 204+False；404 面不变），死码转换机制（`_subagent_foreground_waits`/`_subagent_background_requests`/wait begin-end/consume）随前台链删除；job 系后续票再赋牙。
+  14. **writer lock 单写者（实现期钉）**：App 存活期内二次 `open_database` 必 WriterLockHeldError（设计面）——测试经 `app.database` 属性写行（§outstanding/replay 两处配方）。
 - 评估集（先行）：`tests/integration/test_subagent_eval.py`——能力探测（spec v2 无 background 参/恒后台描述句/Output running 单值）；M1=恒后台即返（返回时延 << 子 run 时长且 status=running）；M2=idle 回执（`<subagent ...>` 包裹+末条 assistant text）；M3=outstanding 尾表+保活（子挂 running shell 行→回执 state=running+「Background work still running:」行）；M4=follow-up steer（running 子 follow-up 不 SessionBusy、并入当前 run）；M5=深度拒（嵌套 spawn 拒+文案）；M6=重启重投分类（parent 删→行清；settled→重投一次）。BEFORE 预期 capability-absent/0%（现 background 为 opt-in 面≠恒后台）。
   - **BEFORE 实测（2026-11-20，main `c31719d`，7 passed 12.85s）**：P0=capability-absent（v1/background 键在/无恒后台句）；M1=blocking-or-absent（returned_s=null，前台 block 至 deadline）；M2=no-receipt；M3=no-tail-or-flat；M4=spawn-absent（spawn 本身超时，诚实读数）；M5=rejected（深度守卫在场，回归行恒绿）；M6=plain-or-absent（replayed=1 但文本=重启 error 串——"completed" 不在 `_TERMINAL` 词表，走 running→error 分支；wrapped=false）。
+  - **AFTER 实测（2026-11-20，p17-s1 实现毕，7 passed 7.46s）**：P0=capability-present（spec v2/schema 四键无 background/恒后台句）；M1=immediate（returned_s≈0.05s，status=running，四行文案逐字）；M2=receipted（synthetic 包裹+state=completed+末条 text）；M3=keep-alive（state_attr=running+metadata.state=completed+still_running_tail）；M4=steered（followup=delivered 非 busy；修 harness 自伤——`_spawn_gated_child` 原无条件放行 gate，follow-up 与子 run finalize 提交竞速致 ConflictError 逃逸，加 `release=False` 参保持子 run 停泊）；M5=rejected（恒绿）；M6=wrapped-replay（改造：真实 parent 会话+`succeeded` 词面行→wrapped 重投一次+行清+二遍空；原裸造 "completed" 状态行与假 parent 在新面下走静默清/保行臂，非重投）。
 - 红契约集：`tests/integration/test_subagent_receipt.py`——恒后台 ToolResult 面钉死（文案四行+status 单值+schema 无 background）；每轮投递（首 run+follow-up run 各一投、同 generation 不重投）；formatBody 行格式（shell/subagent 两 kind+location+clean 空白归一）；state 保活矩阵（completed+outstanding→running/无 outstanding→completed/error/cancelled 三级串）；深度链 walk（直系/隔代/limit 边界）；follow-up parentID 校验+steer 递交；重投矩阵四臂（删行清账/冲突保行/他错删或保/running 不动）。
 - 目标面：**无人值守+token 双门**（长任务委派不阻塞主线；回执按需唤醒 parent 免轮询探测——token 直接节约；outstanding 尾表防模型重复劳动）。
 

@@ -128,6 +128,7 @@ from opencode.storage import (
     StoreError,
     StoreValidationError,
 )
+from opencode.storage.db import Database
 from opencode.storage.repos import MAX_PAGE_LIMIT, InboxItemRow
 from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError, from_epoch_ms
 
@@ -730,6 +731,7 @@ class SessionService:
         catalog: SkillCatalog | None = None,
         close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S,
         compaction_summarizer: SummaryGenerator | None = None,
+        database: Database | None = None,
     ) -> None:
         if not isinstance(working_dir, str) or not working_dir:
             raise StoreValidationError("working_dir must be a non-empty string")
@@ -811,19 +813,20 @@ class SessionService:
         # task) -- the process-local arm of the durable markers (strong
         # references, the _tasks precedent; the observer life outlives the
         # tool call that armed it, the TS global-scope fork). ``_subagent_
-        # foreground_waits``: parent session id -> the child run id whose
-        # foreground wait is live -- the session.background endpoint's
-        # conversion target set (an idle session holds no entry, so an idle
-        # request is structurally a no-op, the TS blockingSessions filter).
-        # ``_subagent_background_requests``: the armed conversion requests
-        # (consumed by the foreground wait's poll). ``_subagent_delivery_
-        # failures``: the last delivery error per notification id --
+        # delivery_failures``: the last delivery error per notification id --
         # recorded, inspectable, never silently dropped (the
         # _compaction_errors precedent); the marker stays outstanding, so a
         # restart's re-arm retries.
+        # T-C3-005 wiring: the optional database handle for the subagent
+        # outbox rows -- settle upserts, successful delivery deletes, the
+        # keep-alive reads run live. None keeps the pre-T-C3-005 face
+        # (in-process delivery only, no replay coverage); the App
+        # composition passes its owned handle. The row helpers are imported
+        # LAZILY at their call sites: ``opencode.tools.__init__`` pulls the
+        # registry, which imports THIS module -- a top-level import would
+        # close a cycle.
+        self._database = database
         self._subagent_observers: dict[str, tuple[str, asyncio.Task[None]]] = {}
-        self._subagent_foreground_waits: dict[str, str] = {}
-        self._subagent_background_requests: set[str] = set()
         self._subagent_delivery_failures: dict[str, BaseException] = {}
         # Lazily-built event-log reader for the re-arm scan's full fold (the
         # _compaction_log precedent).
@@ -1624,6 +1627,42 @@ class SessionService:
             else:
                 state = "cancelled"
                 error_text = None
+            # T-C3-005: the durable outbox row. Settle writes it (the
+            # recovery payload carries everything the replay construction
+            # needs), a successful delivery deletes it (completeBackground),
+            # and a failed delivery leaves it standing for the next boot's
+            # replay -- the marker stays outstanding either way, so the
+            # re-arm and the row can never double-deliver (the pending-row
+            # gate folds the duplicate). The row status keeps the shell-word
+            # terminal vocabulary ("succeeded", not TS "completed" -- the
+            # BEFORE-eval discovery; the report word maps at construction).
+            if self._database is not None:
+                from opencode.tools.background import BackgroundJobRow, upsert_row
+
+                row_status = "succeeded" if state == "completed" else state
+                output = await self._subagent_response_text(
+                    state=state, error_text=error_text, child_session_id=child_session_id
+                )
+                await upsert_row(
+                    self._database,
+                    BackgroundJobRow(
+                        notification_id=notification_id,
+                        session_id=parent_session_id,
+                        tool_call_id=notification_id,
+                        kind="subagent",
+                        status=row_status,
+                        title=description,
+                        payload={
+                            "kind": "subagent",
+                            "parentSessionID": parent_session_id,
+                            "childSessionID": child_session_id,
+                            "agent": agent,
+                            "description": description,
+                            "output": output,
+                        },
+                    ),
+                )
+            delivered = False
             for attempt in range(_SUBAGENT_DELIVERY_ATTEMPTS):
                 try:
                     await self._deliver_subagent_completion(
@@ -1635,17 +1674,56 @@ class SessionService:
                         state=state,
                         error_text=error_text,
                     )
+                    delivered = True
                     break
                 except ConflictError:
                     if attempt == _SUBAGENT_DELIVERY_ATTEMPTS - 1:
                         raise
                     await asyncio.sleep(SUBAGENT_OBSERVER_POLL_S)
+            if delivered and self._database is not None:
+                from opencode.tools.background import delete_row
+
+                await delete_row(self._database, notification_id)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             self._subagent_delivery_failures[notification_id] = error
         finally:
             self._subagent_observers.pop(notification_id, None)
+
+    async def _subagent_response_text(self, *, state: str, error_text: str | None, child_session_id: str) -> str:
+        """The TS three-state text mapping (``SubagentCompletion.deliver``).
+
+        completed -> the shared final-text extraction (the no-text case
+        folds into the TS sentence); error -> ``error ?? "Subagent
+        failed"``; cancelled -> the TS three-tier chain (the child's own
+        last output, else the interrupting error, else the constant).
+        Shared by the delivery and the durable row's recovery payload so
+        the replayed report is byte-identical to the live one.
+        """
+        if state == "completed":
+            return await self.subagent_final_text(child_session_id)
+        if state == "error":
+            return error_text if error_text is not None else SUBAGENT_ERROR_RESPONSE
+        final = await self.subagent_final_text(child_session_id)
+        if final != SUBAGENT_NO_TEXT_RESPONSE:
+            return final
+        if error_text is not None:
+            return error_text
+        return SUBAGENT_CANCELLED_RESPONSE
+
+    async def _subagent_outstanding(self, session_id: str) -> list[str]:
+        """Outstanding background-work lines under a session (TS ``outstanding``).
+
+        Queried live at delivery time -- never snapshotted -- so a settle
+        racing a still-running row reads the truth (the plan's live-read
+        decision). Empty when no database handle is wired.
+        """
+        if self._database is None:
+            return []
+        from opencode.tools.background import outstanding_lines
+
+        return await outstanding_lines(self._database, session_id)
 
     async def _deliver_subagent_completion(
         self,
@@ -1660,27 +1738,29 @@ class SessionService:
     ) -> None:
         """TS ``SubagentCompletion.deliver``: three-state text + XML + admission.
 
-        The text mapping is TS verbatim: completed -> the shared final-text
-        extraction (the no-text case folds into the TS sentence), error ->
-        ``error ?? "Subagent failed"``, else -> ``"Subagent cancelled"``;
-        the wrapper and the metadata carrier are interpolated raw exactly
-        as TS writes them. The admission is the S1 inbox synthetic seam --
-        steer into the active run, or queue + immediate promote when the
-        parent is idle (PY has no TS ``resume:false`` suspension face, so
-        the honest idle mapping wakes the parent; disclosed) -- and the
-        ``completeBackground`` acknowledgment is the admission fold's
-        observation pop, keyed by the same notification id.
+        The text mapping is TS verbatim (see :meth:`_subagent_response_text`);
+        the wrapper and the metadata carrier are interpolated through the
+        shared :func:`opencode.tools.background.subagent_report_text`
+        construction -- a COMPLETED child with outstanding background rows
+        reports ``state="running"`` in the wrapper (the keep-alive) plus
+        the "Background work still running:" tail, while the metadata keeps
+        the TRUE state verbatim. The admission is the S1 inbox synthetic
+        seam -- steer into the active run, or queue + immediate promote
+        when the parent is idle (PY has no TS ``resume:false`` suspension
+        face, so the honest idle mapping wakes the parent; disclosed) --
+        and the ``completeBackground`` acknowledgment is the admission
+        fold's observation pop, keyed by the same notification id.
         """
-        if state == "completed":
-            text = await self.subagent_final_text(child_session_id)
-        elif state == "error":
-            text = error_text if error_text is not None else SUBAGENT_ERROR_RESPONSE
-        else:
-            text = SUBAGENT_CANCELLED_RESPONSE
-        wrapped = (
-            f'<subagent sessionID="{child_session_id}" state="{state}" description="{description}">\n'
-            f"{text}\n"
-            "</subagent>"
+        from opencode.tools.background import subagent_report_text
+
+        text = await self._subagent_response_text(state=state, error_text=error_text, child_session_id=child_session_id)
+        outstanding = await self._subagent_outstanding(child_session_id)
+        wrapped = subagent_report_text(
+            child_session_id=child_session_id,
+            state=state,
+            description=description,
+            body=text,
+            outstanding=outstanding,
         )
         message_metadata: JsonObject = {
             "source": "subagent",
@@ -1709,53 +1789,22 @@ class SessionService:
             if delivery == "queue":
                 await self._promote_next(parent_session_id, "input")
 
-    def subagent_foreground_wait_begin(self, session_id: str, child_run_id: str) -> None:
-        """Record one live foreground wait (the endpoint's conversion target).
-
-        The ToolRegistry serializes invocations per session (the T-C1-098
-        mechanism correction), so one parent holds at most one live
-        subagent foreground wait; the tool calls begin/end around its poll
-        loop (end runs in the finally arm, so a cancel stays balanced).
-        """
-        self._subagent_foreground_waits[session_id] = child_run_id
-
-    def subagent_foreground_wait_end(self, session_id: str) -> None:
-        """Drop the foreground-wait record (balanced with begin by the tool)."""
-        self._subagent_foreground_waits.pop(session_id, None)
-
     async def request_session_background(self, session_id: str) -> bool:
-        """§3-5 ``session.background``: move the session's foreground wait back.
+        """§3-5 ``session.background``: the wire face survives as a no-op.
 
-        The TS ``backgroundAll`` face: arm the conversion request for THIS
-        session's live foreground subagent wait, which the wait's own poll
-        consumes (it commits the marker, returns the background result and
-        hands the child to the observer). An idle session -- no live wait
-        -- commits nothing and answers ``False``: the TS "Idle requests are
-        a no-op" contract, structurally (nothing is registered to arm).
-        Returns whether a wait was found; both arms are NoContent at the
-        route. A missing or deleted session answers NotFound (the TS
-        SessionNotFound error).
+        T-C3-005 deleted the subagent foreground wait this used to convert
+        (every call backgrounds now), so there is structurally nothing to
+        arm: the face keeps its upstream 2.3.2 wire shape (the endpoint
+        lives on over the job system's ``backgroundAll``) but answers
+        ``False`` and commits nothing on every arm -- idle or not. A
+        missing or deleted session still answers NotFound (the TS
+        SessionNotFound error); the later job-system port re-gives this
+        face teeth.
         """
         _require_session_id_arg(session_id)
         if self._closed or self._closing:
             raise SessionClosedError("service is closed")
         await self._read_live_record(session_id)
-        if session_id not in self._subagent_foreground_waits:
-            return False
-        self._subagent_background_requests.add(session_id)
-        return True
-
-    def consume_subagent_background_request(self, session_id: str) -> bool:
-        """The foreground wait's endpoint-conversion check: consume or miss.
-
-        Poll-based by design (the recorded seat form): the TS
-        ``block``/``backgrounded`` deferred pair over the in-memory job
-        registry maps to the wait's existing poll cycle -- one set
-        membership probe per tick, no event subscription face added.
-        """
-        if session_id in self._subagent_background_requests:
-            self._subagent_background_requests.discard(session_id)
-            return True
         return False
 
     async def recover_subagent_observations(self) -> list[str]:
@@ -2868,8 +2917,6 @@ class SessionService:
             task.cancel()
         if observers:
             await asyncio.gather(*observers, return_exceptions=True)
-        self._subagent_background_requests.clear()
-        self._subagent_foreground_waits.clear()
         # Phase 3: every own task has exited or is durably marked -- close in
         # the §7 L339 order: MCP first, then the provider, then the service
         # gate. The DB/engine stays with the App.
