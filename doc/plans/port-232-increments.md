@@ -57,6 +57,16 @@
   6. **裁剪记档**：event 触发（watch/replay cursor）→T-C3-006 后；code 动作+authorize/permission.ask→暂缓；flag `experimental.automations` 每目录复查→py 无 flag 面，第一期默认启用记偏差；command `automation`→不移植。
 - 评估集（先行）：`tests/integration/test_automation_eval.py`——能力探测（模块/表 0006/工具注册）；M1=every 到期触发墙钟、M2=at 重启补跑一次即 done、M3=every 保相位（错槽不补跑）、M4=prompt 失败退避 retry_at、M5=coalesce。BEFORE 预期 capability-absent/0%。
 - 红契约集：`tests/integration/test_automation.py`——create 校验矩阵/following 三 trigger（含 DST 固定表达式）/tick 选取与 retry_at 门/租约单飞（双 scheduler 同库一 tick）/settle 乐观并发/退避/coalesce/pause-resume-remove 幂等/subagent child 派生收养。
+- **BEFORE→AFTER（2026-11-20 实测，p16-s1）**：
+  - **P-capability**：capability-absent → **probed**（模块 `opencode.automation` 在场、0006 双表、5 工具 `opencode__automation_*` 全注册）。
+  - **M1 触发墙钟**：无能力 → **2.03s @ every=2.0s**（=周期+唤醒粒度 max_sleep 50ms，无人值守触发达成）。
+  - **M2 重启补跑**：→ deliveries=1、二次 tick 零新增、`last_outcome=late`、status=done（不丢不重）。
+  - **M3 保相位**：→ run_count=1、**phase_drift_ms=0**（错 3 槽只跑一次、从原槽相位推进，无补跑突发）。
+  - **M4 失败退避**：→ attempts 1/1/2（首槽试一次、退避窗内零新增、窗后一次；failed_retry_s=0.5 注入）。
+  - **M5 coalesce**：→ deliveries=1、`last_outcome=skipped`（pending 期跳过不堆叠）。
+  - **仪器修正两笔（随实现落地并记档）**：①假件 `send_prompt` 改 async——契约钉的是 async 端口，同步假件被 `await` 后副作用先落再抛 TypeError，读数歪成 failed（红集假件本就 async，纯 eval 漂移）；②M4 计量源 `len(sends)`→假件 attempts 计数——失败端口在 append 前抛，sends 把「尝试过」误记为「没尝试」。
+  - **实现期修的真实 bug**：settle 绑定名 `:run_count` 同名覆盖（set 的 run_count 与 WHERE 的期望值撞名）→ WHERE 改绑 `:expected_run_count`；红集 `_BASE_MS` 手算错 6 天致 DST/cron 假红（改为推导值+断言守卫）；租约测试同进程双 database 句柄撞 WriterLock→共享 engine（跨进程单飞由 TTL 语义保证并同测）。
+  - **全量**：2509P/8S/5F（基线 2485P/8S/5F+24 新测；5F 恒为 install WDAC WinError 4551 环境面，CI 双腿仲裁绿）。依赖：`tzdata>=2024.1; sys_platform=='win32'`（uv.lock 已再生随落）。
 - 目标面：**无人值守运行态**（变更窗口定时巡检、告警触发诊断/回退的执行骨架）。
 
 ## 执行纪律
