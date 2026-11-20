@@ -35,9 +35,14 @@
 - py 落点：invoker 归一化面（现 64KiB structured marker，丢结构化）→ 升级为保结构截断+落盘+outputPath；bash/pty 大输出同策略。
 - 目标面：**token 开销门禁**（案例回放输出 token 直接受控+可事后取证）。
 
-### T-C3-002 后台 job 持久化（簇2）——侦察已固化（2026-11-20），实现待开
+### T-C3-002 后台 job 持久化（簇2）——评估 harness 已先行落地（BEFORE 基线可复现），实现待开
 - 上游：表 `job`（job/sql.ts，迁移 20261030054400）；Recovery 描述符（shell/image/codemode/subagent 联合，job/recovery.ts）；Active 注册表（done/backgrounded 双 Deferred、generation、blockingSessions 计数、COMPLETED_LIMIT 内存裁剪）；持久化时机=**backgrounded 即 upsert**（notification_id 主键，start(background) 先于 fork 落行）+settle 终态（非 cancelled、非 settling/consumed）再 upsert+completeBackground（inbox admit）删行+cancelSession 按 session/child 批删；block=done/backgrounded 双 Deferred race（上游调用面 10s 超时转后台）；重启重投（session/execution/restart.ts L370-425）=boot 读表→settled 行 synthetic 通知重放→running+subagent 且 execution 不在→prepareResume 决定 resume/RESUME_EXHAUSTED→孤儿 cancel claim 清理→唤醒序=shell/工具结果先、未决调用次、子代理最后（defer 醒防超预算）。
 - py 落点决策：①**命名区隔**——py `storage/jobs_store.py`=workflow 事件投影（JobRecord/DurableEvent，概念不同源）；上游 Job 表 py 落名 `background_job`+独立模块（Alembic versions/ 新迁移，storage 建表面包=db.py/migrations/env.py 既有）；②裁剪=Recovery 第一期只做 **shell**（bash 大输出后台化+全文落盘复用 tool_output 目录面）+**subagent**（行持久化+重启重投 synthetic 通知）；image/codememode 不做（py 无此面）；子代理回执 outbox（prepareSubagentReport/recordSubagentReport）留 T-C3-005；③注册表=进程内 dict+asyncio.Future 对位双 Deferred+generation 计数；④重投 shell running 行=不可恢复→标 error 重放「服务器重启中断」（py 无 shell daemon 可重挂）。
+- **评估集（先行落地，2026-11-20）**：`tests/integration/test_bg_jobs_eval.py`——恒绿测量面（能力探测式，非断言面），同一入参在实现前/后各跑一遍，差值即本票对 GOAL 双门的证据；探针契约钉死=模块 `opencode.tools.background.replay_pending(database)`（async）+`ToolLimits(background_after_s=)`（测试注 1.0s 防 CI 抖动）+表 `background_job`——实现与 harness 不齐时报 `api-mismatch:<Err>` 而非静默，修对齐不改读数。四场景：
+  - **M1-single**（速率门）：单次 3s 长调用经 `registry.invoke` 稳定缝墙钟——BEFORE **3.31s 全程阻塞 inline**（`backgrounded_markers:0`）→ AFTER 目标 ≈阈值 1s+开销、`backgrounded_markers:1`；
+  - **M1-batch**（速率门）：模型回合式 3×2s 串行墙钟——BEFORE **6.81s**（3 席全 inline）→ AFTER 目标 ≈3×阈值；M1-concurrent 上下位列（gather 并发 3×2s 同为 6.81s，进程生成开销主导，作实现侧对照基线）；
+  - **M2M3-restart**（无人值守门）：后台化调用→模拟崩溃（不 clean settle）→重开库重投——BEFORE **capability-absent**（无表/无重放/交付 null）→ AFTER 目标 `status:probed`、`background_job_rows≥1`、重放交付=settled 行数（完整生存矩阵=随实现一票落地的红→绿契约测试 `tests/integration/test_background_jobs.py`，harness 只钉 API 面+可复现数字）；
+  - **M4-bounded**（token 门）：262144B 洪泛→模型可见 **65606B 有界**（`truncation_markers:1`）但 `disk_full_bytes:null`——bash 自管帽只报尺寸**丢尾不可取证**→ AFTER 目标后台化全文落盘后 `disk_full_bytes≈payload`（复用 tool_output 目录面），有界性保持。
 - 目标面：**执行速率门禁可测**（批量案例回放长任务后台化+重启不丢）。
 
 ### T-C3-003 automation prompt 动作（簇1 裁剪版）
