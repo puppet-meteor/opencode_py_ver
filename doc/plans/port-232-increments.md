@@ -13,7 +13,7 @@
 | 13 | 工具输出截断保头+全文落盘+tail 尾窗读 | High（token 双门直接手段） | S-M | **T-C3-001**（✅ 已落地 `4a80ab1`） | **P0** |
 | 2 | 后台 job 持久化+重启重投（shell/subagent 后台化） | High（长变更执行不丢结果） | M | **T-C3-002**（✅ 已落地，含评估集先行） | **P0** |
 | 1 | automation（every/cron/at+event 触发+租约调度+退避） | High（无人值守执行载体） | L→裁剪 M | **T-C3-003**(prompt 动作)/004(event) | **P0**/P1 |
-| 5 | 子代理完成回执 outbox+synthetic+深度链 | Med-High | M | T-C3-005 | P1 |
+| 5 | 子代理完成回执 outbox+synthetic+深度链 | Med-High | M | **T-C3-005**（侦察固化 2026-11-20：实为恒后台语义翻转+每轮回执+outstanding 保活，四文件 diff 为证） | P1 |
 | 6 | mcp connection 状态机+events（watch_mcp_event） | Med（事件触发前置） | M(L) | T-C3-006 | P1 |
 | 9 | flag 旗标解析链+shared-cache+canonical-json | Med | S-M | T-C3-007 | P1 |
 | 8 | db storage-failure 分类+batch 分批 | Med | S | T-C3-008 | P1 |
@@ -68,6 +68,21 @@
   - **实现期修的真实 bug**：settle 绑定名 `:run_count` 同名覆盖（set 的 run_count 与 WHERE 的期望值撞名）→ WHERE 改绑 `:expected_run_count`；红集 `_BASE_MS` 手算错 6 天致 DST/cron 假红（改为推导值+断言守卫）；租约测试同进程双 database 句柄撞 WriterLock→共享 engine（跨进程单飞由 TTL 语义保证并同测）。
   - **全量**：2509P/8S/5F（基线 2485P/8S/5F+24 新测；5F 恒为 install WDAC WinError 4551 环境面，CI 双腿仲裁绿）。依赖：`tzdata>=2024.1; sys_platform=='win32'`（uv.lock 已再生随落）。
 - 目标面：**无人值守运行态**（变更窗口定时巡检、告警触发诊断/回退的执行骨架）。
+
+### T-C3-005 子代理恒后台+完成回执+outstanding 链（簇5 裁剪版）
+- 上游（2.3.2 diff 侦察已固化，四文件 vs 2.2.2 实 diff 为证）：**语义翻转为恒后台**——`subagent` 工具删前台 block 链（jobs.block/onInterrupt/error/cancelled ToolFailure 面）与 `background` 参，Output status 收缩 Literal("running")，调用即返四行指引（文案改「You will receive a `<subagent>` message when it goes idle, and again after each later round of work」+follow-up sessionID 句）；**每轮 idle 回执**——SubagentJob.start 单口化（run=execution.resume→""，background:true，notificationID 入 job 行；onInterrupt 仅 jobs.isCancelled 显式 cancel 打断子，shutdown 保子 resumable），每轮 settle 投一次；**投递语义**——synthetic 投 parent：`<subagent sessionID state description>` 包裹，metadata={source:"subagent",childID,agent,state}，text=末条 assistant parts join 空则 NO_TEXT；**outstanding 保活**——recovery 行嵌 outstanding 快照（OutstandingItem kind=codemode/shell/image/subagent），completed+outstanding 非空→报文 state="running"（metadata.state 仍真值）+formatBody 追加「Background work still running:」行表（四 kind 行格式+跨 session `, in {sessionID}` location）；cancelled 分支三级串 output??error??"Subagent cancelled"；**active 集**——mid-turn 子（execution 持 claim、job 行已 settle）计入 outstanding（cancelled draining 跳过，仅后代，不与既有行重复）；**深度链**——SubagentDepth.reached 抽出（walk parentID 链 limit 步仍有 parent 则拒，`experimental.subagent_depth`??1）；**follow-up**——sessionID 须当前 session 之子；existing 子 active 或 job running→prompt 不带 resume:false（job 的 resume owns the start）；**重投矩阵**（restart.ts deliverSubagentSafe/recoverSubagent）——settled 行按记录态投（deleted parent→删行清账；SyntheticConflictError→保行下届再投；他错→parent 不在删行/在则告警保行）；running+子 isActive→不动；不可 resume→error 回执 RESUME_EXHAUSTED；可 resume→延迟统一启动。
+- py 落点决策（2026-11-20 固化）：
+  1. **恒后台化**：`tools/builtin/subagent.py` 删前台 await 链（SUBAGENT_TIMEOUT_S/SUBAGENT_POLL_INTERVAL_S/SUBAGENT_CANCEL_WAIT_S 随删）、input_schema 去 `background` 参、ToolResult 恒 `_background_result`（TS 2.3.2 四行文案逐句）、description 改恒后台句；`SUBAGENT_VERSION` 1→2（schema 演进）。
+  2. **每轮回执**：T-C1-101 observer 扩多轮——观察 run 终态投递后**再武装**（follow-up 起新 run 即新 generation，notification id `subagent:{run_id}` 天然 per-run 一投；不再一子一投封顶）。
+  3. **outstanding 快照+尾表**：settle 时查 background_job 行（kind shell/subagent+status running）构 OutstandingItem 进 `BackgroundJobRow.payload`（列已在，**零迁移**）；投递点 formatBody 尾表+state 保活+cancelled 三级串对齐。
+  4. **active 集等价**：py 无 claim/execution——「子 run 非终态（含 cancelling）」+「子名下 running 行」合取判定，偏差记档。
+  5. **深度**：`SUBAGENT_MAX_DEPTH` 常量保持（S4 先例；TS config 化偏差记档）。
+  6. **follow-up 递交**：running 子→`prompt(delivery="steer")` 加入当前 run（T-C1-100 face=TS「joins its current run」）；idle 子→默认起新 run；resume:false N/A 沿 T-C1-101 记档。
+  7. **重投矩阵**：`background.py replay_pending` 扩 kind='subagent'——settled 行按记录态重投；parent session 删→删行清账；inbox 冲突→保行下届再投；他错→parent 不在删/在则告警保；子 run 非终态→保行不动（py 无 execution.resume，首期不自动续跑，偏差记档）。
+  8. **裁剪记档**：codemode/image OutstandingItem kind 暂缓（py 无对应工具）；`experimental.subagent_depth`→常量（S4）；Permission.invocation 统一重构 N/A（policy 面零改动）；agent 目录/换 agent→SUBAGENT_AGENTS={"task"} 不变（既有 DIFFERENT-BY-DESIGN）。
+- 评估集（先行）：`tests/integration/test_subagent_eval.py`——能力探测（spec v2 无 background 参/恒后台描述句/Output running 单值）；M1=恒后台即返（返回时延 << 子 run 时长且 status=running）；M2=idle 回执（`<subagent ...>` 包裹+末条 assistant text）；M3=outstanding 尾表+保活（子挂 running shell 行→回执 state=running+「Background work still running:」行）；M4=follow-up steer（running 子 follow-up 不 SessionBusy、并入当前 run）；M5=深度拒（嵌套 spawn 拒+文案）；M6=重启重投分类（parent 删→行清；settled→重投一次）。BEFORE 预期 capability-absent/0%（现 background 为 opt-in 面≠恒后台）。
+- 红契约集：`tests/integration/test_subagent_receipt.py`——恒后台 ToolResult 面钉死（文案四行+status 单值+schema 无 background）；每轮投递（首 run+follow-up run 各一投、同 generation 不重投）；formatBody 行格式（shell/subagent 两 kind+location+clean 空白归一）；state 保活矩阵（completed+outstanding→running/无 outstanding→completed/error/cancelled 三级串）；深度链 walk（直系/隔代/limit 边界）；follow-up parentID 校验+steer 递交；重投矩阵四臂（删行清账/冲突保行/他错删或保/running 不动）。
+- 目标面：**无人值守+token 双门**（长任务委派不阻塞主线；回执按需唤醒 parent 免轮询探测——token 直接节约；outstanding 尾表防模型重复劳动）。
 
 ## 执行纪律
 - 每票独立 worktree（p<NN>-s1）+三门禁+定向测+全量+CI 哨（repo 常规）。
