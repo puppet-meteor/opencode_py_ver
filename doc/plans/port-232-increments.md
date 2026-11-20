@@ -17,7 +17,7 @@
 | 6 | mcp connection 状态机+events（watch_mcp_event） | Med（事件触发前置） | M(L) | **T-C3-006**（✅ 已落地，含评估集先行：P0/M1-M6 七列 BEFORE 全灰→AFTER 全达；实现八文件+红集 21 契约） | P1 |
 | 9 | flag 旗标解析链+shared-cache+canonical-json | Med | S-M | **T-C3-007**（✅ 已落地，含评估集先行：七列 BEFORE 全灰→AFTER 全达；红集 20 契约+全量 2600P/8S/6E） | P1 |
 | 8 | db storage-failure 分类+batch 分批 | Med | S | **T-C3-008**（✅ 已落地，含评估集先行：七列 BEFORE 全灰→AFTER 全达零探针修正；红集 14 契约+全量 2621P/8S/6E） | P1 |
-| 11 | server 面 automation/job 路由 | Med | M | T-C3-009（侦察固化 2026-11-21：三源+契约组+SessionBackground.list+测试族钉死；py 落点 5 决策随段——flag 门进程级记档偏差/projects 裁剪/job 数据源实现票定） | P1 |
+| 11 | server 面 automation/job 路由 | Med | M | **T-C3-009**（✅ 已落地 2026-11-21，含评估集先行：六列 BEFORE 全灰→AFTER 全达；红集 14 契约+全量 2641P/8S/6E） | P1 |
 | 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | T-C3-010 | P1 |
 | 3 | artifact+blob-store（本地 provider） | Med | M | T-C3-011 | P2 |
 | 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | T-C3-012 | P2 |
@@ -188,7 +188,7 @@
   - 红集 14 测先红后绿（collection 红→14P）：分类矩阵+扩展码+包装链（含自环终结）+rolled_back 集+batches 算术（含帽注入）+finalize 三测+真满盘端到端+**SessionStore 行为面**（共池施 PRAGMA——SessionStore 直收 engine 同池复用连接；**60KiB 文本载荷教训：小行落既有空闲页不触 cap，大载荷方稳定逼页增长**；经接线缝 commit 浮出分类 full+复原后同 batch 重提交）+4 缝源契约（`finalize_transaction(` 每文件恰 2+bare rollback 清零）。
   - **AFTER 实测**：七列全达且**评估集零修正**（本票无探针缺陷，与 T-C3-007 四处对照）——P0=probed；M1=classified 11:11；M2=primary-byte-walked；M3=set-verified；M4=math-verified；M5=live-verified（failed/message_full/rolled_back/next_transaction_ok 全 true）；M6=seam-verified。邻族 83P（storage 全家）；全量 **2621P/8S/6E**（6E=test_cli_install 基线既有环境腿；P=2607 基线+14 红集恰合）；三门禁绿。CI 注记：b084ab7 腿 windows 作业败于 **background_jobs 时序余量 flake**（`wall<2.5` 得 2.78——1.0s 阈值+CI ~1.8s spawn 开销踩爆 0.5s 余量；非本票新测试，ubuntu 绿），`88807ea` 腿（代码全同+纯 docs）双作业 success=同树一败一过证树健康，flake 以 `bec6b17` 拉距修根治（睡眠 3→8s/帽 2.5→3.5s/settle 帽 8→15s，详见台账）。
 
-### T-C3-009 server 面 automation/job 路由（簇11）
+### T-C3-009 server 面 automation/job 路由（簇11）✅ 2026-11-21
 - 上游（2.3.2 侦察已固化，2026-11-21）：三源 `server/src/handlers/automation.ts`（106 行）+`handlers/job.ts`（26 行）+契约组 `protocol/src/groups/automation.ts`（75 行）/`groups/job.ts`（45 行）+语义源 `core/src/session/background.ts` L86-101；测试 `server/test/automation.test.ts`（309 行：L22 大族+`runs due automations in standalone ServerProcess.start`+`starts one child for a due automation when two servers share a database`）+`job.test.ts`（168 行：`lists background jobs by session, kind, and descendants until completion notice clears them` 大族）。
   - **automation.ts 六路由**（`POST/GET /api/experimental/automation`、`GET/POST …/:id[/pause|/resume]`、`DELETE …/:id`）：①每路由 experimental.automations flag 门——`enabled(directory)` 且**目录消失仍可管理**（catch DirectoryNotFoundError→true，可查可删）；`find`=get+allowed 复合（pause/resume/remove 前置）；②create=**Unattended permission**（无状态 HTTP 无 UI 听者答 ask）+错误映射（Automation.InvalidError→InvalidRequestError kind=automation/Disabled→ForbiddenError/Permission.Blocked·Corrected→Forbidden/Session.NotFound→missingSession）；③list=sessionID 给出先校验 session 存在（allowed 门过其 directory）+directory 语义四层（绝对路径校验→allowed 门→`projects.resolve(persist:false)` **不为只问询的目录落 Project 行**→deleted-folder 兼容匹配 `row.projectID==pid || row.directory==dir`）+每 directory 可见性过滤（`Effect.filter(directories, enabled)`）后返回 `{data}`。
   - **job.ts 单路由** list（`GET /api/experimental/job`）：sessionID 给出则校验存在→`SessionBackground.list(jobs, lookup, query)`。
@@ -201,6 +201,7 @@
   4. **projects.resolve 无对位=裁剪**：py 无 Project service（directory→projectID 解析面缺）——list 的 directory 过滤对位=仅 `row.directory==directory` 直配（deleted-folder 兼容匹配的 projectID 支记档偏差缺失；`persist:false` 语义随之免）；job.list 数据源=py 背景作业列面（实现票定：tools/background 或 storage/jobs_store 的 list face 对位 `backgroundJobs` 活动+未消费语义）。
   5. **测试**：红集对位上游 3+1 族蒸馏——CRUD+flag 门（disabled→403/目录消失可查可删）/create 错误映射/list 过滤矩阵（sessionID/directory/可见性）/job.list 过滤矩阵（kind/status/session/descendants）；评估集先行恒绿测量面（P0 路由能力探针+M 族映射/门/过滤矩阵）。
 - 目标面：**automation/job 的 HTTP 管理面**（六+1 路由全语义：flag 门/错误映射/过滤矩阵/unattended 创建——automation service 已全 face 齐[T-C3-003/004/005]，本票纯路由层接线+job list 数据源对位）。
+- **落地（2026-11-21，`677eec5` 侦察→`d1aa747` 评估集→`8891ad5` 实现）**：决策④定案 job.list 数据源=`background_job` 表（`tools/background.py::list_rows` 包装 `_load_all`，序 created_at_ms, notification_id——上游 backgroundJobs=持久行∪活跃项去重，py invoker 实时 upsert 即合并面）；create 期缺靶 raise 换新 `AutomationSessionNotFoundError`（`_resolve_create_action` 目标+create owner 两处；run 期折叠不动）——HTTP 404/422 分流面；wire=snake_case+上游枚举词混搭（backgrounded→running/succeeded→completed；shell_id=tool_call_id、command=title 记档偏差）；descendants 走 `py.session.created` 的 `parent_id` seam（events 表首行 json 解析+seen 集环守卫+深度帽 16）；session 存在性=sessions 表 SELECT 1。红集 14 契约（两处测试缺陷随修：POST 裸 ：id=405 非路由→改 pause/resume 路径探 404；directory 查询=verbatim `str()` 形）；eval M4 探针修正（session 过滤=owner 语义）+`test_create_target_rules` 期望更新（缺靶→404 类）+sdk 路由计数测试更新（22→27 键/26→33 操作）；job 过滤测试 id 字典序=种子序根治同毫秒 tie flake。评估 AFTER 六列全达（P0 probed/M1 mapped/M2 gated 含 gone_folder/M3 round-tripped/M4 filtered/M5 listed）；三门禁绿；全量 2641P/8S/6E。
 
 ## 执行纪律
 
