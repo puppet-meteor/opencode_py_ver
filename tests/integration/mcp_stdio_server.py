@@ -38,6 +38,10 @@ Behavior is selected with ``MCP_FIXTURE_MODE``:
   ``MCP_FIXTURE_EVENT_DELAY_S``, heartbeat ``MCP_FIXTURE_HEARTBEAT_S``,
   data payload ``MCP_FIXTURE_EVENT_DATA`` (JSON). A
   ``notifications/cancelled`` for the request id stops the thread.
+  T-C3-004: the ``deploys`` type declares an ``inputSchema`` (integer
+  ``build``) and ``payloadSchema`` (string ``status``); ``events/stream``
+  ``arguments`` with a non-integer ``build`` are rejected (-32602);
+  ``events/poll`` is logged and never answered (the zero-poll face).
 - ``list_changed`` (T-C3-006): after ``notifications/initialized`` send
   ``notifications/tools/list_changed`` (``MCP_FIXTURE_NOTIFY_DELAY_S``
   later); from the second ``tools/list`` on, an extra ``late_tool`` appears
@@ -52,7 +56,7 @@ Behavior is selected with ``MCP_FIXTURE_MODE``:
 
 Every lifecycle fact is appended to ``$MCP_FIXTURE_LOG`` as one JSON
 object per line: ``{"event": "start"|"child"|"call"|"eof"|"eof_ignored"|
-"initialize"|"events_list"|"stream_request"|"stream_active"|
+"initialize"|"events_list"|"events_poll"|"stream_request"|"stream_active"|
 "stream_error"|"stream_event"|"stream_end"|"stream_terminated"|
 "stream_cancelled"|"tools_list"|"list_changed_sent", ...}`` -- the tests
 read it for pids, call counts, cursors and crash evidence.
@@ -208,7 +212,24 @@ def _answer_initialize(request_id: Any, params: dict[str, Any] | None = None) ->
 
 def _answer_events_list(request_id: Any, params: dict[str, Any]) -> None:
     cursor = params.get("cursor")
-    page_one = [{"name": "deploys", "description": "A deploy finished.", "delivery": ["push"]}]
+    deploys = {
+        "name": "deploys",
+        "description": "A deploy finished.",
+        "delivery": ["push"],
+        # T-C3-004 resolve face: args must carry an integer ``build``; the
+        # event payload must carry a string ``status``.
+        "inputSchema": {
+            "type": "object",
+            "properties": {"build": {"type": "integer"}},
+            "required": ["build"],
+        },
+        "payloadSchema": {
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+        },
+    }
+    page_one = [deploys]
     page_two = [{"name": "drift", "description": "Second-page event type.", "delivery": ["poll"]}]
     if EVENT_PAGES > 1 and cursor is None:
         _send({"jsonrpc": "2.0", "id": request_id, "result": {"events": page_one, "nextCursor": "page2"}})
@@ -294,6 +315,21 @@ def _answer_events_stream(request_id: Any, params: dict[str, Any]) -> None:
     if not isinstance(name, str) or not name:
         _send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "missing event name"}})
         return
+    arguments = params.get("arguments")
+    if arguments is not None:
+        build = arguments.get("build") if isinstance(arguments, dict) else None
+        # T-C3-004: ``deploys`` declares integer ``build`` -- present but
+        # wrong-typed args are rejected (absent args keep the older
+        # T-C3-006 streams working).
+        if not isinstance(build, int) or isinstance(build, bool):
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32602, "message": "arguments.build must be an integer"},
+                }
+            )
+            return
     if STREAM_MODE == "reject":
         _send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "events/stream not supported"}})
         return
@@ -464,6 +500,11 @@ def _handle(message: dict[str, Any]) -> None:
         params = message.get("params")
         _answer_tools_call(request_id, params if isinstance(params, dict) else {})
         return
+    if method == "events/poll":
+        # T-C3-004: never answered (no poll delivery here) -- logged so the
+        # zero-poll assertion has evidence.
+        poll_params = message.get("params")
+        _log({"event": "events_poll", "params": poll_params if isinstance(poll_params, dict) else None})
     if request_id is not None:
         _send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
