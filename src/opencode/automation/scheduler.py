@@ -1,9 +1,9 @@
 """Automation scheduler: the leader loop (T-C3-003).
 
 Upstream 2.3.2 ``automation.ts`` run-loop slice, simplified for the
-first period (no event watches to reconcile): claim the lease, tick,
-sleep until the next wake (doorbell or the earliest due time, capped at
-``max_sleep_s``). A follower -- another process holding the lease --
+first period (timer ticks; T-C3-004 adds the event-watch reconcile):
+claim the lease, tick, reconcile event watches, sleep until the next
+wake (doorbell or the earliest due time, capped at ``max_sleep_s``). A follower -- another process holding the lease --
 sleeps a full ``max_sleep_s`` and retries; ownership decays with the TTL,
 so a crashed leader never wedges the table.
 
@@ -64,6 +64,9 @@ class AutomationScheduler:
             if claimed:
                 try:
                     await self._service.tick()
+                    # T-C3-004: the leader also reconciles event watches --
+                    # active event rows gain a watcher, strays are cancelled.
+                    await self._service.reconcile_event_watches()
                 except Exception:
                     pass
                 now = self._service._now()

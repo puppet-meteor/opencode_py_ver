@@ -232,6 +232,7 @@ async def _drive(
     manager.add_server(_definition("fixture", "events_ok", tmp_path, **extra_env))
     sessions = _RecordingSessions()
     scheduler_mod = importlib.import_module("opencode.automation.scheduler")
+    service: Any = None
     try:
         async with open_database(db_path, mode="create") as database:
             service = _make_service(database, sessions, manager)
@@ -254,8 +255,17 @@ async def _drive(
                 service=service, max_sleep_s=_MAX_SLEEP_S, leader_ttl_s=_LEADER_TTL_S
             ):
                 observed = await observe(sessions, created, service)
-            return {"created": created, "sessions": sessions, "row": _row(db_path, created["id"]), "observed": observed}
+            return {
+                "created": created,
+                "sessions": sessions,
+                "row": _row(db_path, created["id"]),
+                "observed": observed,
+            }
     finally:
+        if service is not None:
+            # cancel the watchers while the loop is healthy, so a cancelled
+            # stream's notifications/cancelled never rides a closing loop
+            await service.stop_watches()
         await manager.close()
 
 
