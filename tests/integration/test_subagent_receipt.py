@@ -492,8 +492,9 @@ async def test_the_first_round_delivers_the_wrapped_receipt(tmp_path: Path) -> N
 async def test_a_followup_round_delivers_a_second_receipt(tmp_path: Path) -> None:
     """A follow-up starts a second run; its receipt rides the NEW run id."""
     script, gate = _gated_final("first round")
+    wake = _Script().text("pw", "parent woken").usage().finish()
     second = _Script().text("p2", "second round").usage().finish()
-    provider = _ScriptedProvider([[script], [second]])
+    provider = _ScriptedProvider([[script], [wake], [second]])
     subagent = SubagentRunAdapter()
     db_path = _migrated_db(tmp_path, "receipt_second.db")
     async with _subagent_app(db_path, provider, tmp_path, subagent) as app:
@@ -508,7 +509,16 @@ async def test_a_followup_round_delivers_a_second_receipt(tmp_path: Path) -> Non
         await _await_run_terminal(db_path, child_id)
         first_run_id = str(_fetch_all(db_path, "SELECT run_id FROM runs WHERE session_id = ?", (child_id,))[0][0])
         await _await_receipt(db_path, parent.session_id, f"subagent:{first_run_id}")
-        # The follow-up (an IDLE child here) starts round two.
+        # The receipt's delivery promotes the parent's WAKE run (it consumes
+        # the wake script). Await its settle BEFORE the follow-up: the test
+        # issues the tool call outside any parent run, so the follow-up's
+        # parent-log marker commit would otherwise race the still-streaming
+        # wake run's finalize commits (the bounded 3-retry can drain -- the
+        # CI Ubuntu leg's ConflictError escape). The real face never races:
+        # a tool call runs inside the parent run, whose runner is
+        # commit-quiescent around its tool calls.
+        await _await_run_terminal(db_path, parent.session_id)
+        # The follow-up (an IDLE child now, parent quiet) starts round two.
         followup = await _spawn_bounded(
             subagent,
             _ctx(parent.session_id, tmp_path, tool_call_id="call_receipt_followup"),
