@@ -174,7 +174,11 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
                 "Consider using a more specific path or pattern.)"
             )
         text = "\n".join(lines)
-    return ToolResult(content=[ToolTextContent(type="text", text=text)])
+    # T-C3-001 opt-out: the count cap is this tool's own honest truncation.
+    return ToolResult(
+        content=[ToolTextContent(type="text", text=text)],
+        metadata={"truncated": truncated},
+    )
 
 
 class FsGlobAdapter:

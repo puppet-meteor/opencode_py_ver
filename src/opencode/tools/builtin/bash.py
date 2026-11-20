@@ -311,6 +311,9 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
         return ToolResult(
             content=content,
             structured_output=_structured(result),
+            # T-C3-001 opt-out: bash enforces its own honest caps, so the
+            # seam never re-truncates (upstream tool-output.ts L76 skip).
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(code=CoreErrorCode.TOOL_TIMEOUT, message=message, retryable=True),
         )
     if result.cancelled:
@@ -319,6 +322,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
         return ToolResult(
             content=content,
             structured_output=_structured(result),
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message=(
@@ -333,6 +337,7 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
         return ToolResult(
             content=content,
             structured_output=_structured(result),
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message="Command finished but its process cleanup could not be confirmed",
@@ -341,7 +346,11 @@ def _execute(context: ToolContext, input: JsonObject) -> ToolResult:
         )
     # A completed command (any exit code) succeeded as a tool run: the exit
     # code is data (notice + structured_output), not a tool failure.
-    return ToolResult(content=content, structured_output=_structured(result))
+    return ToolResult(
+        content=content,
+        structured_output=_structured(result),
+        metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
+    )
 
 
 class BashAdapter:

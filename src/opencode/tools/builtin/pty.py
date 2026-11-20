@@ -574,6 +574,9 @@ def _win32_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            # T-C3-001 opt-out: pty enforces its own honest cap, so the
+            # seam never re-truncates (upstream tool-output.ts L76 skip).
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.TOOL_TIMEOUT,
                 message=(
@@ -587,6 +590,7 @@ def _win32_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message=(
@@ -600,6 +604,7 @@ def _win32_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message="Command finished but its process cleanup could not be confirmed",
@@ -608,7 +613,7 @@ def _win32_execute(
         )
     # A completed command (any exit code) succeeded as a tool run: the exit
     # code is data (notice + structured_output), not a tool failure.
-    return ToolResult(content=content, structured_output=structured)
+    return ToolResult(content=content, structured_output=structured, metadata={"truncated": truncated})
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +850,9 @@ def _posix_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            # T-C3-001 opt-out: pty enforces its own honest cap, so the
+            # seam never re-truncates (upstream tool-output.ts L76 skip).
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.TOOL_TIMEOUT,
                 message=(
@@ -858,6 +866,7 @@ def _posix_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message=(
@@ -871,6 +880,7 @@ def _posix_execute(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message="Command finished but its process cleanup could not be confirmed",
@@ -881,7 +891,7 @@ def _posix_execute(
     # signal-terminated form, e.g. -9 after the killpg sweep) succeeded as
     # a tool run: the exit code is data (notice + structured_output), not
     # a tool failure.
-    return ToolResult(content=content, structured_output=structured)
+    return ToolResult(content=content, structured_output=structured, metadata={"truncated": truncated})
 
 
 class PtyRunAdapter:

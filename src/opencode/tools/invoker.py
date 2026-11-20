@@ -95,6 +95,7 @@ from opencode.tools.policy import (
     SavedDecision,
     extract_resources,
 )
+from opencode.tools.tool_output import truncate_contents
 
 if TYPE_CHECKING:
     # ResolvedTool carries the adapter (registry-owned protocol); string
@@ -400,6 +401,13 @@ def _normalize_result(
     - any terminal without a text item gets one (error message, canonical
       JSON, or a no-output note) so ``py.tool.finished`` always carries
       model-readable text;
+    - T-C3-001 (upstream ``tool-output.ts`` @2.3.2): content without the
+      self-managed opt-out is head-truncated at 2000 lines / 50 KiB with
+      the FULL text saved under the data root and the marker sentence
+      carrying the saved path -- upstream L76 skips any result whose
+      ``metadata.truncated`` is defined (adapters enforcing their own
+      honest caps set the flag), and this seam ports that skip verbatim,
+      reading the flag before the metadata drop below;
     - ``metadata`` has no py.tool.finished wire field (§3.1 L131) and is
       dropped at this boundary (float report); the metadata cap is enforced
       on py.tool.progress via the bounded progress callback.
@@ -426,6 +434,8 @@ def _normalize_result(
         else:
             text = f'Tool "{_wire_name(spec)}" completed with no output.'
         content.append(ToolTextContent(type="text", text=text))
+    if "truncated" not in result.metadata:
+        content = truncate_contents(content)
     return content, structured
 
 

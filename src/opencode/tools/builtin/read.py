@@ -384,7 +384,12 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
         file_size=file_size,
         window_truncated=window_truncated,
     )
-    return ToolResult(content=[ToolTextContent(type="text", text=text)])
+    # read.ts L186 parity: metadata.truncated is set on every text page, so
+    # the invoker seam's truncation skips read results (T-C3-001 opt-out).
+    return ToolResult(
+        content=[ToolTextContent(type="text", text=text)],
+        metadata={"truncated": next_offset is not None},
+    )
 
 
 class FsReadAdapter:

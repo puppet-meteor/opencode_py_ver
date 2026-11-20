@@ -416,7 +416,11 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
     display.sort(key=lambda match: (match[0], match[1]))
     truncated = early_stop
     text = _render(display[:limit], truncated)
-    return ToolResult(content=[ToolTextContent(type="text", text=text)])
+    # T-C3-001 opt-out: the count cap is this tool's own honest truncation.
+    return ToolResult(
+        content=[ToolTextContent(type="text", text=text)],
+        metadata={"truncated": truncated},
+    )
 
 
 class FsGrepAdapter:

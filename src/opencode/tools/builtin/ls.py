@@ -176,7 +176,11 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
             lines.append("")
             lines.append(f"(Results are truncated: showing first {len(shown)} results.{LS_TRUNCATION_SUFFIX}")
         text = "\n".join(lines)
-    return ToolResult(content=[ToolTextContent(type="text", text=text)])
+    # T-C3-001 opt-out: the count cap is this tool's own honest truncation.
+    return ToolResult(
+        content=[ToolTextContent(type="text", text=text)],
+        metadata={"truncated": truncated},
+    )
 
 
 class FsLsAdapter:

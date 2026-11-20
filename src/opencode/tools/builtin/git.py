@@ -481,6 +481,9 @@ def _map_terminal(
         return ToolResult(
             content=content,
             structured_output=structured,
+            # T-C3-001 opt-out: git enforces its own honest caps, so the
+            # seam never re-truncates (upstream tool-output.ts L76 skip).
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(
                 code=CoreErrorCode.TOOL_TIMEOUT,
                 message=(
@@ -494,6 +497,7 @@ def _map_terminal(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message=(
@@ -508,6 +512,7 @@ def _map_terminal(
         return ToolResult(
             content=content,
             structured_output=structured,
+            metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
             error=CoreError(
                 code=CoreErrorCode.EXECUTION_UNKNOWN,
                 message="git finished but its process cleanup could not be confirmed",
@@ -517,7 +522,11 @@ def _map_terminal(
     # A completed command (any exit code, including the 128/129 non-repository
     # face) succeeded as a tool run: the exit code is data (notice +
     # structured_output), not a tool failure (ruling e, bash.py semantics).
-    return ToolResult(content=content, structured_output=structured)
+    return ToolResult(
+        content=content,
+        structured_output=structured,
+        metadata={"truncated": result.stdout_truncated or result.stderr_truncated},
+    )
 
 
 def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str], *, name: str) -> ToolResult:
