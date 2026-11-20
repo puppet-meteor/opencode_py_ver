@@ -56,7 +56,7 @@ _RUN_ID = "run_itbgjob"
 _MESSAGE_ID = "msg_itbgjob"
 _TOOL_CALL_ID = "call_itbgjob"
 _THRESHOLD_S = 1.0
-_SETTLE_DEADLINE_S = 8.0
+_SETTLE_DEADLINE_S = 15.0
 _POLL_INTERVAL_S = 0.1
 
 
@@ -207,12 +207,16 @@ def test_long_call_backgrounds_settles_persists(tmp_path: Path) -> None:
             outcome = await registry.invoke(
                 _context(ToolLimits(background_after_s=_THRESHOLD_S)),
                 "bash__run",
-                {"command": _sleep_command(3, "done-bg")},
+                {"command": _sleep_command(8, "done-bg")},
                 "exec_itbgjob_long",
             )
             wall = time.monotonic() - started
             # The foreground await is bounded by the threshold, not the call.
-            assert wall < 2.5, f"backgrounding did not bound the wall: {wall:.2f}s"
+            # The un-backgrounded floor is the 8s sleep itself; the 3.5s cap
+            # leaves room for the ~1.8s spawn/interpreter overhead CI windows
+            # runners add on top of the 1s threshold (run 44809294745 flaked
+            # at 2.78 against a 2.5 cap with a 3s sleep).
+            assert wall < 3.5, f"backgrounding did not bound the wall: {wall:.2f}s"
             text = _text(outcome)
             assert "done-bg" not in text, "full output leaked inline past the threshold"
             assert "background" in text.lower()
