@@ -911,6 +911,13 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
     DELETE and PATCH /session/{session_id}/inbox/{inbox_id} (one shared
     path key), and POST /session/{session_id}/interrupt — twenty-two
     distinct path keys in total.
+
+    T-C3-009 adds the experimental automation/job face as operations
+    twenty-seven through thirty-three: POST and GET
+    /api/experimental/automation, GET/DELETE
+    /api/experimental/automation/{automation_id}, POST its /pause and
+    /resume, and GET /api/experimental/job — twenty-seven distinct path
+    keys in total.
     """
     request = urllib.request.Request(
         running.base + "/openapi.json", headers={"Authorization": f"Bearer {_TOKEN}"}, method="GET"
@@ -945,6 +952,11 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         "/jobs/{job_id}/cancel",
         "/jobs/{job_id}/events",
         "/jobs/{job_id}/gate/{gate_id}/reply",
+        "/api/experimental/automation",
+        "/api/experimental/automation/{automation_id}",
+        "/api/experimental/automation/{automation_id}/pause",
+        "/api/experimental/automation/{automation_id}/resume",
+        "/api/experimental/job",
     }
     operations = {
         (path, method)
@@ -953,7 +965,7 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         for method in item
         if method in ("get", "post", "delete", "patch")
     }
-    assert len(operations) == 26
+    assert len(operations) == 33
     for path, method in (
         ("/session", "post"),
         ("/session", "get"),
@@ -976,6 +988,13 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         ("/run/{run_id}/status", "get"),
         ("/permission/{permission_id}/reply", "post"),
         ("/events", "get"),
+        ("/api/experimental/automation", "post"),
+        ("/api/experimental/automation", "get"),
+        ("/api/experimental/automation/{automation_id}", "get"),
+        ("/api/experimental/automation/{automation_id}", "delete"),
+        ("/api/experimental/automation/{automation_id}/pause", "post"),
+        ("/api/experimental/automation/{automation_id}/resume", "post"),
+        ("/api/experimental/job", "get"),
     ):
         assert isinstance(paths[path], dict) and method in paths[path], path
 

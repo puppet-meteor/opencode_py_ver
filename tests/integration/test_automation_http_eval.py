@@ -288,7 +288,7 @@ async def test_m4_list_filtering(tmp_path: Path) -> None:
                 api,
                 "POST",
                 "/api/experimental/automation",
-                body=_create_payload(str(tmp_path), name="one"),
+                body=_create_payload(str(tmp_path), name="one", session_id=_SESSION_ID),
             )
             other_dir = tmp_path / "other"
             other_dir.mkdir()
@@ -307,9 +307,12 @@ async def test_m4_list_filtering(tmp_path: Path) -> None:
                 api, "GET", "/api/experimental/automation", query=f"session_id={_SESSION_ID}".encode()
             )
             session_ids = [row.get("id") for row in (by_session_body or {}).get("data", [])]
-            metrics["session_filter"] = (
-                by_session == 200 and session_ids == all_ids
-            )  # both rows target the same session
+            # The session filter matches the OWNER (creating) session, not the
+            # action target -- probe fix: row "one" carries the owner, row
+            # "two" does not, so only "one" lists under the session.
+            metrics["session_filter"] = by_session == 200 and session_ids == [
+                first_id
+            ]  # both rows target the same session
             by_dir, by_dir_body = await _request(
                 api, "GET", "/api/experimental/automation", query=f"directory={other_dir!s}".encode()
             )

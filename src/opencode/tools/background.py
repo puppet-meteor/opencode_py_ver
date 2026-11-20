@@ -333,6 +333,16 @@ async def _load_all(database: Database) -> list[_StoredRow]:
         return [_to_stored(fetched) for fetched in result.fetchall()]
 
 
+async def list_rows(database: Database) -> list[_StoredRow]:
+    """Every durable background row, oldest first (T-C3-009).
+
+    The persisted leg of the upstream ``Job.backgroundJobs`` read; the live
+    leg folds into the same rows because the invoker upserts every transition
+    as it happens, so this one face serves the ``job.list`` route.
+    """
+    return await _load_all(database)
+
+
 async def replay_pending(database: Database) -> list[ReplayedNotification]:
     """Boot-time replay: deliver every pending row exactly once, then admit.
 

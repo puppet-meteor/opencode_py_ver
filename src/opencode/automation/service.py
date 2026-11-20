@@ -136,6 +136,20 @@ class AutomationNotFoundError(Exception):
         self.automation_id = automation_id
 
 
+class AutomationSessionNotFoundError(Exception):
+    """A create payload names a session that does not resolve.
+
+    T-C3-009: the upstream ``Session.NotFoundError`` face -- the HTTP route
+    maps it to 404 while ``InvalidAutomationError`` stays 422. Create-time
+    only: the run-time folds keep raising ``InvalidAutomationError`` so the
+    scheduler's pause-with-reason path is unchanged.
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"Session {session_id} not found")
+        self.session_id = session_id
+
+
 class AutomationSession:
     """What the service needs to know about a resolved session."""
 
@@ -949,7 +963,7 @@ class AutomationService:
                 raise InvalidAutomationError("The automation service has no sessions port wired")
             owner = sessions.resolve_session(session_id)
             if owner is None:
-                raise InvalidAutomationError(f"Session {session_id} no longer exists")
+                raise AutomationSessionNotFoundError(session_id)
         directory = str(payload.get("directory") or (owner.id if owner else "") or "")
         if not directory:
             raise InvalidAutomationError("A automation needs a directory")
@@ -1063,7 +1077,9 @@ class AutomationService:
         if has_session:
             target = self._sessions.resolve_session(str(to["session"])) if self._sessions is not None else None
             if target is None:
-                raise InvalidAutomationError(f"Session {to['session']} no longer exists")
+                # T-C3-009: the upstream Session.NotFoundError face -- the HTTP
+                # route maps this 404 while every other create fold stays 422.
+                raise AutomationSessionNotFoundError(str(to["session"]))
             if target.project_id != project_id:
                 raise InvalidAutomationError(f"Session {to['session']} is in another project")
         else:
@@ -1072,6 +1088,13 @@ class AutomationService:
         return {"type": "prompt", "prompt": prompt, "to": dict(to)}
 
     # -- CRUD ------------------------------------------------------------------
+
+    def resolve_session(self, session_id: str) -> AutomationSession | None:
+        """The sessions-port resolution (T-C3-009: the HTTP list route's 404 face)."""
+        port = self._sessions
+        if port is None:
+            return None
+        return port.resolve_session(session_id)
 
     async def list(self, *, project_id: str | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
         clauses = []

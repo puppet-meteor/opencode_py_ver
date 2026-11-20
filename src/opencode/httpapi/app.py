@@ -144,6 +144,24 @@ body 4 MiB). The token is not readable from the environment here: the host
 validates ``OPENCODE_HTTP_TOKEN`` fail-closed before listening (ruling: the
 transport only receives an already-validated token).
 
+T-C3-009 adds the experimental automation/job routes (upstream
+``server/handlers/automation.ts`` + ``job.ts``; decisions in
+doc/plans/port-232-increments.md) -- ``automation`` injects through
+``create_app`` (the App composition root stays untouched) and the flag gate
+is the process-level ``EVENT_AUTOMATIONS_ENABLED``:
+
+* ``POST   /api/experimental/automation``                    -> ``{data}`` (422 Invalid /
+  404 session gone / 403 flag off)
+* ``GET    /api/experimental/automation``                    -> ``{data: [...]}`` (owner
+  session_id filter, absolute directory direct match, visibility fold)
+* ``GET    /api/experimental/automation/{automation_id}``    -> ``{data}`` (404 before 403)
+* ``POST   /api/experimental/automation/{automation_id}/pause``   -> ``{data}``
+* ``POST   /api/experimental/automation/{automation_id}/resume``  -> ``{data}``
+* ``DELETE /api/experimental/automation/{automation_id}``    -> 204 No Content
+* ``GET    /api/experimental/job``                           -> ``{data: [...]}`` over the
+  durable background rows (kind/status literal sets, ``descendants``
+  "true"/"false" walking the parent seam)
+
 Lifespan (L108): startup awaits the recovery gate and starts the MCP servers
 (a failed server prints one stderr line and the boot continues — the same
 order as the CLI's ``_drive``); shutdown closes the App, which reclaims the
@@ -169,13 +187,23 @@ import secrets
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from pathlib import Path
 from typing import Any, Literal, cast
 
+import sqlalchemy as sa
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from opencode.app import App
+from opencode.automation.service import (
+    EVENT_AUTOMATIONS_ENABLED,
+    AutomationNotFoundError,
+    AutomationService,
+    AutomationSessionNotFoundError,
+    InvalidAutomationError,
+)
 from opencode.bus import Event, SlowConsumerError
 from opencode.bus.eventlog import EventCursor, EventLog, LogItem, Synced
 from opencode.contracts.errors import CoreError, CoreErrorCode
@@ -198,6 +226,7 @@ from opencode.session.service import (
 from opencode.storage import StoreError
 from opencode.storage.jobs_store import JobRecord, job_stream_key
 from opencode.storage.repos import InboxItemRow, MessagePage
+from opencode.tools.background import list_rows
 
 #: §7 L106 "限制请求/并发/输出大小" — the transport-level caps (module-level,
 #: pinned by tests). Request bodies above the cap answer 413 before any
@@ -262,6 +291,16 @@ class _TransportError(Exception):
 
 def _validation(message: str) -> CoreError:
     return CoreError(code=CoreErrorCode.VALIDATION_ERROR, message=message, retryable=False)
+
+
+def _forbidden(message: str) -> _TransportError:
+    """T-C3-009: the experimental routes' 403 (upstream ForbiddenError)."""
+    return _TransportError(403, CoreError(code=CoreErrorCode.PERMISSION_DENIED, message=message, retryable=False))
+
+
+def _not_found(message: str) -> _TransportError:
+    """T-C3-009: the experimental routes' 404 (upstream missing faces)."""
+    return _TransportError(404, CoreError(code=CoreErrorCode.NOT_FOUND, message=message, retryable=False))
 
 
 def _error_response(core: CoreError, status_code: int) -> Response:
@@ -408,6 +447,112 @@ def _job_wire(record: JobRecord) -> JsonObject:
         "created_at_ms": record.created_epoch_ms,
         "updated_at_ms": record.updated_epoch_ms,
     }
+
+
+#: T-C3-009: the upstream ``Job.Status`` literals mapped from the row's
+#: shell-word vocabulary (the report word maps at the wire; the row keeps
+#: "succeeded" -- the BEFORE-eval discovery, see session/service.py).
+_BACKGROUND_JOB_STATUS_WIRE: dict[str, str] = {
+    "backgrounded": "running",
+    "succeeded": "completed",
+    "error": "error",
+    "cancelled": "cancelled",
+}
+_BACKGROUND_JOB_TERMINAL = frozenset({"succeeded", "error", "cancelled"})
+#: The upstream Job.Kind literal set (py rows only ever carry shell/subagent).
+_BACKGROUND_JOB_KINDS = frozenset({"shell", "subagent", "image", "codemode"})
+#: The parent-walk cycle guard (real chains are one or two deep).
+_PARENT_WALK_DEPTH = 16
+
+
+def _background_job_wire(stored: Any) -> JsonObject:
+    """T-C3-009: one ``job.list`` item (upstream ``Job.Info`` tagged union).
+
+    Banked deviations: snake_case keys (py house style); shell items carry
+    ``shell_id`` = the tool call id (py bash runs have no persistent shell
+    handle) and ``command`` = the row title (the closest the row carries).
+    """
+    row = stored.row
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    item: dict[str, Any] = {
+        "kind": row.kind,
+        "id": row.notification_id,
+        "session_id": row.session_id,
+        "status": _BACKGROUND_JOB_STATUS_WIRE.get(row.status, row.status),
+        "title": row.title,
+        "time": {
+            "started_ms": stored.created_at_ms,
+            "completed_ms": stored.updated_at_ms if row.status in _BACKGROUND_JOB_TERMINAL else None,
+        },
+    }
+    if row.kind == "shell":
+        item["shell_id"] = row.tool_call_id
+        item["command"] = row.title
+    elif row.kind == "subagent":
+        item["child_session_id"] = payload.get("childSessionID")
+        item["agent"] = payload.get("agent")
+        item["description"] = payload.get("description")
+    return item
+
+
+async def _session_row_exists(engine: AsyncEngine, session_id: str) -> bool:
+    """The durable existence face for the routes' unknown-session 404s."""
+    async with engine.connect() as connection:
+        found = await connection.execute(
+            sa.text("SELECT 1 FROM sessions WHERE session_id = :sid").bindparams(sid=session_id)
+        )
+        return found.first() is not None
+
+
+async def _session_parents(engine: AsyncEngine, session_ids: set[str]) -> dict[str, str | None]:
+    """``parent_id`` per session from the ``py.session.created`` seam.
+
+    The subagent parent-link seam (contracts/events.py SessionCreatedData):
+    no read-model column -- the walk reads the raw created row's data, first
+    (lowest-seq) event per session.
+    """
+    parents: dict[str, str | None] = {}
+    if not session_ids:
+        return parents
+    async with engine.connect() as connection:
+        found = await connection.execute(
+            sa.text(
+                "SELECT session_id, data FROM events WHERE type = 'py.session.created' "
+                "AND session_id IN :sids ORDER BY session_id, seq"
+            ).bindparams(sa.bindparam("sids", expanding=True, value=sorted(session_ids)))
+        )
+        for fetched in found.fetchall():
+            session_id, data = fetched[0], fetched[1]
+            if session_id in parents:
+                continue
+            parent: str | None = None
+            if isinstance(data, dict):
+                candidate = data.get("parent_id")
+                parent = candidate if isinstance(candidate, str) else None
+            elif isinstance(data, str):
+                try:
+                    decoded = json.loads(data)
+                except ValueError:
+                    decoded = None
+                if isinstance(decoded, dict):
+                    candidate = decoded.get("parent_id")
+                    parent = candidate if isinstance(candidate, str) else None
+            parents[session_id] = parent
+    return parents
+
+
+def _descends(parents: dict[str, str | None], owned: str, root: str) -> bool:
+    """Whether ``owned`` is ``root`` or any descendant of it (upstream descends)."""
+    seen: set[str] = set()
+    current: str | None = owned
+    while current is not None and len(seen) < _PARENT_WALK_DEPTH:
+        if current == root:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
+        current = parents.get(current)
+    return False
 
 
 def _compaction_wire(outcome: CompactionOutcome) -> JsonObject:
@@ -846,7 +991,7 @@ def _interrupt_wire(receipt: InterruptReceipt) -> JsonObject:
     }
 
 
-def create_app(app: App, *, token: str) -> FastAPI:
+def create_app(app: App, *, token: str, automation: AutomationService | None = None) -> FastAPI:
     """Build the FastAPI transport over one App composition (the public face).
 
     ``token`` is the already-validated single-user token (the host reads and
@@ -1261,6 +1406,151 @@ def create_app(app: App, *, token: str) -> FastAPI:
         """
         await service.request_session_background(session_id)
         return Response(status_code=204)
+
+    # -- T-C3-009: the experimental automation/job routes --------------------
+    # Upstream server/handlers/automation.ts (106 lines) + job.ts (26 lines);
+    # the five banked decisions in doc/plans/port-232-increments.md. The flag
+    # gate is the process-level EVENT_AUTOMATIONS_ENABLED (decision 2: py has
+    # no per-directory config face), so "a gone folder stays manageable"
+    # reduces to "the gate never touches the directory" -- no existence check.
+
+    def _require_automation() -> AutomationService:
+        if automation is None:
+            raise _TransportError(
+                501,
+                CoreError(
+                    code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+                    message="the automation service is not wired into this server",
+                    retryable=False,
+                ),
+            )
+        return automation
+
+    def _gate_automations() -> None:
+        if not EVENT_AUTOMATIONS_ENABLED:
+            raise _forbidden("The automations flag is off (OPENCODE_FLAGS=-automations)")
+
+    async def _find_automation(automation_id: str) -> dict[str, Any]:
+        """Upstream ``find``: resolve the row (404) before the gate (403)."""
+        try:
+            info = await _require_automation().get(automation_id)
+        except AutomationNotFoundError:
+            raise _not_found(f"Automation {automation_id} not found") from None
+        _gate_automations()
+        return info
+
+    async def _automation_call(face: str, automation_id: str) -> dict[str, Any]:
+        try:
+            method = getattr(_require_automation(), face)
+            return await method(automation_id)
+        except AutomationNotFoundError:
+            raise _not_found(f"Automation {automation_id} not found") from None
+
+    @api.post("/api/experimental/automation")
+    async def automation_create(request: Request) -> Response:
+        """Create (upstream catchTags): Invalid -> 422, session gone -> 404.
+
+        Unattended (decision 3): the py automation model is already
+        unattended -- the sessions port delivers prompts with no interactive
+        ask -- so no permission seam is mirrored here.
+        """
+        _gate_automations()
+        payload = await _read_json_object(request)
+        try:
+            info = await _require_automation().create(payload)
+        except InvalidAutomationError as error:
+            raise _TransportError(422, _validation(getattr(error, "reason", str(error)))) from None
+        except AutomationSessionNotFoundError as error:
+            raise _not_found(str(error)) from None
+        return _json_response({"data": info})
+
+    @api.get("/api/experimental/automation")
+    async def automation_list(session_id: str | None = None, directory: str | None = None) -> Response:
+        """List: session gate, absolute-path check, direct directory match.
+
+        Upstream four-layer directory semantics; decision 4 trims the
+        ``projects.resolve`` layer (py has no Project service), so matching is
+        the direct ``row.directory == directory`` leg alone.
+        """
+        service = _require_automation()
+        if session_id is not None:
+            if service.resolve_session(session_id) is None:
+                raise _not_found(f"Session {session_id} not found")
+            _gate_automations()
+        if directory is not None:
+            if not Path(directory).is_absolute():
+                raise _TransportError(422, _validation(f"Directory must be an absolute path: {directory}"))
+            _gate_automations()
+        rows: list[Any] = await service.list(session_id=session_id)
+        if directory is not None:
+            rows = [row for row in rows if row["directory"] == directory]
+        if not EVENT_AUTOMATIONS_ENABLED:
+            rows = []  # the per-directory visibility fold under one process flag
+        return _json_response({"data": rows})
+
+    @api.get("/api/experimental/automation/{automation_id}")
+    async def automation_get(automation_id: str) -> Response:
+        return _json_response({"data": await _find_automation(automation_id)})
+
+    @api.post("/api/experimental/automation/{automation_id}/pause")
+    async def automation_pause(automation_id: str) -> Response:
+        await _find_automation(automation_id)
+        return _json_response({"data": await _automation_call("pause", automation_id)})
+
+    @api.post("/api/experimental/automation/{automation_id}/resume")
+    async def automation_resume(automation_id: str) -> Response:
+        await _find_automation(automation_id)
+        return _json_response({"data": await _automation_call("resume", automation_id)})
+
+    @api.delete("/api/experimental/automation/{automation_id}")
+    async def automation_delete(automation_id: str) -> Response:
+        await _find_automation(automation_id)
+        await _automation_call("remove", automation_id)
+        return Response(status_code=204)
+
+    @api.get("/api/experimental/job")
+    async def experimental_job_list(
+        session_id: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        descendants: str | None = None,
+    ) -> Response:
+        """``job.list`` over the durable background rows (upstream job.ts).
+
+        The query mirrors the upstream BooleanFromString contract exactly:
+        ``descendants`` is the string "true"/"false"; ``kind``/``status`` take
+        the upstream literal sets. The session filter walks the parent seam
+        when descendants is on (seen-set cycle guard).
+        """
+        if kind is not None and kind not in _BACKGROUND_JOB_KINDS:
+            raise _TransportError(422, _validation(f"Unknown job kind: {kind}"))
+        if status is not None and status not in set(_BACKGROUND_JOB_STATUS_WIRE.values()):
+            raise _TransportError(422, _validation(f"Unknown job status: {status}"))
+        with_descendants = False
+        if descendants is not None:
+            if descendants not in ("true", "false"):
+                raise _TransportError(422, _validation(f'descendants must be "true" or "false": {descendants}'))
+            with_descendants = descendants == "true"
+        if session_id is not None and not await _session_row_exists(app.database.engine, session_id):
+            raise _not_found(f"Session {session_id} not found")
+        stored_rows = await list_rows(app.database)
+        parents: dict[str, str | None] = {}
+        if session_id is not None and with_descendants:
+            parents = await _session_parents(
+                app.database.engine, {stored.row.session_id for stored in stored_rows} | {session_id}
+            )
+        items: list[JsonValue] = []
+        for stored in stored_rows:
+            row = stored.row
+            if kind is not None and row.kind != kind:
+                continue
+            if status is not None and _BACKGROUND_JOB_STATUS_WIRE.get(row.status, row.status) != status:
+                continue
+            if session_id is not None and row.session_id != session_id:
+                if not with_descendants or not _descends(parents, row.session_id, session_id):
+                    continue
+            items.append(_background_job_wire(stored))
+        return _json_response({"data": items})
 
     api.add_exception_handler(_TransportError, _transport_error_handler)
     api.add_exception_handler(StoreError, _store_error_handler)

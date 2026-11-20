@@ -262,10 +262,12 @@ def test_create_target_rules(tmp_path: Path) -> None:
         no_target = _create_payload()
         del no_target["action"]["to"]
         await _expect_invalid(service, no_target)
-        await _expect_invalid(
-            service,
-            _create_payload(action={"type": "prompt", "prompt": "x", "to": {"session": "ses_other"}}),
-        )
+        # T-C3-009: an unreachable target session is the upstream
+        # Session.NotFoundError face (HTTP 404), no longer a 422 invalid fold.
+        with pytest.raises(_service_module().AutomationSessionNotFoundError):
+            await service.create(
+                _create_payload(action={"type": "prompt", "prompt": "x", "to": {"session": "ses_other"}})
+            )
         await _expect_invalid(
             service,
             _create_payload(action={"type": "prompt", "prompt": "x", "to": {"subagent": "worker"}}),
