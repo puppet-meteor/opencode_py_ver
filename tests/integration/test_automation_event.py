@@ -308,14 +308,27 @@ def test_first_event_delivers_interpolated_prompt_zero_polling(tmp_path: Path) -
     manager = _manager(tmp_path)
 
     async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
-        await _wait_for(lambda: len(sessions.sends) >= 1, what="the first event delivery")
+        # Same coherent-snapshot discipline as the clean-break test: the
+        # bare ``sends >= 1`` wait can resume between a send and its settle.
+        snapshot: dict[str, Any] = {}
+
+        def _settled() -> bool:
+            row = _row(tmp_path / "first.db", created["id"])
+            if row.get("run_count") != 1 or len(sessions.sends) != 1:
+                return False
+            if json.loads(row["event_position"]) == {"cursor": "c1", "id": "evt-1"}:
+                snapshot["row"] = row
+                return True
+            return False
+
+        await _wait_for(_settled, what="the first delivery settled")
         expected = (
             "Deploy finished: react.\n\n"
             + _GUARD
             + ':\n    {"id":"evt-1","timestamp":"2026-11-20T00:00:00Z","data":{"status":"finished"}}'
         )
         assert sessions.sends[0][1] == expected
-        row = _row(tmp_path / "first.db", created["id"])
+        row = snapshot["row"]
         assert row["run_count"] == 1
         assert row["status"] == "active"
         assert json.loads(row["event_position"]) == {"cursor": "c1", "id": "evt-1"}
@@ -363,11 +376,31 @@ def test_clean_break_reopens_from_the_committed_cursor(tmp_path: Path) -> None:
     manager = _manager(tmp_path, MCP_FIXTURE_STREAM_MODE="clean_break", MCP_FIXTURE_BREAK_AFTER="1")
 
     async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
-        await _wait_for(lambda: len(sessions.sends) >= 2, what="the post-reopen delivery")
+        # The fixture stream runs forever (one event per clean break, reopen
+        # from the committed cursor, repeat), so ``run_count`` and the sends
+        # log race forward together. A bare ``sends >= 2`` wait can resume
+        # while the watcher sits between a send and its settle (an await
+        # apart -- the CI flake in run 44796687823). Poll instead for one
+        # coherent snapshot: the predicate is synchronous, so no watcher
+        # step can interleave inside it.
+        snapshot: dict[str, Any] = {}
+
+        def _settled() -> bool:
+            row = _row(tmp_path / "brk.db", created["id"])
+            count = row.get("run_count", 0)
+            if count < 2 or count != len(sessions.sends):
+                return False
+            position = json.loads(row["event_position"])
+            if position == {"cursor": f"c{count}", "id": f"evt-{count}"}:
+                snapshot["row"] = row
+                return True
+            return False
+
+        await _wait_for(_settled, what="the settled post-reopen delivery")
         requests = _stream_requests(tmp_path)
         assert len(requests) >= 2
         assert requests[1]["params"]["cursor"] == "c1"  # the committed cursor
-        row = _row(tmp_path / "brk.db", created["id"])
+        row = snapshot["row"]
         assert row["run_count"] == len(sessions.sends) >= 2
         position = json.loads(row["event_position"])
         assert position == {"cursor": f"c{row['run_count']}", "id": f"evt-{row['run_count']}"}
