@@ -18,7 +18,7 @@
 | 9 | flag 旗标解析链+shared-cache+canonical-json | Med | S-M | **T-C3-007**（✅ 已落地，含评估集先行：七列 BEFORE 全灰→AFTER 全达；红集 20 契约+全量 2600P/8S/6E） | P1 |
 | 8 | db storage-failure 分类+batch 分批 | Med | S | **T-C3-008**（✅ 已落地，含评估集先行：七列 BEFORE 全灰→AFTER 全达零探针修正；红集 14 契约+全量 2621P/8S/6E） | P1 |
 | 11 | server 面 automation/job 路由 | Med | M | **T-C3-009**（✅ 已落地 2026-11-21，含评估集先行：六列 BEFORE 全灰→AFTER 全达；红集 14 契约+全量 2641P/8S/6E） | P1 |
-| 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | T-C3-010 | P1 |
+| 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | T-C3-010（侦察固化 2026-11-21：上游五层钉死[契约/解析/挂载/呈现/runtime]+py 落点 5 决策随段——MaasAdapter 扩参 SSLContext/配置三源同 credentials 链/{file:} 局部展开/三免对位/红集自蒸馏四族） | P1 |
 | 3 | artifact+blob-store（本地 provider） | Med | M | T-C3-011 | P2 |
 | 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | T-C3-012 | P2 |
 | 14a | verbosity 默认低（token 面） | Med | S | T-C3-013 | P2 |
@@ -202,6 +202,16 @@
   5. **测试**：红集对位上游 3+1 族蒸馏——CRUD+flag 门（disabled→403/目录消失可查可删）/create 错误映射/list 过滤矩阵（sessionID/directory/可见性）/job.list 过滤矩阵（kind/status/session/descendants）；评估集先行恒绿测量面（P0 路由能力探针+M 族映射/门/过滤矩阵）。
 - 目标面：**automation/job 的 HTTP 管理面**（六+1 路由全语义：flag 门/错误映射/过滤矩阵/unattended 创建——automation service 已全 face 齐[T-C3-003/004/005]，本票纯路由层接线+job list 数据源对位）。
 - **落地（2026-11-21，`677eec5` 侦察→`d1aa747` 评估集→`8891ad5` 实现）**：决策④定案 job.list 数据源=`background_job` 表（`tools/background.py::list_rows` 包装 `_load_all`，序 created_at_ms, notification_id——上游 backgroundJobs=持久行∪活跃项去重，py invoker 实时 upsert 即合并面）；create 期缺靶 raise 换新 `AutomationSessionNotFoundError`（`_resolve_create_action` 目标+create owner 两处；run 期折叠不动）——HTTP 404/422 分流面；wire=snake_case+上游枚举词混搭（backgrounded→running/succeeded→completed；shell_id=tool_call_id、command=title 记档偏差）；descendants 走 `py.session.created` 的 `parent_id` seam（events 表首行 json 解析+seen 集环守卫+深度帽 16）；session 存在性=sessions 表 SELECT 1。红集 14 契约（两处测试缺陷随修：POST 裸 ：id=405 非路由→改 pause/resume 路径探 404；directory 查询=verbatim `str()` 形）；eval M4 探针修正（session 过滤=owner 语义）+`test_create_target_rules` 期望更新（缺靶→404 类）+sdk 路由计数测试更新（22→27 键/26→33 操作）；job 过滤测试 id 字典序=种子序根治同毫秒 tie flake。评估 AFTER 六列全达（P0 probed/M1 mapped/M2 gated 含 gone_folder/M3 round-tripped/M4 filtered/M5 listed）；三门禁绿；全量 2641P/8S/6E。
+
+### T-C3-010 provider mTLS 客户端证书（簇14b）✅ 侦察固化 2026-11-21
+- 上游（2.3.2 五层钉死）：①**契约** `schema/provider.ts` Tls{cert,key,passphrase?}（PEM 文本；`{file:...}` 语法经 `config/variable.ts` L47-60 **全 config 通用**替换链展开，非 tls 专属）+Settings.tls（provider settings 命名键，余键=provider option）；②**解析** `core/provider.ts` L274-280 `Provider.tls(settings)`=decodeUnknownOption(Tls)，**空 cert 或空 key（如 `{file:}` 缺文件展开后空串）→undefined**；③**挂载**（model-resolver 三点）chat L267（mergeTransport→options.http.tls）、media/decision L323-342（同 prototype copy 挂 http.tls）、L518-519 **tls 存在→transport 强制 "http"**（WebSocket 不能呈证书）；④**呈现** `ai/route/executor.ts` L283 `withTls`=provideService(CurrentTls)——**仅 provider 请求带证书，plain executor 下载不带**；四消费点（transport/http L112/media L359/responses-compaction L128）；⑤**runtime 层** `effect/app-node-platform.ts` L24-54 withClientCertificate：per-request 读 CurrentTls→**仅 https:**→ClientTls.sender→**redirect 强制 error**（防把证书呈给重定向目标主机）→无 sender=TransportError("Client certificates aren't supported on this runtime")；node 实现=`effect/client-tls/client-tls.node.ts` undici Agent（per-cert JSON-id Map 缓存，connect{cert,key,passphrase}），bun/workerd=不支持。**上游无直接测试族**（全仓 grep 零 mTLS 测试）。
+- py 落点决策（5 条）：
+  1. **MaasAdapter 扩参** `client_tls: ClientTls | None`（frozen dataclass {cert,key,passphrase?}）→构造期 `ssl.SSLContext(PROTOCOL_TLS_CLIENT)`+`load_cert_chain(certfile,keyfile,password=passphrase)`→`httpx2.AsyncClient(verify=ctx, timeout=既有四相 Timeout)` 注入 `AsyncOpenAI(http_client=…)`（复刻 SDK 默认 client 的 timeout 面）；坏 PEM=构造期 `ssl.SSLError` 直抛（组合根 fail-fast，不吞）。
+  2. **配置入口=同 credentials 链**（flag>env>layers）：layer `tls` 键 {cert,key,passphrase?}（形状对位上游 Settings.tls 逐字）+env `OPENCODE_PY_TLS_CERT/KEY/PASSPHRASE`+CLI `--client-tls-cert/--client-tls-key/--client-tls-passphrase`；cli.py L437-446 同型 fallback（层值非 dict/缺 cert|key→None，对位上游空值→undefined 语义）；serving.py 同步（env+layer 双源，对位 headers 面 L358-369 房风）；llm_call.py 自组装面透传扩参。
+  3. **`{file:...}` 局部展开记档偏差**：py 无全 config 替换链（既有差距不随票建）——tls 三值点做最小展开（值形 `{file:path}`→读文件文本；缺文件/读败=构造期错误显式报，非上游「展开为空→unset」——py 择 fail-fast 记档偏差）；裸 PEM 文本原样用。
+  4. **三免对位记档**：redirect 面=httpx2 `follow_redirects` 默认 False（天然不跟=上游 redirect:"error" 语义免代码）；https-only=SSLContext verify 仅作用于 https（http 明文无 TLS 面）；runtime-support=py 单 runtime（CPython+httpx2）恒有 sender，无「不支持」分支。
+  5. **测试**：上游零测试族→红集自蒸馏四族——adapter 契约（client_tls→AsyncOpenAI http_client.verify 同一 SSLContext 探针+无 client_tls=SDK 默认 client 路径不变）/SSL 构造面（真 PEM 临时文件对 load_cert_chain 生效+坏 PEM raise）/配置链（cli flag>env>layer 合成+空值→None；serving env/layer）/`{file:}` 展开（文本形/文件形/缺文件 fail-fast）；评估集先行（P0 参数能力探针+M 族构造/SSL/配置/展开四列，BEFORE capability-absent）。
+- 目标面：**内网自签网关的 mTLS 呈证**（MAAS 通道客户端证书：config/env/flag 三源→SSLContext→每 provider 请求携带；下载与无关请求不带证）。
 
 ## 执行纪律
 
