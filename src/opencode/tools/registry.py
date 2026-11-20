@@ -56,6 +56,7 @@ from opencode.contracts.events import canonical_json
 from opencode.contracts.messages import JsonObject
 from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.session.service import AscendingIds, Clock, IdFactory
+from opencode.storage.db import Database
 from opencode.tools.invoker import (
     EventSink,
     ResolvedTool,
@@ -245,10 +246,15 @@ class ToolRegistry:
         clock: Clock | None = None,
         ids: IdFactory | None = None,
         policy: PermissionPolicy | None = None,
+        database: Database | None = None,
     ) -> None:
         self._sink = sink
         self._clock: Clock = clock if clock is not None else _utc_now
         self._ids: IdFactory = ids if ids is not None else AscendingIds(self._clock)
+        # T-C3-002: the storage handle arming background-job persistence.
+        # None keeps the pre-capability face (a ``background_after_s``
+        # threshold still backgrounds -- it just does not persist).
+        self._database = database
         # P6-S5 (T-C1-098): per-session Phase-1 serialization locks (see the
         # class docstring mechanism-correction note). Lazy get-or-create and
         # never pruned -- the EventCommitter per-session lock and the Runner's
@@ -468,4 +474,5 @@ class ToolRegistry:
                 clock=self._clock,
                 ids=self._ids,
                 policy=self._policy,
+                database=self._database,
             )

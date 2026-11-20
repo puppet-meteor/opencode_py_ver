@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from sys import platform as _PLATFORM
@@ -46,6 +48,8 @@ from tests.integration.test_tool_bash import (
     _interpreter_or_skip,
     _RecordingSink,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _SESSION_ID = "ses_itbgjob"
 _RUN_ID = "run_itbgjob"
@@ -109,6 +113,26 @@ def _row_status(db_path: Path, notification_id: str | None = None) -> list[tuple
         conn.close()
 
 
+def _migrated_db(tmp_path: Path, name: str = "jobs.db") -> Path:
+    """A tmp database migrated to head via the real alembic CLI.
+
+    The compaction-engine precedent: migrations run on the sync engine
+    (``migrations/env.py``), never inside ``open_database``, so a test
+    database reaches head explicitly before the async engine opens it.
+    """
+    db_path = tmp_path / name
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "-x", f"db_path={db_path}", "upgrade", "head"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, f"alembic failed\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    return db_path
+
+
 async def _wait_settled(db_path: Path, notification_id: str) -> None:
     deadline = time.monotonic() + _SETTLE_DEADLINE_S
     while time.monotonic() < deadline:
@@ -129,7 +153,7 @@ def test_background_after_s_field_on_limits() -> None:
     defaults = ToolLimits()
     assert getattr(defaults, "background_after_s", "missing") is None
     wired = ToolLimits(background_after_s=_THRESHOLD_S)
-    assert wired.background_after_s == _THRESHOLD_S  # type: ignore[attr-defined]
+    assert wired.background_after_s == _THRESHOLD_S
 
 
 def test_registry_database_param_optional() -> None:
@@ -153,7 +177,7 @@ def test_registry_database_param_optional() -> None:
 def test_short_call_stays_inline_no_row(tmp_path: Path) -> None:
     """Below the threshold nothing changes: inline delivery, no persisted row."""
     _interpreter_or_skip()
-    db_path = tmp_path / "jobs.db"
+    db_path = _migrated_db(tmp_path)
 
     async def _scenario() -> None:
         async with open_database(db_path, mode="create") as database:
@@ -174,9 +198,9 @@ def test_long_call_backgrounds_settles_persists(tmp_path: Path) -> None:
     """Past the threshold: bounded marker returns fast, the row appears with the
     backgrounded status, settles to a terminal payload carrying the output."""
     _interpreter_or_skip()
-    db_path = tmp_path / "jobs.db"
+    db_path = _migrated_db(tmp_path)
 
-    async def _scenario() -> tuple[str]:
+    async def _scenario() -> str:
         async with open_database(db_path, mode="create") as database:
             registry = _registry(database)
             started = time.monotonic()
@@ -240,8 +264,10 @@ def _settled_row(notification_id: str, session_id: str = _SESSION_ID) -> Any:
 def test_replay_empty_database_is_empty(tmp_path: Path) -> None:
     from opencode.tools.background import replay_pending
 
+    db_path = _migrated_db(tmp_path)
+
     async def _scenario() -> None:
-        async with open_database(tmp_path / "jobs.db", mode="create") as database:
+        async with open_database(db_path, mode="create") as database:
             assert await replay_pending(database) == []
 
     asyncio.run(_scenario())
@@ -251,7 +277,7 @@ def test_replay_settled_row_delivers_payload_and_deletes(tmp_path: Path) -> None
     """A settled-but-unadmitted row survives a restart and replays its payload."""
     from opencode.tools.background import replay_pending, upsert_row
 
-    db_path = tmp_path / "jobs.db"
+    db_path = _migrated_db(tmp_path)
 
     async def _seed() -> None:
         async with open_database(db_path, mode="create") as database:
@@ -278,7 +304,7 @@ def test_replay_running_shell_row_replays_honest_error(tmp_path: Path) -> None:
     error naming the interruption, never a fake success, then deletes."""
     from opencode.tools.background import replay_pending, upsert_row
 
-    db_path = tmp_path / "jobs.db"
+    db_path = _migrated_db(tmp_path)
 
     async def _seed() -> None:
         async with open_database(db_path, mode="create") as database:
@@ -302,13 +328,15 @@ def test_delete_for_session_scopes_to_session(tmp_path: Path) -> None:
     """Session cancellation removes only that session's rows and reports the count."""
     from opencode.tools.background import delete_for_session, upsert_row
 
+    db_path = _migrated_db(tmp_path)
+
     async def _scenario() -> None:
-        async with open_database(tmp_path / "jobs.db", mode="create") as database:
+        async with open_database(db_path, mode="create") as database:
             await upsert_row(database, _settled_row("ntf_a1", session_id="ses_A"))
             await upsert_row(database, _settled_row("ntf_a2", session_id="ses_A"))
             await upsert_row(database, _settled_row("ntf_b1", session_id="ses_B"))
             removed = await delete_for_session(database, "ses_A")
             assert removed == 2
-            assert _row_status(tmp_path / "jobs.db") == [("ntf_b1", "succeeded")]
+            assert _row_status(db_path) == [("ntf_b1", "succeeded")]
 
     asyncio.run(_scenario())

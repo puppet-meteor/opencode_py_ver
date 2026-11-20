@@ -32,6 +32,7 @@ fix the alignment, never the reading.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import sqlite3
@@ -43,6 +44,8 @@ from typing import Any, cast
 
 from opencode.contracts.messages import ToolTextContent
 from opencode.session.service import IdFactory
+from opencode.storage import open_database
+from opencode.storage.db import Database
 from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry
 from opencode.tools.builtin import BASH_MAX_OUTPUT_BYTES, BashAdapter
 from tests.integration.test_tool_bash import (
@@ -52,6 +55,8 @@ from tests.integration.test_tool_bash import (
     _interpreter_or_skip,
     _RecordingSink,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _SESSION_ID = "ses_itbgeval"
 _RUN_ID = "run_itbgeval"
@@ -73,21 +78,27 @@ def _sleep_command(seconds: int, marker: str) -> str:
 def _limits_with_threshold() -> tuple[ToolLimits, bool]:
     """The threshold-injected limits when the field exists, else the default face.
 
-    ``model_fields`` + ``**extra`` (not a literal keyword) so the probe is
-    static-safe on pre-implementation code and exact on post-implementation
-    code: mypy sees a dict-unpacked construction, not a phantom field.
+    Instrument note (fixed with the T-C3-002 implementation): the field
+    probe reads ``dataclasses.fields`` -- ``ToolLimits`` is a frozen
+    dataclass, so the earlier pydantic ``model_fields`` probe never fired
+    and the BEFORE M1 readings measured the unwired inline face (the
+    readings themselves stay valid: with no capability in the tree a
+    threshold-wired call also blocked to completion). ``**extra`` keeps
+    the probe static-safe on pre-implementation code.
     """
     extra: dict[str, Any] = {}
-    if "background_after_s" in getattr(ToolLimits, "model_fields", {}):
+    field_names = {field.name for field in dataclasses.fields(ToolLimits)}
+    if "background_after_s" in field_names:
         extra["background_after_s"] = _THRESHOLD_S
     return ToolLimits(**extra), bool(extra)
 
 
-def _registry() -> ToolRegistry:
+def _registry(database: Database | None = None) -> ToolRegistry:
     registry = ToolRegistry(
         sink=cast("Any", _RecordingSink()),
         clock=lambda: _FIXED_TIME,
         ids=cast(IdFactory, _FixedIds()),
+        database=database,
     )
     registry.register(BashAdapter())
     registry.snapshot(_SESSION_ID)
@@ -118,21 +129,27 @@ def _run_calls(
     limits: ToolLimits,
     commands: Sequence[str],
 ) -> tuple[float, list[ToolOutcome]]:
-    """Sequential await-per-call: the model-turn shape (M1's measured face)."""
+    """Sequential await-per-call: the model-turn shape (M1's measured face).
+
+    The wall is captured INSIDE the coroutine, at the last outcome's
+    return -- the model-facing latency. ``asyncio.run``'s loop-shutdown
+    cancellation of the settlement continuations (killing the still
+    running process trees) is real work but not latency the model sees.
+    """
     registry = _registry()
     started = time.monotonic()
 
-    async def _all() -> list[ToolOutcome]:
+    async def _all() -> tuple[list[ToolOutcome], float]:
         outcomes: list[ToolOutcome] = []
         for i, command in enumerate(commands):
             outcome = await registry.invoke(
                 _context(working_dir, limits), "bash__run", {"command": command}, f"exec_itbgeval{i}"
             )
             outcomes.append(outcome)
-        return outcomes
+        return outcomes, time.monotonic() - started
 
-    outcomes = asyncio.run(_all())
-    return time.monotonic() - started, outcomes
+    outcomes, wall = asyncio.run(_all())
+    return wall, outcomes
 
 
 def _outcome_metrics(outcomes: Sequence[ToolOutcome]) -> dict[str, Any]:
@@ -215,8 +232,8 @@ def test_m1_concurrent_batch_context(tmp_path: Path) -> None:
     context = _context(tmp_path, limits)
     started = time.monotonic()
 
-    async def _gathered() -> list[ToolOutcome]:
-        return list(
+    async def _gathered() -> tuple[list[ToolOutcome], float]:
+        outcomes = list(
             await asyncio.gather(
                 *(
                     registry.invoke(context, "bash__run", {"command": command}, f"exec_itbgevalc{i}")
@@ -224,9 +241,9 @@ def test_m1_concurrent_batch_context(tmp_path: Path) -> None:
                 )
             )
         )
+        return outcomes, time.monotonic() - started
 
-    outcomes = asyncio.run(_gathered())
-    wall = time.monotonic() - started
+    outcomes, wall = asyncio.run(_gathered())
     _report(
         {
             "scenario": "M1-concurrent",
@@ -274,26 +291,58 @@ def test_m2_m3_restart_survival(tmp_path: Path) -> None:
         status = "capability-absent"
     else:
         try:
-            from opencode.storage import open_database
+            import subprocess
+            import sys
 
             background = importlib.import_module("opencode.tools.background")
             replay_pending = getattr(background, "replay_pending", None)
             if replay_pending is None:
                 raise AttributeError("replay_pending")
 
-            db_path = tmp_path / "eval.db"
+            def _migrate(db_path: Path) -> None:
+                # Migrations run on the sync engine (compaction-test
+                # precedent): bring the database to head before the async
+                # engine opens it.
+                migrated = subprocess.run(
+                    [sys.executable, "-m", "alembic", "-x", f"db_path={db_path}", "upgrade", "head"],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                if migrated.returncode != 0:
+                    raise RuntimeError(f"alembic failed: {migrated.stderr[-400:]}")
 
-            async def _probe() -> tuple[int, int]:
-                async with open_database(db_path, mode="create") as database:
-                    replayed = await replay_pending(database)
-                conn = sqlite3.connect(db_path)
+            # -- the M2/M3 metric: a db-wired backgrounded call "crashes"
+            # (the loop closes before settle) and must still replay. --
+            wired_db = tmp_path / "wired.db"
+            _migrate(wired_db)
+
+            async def _crash_run() -> int:
+                async with open_database(wired_db, mode="create") as database:
+                    registry = _registry(database)
+                    await registry.invoke(
+                        _context(tmp_path, limits),
+                        "bash__run",
+                        {"command": _sleep_command(_SINGLE_SLEEP_S, "done-wired")},
+                        "exec_itbgevalw",
+                    )
+                # Loop exit kills the settlement continuation: the row
+                # stays backgrounded -- the crash-before-settle state.
+                conn = sqlite3.connect(wired_db)
                 try:
-                    count = conn.execute("select count(*) from background_job").fetchone()[0]
+                    return int(conn.execute("select count(*) from background_job").fetchone()[0])
                 finally:
                     conn.close()
-                return len(replayed), count
 
-            delivered, row_count = asyncio.run(_probe())
+            row_count = asyncio.run(_crash_run())
+
+            async def _replay_after_restart() -> int:
+                async with open_database(wired_db, mode="readwrite") as database:
+                    return len(await replay_pending(database))
+
+            delivered = asyncio.run(_replay_after_restart())
             status = "probed"
         except Exception as error:
             status = f"api-mismatch:{error.__class__.__name__}"

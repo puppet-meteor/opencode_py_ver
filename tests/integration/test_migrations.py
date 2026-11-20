@@ -165,7 +165,7 @@ def test_upgrade_head_builds_0001_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     _require_success(_upgrade_head(db_path))
 
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
     # No separate sequence table (CORE-CONTRACTS §3.2 Python difference);
     # 0002 adds the fifth read model (runs, §3.2 L183-188); 0003 adds jobs
     # (§5.4); 0004 adds the sixth read model (inbox, the T-C1-100 pending
@@ -180,6 +180,7 @@ def test_upgrade_head_builds_0001_schema(tmp_path: Path) -> None:
         "runs",
         "jobs",
         "inbox",
+        "background_job",
     }
     assert _column_names(db_path, "events") == set(EVENTS_COLUMNS)
     assert _column_names(db_path, "sessions") == set(SESSIONS_COLUMNS)
@@ -245,12 +246,12 @@ def test_upgrade_head_is_idempotent(tmp_path: Path) -> None:
     db_path = tmp_path / "app.db"
     _require_success(_upgrade_head(db_path))
     fingerprint = _schema_fingerprint(db_path)
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
 
     # Already at head: the second upgrade is a no-op.
     _require_success(_upgrade_head(db_path))
     assert _schema_fingerprint(db_path) == fingerprint
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
 
 
 async def test_runtime_engine_pragmas_and_wal_persistence(tmp_path: Path) -> None:
@@ -435,7 +436,7 @@ def test_upgrade_0001_to_0002_preserves_legacy_data(tmp_path: Path) -> None:
     _seed_legacy_r1_rows(db_path)
 
     _require_success(_upgrade_head(db_path))
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
     assert _column_names(db_path, "runs") == set(RUNS_COLUMNS)
     # Old-data verification: events/sessions/messages rows are untouched.
     assert _fetch_all(db_path, "SELECT COUNT(*) FROM events") == [(4,)]
@@ -607,7 +608,7 @@ async def test_closed_state_backup_restore_reconciles_row_by_row(tmp_path: Path)
     assert not shm.exists()
     snapshot = _table_snapshot(db_path)
     event_triples = _fetch_closed(db_path, "SELECT id, seq, type FROM events ORDER BY seq")
-    assert _fetch_closed(db_path, "SELECT version_num FROM alembic_version") == [("0004",)]
+    assert _fetch_closed(db_path, "SELECT version_num FROM alembic_version") == [("0005",)]
     assert len(event_triples) == 13  # created..step_finished incl. the permission pair
 
     backup_path = tmp_path / "backup" / "app.db.bak"
@@ -621,7 +622,7 @@ async def test_closed_state_backup_restore_reconciles_row_by_row(tmp_path: Path)
     # Restore: the verified copy takes the lost file's place.
     _copy_main_file(backup_path, db_path)
     assert _table_snapshot(db_path) == snapshot
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
 
     # The restored file serves the durable read face and the async runtime.
     async with open_database(db_path, mode="readonly") as database:
@@ -634,7 +635,7 @@ async def test_closed_state_backup_restore_reconciles_row_by_row(tmp_path: Path)
     # Head idempotence over data (task 1c): the re-run is a no-op.
     _require_success(_upgrade_head(db_path))
     assert _table_snapshot(db_path) == snapshot
-    assert _alembic_version(db_path) == "0004"
+    assert _alembic_version(db_path) == "0005"
 
 
 async def test_open_state_main_file_copy_misses_wal_commits(tmp_path: Path) -> None:
@@ -675,6 +676,7 @@ async def test_open_state_main_file_copy_misses_wal_commits(tmp_path: Path) -> N
             "runs",
             "jobs",
             "inbox",
+            "background_job",
         }
         assert _fetch_all(open_copy, "SELECT COUNT(*) FROM events") == [(0,)]
         assert _fetch_all(open_copy, "SELECT COUNT(*) FROM tool_executions") == [(0,)]

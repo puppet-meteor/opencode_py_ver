@@ -84,6 +84,17 @@ from opencode.contracts.events import (
 from opencode.contracts.messages import JsonObject, JsonValue, ToolContent, ToolTextContent
 from opencode.contracts.tools import ToolRef, ToolResult, ToolSpec
 from opencode.session.service import Clock, IdFactory
+from opencode.storage.db import Database
+from opencode.tools.background import (
+    BACKGROUNDABLE_NAMESPACES,
+    KIND_SHELL,
+    STATUS_BACKGROUNDED,
+    STATUS_ERROR,
+    STATUS_SUCCEEDED,
+    BackgroundJobRow,
+    notification_id_for,
+    upsert_row,
+)
 from opencode.tools.policy import (
     DEFAULT_APPROVAL_TIMEOUT_S,
     REASON_APPROVAL_RUN_CANCELLED,
@@ -131,6 +142,14 @@ class ToolLimits:
     max_progress_metadata_bytes: int = 64 * _KIB
     max_read_bytes: int = _MIB
     max_read_output_bytes: int = 64 * _KIB
+    #: T-C3-002 (upstream 2.3.2 job timeout→background): calls in a
+    #: backgroundable namespace running past this many seconds keep
+    #: running in the background -- the foreground await returns a
+    #: bounded marker and the result replays as a notification (and
+    #: survives a restart via the ``background_job`` row when the
+    #: registry is constructed with a ``database``). ``None`` (default)
+    #: keeps the fully-blocking inline face.
+    background_after_s: float | None = None
 
 
 def _require_pattern(value: Any, name: str, prefix: str) -> None:
@@ -936,6 +955,154 @@ async def _start_approved(
     await sink((replied, started))
 
 
+# --- T-C3-002: threshold -> background (upstream 2.3.2 job) ----------------
+#
+# Strong references to settlement continuations: asyncio only keeps weak
+# refs to running tasks, and a backgrounded call's result must not die
+# with the foreground await. Discarded on completion; bounded by the
+# number of in-flight background calls (the process lifetime face of
+# upstream's Active registry -- the durable face is background.py).
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _background_title(requested_name: str, raw_input: JsonObject) -> str:
+    """The human face of the backgrounded work (the command line, capped)."""
+    command = raw_input.get("command")
+    title = command if isinstance(command, str) and command else requested_name
+    return title[:200]
+
+
+async def _execute_maybe_background(
+    *,
+    tool: ResolvedTool,
+    exec_context: ToolContext,
+    raw_input: JsonObject,
+    requested_name: str,
+    database: Database | None,
+) -> tuple[ToolResult | None, str | None]:
+    """Run the adapter; past the threshold, keep it running in the background.
+
+    Returns ``(result, None)`` for the inline face (identical to a direct
+    ``execute`` await, exceptions propagate unchanged for the caller's
+    failed/unknown path) or ``(None, marker_text)`` once the call has
+    backgrounded -- the row is upserted *before* this returns (upstream
+    ``start(background)`` before the fork) and the settlement
+    continuation owns the terminal upsert. The ``None`` result is never
+    read by the caller (the marker short-circuits first).
+
+    ``asyncio.wait`` (not ``wait_for``): the adapter task must NOT be
+    cancelled at the threshold -- the process keeps running and its
+    output keeps draining (the flood face's no-deadlock contract).
+    """
+    threshold = exec_context.limits.background_after_s
+    if threshold is None or tool.spec.namespace not in BACKGROUNDABLE_NAMESPACES:
+        return await tool.adapter.execute(exec_context, raw_input), None
+    task = asyncio.create_task(tool.adapter.execute(exec_context, raw_input))
+    done, _pending = await asyncio.wait({task}, timeout=threshold)
+    if task in done:
+        # Completed within the threshold: the plain inline result (an
+        # adapter exception re-raised here reaches the same failed/unknown
+        # path as the direct await).
+        return task.result(), None
+    notification_id = notification_id_for(exec_context.tool_call_id)
+    title = _background_title(requested_name, raw_input)
+    session_id = exec_context.session_id
+    tool_call_id = exec_context.tool_call_id
+    if database is not None:
+        await upsert_row(
+            database,
+            BackgroundJobRow(
+                notification_id=notification_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                kind=KIND_SHELL,
+                status=STATUS_BACKGROUNDED,
+                title=title,
+                payload=None,
+            ),
+        )
+    _spawn_settlement(
+        task,
+        spec=tool.spec,
+        limits=exec_context.limits,
+        database=database,
+        notification_id=notification_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        title=title,
+    )
+    marker = (
+        f"Command is still running after {threshold:g}s; it continues in the "
+        f"background (notification {notification_id}). The result will be "
+        f"delivered as a session notification when it completes, and it "
+        f"survives a restart (replayed on boot)."
+    )
+    return None, marker
+
+
+def _spawn_settlement(
+    task: asyncio.Task[ToolResult],
+    *,
+    spec: ToolSpec,
+    limits: ToolLimits,
+    database: Database | None,
+    notification_id: str,
+    session_id: str,
+    tool_call_id: str,
+    title: str,
+) -> None:
+    """The background continuation: settle the row with the real result.
+
+    Runs outside the session's serial pipeline (the pipeline answered
+    with the marker); normalizes with the same face the inline path
+    uses, so the replayed notification's text is byte-identical to what
+    an inline call would have returned. Persistence is best-effort: a
+    settlement write failure must never take down the event loop (the
+    row stays ``backgrounded`` and replays as interrupted-on-restart --
+    honest, not lost).
+    """
+
+    async def _settle() -> None:
+        status = STATUS_SUCCEEDED
+        payload: JsonObject = {}
+        try:
+            result = await task
+            content, structured_output = _normalize_result(spec, result, limits)
+            text = "\n".join(part.text for part in content if isinstance(part, ToolTextContent))
+            if result.error is not None:
+                status = STATUS_ERROR
+                payload["error"] = result.error.message
+            payload["text"] = text
+            if structured_output is not None:
+                payload["structured_output"] = structured_output
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            status = STATUS_ERROR
+            payload = {"text": f"background command failed: {type(error).__name__}: {error}"}
+        if database is None:
+            return
+        try:
+            await upsert_row(
+                database,
+                BackgroundJobRow(
+                    notification_id=notification_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    kind=KIND_SHELL,
+                    status=status,
+                    title=title,
+                    payload=payload,
+                ),
+            )
+        except Exception:
+            return
+
+    continuation = asyncio.create_task(_settle())
+    _BACKGROUND_TASKS.add(continuation)
+    continuation.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 async def invoke_tool(
     *,
     tool: ResolvedTool | None,
@@ -947,6 +1114,7 @@ async def invoke_tool(
     clock: Clock,
     ids: IdFactory,
     policy: PermissionPolicy | None = None,
+    database: Database | None = None,
 ) -> ToolOutcome:
     """Drive the §5.1 L257 sequence for one tool call (registry-internal).
 
@@ -960,6 +1128,14 @@ async def invoke_tool(
     cancellation checkpoint and ``py.tool.started`` (§5.2: PermissionPolicy
     is injected into the Invoker; a tool never approves itself); without
     one the R2 default-allow face is unchanged (§5.2 L264).
+
+    T-C3-002: ``database`` arms background-job persistence -- a
+    backgroundable call (``context.limits.background_after_s`` set,
+    namespace in ``BACKGROUNDABLE_NAMESPACES``) running past the
+    threshold upserts its ``background_job`` row *before* the bounded
+    marker returns (upstream ``start(background)`` before the fork), so
+    a crash at any later point still leaves a replayable row. ``None``
+    keeps the capability un-persisted (threshold still backgrounds).
     """
     if not isinstance(raw_input, dict):
         raise ToolInvokeError("input must be a JSON object")
@@ -1099,8 +1275,15 @@ async def invoke_tool(
     # is already committed -- proceed straight to adapter execution.
 
     exec_context = replace(context, progress=_bounded_progress(context.progress, context.limits))
+    background_marker: str | None = None
     try:
-        result = await tool.adapter.execute(exec_context, raw_input)
+        result, background_marker = await _execute_maybe_background(
+            tool=tool,
+            exec_context=exec_context,
+            raw_input=raw_input,
+            requested_name=requested_name,
+            database=database,
+        )
     except Exception as error:
         # §2.1 L50: the started commit already proved the call began, so a
         # crash after it cannot claim the effect is not_started -- every
@@ -1129,6 +1312,32 @@ async def invoke_tool(
             error=CoreError(code=CoreErrorCode.TOOL_FAILED, message=message, retryable=False),
         )
 
+    if background_marker is not None:
+        # T-C3-002 backgrounded terminal: the *pipeline* answers (the model
+        # got its bounded marker), the *effect* is still in flight -- the
+        # honest pair is succeeded/unknown (the started commit already
+        # proved the call began, so not_started is illegal per §2.1 L50;
+        # completed would claim an effect that has not happened). The real
+        # result replays as a notification (``background_job`` row).
+        return await _finish(
+            sink=sink,
+            ids=ids,
+            clock=clock,
+            context=context,
+            execution_id=execution_id,
+            requested_name=requested_name,
+            tool_ref=tool_ref,
+            input_hash=input_hash,
+            state="succeeded",
+            effect_status="unknown",
+            content=[ToolTextContent(type="text", text=background_marker)],
+            structured_output=None,
+            error=None,
+        )
+
+    # Inline face: the helper only returns None alongside a marker, which
+    # the short-circuit above already consumed.
+    assert result is not None
     content, structured_output = _normalize_result(tool.spec, result, context.limits)
     if result.error is not None:
         # A graceful adapter failure: the pre-start policy deny maps to the
