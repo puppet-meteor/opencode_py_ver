@@ -47,9 +47,16 @@
 - 目标面：**执行速率门禁可测**（批量案例回放长任务后台化+重启不丢）。
 
 ### T-C3-003 automation prompt 动作（簇1 裁剪版）
-- 上游：表 `automation`（trigger∈at/every/cron/event + action∈prompt/code + status/next_due_at/退避字段/event_position）；KV 租约选主（TTL=2×MAX_SLEEP）+doorbell 30s；退避矩阵（prompt 失败 5min/code 1min×3→paused）；settle 乐观并发；恢复语义（at 补跑一次/every/cron 保相位跳槽/event 从 cursor replay）。
-- 裁剪：第一期只做 prompt 动作（to session/subagent）+every/cron/at；event 触发与 code 动作分别缓到 T-C3-006 之后/暂缓。
-- 工具面：automation_create/list/pause/resume/delete（policy ask）。
+- 上游（2.3.2 侦察已固化）：表 `automation`（trigger∈at/every/cron/event JSON + action∈prompt/code JSON + status 默认 active/next_due_at/expires_at/run_count/failures/last_run_at/last_message_id/last_outcome/last_output/retry_at/state/event_position+时间戳；3 索引=project/session/partial `automation_active_idx` ON next_due_at WHERE status='active'）；常量（MIN_PROMPT_INTERVAL=1min/LATE_AFTER=1min/MAX_SLEEP=30s/LEADER_TTL=2×MAX_SLEEP/FAILED_RETRY=5min/DISABLED_RETRY=1h/TICK_CONCURRENCY=4）；调度 `following()`（at→None 一次性；every 保相位 `due+(floor((now-due)/every)+1)*every`；cron 严格下一步+回退时钟安全）；settle 乐观并发（WHERE id+run_count+status）；租约=KV insert onConflict where owner=自己或 until≤now，逐 run claim；runAction（run=run_count+1、消息 id=`msg_{id}_{run}`、complete 在递交后 settle{last_outcome=late?fired,retry_at=null,+advance}、coalesce=无 event+定时器+last_message_id 仍在 inbox→wake+skipped）；失败面（InvalidError→pauseWith；目录消失→pause；其他→FAILED_RETRY 5min）；create 校验（relative at 固化 ISO+须未来、every≥1min、cron 须每分钟至多一次且至少一解、prompt 无 session 须 to、to.session 须同 project、subagent 须 owner session、expires 早于首跑拒）；resume（at 落期间跑一次除非过期；repeat 取 following；failures/retry_at 清零）；pause/resume/remove=幂等条件 UPDATE。
+- py 落点决策（2026-11-20 固化）：
+  1. **表**：迁移 0006 建 `automation`（列/索引对上游全量，`session_id` 无 FK 同 background_job 先例；event_position/state 列保留判别空间）+**租约表 `automation_lease`**（key TEXT PK/owner TEXT/until_ms INTEGER，单行）——py 无 KV 表，独立小表贴上游 KV 语义（TTL 时间衰减，WriterLock 文件锁无 TTL 不合）。
+  2. **模块**：新包 `src/opencode/automation/`（`service.py`=CRUD+tick+runAction+settle；`cron.py`=自研 5 字段 cron；`scheduler.py`=选主循环）——对位 watcher/service.py 的 async CM 服务模式；工具适配器 `src/opencode/tools/automation.py` 挂 registry namespace `opencode`。
+  3. **cron 选型自研**（无新依赖，纪律）：5 字段（min hour dom month dow）+`*`/`,`/`-`/`/step`；next()=逐「本地日」扫描（日字段筛→当日 valid (h,m) 集→tz 转 UTC instant 取 >now 最小；DST 歧义 fold=0 第一次出现、不存在 instant 跳过=上游回退安全语义；上限 5 年无解→None=「cron never runs」拒）。
+  4. **时钟/参数注入**：服务构造 `clock: Clock|None`（SessionService 先例）；`max_sleep_s/leader_ttl_s/late_after_s/failed_retry_s/tick_concurrency` 全部构造参（测试注短值防抖）。
+  5. **递交面**：`SessionService.prompt(session_id, text, request_id, delivery=...)` 现成；coalesce=递交前 `SessionInbox.pending_by_request` 命中→skip；subagent 目标=child id `ses_aut_{aut_id}_{run}`（`is_run_session`=startswith `ses_aut_`）经 `create(parent_id=owner)` 派生可重试收养。
+  6. **裁剪记档**：event 触发（watch/replay cursor）→T-C3-006 后；code 动作+authorize/permission.ask→暂缓；flag `experimental.automations` 每目录复查→py 无 flag 面，第一期默认启用记偏差；command `automation`→不移植。
+- 评估集（先行）：`tests/integration/test_automation_eval.py`——能力探测（模块/表 0006/工具注册）；M1=every 到期触发墙钟、M2=at 重启补跑一次即 done、M3=every 保相位（错槽不补跑）、M4=prompt 失败退避 retry_at、M5=coalesce。BEFORE 预期 capability-absent/0%。
+- 红契约集：`tests/integration/test_automation.py`——create 校验矩阵/following 三 trigger（含 DST 固定表达式）/tick 选取与 retry_at 门/租约单飞（双 scheduler 同库一 tick）/settle 乐观并发/退避/coalesce/pause-resume-remove 幂等/subagent child 派生收养。
 - 目标面：**无人值守运行态**（变更窗口定时巡检、告警触发诊断/回退的执行骨架）。
 
 ## 执行纪律
