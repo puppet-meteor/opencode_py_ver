@@ -610,6 +610,12 @@ class MaasAdapter:
             # OpenAI-compatible create() -- the adapter is transport, not
             # policy (the schema subset was validated at the pipeline gate).
             params["response_format"] = request.response_format
+        if request.text_verbosity is not None:
+            # T-C3-013: the Chat Completions top-level ``verbosity`` key
+            # (openai-chat.ts); the Responses API's nested
+            # ``text: {verbosity}`` shape is the other upstream wire, not
+            # this adapter's protocol.
+            params["verbosity"] = request.text_verbosity
 
         state = _AttemptState()
         # M-1 (R2-S3-review §2 M-1; pinned by T-C1-017a, 2026-11-03): a

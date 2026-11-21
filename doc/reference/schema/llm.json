@@ -543,6 +543,23 @@
           "default": null,
           "title": "Temperature"
         },
+        "text_verbosity": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text Verbosity"
+        },
         "timeout_s": {
           "exclusiveMinimum": 0,
           "title": "Timeout S",

@@ -54,6 +54,7 @@ from collections.abc import Sequence
 from uuid import uuid4
 
 from opencode.ai.provider import Provider
+from opencode.ai.verbosity import default_text_verbosity
 from opencode.contracts.errors import CoreError, CoreErrorCode
 from opencode.contracts.llm import (
     ErrorChunk,
@@ -224,6 +225,10 @@ class ProviderSummarizer:
             max_output_tokens=settings.output_reserve,
             temperature=settings.temperature,
             timeout_s=settings.timeout_s,
+            # T-C3-013: the same default-low gate ContextBuilder applies --
+            # compaction/title ride this one assembly point (upstream hooks
+            # them with the identical function).
+            text_verbosity=default_text_verbosity(settings.model.model),
         )
         parts: dict[str, list[str]] = {}
         usage = Usage()  # all-None = unknown until a UsageChunk arrives (§2.1)

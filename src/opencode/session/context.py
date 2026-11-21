@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from math import ceil, isfinite
 from typing import Any
 
+from opencode.ai.verbosity import default_text_verbosity
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.llm import (
     GenerationRequest,
@@ -284,6 +285,11 @@ class ContextBuilder:
             max_output_tokens=self._settings.output_reserve,
             temperature=self._settings.temperature,
             timeout_s=self._settings.timeout_s,
+            # T-C3-013: the default-low gate, inlined where upstream's
+            # session plugin hooks the context/generate faces (py has no
+            # plugin host); no settings face exists yet, so this fills every
+            # request for a supported model id and leaves the rest None.
+            text_verbosity=default_text_verbosity(self._settings.model.model),
         )
 
     # -- assembly -------------------------------------------------------------

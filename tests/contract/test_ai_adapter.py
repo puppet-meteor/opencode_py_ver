@@ -90,7 +90,11 @@ def make_request(
     timeout_s: float = 10.0,
     messages: Sequence[LLMMessage] = (),
     temperature: float | None = None,
+    text_verbosity: str | None = None,
 ) -> GenerationRequest:
+    # Conditional spread: None never adds the key, so the pre-T-C3-013
+    # contract (extra="forbid") stays satisfied for every existing caller.
+    extra: dict[str, str] = {} if text_verbosity is None else {"text_verbosity": text_verbosity}
     return GenerationRequest(
         request_id=request_id,
         model=ModelRef(provider="maas", model="fake-model"),
@@ -99,6 +103,7 @@ def make_request(
         max_output_tokens=64,
         temperature=temperature,
         timeout_s=timeout_s,
+        **extra,  # type: ignore[arg-type]
     )
 
 
@@ -1122,6 +1127,32 @@ async def test_temperature_omitted_when_unset() -> None:
     assert body is not None
     assert "temperature" not in body
     assert "tools" not in body  # no tools this generation is a state, not a field (§2.2 L78)
+
+
+async def test_verbosity_passed_through_when_set() -> None:
+    """T-C3-013: the Chat Completions top-level ``verbosity`` key (openai-chat.ts)."""
+    async with fake_server(
+        [ScriptedResponse(frames=[Frame(text_delta_frame("ok")), Frame(finish_frame("stop"))])]
+    ) as server:
+        chunks = await consume(make_adapter(server), make_request(text_verbosity="low"))
+
+    validate_sequence(chunks, "req-1")
+    body = server.requests[0].body
+    assert body is not None
+    assert body["verbosity"] == "low"
+
+
+async def test_verbosity_omitted_when_unset() -> None:
+    """T-C3-013: unset verbosity adds no key (the temperature precedent)."""
+    async with fake_server(
+        [ScriptedResponse(frames=[Frame(text_delta_frame("ok")), Frame(finish_frame("stop"))])]
+    ) as server:
+        chunks = await consume(make_adapter(server), make_request())
+
+    validate_sequence(chunks, "req-1")
+    body = server.requests[0].body
+    assert body is not None
+    assert "verbosity" not in body
 
 
 # ---------------------------------------------------------------------------

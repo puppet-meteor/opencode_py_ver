@@ -152,6 +152,14 @@ class GenerationRequest(BaseModel):
     #: caller) is free-form text generation. The pipeline llm_call body is
     #: the only producer; the adapter is transport, not policy.
     response_format: JsonObject | None = None
+    #: The default-low verbosity face (T-C3-013): upstream's session plugin
+    #: ``textVerbosity`` (plugin/verbosity.ts) folded into the request
+    #: contract. ``None`` (the default) means unset -- the assembly points
+    #: (``ContextBuilder.build`` + the compaction summarizer) fill it via
+    #: ``default_text_verbosity(model)`` and never overwrite an explicit
+    #: value (verbosity.ts L28); the adapter passes a set value as the Chat
+    #: Completions top-level ``verbosity`` key (openai-chat.ts wire shape).
+    text_verbosity: Literal["low", "medium", "high"] | None = None
 
     @field_validator("max_output_tokens", mode="before")
     @classmethod
