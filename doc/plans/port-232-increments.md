@@ -20,7 +20,7 @@
 | 11 | server 面 automation/job 路由 | Med | M | **T-C3-009**（✅ 已落地 2026-11-21，含评估集先行：六列 BEFORE 全灰→AFTER 全达；红集 14 契约+全量 2641P/8S/6E） | P1 |
 | 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | **T-C3-010**（✅ 已落地 2026-11-21，含评估集先行：四列 BEFORE 全灰→AFTER 全达；红集 7 契约+全量 2653P/8S/6E；四坑记档：CRLF/write_bytes、OpenSSL stdin prompt 挂死、b64 fixture 根治转录错、AsyncOpenAI `._client` 探针链） | P1 |
 | 3 | artifact+blob-store（本地 provider） | Med | M | **T-C3-011**（✅ 已落地 2026-11-21，`f27defa`：评估集先行[BEFORE P0 absent-partial+M1-M5 capability-absent]→红集 16+eval 6 全达[P0 probed/M1 round-tripped/M2 gated/M3 sandboxed/M4 stored/M5 protocol]；邻族同步 sdk 路由计数 33→42 操作/27→34 路径键+migrations head 0007；三门禁绿+全量 2675P/8S/6E；大坑记档：副本模块 seam[monkeypatch/isinstance 必须真模块]+blob utime 单时钟设计+wire `{"data"}` wrapper） | P2 |
-| 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | **T-C3-012**（侦察固化 2026-11-21：py 已带 bounded 核心[limit+1/slice/truncated/grep 30s]——真缺口仅四项：metadata count/matches 计数、glob `"undefined"/"null"` path 矫正、glob 30s 内联 deadline、坏 glob 校验面[pattern 结构校验+include 捕 rg stderr]；记档偏差三项[permission 序/symlink 外链/stdlib 校验差]随段） | P2 |
+| 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | **T-C3-012**（✅ 已落地 2026-11-21，`1c1ebd2`：评估集先行[BEFORE P0 absent-partial+M1 锚绿+M2-M4 capability-absent]→红集 6+eval 5 全达[P0 probed/M2 enforced/M3 counted/M4 worded]；架构发现=invoker 丢 metadata→structured_output 载体；eval 探针缺陷三项随票修[state 枚举/structured_output/rg patch]；三门禁绿+全量 2686P/8S/6E） | P2 |
 | 14a | verbosity 默认低（token 面） | Med | S | T-C3-013 | P2 |
 | 12 | cli 非交互三读序等后台 job | Low-Med | S | T-C3-014 | P2 |
 | 7/10 | config-managed / codemode 四件 | Low | S/M | 暂缓 | — |
@@ -257,6 +257,12 @@
   4. **D4 坏 glob 校验面**：glob pattern 结构校验（`[` 未闭合→"Invalid glob in pattern '<p>': unclosed character class; missing ']'"，文案形状逐字对位 rg）；grep include 捕 rg exit-2 stderr 含 "invalid glob"→"Invalid glob in include <detail>"（现走「code-2 无 pattern-error 容忍」路径会吞掉）。
 - **记档偏差（不补）**：①permission/external_directory 断言序+symlink 外链免批面（py=roots containment 架构，无 Permission.assert 序列面）；②glob 无 ripgrep 子进程→超时=内联 deadline 非子进程 kill（语义等价：不可无限时）；③stdlib glob 无 rg 全语法校验——结构校验仅对 unclosed character class 精确复刻（上游测试族唯一坏 pattern 用例），其余坏 pattern 自然空结果=「No files found」。
 - py 落点决策（5 条）：①落点=既有 `tools/builtin/glob.py`+`grep.py` 修改，无新 src 文件（search.ts 的 bounded 抽象在 py 折叠为两工具内联已实现面+本票增量）；②D1 计数=slice 后长度（对位上游 entries.length）；③D2 矫正点=path 取值处（`input.get("path", ".")` 前）；④D3=循环内 `time.monotonic()` 检查每步（测试=monkeypatch 注入短时限或假钟）；⑤红集=`test_tool_static_trio.py` 追加 5-6 测（坏 glob 两支/metadata 两支/undefined-null 矫正/glob 超时）+评估集先行新文件 `test_search_tools_eval.py`（P0 四能力探针[metadata count/matches 键+undefined-null 矫正+glob 超时面+坏 glob 面]+M 族——BEFORE absent-partial）。
+- **落地（2026-11-21）**：
+  - 评估集先行 `2420d8c`（BEFORE 5P 判读精准：P0 absent-partial 六新面全 False+M1 bounded 锚绿[证探针看到已船运核心]+M2-M4 capability-absent）。
+  - 实现+红集同票 `1c1ebd2`（worktree p27-s1，4 文件 +172/-13）：D1 双载体（`metadata` 键+`structured_output` 同对象——**架构发现：invoker 在 outcome 边界丢 ToolResult.metadata（§3.1 L131 wire 无此字段，float report）**，structured_output 是 py 的可观测对位载体；truncate 门只探 "truncated" 键不受扰）；D2 字面量矫正；D3 `GLOB_TIMEOUT_S=30.0`+walk 循环 monotonic 检查（`>=` 使零时限 monkeypatch 入环即触发；文案 `:.0f` 与 grep 同形）；D4 双支（glob `_invalid_glob_detail` 结构校验——stdlib 原静默空结果；grep `_invalid_include_detail` 捕 exit-2 stderr **实测形 `rg: error parsing glob '<g>': <detail>`——banner 后切片恰为上游 InvalidGlobError.message**，分支前置对位 mapError 链序；错误码 TOOL_FAILED=invalid-regex 同族）。
+  - **eval 探针缺陷三项随票修**：①`ToolOutcome.state` 枚举="succeeded" 非 "completed"（invoker.py L213）；②metadata 断言面改读 structured_output（同架构发现）；③rg 面加 `_patch_rg_path`（trio 房风——`grep._which_rg` 只查 PATH[binary.ts 对位]，bundled vscode rg 需注入；`_rg_available` 自探测缺席时指标诚实降级、skip 整景语义保留）。
+  - 红集六测（T-C3-012 分节）：metadata 两支精确全等（`{count:5,truncated:False}`/`{count:4,truncated:True}`+matches 同形）+矫正两字面量+坏 pattern/include 精确文案+deadline monkeypatch。
+  - AFTER：eval 5 探针全达（P0 probed 七指标/M1 bounded/M2 enforced/M3 counted/M4 worded 含 include 面）；trio 45P+e2e_r3 4P；三门禁全仓绿（656 formatted/275 mypy files）；全量 **2686P/8S/6E**（基线 2675+5 eval+6 红集；6E=test_cli_install 恒在）。
 
 ## 执行纪律
 
