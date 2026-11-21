@@ -14,12 +14,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # 25 -> 30 (T-C3-011, 2026-11-21): the windows job passed at 18.5min on
-    # f27defa then hit the 25min ceiling on the content-identical docs push
-    # (370bd16, docs-only diff) -- runner variance, not a suite regression.
-    # The bump buys headroom for the growing suite (2675P) without masking
-    # a real hang (30min is still 1.6x the observed worst pass).
-    timeout-minutes: 30
+    # 25 -> 30 -> 40 (T-C3-011/-012, 2026-11-21): windows runner variance now
+    # spans 18.5min (f27defa pass) to 30.1min (26ca85a docs-only push hit
+    # the 30min ceiling) on a 2686-test suite -- same code, different runner.
+    # 40min = 1.3x the observed worst; a real hang is still cut off there.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
