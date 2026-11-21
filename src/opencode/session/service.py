@@ -108,7 +108,7 @@ from opencode.session.compaction import (
     SummaryGenerator,
 )
 from opencode.session.inbox import InboxRef, SessionInbox
-from opencode.session.state import SessionState, SessionStatus
+from opencode.session.state import SessionState, SessionStatus, SubagentObservation
 from opencode.session.state import apply as apply_event
 from opencode.skills import SkillActivationReceipt, SkillCatalog
 from opencode.storage import (
@@ -131,6 +131,13 @@ from opencode.storage import (
 from opencode.storage.db import Database
 from opencode.storage.repos import MAX_PAGE_LIMIT, InboxItemRow
 from opencode.storage.txn import REASON_READ_MODEL_MISSING, ConflictError, from_epoch_ms
+
+if TYPE_CHECKING:
+    # T-C3-014: annotation-only for the same runtime-cycle reason as the
+    # policy types below (``opencode.tools.__init__`` pulls the invoker,
+    # which imports this module); the delivery face imports its runtime
+    # helpers locally, the ``subagent_report_text`` precedent.
+    from opencode.tools.background import BackgroundJobRow
 
 if TYPE_CHECKING:
     # Runtime cycle guard (①): the tools package imports this module at
@@ -1834,6 +1841,66 @@ class SessionService:
             )
             if delivery == "queue":
                 await self._promote_next(session_id, "input")
+
+    async def deliver_background_settlement(self, row: BackgroundJobRow) -> None:
+        """T-C3-014 ``completeBackground``: one settled shell row as the wake.
+
+        The invoker's settlement continuation calls this through the
+        registry's delivery port the moment the terminal row is upserted:
+        the text is the settlement's own ``text`` payload (byte-identical
+        to the boot replay via
+        :func:`opencode.tools.background.shell_report_text`), provenance
+        rides the metadata carrier, and the same S1 synthetic seam as the
+        subagent/MCP wakes steers into the active run or promotes the idle
+        session (``deliver_event_wake``'s idempotency makes a re-settled
+        row deliver once). The caller deletes the row on success and keeps
+        it on failure (at-least-once replay on the next boot).
+        """
+        from opencode.tools.background import shell_report_text
+
+        metadata: JsonObject = {
+            "source": "background",
+            "kind": row.kind,
+            "status": row.status,
+            "title": row.title,
+        }
+        await self.deliver_event_wake(
+            row.session_id,
+            inbox_id=row.notification_id,
+            text=shell_report_text(row.payload),
+            metadata=metadata,
+        )
+
+    async def pending_subagent_wakes(self, session_id: str) -> list[SubagentObservation]:
+        """T-C3-014 read-only face: the session's outstanding subagent wakes.
+
+        The wait loop's third read (after the live shell handles and the
+        inbox): the folded ``py.subagent.backgrounded`` observations no
+        delivery has popped yet -- each one is a child session whose run is
+        still in flight somewhere in this process. A fold failure answers
+        empty (the wait loop's exit condition stays read-only, never fatal).
+        """
+        if self._closed or self._closing:
+            return []
+        try:
+            state = await self._fold_session_state(session_id)
+        except StoreError:
+            return []
+        return list(state.subagent_observations.values())
+
+    async def active_run_id(self, session_id: str) -> str | None:
+        """T-C3-014 read-only face: the session's live active run, if any.
+
+        The wait loop's race guard: a wake's promoted run can start inside
+        the window between the inbox consume and the ``py.run.started``
+        event's delivery, so the pending reads alone cannot prove
+        quiescence -- the live record can.
+        """
+        _require_session_id_arg(session_id)
+        if self._closed or self._closing:
+            return None
+        record = await self._read_live_record(session_id)
+        return record.active_run_id
 
     async def request_session_background(self, session_id: str) -> bool:
         """§3-5 ``session.background``: the wire face survives as a no-op.

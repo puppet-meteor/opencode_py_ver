@@ -211,8 +211,11 @@ def test_m2_shell_job_is_waited_for(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert metrics["flag"] == "accepted"
     assert metrics["exit_code"] == 0
     assert metrics["run_statuses"] == ["succeeded", "succeeded"]
+    # Three requests: the tool-call round, the post-marker round, the woken
+    # round. (output_request_index is NOT assertable here: the request
+    # history echoes the tool-call arguments verbatim, so the command's
+    # marker string reaches request 2 regardless of the wait.)
     assert metrics["llm_requests"] == 3
-    assert metrics["output_request_index"] == 2
     assert metrics["waiting_lines"] >= 1
     assert metrics["background_job_rows"] == 0
 
@@ -240,7 +243,9 @@ def test_m3_exit_code_covers_the_woken_round(tmp_path: Path, capsys: pytest.Capt
     assert metrics["flag"] == "accepted"
     assert metrics["exit_code"] == 2
     assert metrics["run_statuses"] == ["succeeded", "interrupted"]
-    assert metrics["output_request_index"] == 2
+    # The interrupted woken round still consumed its provider turn (the
+    # third request); see M2 for why output_request_index is not assertable.
+    assert metrics["llm_requests"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +279,10 @@ def test_m4_sigint_in_wait_cancels_the_job(
     assert armed
     assert metrics["flag"] == "accepted"
     assert metrics["exit_code"] == 2
-    assert metrics["output_request_index"] is None
+    # Only the first round's two provider turns ever happened -- the woken
+    # round was cancelled before its request (output_request_index is not
+    # assertable: the tool-call arguments echo the marker into request 2).
+    assert metrics["llm_requests"] == 2
     assert metrics["background_job_rows"] == 0
 
 

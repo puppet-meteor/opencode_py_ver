@@ -344,3 +344,78 @@ def test_delete_for_session_scopes_to_session(tmp_path: Path) -> None:
             assert _row_status(db_path) == [("ntf_b1", "succeeded")]
 
     asyncio.run(_scenario())
+
+
+# ---------------------------------------------------------------------------
+# T-C3-014 slice three -- the settled-row delivery port (completeBackground)
+# ---------------------------------------------------------------------------
+
+
+def test_settlement_delivery_port_wakes_and_deletes(tmp_path: Path) -> None:
+    """With the port wired, a settled row reaches the port with its terminal
+    payload and is then deleted -- the in-process wake replaces the boot
+    replay (upstream completeBackground)."""
+    _interpreter_or_skip()
+    db_path = _migrated_db(tmp_path, "deliver.db")
+    delivered: list[Any] = []
+
+    async def _scenario() -> None:
+        async with open_database(db_path, mode="create") as database:
+
+            async def _deliver(row: Any) -> None:
+                delivered.append(row)
+
+            registry = _registry(database)
+            registry.set_background_delivery(_deliver)
+            outcome = await registry.invoke(
+                _context(ToolLimits(background_after_s=_THRESHOLD_S)),
+                "bash__run",
+                {"command": _sleep_command(3, "done-deliver")},
+                "exec_itbgjob_deliver",
+            )
+            assert "background" in _text(outcome).lower()
+            notification_id = _row_status(db_path)[0][0]
+            deadline = time.monotonic() + _SETTLE_DEADLINE_S
+            while time.monotonic() < deadline:
+                if delivered:
+                    break
+                await asyncio.sleep(_POLL_INTERVAL_S)
+            assert delivered, "the settlement never reached the delivery port"
+            assert [row.notification_id for row in delivered] == [notification_id]
+            assert delivered[0].status == "succeeded"
+            assert "done-deliver" in str(delivered[0].payload)
+            # The successful wake consumed the row (no boot replay needed).
+            assert _row_status(db_path) == []
+
+    asyncio.run(_scenario())
+
+
+def test_settlement_delivery_failure_keeps_the_row(tmp_path: Path) -> None:
+    """A raising port keeps the settled row: the settlement is durable and
+    the next boot's replay redelivers (at-least-once), never lost."""
+    _interpreter_or_skip()
+    db_path = _migrated_db(tmp_path, "deliver-failed.db")
+
+    async def _scenario() -> None:
+        async with open_database(db_path, mode="create") as database:
+
+            async def _deliver(row: Any) -> None:
+                raise RuntimeError("wake destination gone")
+
+            registry = _registry(database)
+            registry.set_background_delivery(_deliver)
+            outcome = await registry.invoke(
+                _context(ToolLimits(background_after_s=_THRESHOLD_S)),
+                "bash__run",
+                {"command": _sleep_command(3, "done-keep")},
+                "exec_itbgjob_keep",
+            )
+            assert "background" in _text(outcome).lower()
+            notification_id = _row_status(db_path)[0][0]
+            await _wait_settled(db_path, notification_id)
+            # The delivery failed AFTER the terminal upsert: the settled row
+            # stands for the next boot's replay.
+            rows = _row_status(db_path, notification_id)
+            assert rows == [(notification_id, "succeeded")]
+
+    asyncio.run(_scenario())

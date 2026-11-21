@@ -1005,7 +1005,11 @@ def _apply_tool_finished(state: SessionState, event: DurableEvent[Any]) -> Sessi
             )
     else:
         legal: dict[ToolState, set[EffectStatus]] = {
-            ToolState.SUCCEEDED: {EffectStatus.COMPLETED},
+            # T-C3-002/T-C3-014: the backgrounded marker finishes
+            # succeeded/unknown -- the pipeline answered with its bounded
+            # marker while the real effect is still in flight (the wake
+            # carries the terminal result); honest, never completed.
+            ToolState.SUCCEEDED: {EffectStatus.COMPLETED, EffectStatus.UNKNOWN},
             ToolState.FAILED: {EffectStatus.COMPLETED, EffectStatus.UNKNOWN},
             ToolState.CANCELLED: {EffectStatus.COMPLETED, EffectStatus.UNKNOWN},
             ToolState.UNKNOWN: {EffectStatus.UNKNOWN},

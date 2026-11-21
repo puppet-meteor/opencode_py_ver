@@ -289,7 +289,15 @@ class App:
                 auto_approve=auto_approve,
             )
             committer = EventCommitter(repos, store, self._bus, ids=shared_ids, clock=clock)
-            registry = ToolRegistry(sink=committer.sink, clock=clock, ids=shared_ids, policy=policy)
+            registry = ToolRegistry(
+                sink=committer.sink,
+                clock=clock,
+                ids=shared_ids,
+                policy=policy,
+                # T-C3-014: background-job persistence rides every host
+                # composition (the rows are the wait loop's durable face).
+                database=self._database,
+            )
             for adapter in tools:
                 registry.register(adapter)
             runner = Runner(
@@ -334,6 +342,13 @@ class App:
             # database (settle upsert / delivery delete / keep-alive reads).
             database=self._database,
         )
+        # T-C3-014: the single-shot host's in-process delivery port (upstream
+        # completeBackground) -- settled background rows wake the session
+        # instead of waiting for the next boot's replay. Late-bound after the
+        # service (the steer_consume precedent); the flag stays off for the
+        # REPL/serving hosts, which keep the boot-replay face.
+        if self.deliver_background_jobs and registry is not None:
+            registry.set_background_delivery(self._service.deliver_background_settlement)
         # R4-S2 wiring: the MCP manager is App-owned but lifecycle-closed by
         # the service (§7 L339: MCP -> provider -> DB); the caller injects it
         # explicitly -- config loading is the S3 face. P2-S0 (§6 L304)

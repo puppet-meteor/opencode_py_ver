@@ -58,6 +58,7 @@ from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.session.service import AscendingIds, Clock, IdFactory
 from opencode.storage.db import Database
 from opencode.tools.invoker import (
+    BackgroundDelivery,
     EventSink,
     ResolvedTool,
     ToolContext,
@@ -247,6 +248,7 @@ class ToolRegistry:
         ids: IdFactory | None = None,
         policy: PermissionPolicy | None = None,
         database: Database | None = None,
+        background_delivery: BackgroundDelivery | None = None,
     ) -> None:
         self._sink = sink
         self._clock: Clock = clock if clock is not None else _utc_now
@@ -255,6 +257,10 @@ class ToolRegistry:
         # None keeps the pre-capability face (a ``background_after_s``
         # threshold still backgrounds -- it just does not persist).
         self._database = database
+        # T-C3-014: the settled-row delivery port -- ``None`` keeps the
+        # durable-row-only face; the App late-binds the session service's
+        # delivery for hosts that wait (``set_background_delivery``).
+        self._background_delivery = background_delivery
         # P6-S5 (T-C1-098): per-session Phase-1 serialization locks (see the
         # class docstring mechanism-correction note). Lazy get-or-create and
         # never pruned -- the EventCommitter per-session lock and the Runner's
@@ -432,6 +438,15 @@ class ToolRegistry:
             self._locks[session_id] = lock
         return lock
 
+    def set_background_delivery(self, delivery: BackgroundDelivery | None) -> None:
+        """T-C3-014: late-bind the settled-row delivery port.
+
+        The App owns the composition order (registry before service, the
+        ``steer_consume`` precedent): the port is wired once the session
+        service exists, before any run can background a call.
+        """
+        self._background_delivery = delivery
+
     async def invoke(
         self,
         context: ToolContext,
@@ -475,4 +490,5 @@ class ToolRegistry:
                 ids=self._ids,
                 policy=self._policy,
                 database=self._database,
+                background_delivery=self._background_delivery,
             )

@@ -132,6 +132,17 @@ def subagent_report_text(
     )
 
 
+def shell_report_text(payload: dict[str, Any] | None) -> str:
+    """The settled shell row's report text (T-C3-014): the ``text`` the
+    settlement upserted, verbatim -- the in-process delivery and the boot
+    replay (``replay_pending``) share this one face so both wake surfaces
+    are byte-identical."""
+    if payload is None:
+        return ""
+    value = payload.get("text")
+    return value if isinstance(value, str) else ""
+
+
 def notification_id_for(tool_call_id: str) -> str:
     """The replay key for a call's notification (upstream: one per tool call)."""
     return f"ntf_{tool_call_id}"
@@ -399,11 +410,7 @@ async def replay_pending(database: Database) -> list[ReplayedNotification]:
             )
             continue
         if row.status in _TERMINAL:
-            payload_text = ""
-            if row.payload is not None:
-                value = row.payload.get("text")
-                if isinstance(value, str):
-                    payload_text = value
+            payload_text = shell_report_text(row.payload)
             replayed.append(
                 ReplayedNotification(
                     notification_id=row.notification_id,

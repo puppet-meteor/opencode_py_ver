@@ -93,6 +93,7 @@ from opencode.tools.background import (
     STATUS_ERROR,
     STATUS_SUCCEEDED,
     BackgroundJobRow,
+    delete_row,
     notification_id_for,
     upsert_row,
 )
@@ -968,7 +969,11 @@ async def _start_approved(
 
 
 # --- T-C3-014: the live handle registry (the wait loop's first read) --------
-from opencode.tools.background import delete_row as _bg_delete_row  # noqa: E402
+
+#: The settled-row delivery port (upstream ``completeBackground``'s wake):
+#: the App wires the session service's delivery face for hosts that wait;
+#: ``None`` keeps the durable-row-only face (boot replay carries it).
+BackgroundDelivery = Callable[[BackgroundJobRow], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1014,7 +1019,7 @@ async def cancel_background(session_id: str, *, database: Database | None = None
         await asyncio.gather(handle.settlement, return_exceptions=True)
         if database is not None:
             try:
-                await _bg_delete_row(database, handle.notification_id)
+                await delete_row(database, handle.notification_id)
             except Exception:
                 pass
         cancelled.append(handle.notification_id)
@@ -1035,6 +1040,7 @@ async def _execute_maybe_background(
     raw_input: JsonObject,
     requested_name: str,
     database: Database | None,
+    background_delivery: BackgroundDelivery | None = None,
 ) -> tuple[ToolResult | None, str | None]:
     """Run the adapter; past the threshold, keep it running in the background.
 
@@ -1082,6 +1088,7 @@ async def _execute_maybe_background(
         spec=tool.spec,
         limits=exec_context.limits,
         database=database,
+        background_delivery=background_delivery,
         notification_id=notification_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
@@ -1111,6 +1118,7 @@ def _spawn_settlement(
     spec: ToolSpec,
     limits: ToolLimits,
     database: Database | None,
+    background_delivery: BackgroundDelivery | None,
     notification_id: str,
     session_id: str,
     tool_call_id: str,
@@ -1147,25 +1155,37 @@ def _spawn_settlement(
             payload = {"text": f"background command failed: {type(error).__name__}: {error}"}
         if database is None:
             return
+        row = BackgroundJobRow(
+            notification_id=notification_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            kind=KIND_SHELL,
+            status=status,
+            title=title,
+            payload=payload,
+        )
         try:
-            await upsert_row(
-                database,
-                BackgroundJobRow(
-                    notification_id=notification_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    kind=KIND_SHELL,
-                    status=status,
-                    title=title,
-                    payload=payload,
-                ),
-            )
+            await upsert_row(database, row)
         except Exception:
             return
         finally:
             # The live handle's lifetime ends with its settlement (the wait
             # loop's pending read and the cancel face both key off this).
             _BACKGROUND_HANDLES.pop(notification_id, None)
+        if background_delivery is None:
+            return
+        # T-C3-014: the delivery port (upstream completeBackground). A
+        # delivery failure keeps the settled row -- the next boot's replay
+        # redelivers (at-least-once); a successful wake deletes it (the
+        # row's keep-alive purpose ended with the in-process delivery).
+        try:
+            await background_delivery(row)
+        except Exception:
+            return
+        try:
+            await delete_row(database, notification_id)
+        except Exception:
+            pass
 
     continuation = asyncio.create_task(_settle())
     return continuation
@@ -1183,6 +1203,7 @@ async def invoke_tool(
     ids: IdFactory,
     policy: PermissionPolicy | None = None,
     database: Database | None = None,
+    background_delivery: BackgroundDelivery | None = None,
 ) -> ToolOutcome:
     """Drive the §5.1 L257 sequence for one tool call (registry-internal).
 
@@ -1351,6 +1372,7 @@ async def invoke_tool(
             raw_input=raw_input,
             requested_name=requested_name,
             database=database,
+            background_delivery=background_delivery,
         )
     except Exception as error:
         # §2.1 L50: the started commit already proved the call began, so a

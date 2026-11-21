@@ -94,6 +94,7 @@ from opencode.contracts.events import (
     PY_PERMISSION_REQUESTED,
     PY_REASONING_DELTA,
     PY_REASONING_FINALIZED,
+    PY_RUN_STARTED,
     PY_STEP_FINISHED,
     PY_STEP_STARTED,
     PY_TEXT_DELTA,
@@ -103,6 +104,7 @@ from opencode.contracts.events import (
     ConfigSnapshotV3,
     JobBudget,
     McpServerRef,
+    RunStartedData,
     SessionCreatedData,
     SessionCreatedDataV2,
     SessionCreatedDataV3,
@@ -165,6 +167,7 @@ from opencode.tools.builtin import (
     WebSearchAdapter,
     pty_adapters,
 )
+from opencode.tools.invoker import ToolLimits, cancel_background, pending_background
 from opencode.tools.policy import permission_rules_from_snapshot
 from opencode.websearch import KV_FILE_NAME, WebSearchService
 
@@ -216,6 +219,10 @@ _ROUND_EXIT_CODES = {
     RunStatusValue.FAILED: 1,
     RunStatusValue.INTERRUPTED: 2,
 }
+#: One awaited background work item (T-C3-014, the wait loop's render/cancel
+#: face): ``(id, kind, title, child_session_id)`` -- the child id is None for
+#: every kind but ``subagent`` (the SIGINT face's interrupt target).
+_PendingJob = tuple[str, str, str, str | None]
 #: The seven live-preview event types the printer subscribes to (R3-S7 adds
 #: the pending-approval notice).
 _PREVIEW_TYPES = frozenset(
@@ -1024,6 +1031,7 @@ def main(
                 workflow_tools=args.workflow_tools,
                 auto_approve=args.auto,
                 json_output=args.format == "json",
+                background_after=args.background_after if prompt_text else None,
             )
         )
     except _SelectionError as error:
@@ -1193,6 +1201,7 @@ async def _drive(
     auto_approve: bool = False,
     json_output: bool = False,
     memory_client: MemoryGatewayClient | None = None,
+    background_after: float | None = None,
 ) -> int:
     """One process = one migrated database + one App + one driving session.
 
@@ -1315,6 +1324,12 @@ async def _drive(
         max_steps=runtime.snapshot.limits.max_steps,
         rules=rules,
         working_dir=working_dir,
+        # T-C3-014: the opt-in backgrounding threshold (the single-shot face
+        # only -- main passes it just for a prompt) and the single-shot
+        # host's in-process settlement delivery (the wait loop below is the
+        # delivery's consumer; the REPL keeps the boot-replay face).
+        limits=ToolLimits(background_after_s=background_after) if background_after is not None else None,
+        deliver_background_jobs=bool(prompt_text),
         mcp_manager=mcp_manager,
         mcp_refs=mcp_refs,
         pipeline_engine=pipeline_engine,
@@ -1354,7 +1369,7 @@ async def _drive(
             session_id = session.session_id
         _ACTIVE_INPUT = repl_input
         if prompt_text:
-            status = await _run_round(
+            return await _run_single_shot(
                 app,
                 session_id,
                 prompt_text,
@@ -1363,10 +1378,6 @@ async def _drive(
                 repl_input=repl_input,
                 json_output=json_output,
             )
-            if status is None:
-                return _CLEANUP_EXIT_CODE
-            _print_terminal(status, json_output=json_output, session_id=session_id)
-            return _ROUND_EXIT_CODES[status.status]
         return await _repl(
             app,
             session_id,
@@ -1380,6 +1391,175 @@ async def _drive(
         # to the default raise (the 130 face) instead of vanishing in-band.
         _ACTIVE_INPUT = None
         await app.close()
+
+
+async def _run_single_shot(
+    app: App,
+    session_id: str,
+    text: str,
+    *,
+    request_id: str,
+    wait_hook: Callable[[], None] | None,
+    repl_input: _ReplInput,
+    json_output: bool = False,
+) -> int:
+    """One prompt round, then the background wait (T-C3-014, upstream
+    noninteractive.ts): the process outlives its prompt's slow work -- every
+    backgrounded job the round spawned is waited for, each wake's promoted
+    round is driven like the first, and the exit code law covers every
+    waited round (the first non-succeeded round wins; a non-succeeded first
+    round never waits -- upstream ``finalError``)."""
+    seen: set[str] = set()
+    admitted_ms = int(time.time() * 1000)
+    status = await _run_round(
+        app,
+        session_id,
+        text,
+        request_id=request_id,
+        wait_hook=wait_hook,
+        repl_input=repl_input,
+        json_output=json_output,
+        on_admit=seen.add,
+    )
+    if status is None:
+        return _CLEANUP_EXIT_CODE
+    _print_terminal(status, json_output=json_output, session_id=session_id)
+    exit_code = _ROUND_EXIT_CODES.get(status.status, 1)
+    if exit_code != 0:
+        return exit_code
+    return await _wait_background_wakes(
+        app,
+        session_id,
+        admitted_ms=admitted_ms,
+        seen=seen,
+        wait_hook=wait_hook,
+        repl_input=repl_input,
+        json_output=json_output,
+        exit_code=exit_code,
+    )
+
+
+async def _wait_background_wakes(
+    app: App,
+    session_id: str,
+    *,
+    admitted_ms: int,
+    seen: set[str],
+    wait_hook: Callable[[], None] | None,
+    repl_input: _ReplInput,
+    json_output: bool = False,
+    exit_code: int,
+) -> int:
+    """The wait loop (upstream ``background()``): read job -> inbox -> active
+    subagent, render a changed count (count 0 never renders), and drive every
+    run the service admits meanwhile (a wake's promoted round) through the
+    same terminal wait and terminal print as round one. A SIGINT here is the
+    wait face's cancel: the in-flight jobs are cancelled (rows deleted --
+    aborted work never replays) and the active subagent children are
+    interrupted; exit 2. The exit requires two consecutive empty reads (the
+    first may race the promote's inbox-consume -> run.started window)."""
+    discovered: list[str] = []
+    subscription_types = (_JSON_TYPES if json_output else _PREVIEW_TYPES) | frozenset({PY_RUN_STARTED})
+    last_count = -1
+    empty_polls = 0
+    async with app.bus.subscribe(session_id, subscription_types) as events:
+        printer = asyncio.create_task(
+            _print_events(events, json_output=json_output, session_id=session_id, on_run_started=discovered.append)
+        )
+        try:
+            while True:
+                if repl_input.consume_sigint():
+                    return await _cancel_pending_background(app, session_id)
+                try:
+                    if wait_hook is not None:
+                        wait_hook()
+                except KeyboardInterrupt:
+                    return await _cancel_pending_background(app, session_id)
+                # A wake's promoted round is driven exactly like round one
+                # (upstream re-enters the run loop per admitted run). Both
+                # feeds reach the driver: the subscribed run.started events
+                # and the live active-run read -- the read closes the event
+                # delivery race (the promote's consume-then-commit window).
+                candidates = discovered[:]
+                discovered.clear()
+                active = await app.service.active_run_id(session_id)
+                if active is not None:
+                    candidates.append(active)
+                drove = False
+                for run_id in candidates:
+                    if run_id in seen:
+                        continue
+                    seen.add(run_id)
+                    drove = True
+                    status = await _wait_terminal(app.service, run_id, wait_hook=wait_hook, repl_input=repl_input)
+                    if status is None:
+                        return _CLEANUP_EXIT_CODE
+                    _print_terminal(status, json_output=json_output, session_id=session_id)
+                    round_code = _ROUND_EXIT_CODES.get(status.status, 1)
+                    if round_code != 0 and exit_code == 0:
+                        exit_code = round_code
+                if drove:
+                    empty_polls = 0
+                    continue
+                jobs = await _pending_background(app, session_id, admitted_ms)
+                if not jobs:
+                    empty_polls += 1
+                    if empty_polls >= 2:
+                        return exit_code
+                    await asyncio.sleep(_POLL_INTERVAL_S)
+                    continue
+                empty_polls = 0
+                if len(jobs) != last_count:
+                    last_count = len(jobs)
+                    _render_waiting(session_id, jobs, json_output=json_output)
+                await asyncio.sleep(_POLL_INTERVAL_S)
+        finally:
+            printer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await printer
+
+
+async def _pending_background(app: App, session_id: str, admitted_ms: int) -> list[_PendingJob]:
+    """Upstream ``background()``'s three reads, first non-empty face wins:
+    this process's live shell handles (started at or after the first
+    admission), the pending inbox (a wake admitted but not yet promoted),
+    then the folded subagent observations (a child run still in flight)."""
+    handles = pending_background(session_id, admitted_ms)
+    if handles:
+        return [(handle.notification_id, handle.kind, handle.title, None) for handle in handles]
+    inbox = await app.service.inbox_list(session_id)
+    if inbox:
+        return [(row.inbox_id, "inbox", row.inbox_id, None) for row in inbox]
+    wakes = await app.service.pending_subagent_wakes(session_id)
+    return [
+        (observation.notification_id, "subagent", observation.description, observation.child_session_id)
+        for observation in wakes
+    ]
+
+
+def _render_waiting(session_id: str, jobs: list[_PendingJob], *, json_output: bool = False) -> None:
+    """One changed-count waiting announcement (upstream ``render.waiting``);
+    the JSON face is the ``background_wait`` line carrying the job list."""
+    if json_output:
+        _emit_json_line(
+            session_id,
+            "background_wait",
+            {"jobs": [{"id": job[0], "kind": job[1], "title": job[2]} for job in jobs]},
+        )
+        return
+    print(f"waiting for {len(jobs)} background job(s)", flush=True)
+
+
+async def _cancel_pending_background(app: App, session_id: str) -> int:
+    """The wait-phase SIGINT face (upstream Ctrl-C in the wait): cancel the
+    session's in-flight backgrounded shell calls (adapter cancelled,
+    settlement drained, durable rows deleted) and interrupt the active
+    subagent children, then answer the interrupt exit code."""
+    await cancel_background(session_id, database=app.database)
+    for observation in await app.service.pending_subagent_wakes(session_id):
+        with contextlib.suppress(Exception):
+            await app.service.interrupt(observation.child_session_id)
+    return 2
 
 
 async def _repl(
@@ -1486,6 +1666,7 @@ async def _run_round(
     wait_hook: Callable[[], None] | None,
     repl_input: _ReplInput,
     json_output: bool = False,
+    on_admit: Callable[[str], None] | None = None,
 ) -> RunStatus | None:
     """One run: subscribe first (no early events lost), prompt, then poll the
     durable terminal; the bus printer is preview-only, never authoritative.
@@ -1503,6 +1684,8 @@ async def _run_round(
         pump = asyncio.create_task(_pump_input(app, repl_input))
         try:
             ref = await app.service.prompt(session_id, text, request_id)
+            if on_admit is not None:
+                on_admit(ref.run_id)
             status = await _wait_terminal(app.service, ref.run_id, wait_hook=wait_hook, repl_input=repl_input)
             await asyncio.sleep(_DRAIN_S)
         finally:
@@ -1594,7 +1777,13 @@ def _emit_json_line(session_id: str, type_: str, payload: dict[str, object]) -> 
     sys.stdout.flush()
 
 
-async def _print_events(events: AsyncIterator[Event], *, json_output: bool = False, session_id: str = "") -> None:
+async def _print_events(
+    events: AsyncIterator[Event],
+    *,
+    json_output: bool = False,
+    session_id: str = "",
+    on_run_started: Callable[[str], None] | None = None,
+) -> None:
     """Live preview printer: deltas inline, the durable finalized value on its
     own ``[final]`` line (§4 L244/L246 preview -> override, distinguishable in
     the output), tool events single-line, and one pending-approval notice per
@@ -1613,6 +1802,12 @@ async def _print_events(events: AsyncIterator[Event], *, json_output: bool = Fal
     try:
         async for event in events:
             data = event.data
+            # T-C3-014: run admissions route to the wait loop's driver (a
+            # wake's promoted round), never to the preview output.
+            if event.type == PY_RUN_STARTED and on_run_started is not None:
+                if isinstance(data, RunStartedData):
+                    on_run_started(data.run_id)
+                continue
             if json_output:
                 if event.type == PY_TEXT_FINALIZED:
                     _emit_json_line(

@@ -836,9 +836,15 @@ async def test_r2_illegal_transitions_are_rejected_with_zero_residue(tmp_path: P
         await probe_illegal(
             staged("tool_requested", event_id="evt_9000000000000000000000000025"), "tool.requested after start"
         )
-        running_unknown = staged("tool_finished", event_id="evt_9000000000000000000000000026")
-        running_unknown["data"]["effect_status"] = "unknown"
-        await probe_illegal(running_unknown, "tool.finished succeeded/unknown from running")
+        # T-C3-014: running -> succeeded/unknown is now the LEGAL
+        # backgrounded-marker terminal (the pipeline answered with its
+        # bounded marker while the real effect is still in flight; the wake
+        # carries the result) -- covered end-to-end by the background-job
+        # suites. What stays illegal from running is claiming the effect
+        # never started (the started commit already proved it did).
+        running_not_started = staged("tool_finished", event_id="evt_9000000000000000000000000026")
+        running_not_started["data"]["effect_status"] = "not_started"
+        await probe_illegal(running_not_started, "tool.finished succeeded/not_started from running")
 
         # Anchor 6 (H=10, tool terminal): terminals are irreversible.
         await commit_legal("tool_finished")
