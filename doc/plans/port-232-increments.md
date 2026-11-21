@@ -21,7 +21,7 @@
 | 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | **T-C3-010**（✅ 已落地 2026-11-21，含评估集先行：四列 BEFORE 全灰→AFTER 全达；红集 7 契约+全量 2653P/8S/6E；四坑记档：CRLF/write_bytes、OpenSSL stdin prompt 挂死、b64 fixture 根治转录错、AsyncOpenAI `._client` 探针链） | P1 |
 | 3 | artifact+blob-store（本地 provider） | Med | M | **T-C3-011**（✅ 已落地 2026-11-21，`f27defa`：评估集先行[BEFORE P0 absent-partial+M1-M5 capability-absent]→红集 16+eval 6 全达[P0 probed/M1 round-tripped/M2 gated/M3 sandboxed/M4 stored/M5 protocol]；邻族同步 sdk 路由计数 33→42 操作/27→34 路径键+migrations head 0007；三门禁绿+全量 2675P/8S/6E；大坑记档：副本模块 seam[monkeypatch/isinstance 必须真模块]+blob utime 单时钟设计+wire `{"data"}` wrapper） | P2 |
 | 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | **T-C3-012**（✅ 已落地 2026-11-21，`1c1ebd2`：评估集先行[BEFORE P0 absent-partial+M1 锚绿+M2-M4 capability-absent]→红集 6+eval 5 全达[P0 probed/M2 enforced/M3 counted/M4 worded]；架构发现=invoker 丢 metadata→structured_output 载体；eval 探针缺陷三项随票修[state 枚举/structured_output/rg patch]；三门禁绿+全量 2686P/8S/6E） | P2 |
-| 14a | verbosity 默认低（token 面） | Med | S | **T-C3-013**（侦察固化 2026-11-21：py 零面从零移植；上游 verbosity.ts 58 行四 hook 默认 low+supportsVerbosity 门[gpt-6 全支持/-chat/-image 拒/gpt-5.[1-6]+mini/nano 正则]+openai-chat 顶层 `verbosity` wire[py=Chat Completions 协议]；落点=GenerationRequest 扩字段[response_format 房风]+maas 透传+内联门函数[无 plugin host]；裁剪=三通道解析+model/variant settings 短路[py 无该面]） | P2 |
+| 14a | verbosity 默认低（token 面） | Med | S | **T-C3-013**（✅ 已落地 2026-11-21，`998370a`：评估集先行 12ad698[BEFORE P0 absent-partial+M1-M3 absent]→红集 30+eval 4 景全达[probed/gated/preserved/wired]；门函数逐字含序+toLowerCase 归一折入；llm_call 管线节点不注入记档；schema llm.json 随字段再生；三门禁绿+全量 2720P/8S/6E；侦察：py 零面从零移植；上游 verbosity.ts 58 行四 hook 默认 low+supportsVerbosity 门[gpt-6 全支持/-chat/-image 拒/gpt-5.[1-6]+mini/nano 正则]+openai-chat 顶层 `verbosity` wire[py=Chat Completions 协议]；落点=GenerationRequest 扩字段[response_format 房风]+maas 透传+内联门函数[无 plugin host]；裁剪=三通道解析+model/variant settings 短路[py 无该面]） | P2 |
 | 12 | cli 非交互三读序等后台 job | Low-Med | S | T-C3-014 | P2 |
 | 7/10 | config-managed / codemode 四件 | Low | S/M | 暂缓 | — |
 
@@ -275,6 +275,13 @@
   4. 裁剪记档：①openAIModelID 三通道不移植（py 单 provider——Provider Protocol maas 固定，ModelRef.model 即 wire id，无 package 面）；②model.settings/variant.settings 短路不移植（py 无模型级配置面，未来 config 加面时补）；③py 阶段无用户 verbosity 入口（CLI/config 均无）——注入=门命中即 low，覆写保留为直构 GenerationRequest 的契约面测试。
   5. 红集：门矩阵蒸馏（支持 5+拒绝 13 用例参数化）+wire 透传断言（maas params 面——fake/捕获 create 先例待查 maas 测试族）+覆写保留（builder 层已设 high 不改写）+GenerationRequest 契约面（三值枚举+bool 拒+None 缺省）。
   6. 评估集先行 `test_verbosity_eval.py`：P0 能力探针（GenerationRequest 字段+maas params 透传面+门函数存在）+M 族（门矩阵抽测/覆写保留/wire 断言）——BEFORE capability-absent。
+- **落地（2026-11-21）**：
+  - 评估集先行 `12ad698`（BEFORE 4P 判读精准：P0 absent-partial 四新面 False+M1/M2/M3 capability-absent；`request_rejects_non_enum` BEFORE 即 True=extra=forbid 同断言，随字段落地转 Literal 语义）。
+  - 实现+红集同票 `998370a`（worktree p28-s1，8 文件 +287/-0 纯增）：新 `ai/verbosity.py`（`default_text_verbosity`——supportsVerbosity L45-50 **逐字含序**[gpt-6 先于 -chat/-image 拒：`gpt-5.5-chat` 虽匹配 minor 正则仍拒]+L53 `toLowerCase()` 归一折入+返回 `Literal["low","medium","high"]|None`[Literal 签名免两调用点 cast——mypy 面]）；`GenerationRequest.text_verbosity`（T-C1-084 扩字段房风，None=未设、组装点只填洞不覆写=L28 早退语义）；maas `_attempt` 顶层 `params["verbosity"]`；两组装点注入（`ContextBuilder.build`+`llm_summarizer`）。
+  - **组装点定谳**：src 内 `GenerationRequest(` 构造共三处——context.py/llm_summarizer.py 两处注入；`orchestrator/llm_call.py`（管线 llm_call 工具节点面）**不注入**——上游 hook 只挂 session 请求（context/compaction/generate/title），不挂管线工具。
+  - **schema-lock 面发现（扩字段 checklist 新项）**：契约字段扩字段必带 `doc/reference/schema/llm.json` 再生（`tools/r5/generate_schema_artifacts.py`；+17 行恰为字段 enum/null anyOf）——首跑全量唯一 failed=该 artifact 漂移锁定（test_schema_lock 151P 复绿），属预期面非缺陷；再生后复跑全量精确 2720P。
+  - 红集 30 测：`tests/integration/test_verbosity.py`（28：契约面 3+门矩阵参数化 20[支持 11 含边界 gpt-5 裸/-mini/-nano/5.6 尾/gpt-6/`openai/` 前缀；拒绝 9 含 gpt-50/gpt-5-max/xgpt-5.5]+case 归一 1+builder 2+summarizer 2）+`test_ai_adapter.py` wire 2（set→`body["verbosity"]=="low"`/unset→无键；make_request **条件展开扩参**——None 不传键，BEFORE extra=forbid 下既有 43 测零破，红集扩参房风新条目）。红验证：adapter 恰 1 红（omitted 测恒绿=防呆面）+新文件 collection error。
+  - AFTER：eval 4 景全达（P0 probed 五指标/M1 gated/M2 preserved/M3 wired）；三门禁全仓绿（659 formatted/278 mypy files）；全量 **2720P/8S/6E**（基线 2690[2686+eval 4]+28+2；6E=test_cli_install 恒在）。
 
 ## 执行纪律
 
