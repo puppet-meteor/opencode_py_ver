@@ -20,7 +20,7 @@
 | 11 | server 面 automation/job 路由 | Med | M | **T-C3-009**（✅ 已落地 2026-11-21，含评估集先行：六列 BEFORE 全灰→AFTER 全达；红集 14 契约+全量 2641P/8S/6E） | P1 |
 | 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | **T-C3-010**（✅ 已落地 2026-11-21，含评估集先行：四列 BEFORE 全灰→AFTER 全达；红集 7 契约+全量 2653P/8S/6E；四坑记档：CRLF/write_bytes、OpenSSL stdin prompt 挂死、b64 fixture 根治转录错、AsyncOpenAI `._client` 探针链） | P1 |
 | 3 | artifact+blob-store（本地 provider） | Med | M | **T-C3-011**（✅ 已落地 2026-11-21，`f27defa`：评估集先行[BEFORE P0 absent-partial+M1-M5 capability-absent]→红集 16+eval 6 全达[P0 probed/M1 round-tripped/M2 gated/M3 sandboxed/M4 stored/M5 protocol]；邻族同步 sdk 路由计数 33→42 操作/27→34 路径键+migrations head 0007；三门禁绿+全量 2675P/8S/6E；大坑记档：副本模块 seam[monkeypatch/isinstance 必须真模块]+blob utime 单时钟设计+wire `{"data"}` wrapper） | P2 |
-| 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | T-C3-012 | P2 |
+| 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | **T-C3-012**（侦察固化 2026-11-21：py 已带 bounded 核心[limit+1/slice/truncated/grep 30s]——真缺口仅四项：metadata count/matches 计数、glob `"undefined"/"null"` path 矫正、glob 30s 内联 deadline、坏 glob 校验面[pattern 结构校验+include 捕 rg stderr]；记档偏差三项[permission 序/symlink 外链/stdlib 校验差]随段） | P2 |
 | 14a | verbosity 默认低（token 面） | Med | S | T-C3-013 | P2 |
 | 12 | cli 非交互三读序等后台 job | Low-Med | S | T-C3-014 | P2 |
 | 7/10 | config-managed / codemode 四件 | Low | S/M | 暂缓 | — |
@@ -246,6 +246,17 @@
   - eval 修正随票：`_request` 四元组返 raw（view 返 HTML）、traversal 接受 422（上游 Invalid→422 映射）、P0 `_make_api` http 子目录 mkdir（alembic「unable to open database file」根因=父目录缺，非 migration 错）、路由断言归一化 Starlette route.path 的 `:path` 转换器后缀、M2 flag 恢复入 finally（防中途失败污染后续测试）。
   - 邻族同步：`test_sdk_client` 路由计数 33→42 操作/27→34 路径键（T-C3-009 房风只扩不改名）；`test_migrations` head 0007+两处表集加 artifact。
   - AFTER 六列全达（P0 probed 九指标/M1 round-tripped 七指标/M2 gated/M3 sandboxed 七指标/M4 stored 六指标/M5 protocol 四指标）；邻族 107P（httpapi_server+automation http eval+sdk 20+migrations 9）；三门禁全仓绿（655 formatted/274 mypy files）；全量 **2675P/8S/6E**（基线 2653+6 eval+16 红集；6E=test_cli_install 恒在）。
+
+### T-C3-012 tool/search bounded(limit+1)+timeout（簇4）——侦察固化 2026-11-21
+- **py 已有大面（对表结论，本票非从零移植）**：glob/grep 两工具已带 limit+1 取数+slice+truncated 标记+截断文案（`test_tool_static_trio.py` glob 10+grep 17 测覆盖）；grep 30s 超时同文案（GREP_TIMEOUT_S）；`Search path does not exist`/`is not a directory`；file-vs-dir 双 path；空 pattern 拒；invalid regex 面三诊断；`No files found`/`No matches found`/`Found N matches` 渲染；hidden 对位；.git 排除；钳制容错（locked sibling code-2 无 pattern-error 容忍）。
+- 上游面（2.3.2）：**tool/search.ts（28 行）**=`pathType`（typeFollowing+NotFound→ToolFailure）+`bounded(limit, search)`=search(**limit+1**)→`timeoutOrElse`（DEFAULT_SEARCH_TIMEOUT_MS=30s→ToolFailure "Search timed out after 30 seconds. Consider using a more specific path or pattern."）→`map(items → {items: slice(0,limit), truncated: len>limit})`；**filesystem.ts L66-67**=DEFAULT_SEARCH_LIMIT=100/DEFAULT_SEARCH_TIMEOUT_MS=30_000+Glob/GrepInput 加 `limit?`(PositiveInt)；**glob.ts（126 行）**=execute 链：`"undefined"/"null"` path 矫正（L74 模型怪癖护栏）→resolve directory→非目录→"Search path is not a directory"→bounded(ripgrep.glob)→metadata **`{count, truncated}`**+InvalidGlobError→"Invalid glob in pattern <detail>"；**grep.ts（160 行）**=file→cwd=dirname+file=basename→bounded(ripgrep.grep)→metadata **`{matches, truncated}`**+InvalidGlobError→"Invalid glob in include <detail>"/InvalidPatternError→"Invalid regex pattern: <detail>"；**测试族 tool-search.test.ts（393 行 10 面）**=坏 glob pattern/include 精确文案（"unclosed character class; missing ']'"）/hidden×limit 矩阵（metadata count 精确断言）/101 文件默认 limit→100+truncated/空 pattern/文件与目录 path/no matches（matches:0）/invalid regex/external_directory 权限序/missing path/glob file-as-path/symlink 外链（win32 skip）。
+- **四真缺口（本票范围）**：
+  1. **D1 metadata 计数字段**：glob 补 `count`=len(shown)、grep 补 `matches`=len(display[:limit])（上游= entries/matches slice 后长度；py 现两处只有 `{truncated}`——既有测试只断言文本面，加键为增量不破面）。
+  2. **D2 glob `"undefined"/"null"` path 矫正**：`_execute` 入口处字面量→缺省 `"."`（上游 glob.ts L74；grep.ts 无此面）。
+  3. **D3 glob 30s 内联 deadline**：os.walk/iglob 迭代循环 monotonic 时钟检查（起点=execute 进入；超时→`_failure(TOOL_FAILED, "Search timed out after 30 seconds. Consider using a more specific path or pattern.")`；常量 GLOB_TIMEOUT_S=30.0 对位 DEFAULT_SEARCH_TIMEOUT_MS）。
+  4. **D4 坏 glob 校验面**：glob pattern 结构校验（`[` 未闭合→"Invalid glob in pattern '<p>': unclosed character class; missing ']'"，文案形状逐字对位 rg）；grep include 捕 rg exit-2 stderr 含 "invalid glob"→"Invalid glob in include <detail>"（现走「code-2 无 pattern-error 容忍」路径会吞掉）。
+- **记档偏差（不补）**：①permission/external_directory 断言序+symlink 外链免批面（py=roots containment 架构，无 Permission.assert 序列面）；②glob 无 ripgrep 子进程→超时=内联 deadline 非子进程 kill（语义等价：不可无限时）；③stdlib glob 无 rg 全语法校验——结构校验仅对 unclosed character class 精确复刻（上游测试族唯一坏 pattern 用例），其余坏 pattern 自然空结果=「No files found」。
+- py 落点决策（5 条）：①落点=既有 `tools/builtin/glob.py`+`grep.py` 修改，无新 src 文件（search.ts 的 bounded 抽象在 py 折叠为两工具内联已实现面+本票增量）；②D1 计数=slice 后长度（对位上游 entries.length）；③D2 矫正点=path 取值处（`input.get("path", ".")` 前）；④D3=循环内 `time.monotonic()` 检查每步（测试=monkeypatch 注入短时限或假钟）；⑤红集=`test_tool_static_trio.py` 追加 5-6 测（坏 glob 两支/metadata 两支/undefined-null 矫正/glob 超时）+评估集先行新文件 `test_search_tools_eval.py`（P0 四能力探针[metadata count/matches 键+undefined-null 矫正+glob 超时面+坏 glob 面]+M 族——BEFORE absent-partial）。
 
 ## 执行纪律
 
