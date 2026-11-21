@@ -19,7 +19,7 @@
 | 8 | db storage-failure 分类+batch 分批 | Med | S | **T-C3-008**（✅ 已落地，含评估集先行：七列 BEFORE 全灰→AFTER 全达零探针修正；红集 14 契约+全量 2621P/8S/6E） | P1 |
 | 11 | server 面 automation/job 路由 | Med | M | **T-C3-009**（✅ 已落地 2026-11-21，含评估集先行：六列 BEFORE 全灰→AFTER 全达；红集 14 契约+全量 2641P/8S/6E） | P1 |
 | 14b | provider mTLS 客户端证书 | Med（内网自签网关） | S-M | **T-C3-010**（✅ 已落地 2026-11-21，含评估集先行：四列 BEFORE 全灰→AFTER 全达；红集 7 契约+全量 2653P/8S/6E；四坑记档：CRLF/write_bytes、OpenSSL stdin prompt 挂死、b64 fixture 根治转录错、AsyncOpenAI `._client` 探针链） | P1 |
-| 3 | artifact+blob-store（本地 provider） | Med | M | **T-C3-011**（侦察固化 2026-11-21：上游双 blob 线分清——文件 blob-store ≠ session/blob DB 面[后者另立票]；artifact 面=schema 契约+core 571 行[KV 记录/local provider staging+backup 原子换/provider 注册表/校验/viewURL/mime 查表+魔数]+server 七路由+blob raw 路由[ETag/304/Range]+四工具；py 落点 9 决策随段——artifact/ 目录包+migration 0007 表+进程级 flag 门+util/mime+四 adapter+裁剪五项记档） | P2 |
+| 3 | artifact+blob-store（本地 provider） | Med | M | **T-C3-011**（✅ 已落地 2026-11-21，`f27defa`：评估集先行[BEFORE P0 absent-partial+M1-M5 capability-absent]→红集 16+eval 6 全达[P0 probed/M1 round-tripped/M2 gated/M3 sandboxed/M4 stored/M5 protocol]；邻族同步 sdk 路由计数 33→42 操作/27→34 路径键+migrations head 0007；三门禁绿+全量 2675P/8S/6E；大坑记档：副本模块 seam[monkeypatch/isinstance 必须真模块]+blob utime 单时钟设计+wire `{"data"}` wrapper） | P2 |
 | 4 | tool/search bounded(limit+1)+timeout | Low-Med | S | T-C3-012 | P2 |
 | 14a | verbosity 默认低（token 面） | Med | S | T-C3-013 | P2 |
 | 12 | cli 非交互三读序等后台 job | Low-Med | S | T-C3-014 | P2 |
@@ -238,6 +238,14 @@
   7. **blob raw 路由**：`GET /api/experimental/blob/{id}`——ETag=`"<id>"`+If-None-Match 304+单 Range 206/多 Range 416+`cache-control: private, max-age=60`+download 头（FileResponse/StreamingResponse 按需）。
   8. **裁剪记档**：①Console provider（opencode-artifacts.ts——依赖 IntegrationConnection+ConsoleAccess，py 无 Console 集成面；provider 注册表 transform(editor) 语义仍在 service 内实现，仅无 console 内建远程 provider）；②video-generation.ts（依赖 Generate.Service video 面+video_generate flag——py 无视频生成线；blob-store 写方缺位=清扫/raw 读/原子写仍可测，写方=未来 video 票）；③session/blob.ts DB media_blob 面（独立线——media_blob flag、SHA-256、blob/blob_ref 表、externalize/hydrate/refcount——**另立票**）；④util/artifact.ts kind 表+app/workspaces/files+gui-plugins（GUI 专用）；⑤plugin SDK effect/promise artifact 面（py 无 plugin 宿主）。
   9. **测试**：红集蒸馏上游 2+1 族——flag 门（off→DisabledError+四工具不注册）/自定义 provider 注册+default 覆盖+override 独立存/CRUD 全链（update 同 ID 同 URL+delete 后 404）/traversal 拒/view 语义（308/CSP/相对资产/sessionless）/跨项目隔离（directory 直配面）/create 描述两行；blob 面=写读原子（.part 不留）+首 64B 魔数 mime+7d 保留清扫（时钟注入）+raw 路由（ETag/304/Range 206/416/416 多 Range）；评估集先行（P0 模块能力探针+M 族：CRUD 映射/flag 门/view 语义/blob 原子+清扫/raw 协议——BEFORE capability-absent）。
+- **落地（2026-11-21）**：
+  - 评估集先行 `c2ef81a`（BEFORE 6P 判读精准：P0 absent-partial[九指标全 False——模块/表/参数/路由全缺]+M1-M5 capability-absent）。
+  - 实现+红集同票 `f27defa`（worktree p26-s1）：migration 0007（artifact 表+directory 索引+downgrade 拒）+`util/mime.py`（魔数表逐字对位含 ftyp brand 走查）+`blob_store.py`（.part+fsync+rename 原子写；**时钟设计=write 时 `os.utime` 把 mtime 设为注入时钟值——write Info/read expires_at/sweep 三面单逻辑时钟一致，无侧表**）+`artifact/service.py`（ARTIFACTS_ENABLED import 期 flags 链+错误族[NotFound/ProviderNotFound 继 LookupError，Invalid 继 ValueError 带 reason/field]+normalize/resolveEntry+local provider staging→backup→正位→回滚 原子换+注册表/provider_prompt_text 两行渲染+CRUD+checkSession 写入时校验+local_file 穿越拒）+`tools/builtin/artifact.py`（TOOL_SPECS 四路径字面量+adapters(service=) 工厂 flag off→[]；idempotency_support=read 声明 pure）+app.py 九路由（`_gate_artifacts` 动态读真模块常量；view 308+`{file_path:path}`+CSP sandbox allow-scripts+nosniff；blob raw ETag/304/单 Range 206/416+`private, max-age=60`+attachment）。
+  - **wire 契约修正记档**：TS server 面=`{"data": ...}` wrapper（automation 房风+上游 server test `providers.data`/`created.data`）——红集 body 解包取 `["data"]`；view/blob 路由返 raw bytes 非 JSON（断言用 `_raw`）。
+  - **本票最大坑：副本模块 seam**——`_load`/`_find` 的 `module_from_spec+exec_module` 每次造**新模块对象**：存在性探针可用，但 monkeypatch 属性（flag 翻转）、异常类 isinstance、构造服务必须 `importlib.import_module` **真模块**（patch 副本属性不达 app.py/service 内读的真模块常量；副本类 ArtifactNotFoundError 不被 handler 的真模块类 except 捕→500）。红集/eval 全部统一 `_real()` 帮手。
+  - eval 修正随票：`_request` 四元组返 raw（view 返 HTML）、traversal 接受 422（上游 Invalid→422 映射）、P0 `_make_api` http 子目录 mkdir（alembic「unable to open database file」根因=父目录缺，非 migration 错）、路由断言归一化 Starlette route.path 的 `:path` 转换器后缀、M2 flag 恢复入 finally（防中途失败污染后续测试）。
+  - 邻族同步：`test_sdk_client` 路由计数 33→42 操作/27→34 路径键（T-C3-009 房风只扩不改名）；`test_migrations` head 0007+两处表集加 artifact。
+  - AFTER 六列全达（P0 probed 九指标/M1 round-tripped 七指标/M2 gated/M3 sandboxed 七指标/M4 stored 六指标/M5 protocol 四指标）；邻族 107P（httpapi_server+automation http eval+sdk 20+migrations 9）；三门禁全仓绿（655 formatted/274 mypy files）；全量 **2675P/8S/6E**（基线 2653+6 eval+16 红集；6E=test_cli_install 恒在）。
 
 ## 执行纪律
 
