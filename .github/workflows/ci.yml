@@ -14,11 +14,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # 25 -> 30 -> 40 (T-C3-011/-012, 2026-11-21): windows runner variance now
-    # spans 18.5min (f27defa pass) to 30.1min (26ca85a docs-only push hit
-    # the 30min ceiling) on a 2686-test suite -- same code, different runner.
-    # 40min = 1.3x the observed worst; a real hang is still cut off there.
-    timeout-minutes: 40
+    # 25 -> 30 -> 40 -> 55 (T-C3-011/-012, 2026-11-21): windows runner pool
+    # degradation, not suite growth -- ubuntu holds at ~8.4min and local full
+    # runs at 14.5min while the windows Test suite step took 18.5min (f27defa),
+    # 25.1 (370bd16), 30.1 (26ca85a), 39.8 (df47824), each hitting its ceiling.
+    # 55min covers the observed worst with margin; a real hang is still cut.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
