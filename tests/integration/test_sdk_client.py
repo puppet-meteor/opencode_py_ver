@@ -918,6 +918,13 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
     /api/experimental/automation/{automation_id}, POST its /pause and
     /resume, and GET /api/experimental/job — twenty-seven distinct path
     keys in total.
+
+    T-C3-011 adds the experimental artifact/blob face as operations
+    thirty-four through forty-two: GET /api/experimental/artifacts/
+    providers, GET+POST /api/experimental/artifacts, GET+PATCH+DELETE
+    /api/experimental/artifacts/{artifact_id}, GET its /view redirect and
+    /view/{file_path} file face, and GET /api/experimental/blob/{blob_id}
+    — thirty-four distinct path keys in total.
     """
     request = urllib.request.Request(
         running.base + "/openapi.json", headers={"Authorization": f"Bearer {_TOKEN}"}, method="GET"
@@ -957,6 +964,12 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         "/api/experimental/automation/{automation_id}/pause",
         "/api/experimental/automation/{automation_id}/resume",
         "/api/experimental/job",
+        "/api/experimental/artifacts/providers",
+        "/api/experimental/artifacts",
+        "/api/experimental/artifacts/{artifact_id}",
+        "/api/experimental/artifacts/{artifact_id}/view",
+        "/api/experimental/artifacts/{artifact_id}/view/{file_path}",
+        "/api/experimental/blob/{blob_id}",
     }
     operations = {
         (path, method)
@@ -965,7 +978,7 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         for method in item
         if method in ("get", "post", "delete", "patch")
     }
-    assert len(operations) == 33
+    assert len(operations) == 42
     for path, method in (
         ("/session", "post"),
         ("/session", "get"),
@@ -995,6 +1008,15 @@ def test_the_runtime_openapi_document_answers_the_twenty_five_routes(running: _R
         ("/api/experimental/automation/{automation_id}/pause", "post"),
         ("/api/experimental/automation/{automation_id}/resume", "post"),
         ("/api/experimental/job", "get"),
+        ("/api/experimental/artifacts/providers", "get"),
+        ("/api/experimental/artifacts", "post"),
+        ("/api/experimental/artifacts", "get"),
+        ("/api/experimental/artifacts/{artifact_id}", "get"),
+        ("/api/experimental/artifacts/{artifact_id}", "patch"),
+        ("/api/experimental/artifacts/{artifact_id}", "delete"),
+        ("/api/experimental/artifacts/{artifact_id}/view", "get"),
+        ("/api/experimental/artifacts/{artifact_id}/view/{file_path}", "get"),
+        ("/api/experimental/blob/{blob_id}", "get"),
     ):
         assert isinstance(paths[path], dict) and method in paths[path], path
 

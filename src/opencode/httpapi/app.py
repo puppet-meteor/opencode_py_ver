@@ -183,6 +183,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import sys
 from collections.abc import AsyncIterator, Callable
@@ -197,6 +198,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from opencode.app import App
+from opencode.artifact import service as _artifact_service_module
+from opencode.artifact.service import (
+    ArtifactInvalidError,
+    ArtifactNotFoundError,
+    ArtifactProviderError,
+    ArtifactProviderNotFoundError,
+    ArtifactService,
+)
 from opencode.automation.service import (
     EVENT_AUTOMATIONS_ENABLED,
     AutomationNotFoundError,
@@ -991,7 +1000,9 @@ def _interrupt_wire(receipt: InterruptReceipt) -> JsonObject:
     }
 
 
-def create_app(app: App, *, token: str, automation: AutomationService | None = None) -> FastAPI:
+def create_app(
+    app: App, *, token: str, automation: AutomationService | None = None, artifact: ArtifactService | None = None
+) -> FastAPI:
     """Build the FastAPI transport over one App composition (the public face).
 
     ``token`` is the already-validated single-user token (the host reads and
@@ -1551,6 +1562,143 @@ def create_app(app: App, *, token: str, automation: AutomationService | None = N
                     continue
             items.append(_background_job_wire(stored))
         return _json_response({"data": items})
+
+    # Upstream server/handlers/artifact.ts (242 lines) + handlers/blob.ts
+    # (55 lines); the nine banked decisions in doc/plans/port-232-increments.md
+    # T-C3-011. The per-directory flag gate is the process-level
+    # ARTIFACTS_ENABLED read live off the service module (tests flip it), the
+    # location chain folds to the record's stored directory, and the view
+    # route serves files from the local provider only (upstream readLocalFile).
+
+    def _gate_artifacts() -> None:
+        if not getattr(_artifact_service_module, "ARTIFACTS_ENABLED", False):
+            raise _forbidden("The artifacts flag is off (OPENCODE_FLAGS=-artifacts)")
+
+    def _require_artifact() -> ArtifactService:
+        if artifact is None:
+            raise _TransportError(
+                501,
+                CoreError(
+                    code=CoreErrorCode.UNSUPPORTED_CAPABILITY,
+                    message="the artifact service is not wired into this server",
+                    retryable=False,
+                ),
+            )
+        return artifact
+
+    async def _artifact_call(face: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            method = getattr(_require_artifact(), face)
+            return await method(*args, **kwargs)
+        except (ArtifactNotFoundError, ArtifactProviderNotFoundError) as error:
+            raise _not_found(str(error)) from None
+        except ArtifactInvalidError as error:
+            raise _TransportError(422, _validation(getattr(error, "reason", str(error)))) from None
+
+    @api.get("/api/experimental/artifacts/providers")
+    async def artifact_providers() -> Response:
+        _gate_artifacts()
+        return _json_response({"data": cast("JsonValue", _require_artifact().providers())})
+
+    @api.get("/api/experimental/artifacts")
+    async def artifact_list(request: Request, session_id: str | None = None, provider: str | None = None) -> Response:
+        """List with the isolation fold: another directory sees nothing."""
+        _gate_artifacts()
+        directory = request.headers.get("x-opencode-directory")
+        rows = await _artifact_call("list", session_id=session_id, provider=provider, directory=directory)
+        return _json_response({"data": rows})
+
+    @api.post("/api/experimental/artifacts")
+    async def artifact_create(request: Request) -> Response:
+        _gate_artifacts()
+        payload = await _read_json_object(request)
+        info = await _artifact_call("create", payload)
+        return _json_response({"data": info})
+
+    @api.get("/api/experimental/artifacts/{artifact_id}")
+    async def artifact_get(artifact_id: str) -> Response:
+        _gate_artifacts()
+        return _json_response({"data": await _artifact_call("get", artifact_id)})
+
+    @api.patch("/api/experimental/artifacts/{artifact_id}")
+    async def artifact_update(artifact_id: str, request: Request) -> Response:
+        _gate_artifacts()
+        payload = await _read_json_object(request)
+        return _json_response({"data": await _artifact_call("update", artifact_id, payload)})
+
+    @api.delete("/api/experimental/artifacts/{artifact_id}")
+    async def artifact_delete(artifact_id: str) -> Response:
+        _gate_artifacts()
+        await _artifact_call("delete", artifact_id)
+        return Response(status_code=204)
+
+    @api.get("/api/experimental/artifacts/{artifact_id}/view")
+    async def artifact_view_redirect(artifact_id: str) -> Response:
+        """The trailing-slash 308 so relative ``./assets/*`` resolves."""
+        _gate_artifacts()
+        return Response(
+            status_code=308,
+            headers={"location": f"/api/experimental/artifacts/{artifact_id}/view/"},
+        )
+
+    @api.get("/api/experimental/artifacts/{artifact_id}/view/{file_path:path}")
+    async def artifact_view_file(artifact_id: str, file_path: str) -> Response:
+        """Serve one local-provider file inside the sandboxed origin."""
+        _gate_artifacts()
+        try:
+            content = await _require_artifact().get(artifact_id)
+            rel = file_path or cast(str, content["info"]["entry"])
+            data, mime = _require_artifact().local_file(artifact_id, rel)
+        except (ArtifactNotFoundError, ArtifactProviderError) as error:
+            raise _not_found(str(error)) from None
+        return Response(
+            content=data,
+            media_type=mime,
+            headers={
+                "content-security-policy": "sandbox allow-scripts",
+                "x-content-type-options": "nosniff",
+            },
+        )
+
+    @api.get("/api/experimental/blob/{blob_id}")
+    async def blob_get(request: Request, blob_id: str) -> Response:
+        """The raw blob route: ETag/304, one Range -> 206, else 416.
+
+        The ID names one immutable blob, so the etag is the quoted id and
+        the cache window is the upstream private minute.
+        """
+        store = _require_artifact().blobs
+        try:
+            info = store.read(blob_id)
+            data = store.read_bytes(blob_id)
+        except LookupError as error:
+            raise _not_found(str(error)) from None
+        headers = {
+            "etag": f'"{blob_id}"',
+            "cache-control": "private, max-age=60",
+            "content-disposition": f'attachment; filename="{blob_id}"',
+        }
+        if request.headers.get("if-none-match") == f'"{blob_id}"':
+            return Response(status_code=304, headers=headers)
+        total = len(data)
+        range_header = request.headers.get("range")
+        if range_header is not None:
+            match = re.match(r"^bytes=(\d+)-(\d*)$", range_header.strip())
+            start = int(match.group(1)) if match else total
+            end = int(match.group(2)) if match and match.group(2) else (total - 1 if match else -1)
+            if not match or start > end or start >= total:
+                return Response(
+                    status_code=416,
+                    headers={**headers, "content-range": f"bytes */{total}"},
+                )
+            chunk = data[start : end + 1]
+            return Response(
+                content=chunk,
+                status_code=206,
+                media_type=str(info["mime"]),
+                headers={**headers, "content-range": f"bytes {start}-{end}/{total}"},
+            )
+        return Response(content=data, media_type=str(info["mime"]), headers=headers)
 
     api.add_exception_handler(_TransportError, _transport_error_handler)
     api.add_exception_handler(StoreError, _store_error_handler)

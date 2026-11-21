@@ -31,6 +31,7 @@ Measured seams (banked in doc/plans/port-232-increments.md, T-C3-011):
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import inspect
 import json
@@ -90,7 +91,10 @@ async def _make_service(tmp_path: Path) -> tuple[Any, Any]:
     db_path = tmp_path / "probe.db"
     _require_success(_upgrade_head(db_path))
     app = App(db_path, working_dir=str(tmp_path / "work"))
-    module = _find("opencode.artifact.service")
+    try:
+        module = importlib.import_module("opencode.artifact.service")
+    except ImportError:
+        module = None
     if module is None or not hasattr(module, "ArtifactService"):
         await _close(app)
         raise _CapabilityAbsent("opencode.artifact.service.ArtifactService missing")
@@ -118,7 +122,7 @@ async def _request(
     *,
     body: dict[str, Any] | None = None,
     extra_headers: list[tuple[bytes, bytes]] | None = None,
-) -> tuple[int, dict[bytes, bytes], Any]:
+) -> tuple[int, dict[bytes, bytes], Any, bytes]:
     raw = _json_body(body) if body is not None else None
     status, headers, payload, _receive = await _asgi_request(
         api, method, path, token=_TOKEN, body=raw, extra_headers=extra_headers
@@ -129,7 +133,7 @@ async def _request(
             decoded = json.loads(payload)
         except (ValueError, UnicodeDecodeError):
             decoded = None
-    return status, headers, decoded
+    return status, headers, decoded, payload
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +177,14 @@ async def test_p0_capability(tmp_path: Path) -> None:
         metrics["artifact_table"] = bool(rows)
         metrics["create_app_param"] = "artifact" in inspect.signature(create_app).parameters
         if metrics["create_app_param"]:
-            api, app, _service = await _make_api(tmp_path / "http")
+            http_dir = tmp_path / "http"
+            http_dir.mkdir()
+            api, app, _service = await _make_api(http_dir)
             try:
-                seen = {getattr(route, "path", "") for route in api.router.routes}
+                # Starlette keeps the converter suffix on route.path
+                # (``{file_path:path}``); strip it so the semantic face is
+                # what the probe compares.
+                seen = {getattr(route, "path", "").replace(":path}", "}") for route in api.router.routes}
                 metrics["artifact_routes"] = {
                     "/api/experimental/artifacts",
                     "/api/experimental/artifacts/{artifact_id}/view/{file_path}",
@@ -243,27 +252,29 @@ async def test_m2_flag_gate(tmp_path: Path) -> None:
     status = "capability-absent"
     try:
         api, app, service = await _make_api(tmp_path)
-        module = _find("opencode.artifact.service")
+        module = importlib.import_module("opencode.artifact.service")
         try:
             original = getattr(cast(Any, module), "ARTIFACTS_ENABLED", None)
             if original is None:
                 raise _CapabilityAbsent("ARTIFACTS_ENABLED constant missing")
             cast(Any, module).ARTIFACTS_ENABLED = False
-            blocked = False
             try:
-                await service.create({"title": "nope", "files": {"index.html": "x"}})
-            except Exception as error:
-                blocked = "disabl" in type(error).__name__.lower() or "disabl" in str(error).lower()
-            metrics["disabled_create_raises"] = blocked
-            http_status, _headers, _body = await _request(
-                api,
-                "POST",
-                "/api/experimental/artifacts",
-                body={"title": "nope", "files": {"index.html": "x"}},
-            )
-            metrics["http_403_when_disabled"] = http_status == 403
-            status = "gated" if all(metrics.values()) else "drifting"
-            cast(Any, module).ARTIFACTS_ENABLED = original
+                blocked = False
+                try:
+                    await service.create({"title": "nope", "files": {"index.html": "x"}})
+                except Exception as error:
+                    blocked = "disabl" in type(error).__name__.lower() or "disabl" in str(error).lower()
+                metrics["disabled_create_raises"] = blocked
+                http_status, _headers, _body, _raw = await _request(
+                    api,
+                    "POST",
+                    "/api/experimental/artifacts",
+                    body={"title": "nope", "files": {"index.html": "x"}},
+                )
+                metrics["http_403_when_disabled"] = http_status == 403
+                status = "gated" if all(metrics.values()) else "drifting"
+            finally:
+                cast(Any, module).ARTIFACTS_ENABLED = original
         finally:
             await _close(app)
     except _CapabilityAbsent:
@@ -293,22 +304,24 @@ async def test_m3_view_semantics(tmp_path: Path) -> None:
                 }
             )
             base = str(info.get("url", ""))  # .../view/
-            redirect_status, redirect_headers, _body = await _request(api, "GET", base.rstrip("/"))
+            redirect_status, redirect_headers, _body, _raw = await _request(api, "GET", base.rstrip("/"))
             metrics["trailing_slash_308"] = redirect_status == 308 and base.encode() in [
                 value for _k, value in redirect_headers.items() if _k == b"location"
             ]
-            entry_status, entry_headers, entry_body = await _request(api, "GET", base)
+            entry_status, entry_headers, _entry_body, _raw = await _request(api, "GET", base)
             csp_values = [v for k, v in entry_headers.items() if k == b"content-security-policy"]
             metrics["entry_200"] = entry_status == 200
             metrics["csp_sandbox"] = csp_values == [b"sandbox allow-scripts"]
             metrics["nosniff"] = any(
                 v == b"nosniff" for k, v in entry_headers.items() if k == b"x-content-type-options"
             )
-            metrics["html_served"] = "<h1>v1</h1>" in str(entry_body or "")
-            asset_status, _asset_headers, asset_body = await _request(api, "GET", base + "assets/app.js")
-            metrics["relative_asset_served"] = asset_status == 200 and "window.VERSION = 1" in str(asset_body or "")
-            traversal_status, _t_headers, _t_body = await _request(api, "GET", base + "%2e%2e/escape.html")
-            metrics["traversal_rejected"] = traversal_status in (400, 404)
+            metrics["html_served"] = "<h1>v1</h1>" in _raw.decode("utf-8", "replace")
+            asset_status, _asset_headers, _asset_body, _raw = await _request(api, "GET", base + "assets/app.js")
+            metrics["relative_asset_served"] = asset_status == 200 and "window.VERSION = 1" in _raw.decode(
+                "utf-8", "replace"
+            )
+            traversal_status, _t_headers, _t_body, _raw = await _request(api, "GET", base + "%2e%2e/escape.html")
+            metrics["traversal_rejected"] = traversal_status in (400, 404, 422)
             status = "sandboxed" if all(metrics.values()) else "drifting"
         finally:
             await _close(app)
@@ -378,16 +391,18 @@ async def test_m5_blob_http_protocol(tmp_path: Path) -> None:
             store = cast(Any, module).BlobStore(data_dir=str(data_root), now_ms=lambda: _FIXED_NOW_MS)
             store.write(_BLOB_ID, _PNG_BYTES)
             path = f"/api/experimental/blob/{_BLOB_ID}"
-            ok_status, ok_headers, _body = await _request(api, "GET", path)
+            ok_status, ok_headers, _body, _raw = await _request(api, "GET", path)
             etag = next((v for k, v in ok_headers.items() if k == b"etag"), b"")
             metrics["get_200_etagged"] = ok_status == 200 and etag == f'"{_BLOB_ID}"'.encode()
-            not_modified, _nm_headers, _nm_body = await _request(
+            not_modified, _nm_headers, _nm_body, _raw = await _request(
                 api, "GET", path, extra_headers=[(b"if-none-match", etag)]
             )
             metrics["if_none_match_304"] = not_modified == 304
-            ranged, _r_headers, ranged_body = await _request(api, "GET", path, extra_headers=[(b"range", b"bytes=0-3")])
-            metrics["single_range_206"] = ranged == 206 and ranged_body == _PNG_BYTES[:4]
-            unsatisfiable, _u_headers, _u_body = await _request(
+            ranged, _r_headers, _ranged_body, _raw = await _request(
+                api, "GET", path, extra_headers=[(b"range", b"bytes=0-3")]
+            )
+            metrics["single_range_206"] = ranged == 206 and _raw == _PNG_BYTES[:4]
+            unsatisfiable, _u_headers, _u_body, _raw = await _request(
                 api, "GET", path, extra_headers=[(b"range", b"bytes=99999-100000")]
             )
             metrics["range_416"] = unsatisfiable == 416
