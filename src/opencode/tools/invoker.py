@@ -51,6 +51,7 @@ touch the frozen R1 surface, so it is imported instead of duplicated
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -962,7 +963,62 @@ async def _start_approved(
 # with the foreground await. Discarded on completion; bounded by the
 # number of in-flight background calls (the process lifetime face of
 # upstream's Active registry -- the durable face is background.py).
-_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+# Strong references now live in the handle registry below (T-C3-014): the
+# settlement task is held by its BackgroundHandle until it settles.
+
+
+# --- T-C3-014: the live handle registry (the wait loop's first read) --------
+from opencode.tools.background import delete_row as _bg_delete_row  # noqa: E402
+
+
+@dataclass(frozen=True, slots=True)
+class BackgroundHandle:
+    """One backgrounded shell call's live face: the single-shot wait loop's
+    first read (upstream ``jobs``) and the wait-phase SIGINT cancel target."""
+
+    notification_id: str
+    session_id: str
+    kind: str
+    title: str
+    started_ms: int
+    task: asyncio.Task[ToolResult]
+    settlement: asyncio.Task[None]
+
+
+_BACKGROUND_HANDLES: dict[str, BackgroundHandle] = {}
+
+
+def pending_background(session_id: str, since_ms: int = 0) -> list[BackgroundHandle]:
+    """The session's still-running backgrounded shell calls started at or
+    after ``since_ms`` (epoch ms) -- live process state, not the rows."""
+    return sorted(
+        (
+            handle
+            for handle in _BACKGROUND_HANDLES.values()
+            if handle.session_id == session_id and handle.started_ms >= since_ms and not handle.task.done()
+        ),
+        key=lambda handle: handle.started_ms,
+    )
+
+
+async def cancel_background(session_id: str, *, database: Database | None = None) -> list[str]:
+    """Cancel the session's in-flight backgrounded shell calls (the wait-phase
+    SIGINT face): the adapter task is cancelled, its settlement drained, and
+    the durable row deleted -- aborted work never replays. Best-effort on the
+    row face: a delete failure leaves the honest ``backgrounded`` row."""
+    cancelled: list[str] = []
+    for handle in list(_BACKGROUND_HANDLES.values()):
+        if handle.session_id != session_id or handle.task.done():
+            continue
+        handle.task.cancel()
+        await asyncio.gather(handle.settlement, return_exceptions=True)
+        if database is not None:
+            try:
+                await _bg_delete_row(database, handle.notification_id)
+            except Exception:
+                pass
+        cancelled.append(handle.notification_id)
+    return cancelled
 
 
 def _background_title(requested_name: str, raw_input: JsonObject) -> str:
@@ -1021,7 +1077,7 @@ async def _execute_maybe_background(
                 payload=None,
             ),
         )
-    _spawn_settlement(
+    continuation = _spawn_settlement(
         task,
         spec=tool.spec,
         limits=exec_context.limits,
@@ -1030,6 +1086,15 @@ async def _execute_maybe_background(
         session_id=session_id,
         tool_call_id=tool_call_id,
         title=title,
+    )
+    _BACKGROUND_HANDLES[notification_id] = BackgroundHandle(
+        notification_id=notification_id,
+        session_id=session_id,
+        kind=KIND_SHELL,
+        title=title,
+        started_ms=int(time.time() * 1000),
+        task=task,
+        settlement=continuation,
     )
     marker = (
         f"Command is still running after {threshold:g}s; it continues in the "
@@ -1050,7 +1115,7 @@ def _spawn_settlement(
     session_id: str,
     tool_call_id: str,
     title: str,
-) -> None:
+) -> asyncio.Task[None]:
     """The background continuation: settle the row with the real result.
 
     Runs outside the session's serial pipeline (the pipeline answered
@@ -1097,10 +1162,13 @@ def _spawn_settlement(
             )
         except Exception:
             return
+        finally:
+            # The live handle's lifetime ends with its settlement (the wait
+            # loop's pending read and the cancel face both key off this).
+            _BACKGROUND_HANDLES.pop(notification_id, None)
 
     continuation = asyncio.create_task(_settle())
-    _BACKGROUND_TASKS.add(continuation)
-    continuation.add_done_callback(_BACKGROUND_TASKS.discard)
+    return continuation
 
 
 async def invoke_tool(
