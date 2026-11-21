@@ -34,7 +34,7 @@ from typing import Any
 import pytest
 
 from opencode.tools.builtin import glob as glob_module
-from tests.integration.test_tool_static_trio import _run, _text
+from tests.integration.test_tool_static_trio import _patch_rg_path, _run, _text
 
 
 def _report(payload: dict[str, Any]) -> None:
@@ -61,7 +61,9 @@ def _failure_text(outcome: Any) -> str:
 
 
 def _metadata(outcome: Any) -> dict[str, Any]:
-    value = getattr(outcome, "metadata", None)
+    """The counters ride structured_output: the invoker drops ToolResult
+    .metadata at the outcome boundary (§3.1 L131 has no wire field)."""
+    value = getattr(outcome, "structured_output", None)
     return value if isinstance(value, dict) else {}
 
 
@@ -75,8 +77,10 @@ def _seed_files(root: Path, count: int, text: str = "needle\n") -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_p0_capability(tmp_path: Path) -> None:
+async def test_p0_capability(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rg = _rg_available()
+    if rg is not None:
+        _patch_rg_path(monkeypatch, rg)
     _seed_files(tmp_path, 3)
     (tmp_path / "deep").mkdir()
     (tmp_path / "deep" / "d.ts").write_text("needle\n", encoding="utf-8")
@@ -93,7 +97,7 @@ async def test_p0_capability(tmp_path: Path) -> None:
     glob_out = await _run(tmp_path, "fs__glob", {"pattern": "*.txt", "limit": 2})
     metrics["glob_metadata_count"] = _metadata(glob_out).get("count") == 2
     coerced = await _run(tmp_path, "fs__glob", {"pattern": "*.txt", "path": "undefined"})
-    metrics["glob_undefined_null_coerced"] = getattr(coerced, "state", "") == "completed" and "g0.txt" in _text(coerced)
+    metrics["glob_undefined_null_coerced"] = getattr(coerced, "state", "") == "succeeded" and "g0.txt" in _text(coerced)
     bad = await _run(tmp_path, "fs__glob", {"pattern": "["})
     metrics["glob_invalid_pattern_face"] = _failure_text(bad).startswith("Invalid glob in pattern")
     metrics["glob_timeout_constant"] = getattr(glob_module, "GLOB_TIMEOUT_S", None) == 30.0
@@ -168,8 +172,10 @@ async def test_m2_glob_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 # ---------------------------------------------------------------------------
 
 
-async def test_m3_metadata_counters_exact(tmp_path: Path) -> None:
+async def test_m3_metadata_counters_exact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rg = _rg_available()
+    if rg is not None:
+        _patch_rg_path(monkeypatch, rg)
     metrics: dict[str, Any] = {}
     status = "capability-absent"
     try:
@@ -195,8 +201,10 @@ async def test_m3_metadata_counters_exact(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_m4_invalid_glob_wording(tmp_path: Path) -> None:
+async def test_m4_invalid_glob_wording(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rg = _rg_available()
+    if rg is not None:
+        _patch_rg_path(monkeypatch, rg)
     metrics: dict[str, Any] = {}
     status = "capability-absent"
     try:

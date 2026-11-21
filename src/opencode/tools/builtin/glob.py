@@ -21,8 +21,10 @@ reading, quantified and float-reported):
   only (the one tool whose semantics need it), so ``fs__glob`` works on a
   machine without rg. Stdlib glob has no ignore-file awareness (TS routes
   through ripgrep, which respects ``.gitignore`` by default) and is
-  memory-bounded by the ``limit + 1`` early stop, not by a search timeout
-  (TS's 30 s timeout guards a subprocess; there is no subprocess here).
+  memory-bounded by the ``limit + 1`` early stop. T-C3-012 adds the 30 s
+  deadline as an in-process ``time.monotonic`` check inside the walk loop
+  (``GLOB_TIMEOUT_S``, filesystem.ts L67): same bound, same wording as the
+  subprocess kill -- there is simply no subprocess to kill here.
 - Results are sorted by path for deterministic output, and rendered
   relative to the working directory with '/' separators (Windows/Linux
   identical model-facing output).
@@ -41,11 +43,12 @@ from __future__ import annotations
 
 import glob as _globlib
 import os
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
-from opencode.contracts.messages import JsonObject, ToolTextContent
+from opencode.contracts.messages import JsonObject, JsonValue, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.tools.builtin.read import (
     _display_path,
@@ -68,6 +71,9 @@ GLOB_VERSION = 1
 GLOB_DEFAULT_LIMIT = 100
 #: Python-side hard cap (read.py limit-clamp precedent; float-reported).
 GLOB_MAX_LIMIT = 1_000
+#: filesystem.ts L67 DEFAULT_SEARCH_TIMEOUT_MS (30 s): the in-process walk
+#: deadline, the counterpart of ToolSearch.bounded's timeoutOrElse (T-C3-012).
+GLOB_TIMEOUT_S = 30.0
 
 GLOB_DESCRIPTION = (
     'Search file paths using a glob pattern (examples: "**/*.ts", "src/**/*.tsx") '
@@ -130,11 +136,27 @@ def _pattern_stays_inside(pattern: str) -> bool:
     return all(part != ".." for part in pattern.replace("\\", "/").split("/"))
 
 
+def _invalid_glob_detail(pattern: str) -> str | None:
+    """The unclosed-character-class check (T-C3-012): the upstream family's
+    one malformed-pattern face, worded like rg so the message reads
+    ``Invalid glob in pattern '<p>': unclosed character class; missing ']'``
+    (glob.ts L116-118). Other malformed shapes stdlib glob silently treats
+    as non-matches; that difference is banked in the plan's deviation list."""
+    opened = pattern.find("[")
+    if opened == -1 or pattern.find("]", opened + 1) != -1:
+        return None
+    return f"'{pattern}': unclosed character class; missing ']'"
+
+
 def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against GLOB_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts are narrows.
     pattern = cast(str, input["pattern"])
     path = cast(str, input.get("path", "."))
+    # glob.ts L74: the model-quirk path literals coerce to the working
+    # directory instead of failing as a missing path (grep has no such face).
+    if path in ("undefined", "null"):
+        path = "."
     hidden = cast(bool, input.get("hidden", False))
     limit = min(cast(int, input.get("limit", GLOB_DEFAULT_LIMIT)), GLOB_MAX_LIMIT)
 
@@ -152,9 +174,20 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
         return _failure(CoreErrorCode.UNSUPPORTED_CAPABILITY, f"Search path is not a directory: {path}")
 
     # glob.ts L98: fetch limit + 1, then slice -- the +1 makes "more than
-    # the limit" a local decision and bounds the collected set.
+    # the limit" a local decision and bounds the collected set. The walk is
+    # also deadline-bounded (T-C3-012): the monotonic check fires before the
+    # next engine step, >= so a zero/monkeypatched deadline trips on entry.
+    invalid_detail = _invalid_glob_detail(pattern)
+    if invalid_detail is not None:
+        return _failure(CoreErrorCode.TOOL_FAILED, f"Invalid glob in pattern {invalid_detail}")
+    deadline = time.monotonic() + GLOB_TIMEOUT_S
     collected: list[str] = []
     for candidate in _globlib.iglob(pattern, root_dir=real, recursive=True, include_hidden=hidden):
+        if time.monotonic() >= deadline:
+            return _failure(
+                CoreErrorCode.TOOL_FAILED,
+                f"Search timed out after {GLOB_TIMEOUT_S:.0f} seconds. Consider using a more specific path or pattern.",
+            )
         if os.path.isfile(os.path.join(real, candidate)):
             collected.append(candidate)
             if len(collected) > limit:
@@ -175,9 +208,15 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
             )
         text = "\n".join(lines)
     # T-C3-001 opt-out: the count cap is this tool's own honest truncation.
+    # glob.ts L114: {count, truncated} -- count = shown length. The invoker
+    # drops ToolResult.metadata at the outcome boundary (§3.1 L131 has no
+    # wire field for it), so the same object rides structured_output to stay
+    # observable end-to-end (T-C3-012).
+    counters: JsonObject = {"count": len(shown), "truncated": truncated}
     return ToolResult(
         content=[ToolTextContent(type="text", text=text)],
-        metadata={"truncated": truncated},
+        metadata=counters,
+        structured_output=cast("JsonValue", counters),
     )
 
 

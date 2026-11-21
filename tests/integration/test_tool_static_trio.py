@@ -27,6 +27,7 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
+import opencode.tools.builtin.glob as glob_module
 import opencode.tools.builtin.grep as grep_module
 from opencode.contracts.errors import CoreErrorCode
 from opencode.contracts.events import (
@@ -731,3 +732,91 @@ async def test_grep_real_path_absence_is_the_diagnostic_face(tmp_path: Path) -> 
     assert outcome.error is not None
     assert outcome.error.code == CoreErrorCode.TOOL_FAILED
     assert "not found on PATH" in _text(outcome)
+
+
+# ----------------------------------------------------------------------------
+# T-C3-012 -- tool/search bounded deltas: metadata counters, the glob path
+# coercion + deadline, and the malformed-glob error face (glob.ts L74/L114/
+# L116-118, grep.ts L145/L149-152, filesystem.ts L66-67).
+# ----------------------------------------------------------------------------
+
+
+async def test_glob_metadata_counts_shown_results(tmp_path: Path) -> None:
+    """glob.ts L114: metadata is {count, truncated} -- count = shown length."""
+    for index in range(5):
+        (tmp_path / f"g{index}.txt").write_bytes(b"x\n")
+
+    exact = await _run(tmp_path, "fs__glob", {"pattern": "*.txt", "limit": 5})
+    assert exact.state == "succeeded"
+    assert cast(dict[str, Any], exact.structured_output) == {"count": 5, "truncated": False}
+
+    over = await _run(tmp_path, "fs__glob", {"pattern": "*.txt", "limit": 4})
+    assert over.state == "succeeded"
+    assert cast(dict[str, Any], over.structured_output) == {"count": 4, "truncated": True}
+
+
+async def test_grep_metadata_counts_shown_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """grep.ts L145: metadata is {matches, truncated} -- matches = shown length."""
+    rg = _real_rg_or_skip()
+    _patch_rg_path(monkeypatch, rg)
+    (tmp_path / "many.txt").write_bytes(b"".join(f"needle {n}\n".encode() for n in range(5)))
+
+    exact = await _run(tmp_path, "fs__grep", {"pattern": "needle", "limit": 5})
+    assert exact.state == "succeeded"
+    assert cast(dict[str, Any], exact.structured_output) == {"matches": 5, "truncated": False}
+
+    over = await _run(tmp_path, "fs__grep", {"pattern": "needle", "limit": 4})
+    assert over.state == "succeeded"
+    assert cast(dict[str, Any], over.structured_output) == {"matches": 4, "truncated": True}
+
+
+async def test_glob_undefined_and_null_path_literals_coerced(tmp_path: Path) -> None:
+    """glob.ts L74: the model-quirk path literals coerce to the working dir."""
+    (tmp_path / "visible.txt").write_bytes(b"x\n")
+
+    for literal in ("undefined", "null"):
+        outcome = await _run(tmp_path, "fs__glob", {"pattern": "*.txt", "path": literal})
+        assert outcome.state == "succeeded", literal
+        assert "visible.txt" in _text(outcome), literal
+
+
+async def test_glob_invalid_pattern_reports_invalid_glob(tmp_path: Path) -> None:
+    """glob.ts L116-118: a malformed pattern is an explicit error (the upstream
+    tool-search family's exact wording), never a quiet "No files found"."""
+    (tmp_path / "a.txt").write_bytes(b"x\n")
+
+    outcome = await _run(tmp_path, "fs__glob", {"pattern": "["})
+
+    assert outcome.state == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == CoreErrorCode.TOOL_FAILED
+    assert "Invalid glob in pattern '[': unclosed character class; missing ']'" in _text(outcome)
+
+
+async def test_grep_invalid_include_reports_invalid_glob(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """grep.ts L149-150: a malformed include glob surfaces rg's parse error."""
+    rg = _real_rg_or_skip()
+    _patch_rg_path(monkeypatch, rg)
+    (tmp_path / "a.txt").write_bytes(b"needle\n")
+
+    outcome = await _run(tmp_path, "fs__grep", {"pattern": "needle", "include": "["})
+
+    assert outcome.state == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == CoreErrorCode.TOOL_FAILED
+    assert "Invalid glob in include '[': unclosed character class; missing ']'" in _text(outcome)
+
+
+async def test_glob_deadline_is_enforced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """filesystem.ts L67: the 30 s search deadline (the in-process monotonic
+    counterpart of ToolSearch.bounded's timeoutOrElse; grep.ts wording)."""
+    for index in range(3):
+        (tmp_path / f"g{index}.txt").write_bytes(b"x\n")
+
+    monkeypatch.setattr(glob_module, "GLOB_TIMEOUT_S", 0.0)
+    outcome = await _run(tmp_path, "fs__glob", {"pattern": "*.txt"})
+
+    assert outcome.state == "failed"
+    assert outcome.error is not None
+    assert outcome.error.code == CoreErrorCode.TOOL_FAILED
+    assert "Search timed out after 0 seconds. Consider using a more specific path or pattern." in _text(outcome)

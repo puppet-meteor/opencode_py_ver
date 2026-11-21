@@ -66,7 +66,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from opencode.contracts.errors import CoreErrorCode
-from opencode.contracts.messages import JsonObject, ToolTextContent
+from opencode.contracts.messages import JsonObject, JsonValue, ToolTextContent
 from opencode.contracts.tools import ToolResult, ToolSpec
 from opencode.process import run_command
 from opencode.tools.builtin.read import (
@@ -320,6 +320,18 @@ def _is_invalid_pattern(stderr: str) -> bool:
     return "regex parse error" in lowered or "error parsing regex" in lowered
 
 
+def _invalid_include_detail(stderr: str) -> str | None:
+    """grep.ts L149-150 (T-C3-012): a malformed ``include`` glob surfaces as
+    rg's parse error. rg prints ``rg: error parsing glob '<g>': <detail>`` --
+    everything after the banner prefix is exactly Ripgrep.InvalidGlobError's
+    message upstream, so the slice reproduces the TS wording verbatim."""
+    flattened = " ".join(stderr.split())
+    marker = "error parsing glob"
+    if marker not in flattened:
+        return None
+    return flattened.split(marker, 1)[1].strip()[:400] or None
+
+
 def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ()) -> ToolResult:
     # The Invoker strictly validated this input against GREP_INPUT_SCHEMA
     # before execute (adapter contract, §5.1 L257); the casts are narrows.
@@ -396,6 +408,11 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
     # to diagnose.
     early_stop = len(matches) > limit
     if not early_stop:
+        invalid_include = _invalid_include_detail(stderr) if returncode == 2 else None
+        if invalid_include is not None:
+            # grep.ts L149-150: the InvalidGlobError branch precedes the
+            # pattern-error branch (upstream mapError chain order).
+            return _failure(CoreErrorCode.TOOL_FAILED, f"Invalid glob in include {invalid_include}")
         if returncode == 2 and _is_invalid_pattern(stderr):
             detail = " ".join(stderr.split())[:400]
             # grep.ts L162 wording.
@@ -417,9 +434,15 @@ def _execute(context: ToolContext, input: JsonObject, roots: Sequence[str] = ())
     truncated = early_stop
     text = _render(display[:limit], truncated)
     # T-C3-001 opt-out: the count cap is this tool's own honest truncation.
+    # grep.ts L145: {matches, truncated} -- matches = shown length. The
+    # invoker drops ToolResult.metadata at the outcome boundary (§3.1 L131
+    # has no wire field for it), so the same object rides structured_output
+    # to stay observable end-to-end (T-C3-012).
+    counters: JsonObject = {"matches": len(display[:limit]), "truncated": truncated}
     return ToolResult(
         content=[ToolTextContent(type="text", text=text)],
-        metadata={"truncated": truncated},
+        metadata=counters,
+        structured_output=cast("JsonValue", counters),
     )
 
 
