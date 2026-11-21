@@ -172,9 +172,14 @@ class App:
         skills_dir: str | Path | None = None,
         workflow_tools: bool = False,
         auto_approve: bool = False,
+        deliver_background_jobs: bool = False,
     ) -> None:
         if provider is not None and settings is None:
             raise StoreValidationError("settings are required when a provider is given")
+        # T-C3-014: the single-shot host's background-settlement delivery
+        # switch (upstream completeBackground); the REPL/serving hosts keep
+        # it off.
+        self.deliver_background_jobs = deliver_background_jobs
         # P3-S4 (T-C1-079): the workflow tools and the brain driver are the
         # provider composition's faces -- they register into the brain's
         # single ToolRegistry and drive its session runner. Wiring them

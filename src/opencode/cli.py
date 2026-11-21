@@ -69,6 +69,7 @@ import io
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -267,14 +268,104 @@ def _int_at_least_one(name: str) -> Callable[[str], int]:
     return parse
 
 
-def _positive_seconds(text: str) -> float:
-    try:
-        value = float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"timeout-s must be a number, got {text!r}") from None
-    if value <= 0:
-        raise argparse.ArgumentTypeError(f"timeout-s must be > 0, got {value!r}")
-    return value
+def _positive_seconds(name: str) -> Callable[[str], float]:
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{name} must be a number, got {text!r}") from None
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"{name} must be > 0, got {value!r}")
+        return value
+
+    return parse
+
+
+def merge_input(argument: str | None, piped: str | None) -> str | None:
+    """Upstream ``mergeInput``: neither input -> None; one -> that one; both
+    -> the two joined by a newline (the argument first, the piped context
+    under it)."""
+    if not argument and not piped:
+        return None
+    return "\n".join(part for part in (argument, piped) if part)
+
+
+class _PipedStdin:
+    """The single-shot prompt's stdin reader (upstream ``readStdinIfReady``).
+
+    T-C3-014: a TTY is never read (the interactive shell owns it). A
+    redirected regular file reads to EOF with no time limit (the data is
+    already on disk). Everything else -- pipes and descriptor-less capture
+    streams -- gets the grace window: the first data (or an EOF) inside it
+    commits to the full read; silence past it yields None and the daemon
+    reader is abandoned, so a host spawning this process with a silent
+    stdin never hangs the run. A read failure folds into the empty context
+    (a broken pipe never fails the run on the input-merge face).
+    """
+
+    _SLICE_S = 0.05
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def read_if_ready(self, *, grace: float = 1.0) -> str | None:
+        stream = self._stream
+        try:
+            if stream.isatty():
+                return None
+        except (AttributeError, OSError, ValueError):
+            return None
+        try:
+            mode = os.fstat(stream.fileno()).st_mode
+        except (AttributeError, OSError, TypeError, ValueError):
+            mode = None
+        if mode is not None and stat.S_ISREG(mode):
+            return self._read_all()
+        return self._read_with_grace(grace)
+
+    @staticmethod
+    def _decode(data: Any) -> str:
+        if isinstance(data, str):
+            return data
+        return bytes(data).decode("utf-8", errors="replace")
+
+    def _read_all(self) -> str:
+        try:
+            return self._decode(self._stream.read())
+        except Exception:
+            return ""
+
+    def _read_with_grace(self, grace: float) -> str | None:
+        outcome: list[str] = []
+        first = threading.Event()
+        done = threading.Event()
+
+        def _reader() -> None:
+            try:
+                head = self._stream.read(1)
+                if head:
+                    first.set()
+                    outcome.append(self._decode(head) + self._decode(self._stream.read()))
+                else:
+                    outcome.append("")
+            except Exception:
+                outcome.append("")
+            finally:
+                done.set()
+
+        threading.Thread(target=_reader, daemon=True).start()
+        deadline = time.monotonic() + grace
+        while True:
+            if first.is_set():
+                done.wait()
+                return outcome[0]
+            if done.is_set():
+                # An EOF inside the window is the empty context, fast.
+                return outcome[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            first.wait(min(self._SLICE_S, remaining))
 
 
 def _package_version() -> str:
@@ -384,7 +475,7 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--timeout-s",
-        type=_positive_seconds,
+        type=_positive_seconds("timeout-s"),
         default=None,
         help="request total timeout in seconds (unset falls through to config, builtin default 30)",
     )
@@ -393,6 +484,17 @@ def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         type=_int_at_least_one("--max-steps"),
         default=None,
         help=f"runner step budget (unset falls through to config, builtin default {DEFAULT_MAX_STEPS})",
+    )
+    parser.add_argument(
+        "--background-after",
+        type=_positive_seconds("--background-after"),
+        default=None,
+        help=(
+            "opt-in shell backgrounding threshold in seconds (T-C3-014): a bash__run call still "
+            "running past it returns a backgrounded marker and the single-shot host waits for the "
+            "settlement before exiting; single-shot runs only (ignored in the REPL); default: off "
+            "(the bash adapter keeps its own timeout semantics)"
+        ),
     )
     # T-C1-081 (TS parity): '--version' prints 'opencode v{V}' on stdout and
     # exits 0 — the exact TS CLI face. The argparse version action fires inside
@@ -752,13 +854,22 @@ def main(
     *,
     lines: Iterable[str] | None = None,
     wait_hook: Callable[[], None] | None = None,
+    stdin: Any | None = None,
 ) -> int:
-    """CLI entry; ``lines``/``wait_hook`` are in-process test seams (production omits them)."""
+    """CLI entry; ``lines``/``wait_hook``/``stdin`` are in-process test seams (production omits them;
+    ``stdin`` defaults to the process stdin for the T-C3-014 piped-context read)."""
     _harden_console_streams()
     _enable_windows_ctrl_c()
     previous_handler = _install_sigint_router()
     try:
         args = _parse_arguments(argv)
+        if args.background_after is not None and not args.prompt:
+            # T-C3-014: the opt-in shell backgrounding is a single-shot face;
+            # the REPL announces the ignore instead of failing the launch.
+            print(
+                f"--background-after {args.background_after}s applies to a single-shot run only; ignoring",
+                file=sys.stderr,
+            )
         db_path = Path(args.db).resolve()
         # T-C1-PT-008 (D4): the global-data-dir default may not exist yet
         # (pure path math in default_db_path); the migration subprocess needs
@@ -890,12 +1001,17 @@ def main(
         # loader.load() face mirrors the serving host's headers read.
         memory_config = memory_config_from_values(loader.load().values)
         memory_client = MemoryGatewayClient(memory_config) if memory_config is not None else None
+        # T-C3-014 (upstream run.ts read-merge): a prompt plus a non-TTY
+        # stdin takes the grace read and ``merge_input`` joins the two (the
+        # REPL keeps its own line-at-a-time reading; a TTY is never read).
+        piped_context = _PipedStdin(stdin if stdin is not None else sys.stdin).read_if_ready() if args.prompt else None
+        prompt_text = merge_input(" ".join(args.prompt), piped_context) or ""
         return asyncio.run(
             _drive(
                 db_path,
                 provider,
                 runtime,
-                prompt_text=" ".join(args.prompt),
+                prompt_text=prompt_text,
                 lines=lines,
                 wait_hook=wait_hook,
                 session_id=recovery.session_id if recovery is not None else None,
