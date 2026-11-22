@@ -23,6 +23,10 @@ actions, at/every/cron triggers) per doc/plans/port-232-increments.md:
   settle waits the settle out instead of dropping it (a dropped settle
   replays the delivered event after the reopen; the timer face repeats the
   slot at the next start);
+- retiring -- a cancelled watcher whose run is still settling is awaited
+  (T-C3-018): the successor watcher (resume/reconcile) reads the row only
+  after that settle, and ``stop_watches`` returns only after it, so the
+  settled position is never read past and the settle is never cut;
 - outcomes -- ``fired``/``late`` (past ``late_after_s``) on delivery,
   ``skipped`` when the previous prompt is still pending in the target's
   inbox (coalesce: no send, but the timer still advances), ``failed`` with
@@ -264,6 +268,10 @@ def run_session_id(automation_id: str, run: int) -> str:
     return f"ses_aut_{automation_id}_{run}"
 
 
+def _watch_name(automation_id: str) -> str:
+    return f"automation-watch-{automation_id}"
+
+
 async def _run_to_completion(run: Coroutine[Any, Any, None]) -> None:
     """Await ``run`` to its end even if the awaiting task is cancelled
     meanwhile (T-C3-017); the cancel is re-raised once the run has ended.
@@ -418,6 +426,9 @@ class AutomationService:
         self._stream_idle_s = float(stream_idle_s)
         #: Per-automation watch tasks (decision 4), keyed by automation id.
         self._watchers: dict[str, asyncio.Task[None]] = {}
+        #: watchers cancelled by pause/remove/reconcile whose run has not
+        #: settled yet (T-C3-018): awaited by the successor and by stop_watches
+        self._retiring: set[asyncio.Task[None]] = set()
         #: Resolved event types keyed by (server, event) -- the resolve face.
         self._event_types: dict[tuple[str, str], dict[str, Any]] = {}
         # The scheduler's doorbell: create/resume ring it so a fresh slot is
@@ -793,15 +804,31 @@ class AutomationService:
         watcher = self._watchers.get(automation_id)
         if watcher is not None and not watcher.done():
             return
-        self._watchers[automation_id] = asyncio.create_task(
-            self._watch(automation_id), name=f"automation-watch-{automation_id}"
-        )
+        self._watchers[automation_id] = asyncio.create_task(self._watch(automation_id), name=_watch_name(automation_id))
 
     def _cancel_watch(self, automation_id: str) -> None:
-        """Cancel the row's watcher (pause/remove/reconcile-stray)."""
+        """Cancel the row's watcher (pause/remove/reconcile-stray).
+
+        A watcher caught mid-run settles that run before it ends (T-C3-017).
+        Until it has, it sits in ``_retiring``: the successor waits it out
+        before it reads the row, and ``stop_watches`` before it returns
+        (T-C3-018).
+        """
         watcher = self._watchers.pop(automation_id, None)
-        if watcher is not None:
-            watcher.cancel()
+        if watcher is None:
+            return
+        if not watcher.done():
+            self._retiring.add(watcher)
+            watcher.add_done_callback(self._retiring.discard)
+        watcher.cancel()
+
+    async def _join_retiring(self, automation_id: str) -> None:
+        """Wait out the row's retiring watchers (T-C3-018): the row they are
+        still settling is not read before they have ended."""
+        name = _watch_name(automation_id)
+        retiring = {task for task in self._retiring if task.get_name() == name}
+        if retiring:
+            await asyncio.wait(retiring)
 
     async def reconcile_event_watches(self) -> None:
         """The scheduler's backstop (decision 6): every active event row gets
@@ -824,7 +851,9 @@ class AutomationService:
     async def stop_watches(self) -> None:
         """Cancel every watcher and wait out their teardown (the rows stay
         as they are: active rows regain a watcher at the next reconcile).
-        A watcher caught mid-run settles that run first (T-C3-017).
+        A watcher caught mid-run settles that run first (T-C3-017), and so
+        does one that pause/remove cancelled earlier and is still settling
+        (T-C3-018): both are awaited here.
 
         Harnesses call this BEFORE closing the MCP manager so a cancelled
         stream's ``notifications/cancelled`` still has a live loop to ride.
@@ -834,7 +863,9 @@ class AutomationService:
             self._watchers.pop(automation_id, None)
         for task in watchers:
             task.cancel()
-        for task in watchers:
+        # cancelled earlier by pause/remove; maybe still settling a run
+        retiring = set(self._retiring)
+        for task in (*watchers, *retiring):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
@@ -890,8 +921,13 @@ class AutomationService:
         without a delivered event park the row (the recorded deviation --
         upstream leaves the dead stream for reconcile). The terminal faces
         (terminated/rejected) park at once and never reopen.
+
+        A predecessor that pause cancelled while its run was still settling
+        is waited out first (T-C3-018), so the cursor read below is the
+        settled one.
         """
         silent_reopens = 0
+        await self._join_retiring(automation_id)
         try:
             while True:
                 try:

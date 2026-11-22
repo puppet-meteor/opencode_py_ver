@@ -617,6 +617,49 @@ def test_stop_mid_run_waits_the_settle_and_still_ends_the_watcher(tmp_path: Path
     asyncio.run(_scenario(tmp_path, "midstop", manager, body, sessions=sessions, scheduler=False))
 
 
+def test_resume_right_after_pause_waits_the_retiring_run(tmp_path: Path) -> None:
+    """T-C3-018: a ``resume`` that lands while the paused watcher's run is
+    still settling must not act on the unsettled row -- the successor reads
+    the settled position and opens from it, so the in-flight event is not
+    delivered a second time."""
+    manager = _ReplayManager([_event("evt-1", "c1"), _event("evt-2", "c2")])
+    sessions = _ParkedSessions()
+
+    async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
+        automation_id = created["id"]
+        await sessions.delivered.wait()
+        await service.pause(automation_id)
+        await service.resume(automation_id)  # the successor starts before the retiring run settles
+        sessions.release.set()
+        await _wait_for(lambda: sessions.sends and "evt-2" in sessions.sends[-1][1], what="the event past the cursor")
+        assert ["evt-1" in text for _, text in sessions.sends] == [True, False]
+        assert ["evt-2" in text for _, text in sessions.sends] == [False, True]
+        assert manager.stream_calls[1]["cursor"] == "c1"
+        assert len(set(sessions.message_ids)) == 2
+
+    asyncio.run(_scenario(tmp_path, "resume", manager, body, sessions=sessions, scheduler=False))
+
+
+def test_stop_right_after_pause_waits_the_retiring_run(tmp_path: Path) -> None:
+    """T-C3-018: ``stop_watches`` also waits a watcher that pause already
+    cancelled but whose run is still settling -- otherwise the teardown that
+    follows cuts the settle (the T-C3-017 hole, through the other door)."""
+    manager = _ReplayManager([_event("evt-1", "c1")])
+    sessions = _ParkedSessions()
+
+    async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
+        await sessions.delivered.wait()
+        await service.pause(created["id"])  # cancel issued; the run is still parked
+        stop = asyncio.create_task(service.stop_watches())
+        sessions.release.set()
+        await stop
+        assert _position(tmp_path, "pausestop", created["id"]) == {"cursor": "c1", "id": "evt-1"}
+        assert _row(tmp_path / "pausestop.db", created["id"])["run_count"] == 1
+        assert manager.stream_closes == 1
+
+    asyncio.run(_scenario(tmp_path, "pausestop", manager, body, sessions=sessions, scheduler=False))
+
+
 def test_remove_cancels_the_watch_and_deletes_the_row(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
 
