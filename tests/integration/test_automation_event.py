@@ -55,6 +55,7 @@ from tests.integration.test_automation_event_eval import (
     _RecordingSessions,
     _row,
     _stream_requests,
+    _stream_trace,
     _wait_for,
 )
 
@@ -407,7 +408,7 @@ def test_first_event_delivers_interpolated_prompt_zero_polling(tmp_path: Path) -
         before = len(_stream_requests(tmp_path))
         await service.reconcile_event_watches()
         await asyncio.sleep(0.3)
-        assert len(_stream_requests(tmp_path)) == before
+        assert len(_stream_requests(tmp_path)) == before, _stream_trace(tmp_path)
 
     asyncio.run(_scenario(tmp_path, "first", manager, body))
 
@@ -501,7 +502,7 @@ def test_terminated_notification_parks_without_reopen(tmp_path: Path) -> None:
         assert "terminated" in (row["last_output"] or "").lower()
         requests = len(_stream_requests(tmp_path))
         await asyncio.sleep(0.4)
-        assert len(_stream_requests(tmp_path)) == requests  # terminal: never reopened
+        assert len(_stream_requests(tmp_path)) == requests, _stream_trace(tmp_path)  # terminal: never reopened
 
     asyncio.run(_scenario(tmp_path, "term", manager, body))
 
@@ -632,7 +633,7 @@ def test_remove_cancels_the_watch_and_deletes_the_row(tmp_path: Path) -> None:
         requests = len(_stream_requests(tmp_path))
         await asyncio.sleep(0.35)
         assert len(sessions.sends) == sends
-        assert len(_stream_requests(tmp_path)) == requests
+        assert len(_stream_requests(tmp_path)) == requests, _stream_trace(tmp_path)
 
     asyncio.run(_scenario(tmp_path, "rm", manager, body))
 
@@ -673,7 +674,7 @@ def test_oversized_event_data_is_invalid(tmp_path: Path) -> None:
         assert "invalid mcp event" in (row["last_output"] or "").lower()
         assert row["run_count"] == 0
         assert len(sessions.sends) == 0
-        assert len(_stream_requests(tmp_path)) == 1  # the per-message fail parks, no reopen
+        assert len(_stream_requests(tmp_path)) == 1, _stream_trace(tmp_path)  # the per-message fail parks, no reopen
 
     asyncio.run(_scenario(tmp_path, "big", manager, body))
 

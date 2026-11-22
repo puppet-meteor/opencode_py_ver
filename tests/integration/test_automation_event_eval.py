@@ -153,6 +153,20 @@ def _stream_requests(tmp_path: Path) -> list[dict[str, Any]]:
     return [e for e in _log_events(tmp_path, "fixture") if e.get("event") == "stream_request"]
 
 
+def _stream_trace(tmp_path: Path) -> str:
+    """The fixture log as one line, for stream-count assertion messages
+    (T-C3-018): a count that came out wrong is classified right off the
+    sequence -- what sat between two ``stream_request`` entries, or a doubled
+    ``initialize``."""
+    parts: list[str] = []
+    for event in _log_events(tmp_path, "fixture"):
+        name = str(event.get("event", "?"))
+        part = name if event.get("id") is None else f"{name}#{event['id']}"
+        detail = event.get("cursor") if name == "stream_event" else event.get("reason")
+        parts.append(part if detail is None else f"{part}({detail})")
+    return " ".join(parts) or "(no fixture log)"
+
+
 async def _wait_for(predicate: Callable[[], Any], *, timeout_s: float = _DEADLINE_S, what: str = "condition") -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
