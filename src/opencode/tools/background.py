@@ -354,6 +354,74 @@ async def list_rows(database: Database) -> list[_StoredRow]:
     return await _load_all(database)
 
 
+async def replay_notice_for(database: Database, stored: _StoredRow) -> tuple[ReplayedNotification | None, bool]:
+    """Map one durable row for replay: ``(notice, keep)`` (T-C3-015).
+
+    The single mapping shared by both replay faces -- this module's batch
+    admit (:func:`replay_pending`) and the service's per-row boot sweep
+    (``SessionService.replay_background_pending``) -- so the two wake
+    surfaces can never drift. ``(None, True)`` keeps the row (a running
+    subagent child PY cannot re-drive); ``(None, False)`` drops it
+    silently (the parent left no durable trace -- the notice is owed to
+    nobody); a notice means deliver it, then consume the row.
+    """
+    row = stored.row
+    if row.kind == KIND_SUBAGENT:
+        live_parents = await _live_session_ids(database)
+        if row.session_id not in live_parents:
+            # Deleted parent: silent clear (the sweep drops the row).
+            return None, False
+        if row.status not in _TERMINAL:
+            return None, True
+        payload = row.payload if row.payload is not None else {}
+        child = _payload_str(payload, "childSessionID") or row.tool_call_id
+        description = _payload_str(payload, "description") or row.title
+        body = _payload_str(payload, "output") or ""
+        outstanding = await outstanding_lines(database, child)
+        return (
+            ReplayedNotification(
+                notification_id=row.notification_id,
+                session_id=row.session_id,
+                tool_call_id=row.tool_call_id,
+                kind=row.kind,
+                status=row.status,
+                text=subagent_report_text(
+                    child_session_id=child,
+                    state=SUBAGENT_REPORT_STATE[row.status],
+                    description=description,
+                    body=body,
+                    outstanding=outstanding,
+                ),
+            ),
+            False,
+        )
+    if row.status in _TERMINAL:
+        return (
+            ReplayedNotification(
+                notification_id=row.notification_id,
+                session_id=row.session_id,
+                tool_call_id=row.tool_call_id,
+                kind=row.kind,
+                status=row.status,
+                text=shell_report_text(row.payload),
+            ),
+            False,
+        )
+    # Running at boot: unrecoverable in-process (no shell daemon). Settle
+    # honestly to error and replay the interruption.
+    return (
+        ReplayedNotification(
+            notification_id=row.notification_id,
+            session_id=row.session_id,
+            tool_call_id=row.tool_call_id,
+            kind=row.kind,
+            status=STATUS_ERROR,
+            text=_RESTART_ERROR_TEXT.format(title=row.title),
+        ),
+        False,
+    )
+
+
 async def replay_pending(database: Database) -> list[ReplayedNotification]:
     """Boot-time replay: deliver every pending row exactly once, then admit.
 
@@ -373,67 +441,21 @@ async def replay_pending(database: Database) -> list[ReplayedNotification]:
     was still running at boot is KEPT -- PY has no ``execution.resume`` to
     re-drive it (recorded deviation), so the row survives for the next
     boot rather than faking a terminal receipt.
+
+    T-C3-015 extracts the per-row mapping into :func:`replay_notice_for`
+    so this batch face and the service's per-row boot sweep
+    (``SessionService.replay_background_pending``) share one construction
+    -- the two wake surfaces can never drift.
     """
     stored_rows = await _load_all(database)
-    live_parents = await _live_session_ids(database)
     replayed: list[ReplayedNotification] = []
     keep: set[str] = set()
     for stored in stored_rows:
-        row = stored.row
-        if row.kind == KIND_SUBAGENT:
-            if row.session_id not in live_parents:
-                # Deleted parent: silent clear (the sweep drops the row).
-                continue
-            if row.status not in _TERMINAL:
-                keep.add(row.notification_id)
-                continue
-            payload = row.payload if row.payload is not None else {}
-            child = _payload_str(payload, "childSessionID") or row.tool_call_id
-            description = _payload_str(payload, "description") or row.title
-            body = _payload_str(payload, "output") or ""
-            outstanding = await outstanding_lines(database, child)
-            replayed.append(
-                ReplayedNotification(
-                    notification_id=row.notification_id,
-                    session_id=row.session_id,
-                    tool_call_id=row.tool_call_id,
-                    kind=row.kind,
-                    status=row.status,
-                    text=subagent_report_text(
-                        child_session_id=child,
-                        state=SUBAGENT_REPORT_STATE[row.status],
-                        description=description,
-                        body=body,
-                        outstanding=outstanding,
-                    ),
-                )
-            )
-            continue
-        if row.status in _TERMINAL:
-            payload_text = shell_report_text(row.payload)
-            replayed.append(
-                ReplayedNotification(
-                    notification_id=row.notification_id,
-                    session_id=row.session_id,
-                    tool_call_id=row.tool_call_id,
-                    kind=row.kind,
-                    status=row.status,
-                    text=payload_text,
-                )
-            )
-        else:
-            # Running at boot: unrecoverable in-process (no shell daemon).
-            # Settle honestly to error and replay the interruption.
-            replayed.append(
-                ReplayedNotification(
-                    notification_id=row.notification_id,
-                    session_id=row.session_id,
-                    tool_call_id=row.tool_call_id,
-                    kind=row.kind,
-                    status=STATUS_ERROR,
-                    text=_RESTART_ERROR_TEXT.format(title=row.title),
-                )
-            )
+        notice, keep_row = await replay_notice_for(database, stored)
+        if keep_row:
+            keep.add(stored.row.notification_id)
+        elif notice is not None:
+            replayed.append(notice)
     doomed = [stored.row.notification_id for stored in stored_rows if stored.row.notification_id not in keep]
     if doomed:
         delete_statement = text("delete from background_job where notification_id in :notification_ids").bindparams(

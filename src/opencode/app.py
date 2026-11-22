@@ -242,6 +242,25 @@ class App:
                 return
             await self._service.wake_pending_inbox()
 
+        # T-C3-015: the boot background-row replay follow-up, the same
+        # post-scan shape. The upstream restart wake order replays settled
+        # tool results BEFORE the pending-call wake and the subagent re-arm
+        # (restart.ts: shell/tool results, then pending calls, subagent
+        # last), so this task is created between the two -- the ordering is
+        # soft (each face first awaits the gate), but the schedule keeps
+        # subagent last. A failed scan re-raises at the gate and keeps the
+        # replay skipped (fail-closed with every other write face); outside
+        # a running loop the face is never scheduled (the same
+        # eager-composition disclosure as the wake and the re-arm).
+        self._background_replay_task: asyncio.Task[None] | None = None
+
+        async def _replay_background_pending_after_scan() -> None:
+            try:
+                await recovery_gate.wait()
+            except Exception:
+                return
+            await self._service.replay_background_pending()
+
         # T-C1-101 (P7-S2): the subagent observation re-arm follow-up, the
         # same post-scan shape. Awaits the gate FIRST so the R4 recovery
         # scan has already folded every in-flight background child to its
@@ -265,6 +284,9 @@ class App:
             loop = None
         if loop is not None:
             self._inbox_wake_task = loop.create_task(_wake_pending_inbox_after_scan(), name="opencode-inbox-wake")
+            self._background_replay_task = loop.create_task(
+                _replay_background_pending_after_scan(), name="opencode-background-replay"
+            )
             self._subagent_rearm_task = loop.create_task(
                 _rearm_subagent_observations_after_scan(), name="opencode-subagent-rearm"
             )
@@ -578,6 +600,18 @@ class App:
             rearm.cancel()
             try:
                 await rearm
+            except asyncio.CancelledError:
+                pass
+        replay = self._background_replay_task
+        if replay is not None and not replay.done():
+            # The post-scan background replay is App-owned the same way:
+            # cancelling mid-sweep is at-least-once safe -- a notice
+            # admitted before the cancellation redelivers as the durable
+            # seen-noop on the next boot (which then consumes the row), and
+            # an undelivered row simply stands.
+            replay.cancel()
+            try:
+                await replay
             except asyncio.CancelledError:
                 pass
         await self._jobs.close()

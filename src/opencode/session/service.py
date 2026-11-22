@@ -1871,6 +1871,56 @@ class SessionService:
             metadata=metadata,
         )
 
+    async def replay_background_pending(self) -> None:
+        """T-C3-015 boot sweep: deliver every pending row, then consume it.
+
+        The per-row law of the upstream ``recoverToolJob`` (2.3.2
+        restart.ts): map each row through the SAME construction
+        ``replay_pending`` uses (:func:`opencode.tools.background.replay_notice_for`
+        -- zero drift), deliver via the ``deliver_event_wake`` synthetic
+        seam with ``inbox_id`` = the row's notification id (the durable
+        ``inbox_enqueued_seen`` idempotency makes a re-settled row admit
+        once), then delete the row. A successful delivery INCLUDING the
+        idempotent seen-noop consumes the row; a session that no longer
+        exists raises ``NotFoundError`` out of the wake -- the notice is
+        owed to nobody, so the row is acknowledged by deletion; any other
+        delivery failure keeps the row standing for the next boot
+        (at-least-once) without breaking the sweep over the remaining
+        rows. Kept rows (a running subagent child PY cannot re-drive) are
+        skipped whole, and a row whose parent left no durable trace is
+        dropped silently.
+        """
+        if self._database is None:
+            return
+        from opencode.tools.background import delete_row, list_rows, replay_notice_for
+
+        for stored in await list_rows(self._database):
+            notice, keep_row = await replay_notice_for(self._database, stored)
+            if keep_row:
+                continue
+            if notice is None:
+                await delete_row(self._database, stored.row.notification_id)
+                continue
+            metadata: JsonObject = {
+                "source": "background",
+                "kind": notice.kind,
+                "status": notice.status,
+                "title": stored.row.title,
+            }
+            try:
+                await self.deliver_event_wake(
+                    notice.session_id,
+                    inbox_id=notice.notification_id,
+                    text=notice.text,
+                    metadata=metadata,
+                )
+            except NotFoundError:
+                await delete_row(self._database, notice.notification_id)
+            except Exception:
+                continue  # keep the row; the sweep never breaks on one row
+            else:
+                await delete_row(self._database, notice.notification_id)
+
     async def pending_subagent_wakes(self, session_id: str) -> list[SubagentObservation]:
         """T-C3-014 read-only face: the session's outstanding subagent wakes.
 
