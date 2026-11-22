@@ -1871,7 +1871,7 @@ class SessionService:
             metadata=metadata,
         )
 
-    async def replay_background_pending(self) -> None:
+    async def replay_background_pending(self, *, before_ms: int | None = None) -> None:
         """T-C3-015 boot sweep: deliver every pending row, then consume it.
 
         The per-row law of the upstream ``recoverToolJob`` (2.3.2
@@ -1889,12 +1889,25 @@ class SessionService:
         rows. Kept rows (a running subagent child PY cannot re-drive) are
         skipped whole, and a row whose parent left no durable trace is
         dropped silently.
+
+        ``before_ms`` scopes the sweep to the boot backlog: the App boot
+        task passes a cutoff captured synchronously in ``App.__init__``,
+        and only rows created strictly before it are swept. Rows born
+        during the scan window belong to the in-process delivery path
+        (T-C3-014), and sweeping them would race its ownership (the
+        87eaee6 CI attempt-2 lesson -- the task's first step runs at the
+        first loop yield, which can already be inside the seeding). A
+        real backlog row that lands in the same millisecond as the cutoff
+        is conservatively left for the next boot (at-least-once). ``None``
+        (the direct-call face) sweeps every row.
         """
         if self._database is None:
             return
         from opencode.tools.background import delete_row, list_rows, replay_notice_for
 
         for stored in await list_rows(self._database):
+            if before_ms is not None and stored.created_at_ms >= before_ms:
+                continue
             notice, keep_row = await replay_notice_for(self._database, stored)
             if keep_row:
                 continue

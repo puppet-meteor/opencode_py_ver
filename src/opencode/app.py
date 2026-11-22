@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -242,24 +243,29 @@ class App:
                 return
             await self._service.wake_pending_inbox()
 
-        # T-C3-015: the boot background-row replay follow-up, the same
-        # post-scan shape. The upstream restart wake order replays settled
-        # tool results BEFORE the pending-call wake and the subagent re-arm
-        # (restart.ts: shell/tool results, then pending calls, subagent
-        # last), so this task is created between the two -- the ordering is
-        # soft (each face first awaits the gate), but the schedule keeps
-        # subagent last. A failed scan re-raises at the gate and keeps the
-        # replay skipped (fail-closed with every other write face); outside
-        # a running loop the face is never scheduled (the same
+        # T-C3-015: the boot backlog cutoff, captured synchronously in
+        # __init__ BEFORE any task can run (the task's first step happens
+        # at the first loop yield, which can already be inside test
+        # seeding or production tool calls): only rows created strictly
+        # before this instant are the sweep's to consume. The upstream
+        # restart wake order replays settled tool results BEFORE the
+        # pending-call wake and the subagent re-arm (restart.ts:
+        # shell/tool results, then pending calls, subagent last), so the
+        # task is created between the two -- the ordering is soft (each
+        # face first awaits the gate), but the schedule keeps subagent
+        # last. A failed scan re-raises at the gate and keeps the replay
+        # skipped (fail-closed with every other write face); outside a
+        # running loop the face is never scheduled (the same
         # eager-composition disclosure as the wake and the re-arm).
         self._background_replay_task: asyncio.Task[None] | None = None
+        background_replay_cutoff_ms = time.time_ns() // 1_000_000
 
         async def _replay_background_pending_after_scan() -> None:
             try:
                 await recovery_gate.wait()
             except Exception:
                 return
-            await self._service.replay_background_pending()
+            await self._service.replay_background_pending(before_ms=background_replay_cutoff_ms)
 
         # T-C1-101 (P7-S2): the subagent observation re-arm follow-up, the
         # same post-scan shape. Awaits the gate FIRST so the R4 recovery

@@ -30,6 +30,7 @@ interruption, terminal -> settled payload).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sqlite3
@@ -40,6 +41,7 @@ from typing import Any
 
 import pytest
 
+from opencode.app import App
 from opencode.bus import VolatileBus
 from opencode.contracts import ConfigSnapshot
 from opencode.contracts.events import PY_INBOX_ENQUEUED
@@ -61,6 +63,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _TITLE = "echo bg-replay-red"
 _SETTLED_TEXT = "BG-REPLAY-RED-SETTLED"
+_MISSING_KWARG = object()
 
 
 def _migrated_db(tmp_path: Path, name: str) -> Path:
@@ -353,3 +356,56 @@ async def test_r9_empty_sweep_is_a_quiet_noop(tmp_path: Path) -> None:
             assert _inbox_events(db_path) == []
         finally:
             await service.close()
+
+
+async def test_r10_sweep_owns_only_the_boot_backlog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The App task sweeps exactly the pre-construction backlog.
+
+    The task must pass ``before_ms=<cutoff captured synchronously in
+    App.__init__>``: rows born later (even milliseconds later, seeded at
+    the first loop yield) belong to the in-process delivery path
+    (T-C3-014). Spying the service call makes the pin deterministic --
+    no race between the seed and the sweep's read -- and the pre-boot row
+    must be consumed by the spied-through sweep.
+    """
+    db_path = _migrated_db(tmp_path, "r10.db")
+    async with open_database(db_path, mode="create") as database:
+        await _seed(database, notification_id="ntf_boot", session_id="ses_gone_r10")
+    calls: list[Any] = []
+    async with App(db_path, working_dir="C:/work") as app:
+        original = app._service.replay_background_pending
+
+        async def _spy(*args: Any, **kwargs: Any) -> None:
+            calls.append(kwargs.get("before_ms", _MISSING_KWARG))
+            await original(*args, **kwargs)
+
+        monkeypatch.setattr(app._service, "replay_background_pending", _spy)
+        task = app._background_replay_task
+        assert task is not None, "the App wires the boot replay task (P0)"
+        await asyncio.wait_for(task, timeout=30)
+    assert len(calls) == 1, f"the boot task calls the sweep once, got {calls}"
+    assert calls[0] is not _MISSING_KWARG and isinstance(calls[0], int), (
+        f"the sweep is scoped by a synchronous boot cutoff, got {calls[0]!r}"
+    )
+    assert _rows(db_path, "ntf_boot") == [], "the pre-boot backlog row was still consumed"
+
+
+async def test_r11_rows_born_after_boot_survive_the_sweep(tmp_path: Path) -> None:
+    """The 87eaee6 CI attempt-2 failure shape, as a deterministic echo.
+
+    The post-scan sweep asynchronously deleted a test-seeded running row
+    mid-assertion (job.list ``descendants`` lost ``ntf_a``). With the
+    synchronous cutoff the row's created_at is strictly past the cutoff,
+    so it survives the awaited sweep deterministically (a same-millisecond
+    row is excluded too -- conservatively left for the next boot).
+    """
+    db_path = _migrated_db(tmp_path, "r11.db")
+    async with App(db_path, working_dir="C:/work") as app:
+        await _seed(app._database, notification_id="ntf_r11", session_id="ses_gone_r11", status=STATUS_BACKGROUNDED)
+        task = app._background_replay_task
+        assert task is not None, "the App wires the boot replay task (P0)"
+        await asyncio.wait_for(task, timeout=30)
+        rows = _rows(db_path, "ntf_r11")
+        assert rows == [("ntf_r11", STATUS_BACKGROUNDED)], (
+            "a row born after boot is the in-process path's to deliver, not the sweep's to consume"
+        )
