@@ -36,11 +36,14 @@ from pathlib import Path
 from sys import platform as _PLATFORM
 from typing import Any, cast
 
+import pytest
+
 from opencode.contracts.messages import ToolTextContent
 from opencode.session.service import IdFactory
 from opencode.storage import open_database
 from opencode.storage.db import Database
-from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry
+from opencode.tools import ToolContext, ToolLimits, ToolOutcome, ToolRegistry, invoker
+from opencode.tools.background import STATUS_BACKGROUNDED, BackgroundJobRow
 from opencode.tools.builtin import BashAdapter
 from tests.integration.test_tool_bash import (
     _FIXED_TIME,
@@ -417,5 +420,124 @@ def test_settlement_delivery_failure_keeps_the_row(tmp_path: Path) -> None:
             # stands for the next boot's replay.
             rows = _row_status(db_path, notification_id)
             assert rows == [(notification_id, "succeeded")]
+
+    asyncio.run(_scenario())
+
+
+# ---------------------------------------------------------------------------
+# T-C3-019 slice -- the live handle spans the whole settlement
+# ---------------------------------------------------------------------------
+
+
+def test_pending_handle_outlives_its_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A finished process is not a finished job: with the terminal row write
+    held, the adapter task is done while the settlement is still in flight,
+    and the wait loop's first read must still list the handle (CI run
+    45031014521: it vanished the moment the process exited)."""
+    _interpreter_or_skip()
+    db_path = _migrated_db(tmp_path, "outlive.db")
+    invoker._BACKGROUND_HANDLES.clear()
+    original_upsert = invoker.upsert_row
+
+    async def _scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _held_upsert(database: Database, row: BackgroundJobRow) -> None:
+            if row.status != STATUS_BACKGROUNDED:
+                entered.set()
+                await release.wait()
+            await original_upsert(database, row)
+
+        monkeypatch.setattr(invoker, "upsert_row", _held_upsert)
+        async with open_database(db_path, mode="create") as database:
+            registry = _registry(database)
+            outcome = await registry.invoke(
+                _context(ToolLimits(background_after_s=_THRESHOLD_S)),
+                "bash__run",
+                {"command": _sleep_command(3, "done-outlive")},
+                "exec_itbgjob_outlive",
+            )
+            assert "background" in _text(outcome).lower()
+            notification_id = _row_status(db_path)[0][0]
+            handle = invoker._BACKGROUND_HANDLES[notification_id]
+            await asyncio.wait_for(entered.wait(), _SETTLE_DEADLINE_S)
+            # Process done, row still ``backgrounded``, settlement in flight.
+            assert handle.task.done()
+            assert _row_status(db_path, notification_id) == [(notification_id, "backgrounded")]
+            assert [pending.notification_id for pending in invoker.pending_background(_SESSION_ID)] == [notification_id]
+            release.set()
+            await asyncio.wait_for(handle.settlement, _SETTLE_DEADLINE_S)
+            assert invoker.pending_background(_SESSION_ID) == []
+            assert notification_id not in invoker._BACKGROUND_HANDLES
+            assert _row_status(db_path, notification_id) == [(notification_id, "succeeded")]
+
+    asyncio.run(_scenario())
+
+
+def test_pending_handle_spans_the_wake_delivery(tmp_path: Path) -> None:
+    """The written row is not a delivered wake: with the delivery port held
+    the process is done and the row terminal, yet the handle stays listed
+    until the wake is delivered (CI run 45031014521: the handle was discarded
+    at the row write, and the wait loop read the delivery window as
+    quiescence); released, the settled handle is discarded."""
+    _interpreter_or_skip()
+    db_path = _migrated_db(tmp_path, "span.db")
+    invoker._BACKGROUND_HANDLES.clear()
+
+    async def _scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _deliver(row: Any) -> None:
+            entered.set()
+            await release.wait()
+
+        async with open_database(db_path, mode="create") as database:
+            registry = _registry(database)
+            registry.set_background_delivery(_deliver)
+            outcome = await registry.invoke(
+                _context(ToolLimits(background_after_s=_THRESHOLD_S)),
+                "bash__run",
+                {"command": _sleep_command(3, "done-span")},
+                "exec_itbgjob_span",
+            )
+            assert "background" in _text(outcome).lower()
+            notification_id = _row_status(db_path)[0][0]
+            handle = invoker._BACKGROUND_HANDLES[notification_id]
+            await asyncio.wait_for(entered.wait(), _SETTLE_DEADLINE_S)
+            # Process done, row ``succeeded`` and written, wake not yet delivered.
+            assert handle.task.done()
+            assert _row_status(db_path, notification_id) == [(notification_id, "succeeded")]
+            assert [pending.notification_id for pending in invoker.pending_background(_SESSION_ID)] == [notification_id]
+            release.set()
+            await asyncio.wait_for(handle.settlement, _SETTLE_DEADLINE_S)
+            assert invoker.pending_background(_SESSION_ID) == []
+            assert notification_id not in invoker._BACKGROUND_HANDLES
+            assert _row_status(db_path) == []
+
+    asyncio.run(_scenario())
+
+
+def test_pending_handle_is_discarded_without_a_database() -> None:
+    """The un-persisted face (``database=None``: no row, no delivery) settles
+    too, and its handle is discarded with it -- the registry never
+    accumulates finished calls."""
+    _interpreter_or_skip()
+    invoker._BACKGROUND_HANDLES.clear()
+
+    async def _scenario() -> None:
+        registry = _registry(None)
+        outcome = await registry.invoke(
+            _context(ToolLimits(background_after_s=_THRESHOLD_S)),
+            "bash__run",
+            {"command": _sleep_command(2, "done-nodb")},
+            "exec_itbgjob_nodb",
+        )
+        assert "background" in _text(outcome).lower()
+        (handle,) = tuple(invoker._BACKGROUND_HANDLES.values())
+        await asyncio.wait_for(handle.settlement, _SETTLE_DEADLINE_S)
+        assert invoker.pending_background(_SESSION_ID) == []
+        assert invoker._BACKGROUND_HANDLES == {}
 
     asyncio.run(_scenario())

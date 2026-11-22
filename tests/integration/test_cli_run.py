@@ -19,6 +19,7 @@ the evaluation set only measures.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import io
 import json
@@ -32,6 +33,11 @@ import pytest
 
 from opencode import cli
 from opencode.app import App
+from opencode.contracts.messages import JsonObject
+from opencode.session.service import SessionService
+from opencode.storage.db import Database
+from opencode.tools import invoker
+from opencode.tools.background import STATUS_BACKGROUNDED, BackgroundJobRow
 from tests.integration import test_cli_run_eval as eval_module
 from tests.integration.test_cli import _argv, _ok_response, _ServerHost
 from tests.integration.test_cli_run_eval import (
@@ -233,6 +239,121 @@ def test_m2b_json_stream_announces_the_wait(tmp_path: Path, capsys: pytest.Captu
 
 
 # ---------------------------------------------------------------------------
+# T-C3-019 M2c/M2d -- the wait covers the job's whole settlement (write + wake)
+# ---------------------------------------------------------------------------
+
+#: The held settlement step is released once the wait loop has polled this
+#: many times past the hold -- well past the two empty reads the exit rule
+#: needs, so a loop that cannot see the settling job exits before the hold
+#: lifts, every time (CI run 45031014521: the two reads slipped between a
+#: finished process and its delivered wake).
+_SETTLEMENT_POLLS = 5
+
+
+class _SettlementHold:
+    """Holds one settlement step until the wait loop has polled enough.
+
+    Armed by the held step itself (the poll count starts only once the job's
+    process is done and its settlement is in flight) and released from the
+    wait loop's own pending read: a loop that still lists the settling job
+    polls through the hold, while a loop that reads it as "nothing pending"
+    exits after its two empty reads -- the loop teardown then cancels the
+    held step. No sleep is raced.
+    """
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.polls = 0
+        self._release = asyncio.Event()
+
+    async def wait_turn(self) -> None:
+        self.armed = True
+        await self._release.wait()
+
+    def count_poll(self) -> None:
+        if self.armed:
+            self.polls += 1
+            if self.polls >= _SETTLEMENT_POLLS:
+                self._release.set()
+
+
+def _hold_settlement(monkeypatch: pytest.MonkeyPatch, hold: _SettlementHold, *, step: str) -> None:
+    """Park the settlement's ``step`` on ``hold`` and count the wait loop's
+    pending reads against it: ``write`` = the terminal row upsert,
+    ``deliver`` = the wake delivery (upstream ``completeBackground``)."""
+    original_pending = cli._pending_background
+
+    async def _counting_pending(app: App, session_id: str, admitted_ms: int) -> list[cli._PendingJob]:
+        hold.count_poll()
+        return await original_pending(app, session_id, admitted_ms)
+
+    monkeypatch.setattr(cli, "_pending_background", _counting_pending)
+    if step == "write":
+        original_upsert = invoker.upsert_row
+
+        async def _held_upsert(database: Database, row: BackgroundJobRow) -> None:
+            # Only the settlement's terminal write: the backgrounded row's
+            # upsert precedes the marker and is never held.
+            if row.status != STATUS_BACKGROUNDED:
+                await hold.wait_turn()
+            await original_upsert(database, row)
+
+        monkeypatch.setattr(invoker, "upsert_row", _held_upsert)
+        return
+    original_deliver = SessionService.deliver_event_wake
+
+    async def _held_deliver(
+        self: SessionService,
+        session_id: str,
+        *,
+        inbox_id: str,
+        text: str,
+        metadata: JsonObject,
+    ) -> None:
+        if metadata.get("source") == "background":
+            await hold.wait_turn()
+        await original_deliver(self, session_id, inbox_id=inbox_id, text=text, metadata=metadata)
+
+    monkeypatch.setattr(SessionService, "deliver_event_wake", _held_deliver)
+
+
+def test_m2c_wait_covers_the_settlement_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished process is not a finished job: with the terminal row write
+    held past the exit rule's two empty reads, the loop still waits and the
+    woken round still happens."""
+    _interpreter_or_skip()
+    hold = _SettlementHold()
+    _hold_settlement(monkeypatch, hold, step="write")
+    metrics = _drive_shell_job(tmp_path, capsys, woken=_ok_response("woke round done"), name="m2c")
+    assert hold.armed
+    assert metrics["flag"] == "accepted"
+    assert metrics["exit_code"] == 0
+    assert metrics["run_statuses"] == ["succeeded", "succeeded"]
+    assert metrics["llm_requests"] == 3
+    assert metrics["background_job_rows"] == 0
+
+
+def test_m2d_wait_covers_the_wake_delivery(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The written row is not a delivered wake: with the wake delivery held
+    (row already ``succeeded``, handle already discarded by the row-write
+    lifetime), the loop still waits and the woken round still happens."""
+    _interpreter_or_skip()
+    hold = _SettlementHold()
+    _hold_settlement(monkeypatch, hold, step="deliver")
+    metrics = _drive_shell_job(tmp_path, capsys, woken=_ok_response("woke round done"), name="m2d")
+    assert hold.armed
+    assert metrics["flag"] == "accepted"
+    assert metrics["exit_code"] == 0
+    assert metrics["run_statuses"] == ["succeeded", "succeeded"]
+    assert metrics["llm_requests"] == 3
+    assert metrics["background_job_rows"] == 0
+
+
+# ---------------------------------------------------------------------------
 # M3 -- the exit-code law covers every waited round (finalError)
 # ---------------------------------------------------------------------------
 
@@ -245,6 +366,23 @@ def test_m3_exit_code_covers_the_woken_round(tmp_path: Path, capsys: pytest.Capt
     assert metrics["run_statuses"] == ["succeeded", "interrupted"]
     # The interrupted woken round still consumed its provider turn (the
     # third request); see M2 for why output_request_index is not assertable.
+    assert metrics["llm_requests"] == 3
+
+
+def test_m3b_exit_code_law_holds_under_the_settlement_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-C3-019: the woken round reached through a held wake delivery is a
+    waited round like any other -- its ``interrupted`` terminal still moves
+    the exit code to 2 (CI run 45031014521 read 0 here)."""
+    _interpreter_or_skip()
+    hold = _SettlementHold()
+    _hold_settlement(monkeypatch, hold, step="deliver")
+    metrics = _drive_shell_job(tmp_path, capsys, woken=eval_module._interrupted_stream(), name="m3b")
+    assert hold.armed
+    assert metrics["flag"] == "accepted"
+    assert metrics["exit_code"] == 2
+    assert metrics["run_statuses"] == ["succeeded", "interrupted"]
     assert metrics["llm_requests"] == 3
 
 

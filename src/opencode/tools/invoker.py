@@ -979,7 +979,11 @@ BackgroundDelivery = Callable[[BackgroundJobRow], Awaitable[None]]
 @dataclass(frozen=True, slots=True)
 class BackgroundHandle:
     """One backgrounded shell call's live face: the single-shot wait loop's
-    first read (upstream ``jobs``) and the wait-phase SIGINT cancel target."""
+    first read (upstream ``jobs``) and the wait-phase SIGINT cancel target.
+
+    Listed from the backgrounding moment until its *whole settlement* is over
+    (the terminal row upsert and the wake delivery) -- not merely while the
+    process runs (T-C3-019)."""
 
     notification_id: str
     session_id: str
@@ -994,13 +998,18 @@ _BACKGROUND_HANDLES: dict[str, BackgroundHandle] = {}
 
 
 def pending_background(session_id: str, since_ms: int = 0) -> list[BackgroundHandle]:
-    """The session's still-running backgrounded shell calls started at or
-    after ``since_ms`` (epoch ms) -- live process state, not the rows."""
+    """The session's unsettled backgrounded shell calls started at or after
+    ``since_ms`` (epoch ms) -- live process state, not the rows.
+
+    A handle is pending until its settlement task is done: a process that
+    already exited but whose terminal row or wake delivery is still in
+    flight is still work (the wait loop must not read that window as
+    quiescence -- T-C3-019, CI run 45031014521)."""
     return sorted(
         (
             handle
             for handle in _BACKGROUND_HANDLES.values()
-            if handle.session_id == session_id and handle.started_ms >= since_ms and not handle.task.done()
+            if handle.session_id == session_id and handle.started_ms >= since_ms and not handle.settlement.done()
         ),
         key=lambda handle: handle.started_ms,
     )
@@ -1133,9 +1142,16 @@ def _spawn_settlement(
     settlement write failure must never take down the event loop (the
     row stays ``backgrounded`` and replays as interrupted-on-restart --
     honest, not lost).
+
+    T-C3-019: the live handle is discarded only when the *whole* settlement
+    is over -- the terminal upsert AND the wake delivery. The wait loop's
+    pending read keys off this continuation, so a finished process whose
+    wake is still being written or delivered stays "pending" (discarding at
+    the row write, or keying off the process alone, let two empty reads
+    slip through that window -- CI run 45031014521).
     """
 
-    async def _settle() -> None:
+    async def _settle_row() -> None:
         status = STATUS_SUCCEEDED
         payload: JsonObject = {}
         try:
@@ -1168,10 +1184,6 @@ def _spawn_settlement(
             await upsert_row(database, row)
         except Exception:
             return
-        finally:
-            # The live handle's lifetime ends with its settlement (the wait
-            # loop's pending read and the cancel face both key off this).
-            _BACKGROUND_HANDLES.pop(notification_id, None)
         if background_delivery is None:
             return
         # T-C3-014: the delivery port (upstream completeBackground). A
@@ -1186,6 +1198,16 @@ def _spawn_settlement(
             await delete_row(database, notification_id)
         except Exception:
             pass
+
+    async def _settle() -> None:
+        # One discard for every exit of the settlement (no database, a write
+        # or delivery failure, cancellation included) -- the live handle's
+        # lifetime ends with it (the wait loop's pending read keys off this
+        # continuation, the cancel face off the adapter task).
+        try:
+            await _settle_row()
+        finally:
+            _BACKGROUND_HANDLES.pop(notification_id, None)
 
     continuation = asyncio.create_task(_settle())
     return continuation

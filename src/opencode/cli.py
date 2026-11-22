@@ -1457,7 +1457,10 @@ async def _wait_background_wakes(
     wait face's cancel: the in-flight jobs are cancelled (rows deleted --
     aborted work never replays) and the active subagent children are
     interrupted; exit 2. The exit requires two consecutive empty reads (the
-    first may race the promote's inbox-consume -> run.started window)."""
+    first may race the promote's inbox-consume -> run.started window). A
+    shell handle counts as pending until its whole settlement is over
+    (T-C3-019): a process that already exited but whose terminal row or
+    wake delivery is still in flight is work, not quiescence."""
     discovered: list[str] = []
     subscription_types = (_JSON_TYPES if json_output else _PREVIEW_TYPES) | frozenset({PY_RUN_STARTED})
     last_count = -1
@@ -1521,8 +1524,9 @@ async def _wait_background_wakes(
 
 async def _pending_background(app: App, session_id: str, admitted_ms: int) -> list[_PendingJob]:
     """Upstream ``background()``'s three reads, first non-empty face wins:
-    this process's live shell handles (started at or after the first
-    admission), the pending inbox (a wake admitted but not yet promoted),
+    this process's unsettled shell handles (started at or after the first
+    admission, listed until their settlement -- row write and wake delivery
+    -- is over), the pending inbox (a wake admitted but not yet promoted),
     then the folded subagent observations (a child run still in flight)."""
     handles = pending_background(session_id, admitted_ms)
     if handles:
