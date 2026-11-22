@@ -94,6 +94,18 @@ def _action(prompt: str = "Deploy finished: react.") -> dict[str, Any]:
     return {"type": "prompt", "prompt": prompt, "to": {"session": _SESSION_ID}}
 
 
+def _event(event_id: str, cursor: str) -> dict[str, Any]:
+    """One ``deploys`` event message as the fixture streams it."""
+    return {
+        "type": "event",
+        "eventId": event_id,
+        "name": "deploys",
+        "timestamp": "2026-11-21T00:00:00Z",
+        "data": {"status": "finished"},
+        "cursor": cursor,
+    }
+
+
 def _manager(tmp_path: Path, **extra_env: str) -> McpManager:
     mcp = _mcp_manager_module()
     if mcp is None:
@@ -117,6 +129,12 @@ class _ScriptedManager(McpManager):
         super().__init__()
         self._scripts = list(scripts)
         self.stream_calls: list[dict[str, Any]] = []
+        self.stream_closes = 0  # streams the watcher let go of
+
+    def _record(self, server: str, event_name: str, arguments: dict[str, Any] | None, cursor: str | None) -> None:
+        self.stream_calls.append(
+            {"server": server, "name": event_name, "arguments": dict(arguments or {}), "cursor": cursor}
+        )
 
     async def start_server(self, name: str) -> tuple[Any, ...]:
         return ()
@@ -133,13 +151,62 @@ class _ScriptedManager(McpManager):
         cursor: str | None = None,
         idle_timeout_s: float = 1.0,
     ) -> Any:
-        self.stream_calls.append(
-            {"server": server, "name": event_name, "arguments": dict(arguments or {}), "cursor": cursor}
-        )
+        self._record(server, event_name, arguments, cursor)
         script = self._scripts.pop(0) if self._scripts else []
-        for message in script:
-            yield message
-        await asyncio.Event().wait()  # hold quiet; teardown cancels
+        try:
+            for message in script:
+                yield message
+            await asyncio.Event().wait()  # hold quiet; teardown cancels
+        finally:
+            self.stream_closes += 1
+
+
+class _ReplayManager(_ScriptedManager):
+    """The server face a reopen depends on: every event past the cursor the
+    request carried is replayed (no cursor = the whole history)."""
+
+    def __init__(self, history: list[dict[str, Any]]) -> None:
+        super().__init__([])
+        self._history = list(history)
+
+    async def stream_events(
+        self,
+        server: str,
+        event_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+        cursor: str | None = None,
+        idle_timeout_s: float = 1.0,
+    ) -> Any:
+        self._record(server, event_name, arguments, cursor)
+        past = cursor is None
+        try:
+            for message in self._history:
+                if past:
+                    yield message
+                elif message["cursor"] == cursor:
+                    past = True
+            await asyncio.Event().wait()
+        finally:
+            self.stream_closes += 1
+
+
+class _ParkedSessions(_RecordingSessions):
+    """The prompt is delivered, then the run parks until released: the watcher
+    is caught mid-run (prompt sent, settle pending)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delivered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.message_ids: list[str] = []
+
+    async def send_prompt(self, session_id: str, text: str, message_id: str) -> str:
+        self.sends.append((session_id, text))
+        self.message_ids.append(message_id)
+        self.delivered.set()
+        await self.release.wait()
+        return message_id
 
 
 async def _make_service(database: Any, sessions: Any, manager: McpManager) -> Any:
@@ -501,6 +568,52 @@ def test_pause_cancels_the_stream_resume_reopens_from_cursor(tmp_path: Path) -> 
         await _wait_for(lambda: len(sessions.sends) > frozen, what="delivery to resume")
 
     asyncio.run(_scenario(tmp_path, "pr", manager, body))
+
+
+def test_pause_mid_run_keeps_the_settle_so_the_reopen_does_not_replay(tmp_path: Path) -> None:
+    """T-C3-017 (the ``pause_cancels`` flake, made deterministic): a pause that
+    lands after the prompt was sent and before its settle must not drop the
+    settle. A dropped one reopens without the cursor and prompts the same
+    event a second time under the same message id."""
+    manager = _ReplayManager([_event("evt-1", "c1"), _event("evt-2", "c2")])
+    sessions = _ParkedSessions()
+
+    async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
+        automation_id = created["id"]
+        await sessions.delivered.wait()
+        await service.pause(automation_id)  # the cancel lands inside the run
+        sessions.release.set()
+        await _wait_for(lambda: manager.stream_closes == 1, what="the cancelled watcher to let go of the stream")
+        assert _position(tmp_path, "midrun", automation_id) == {"cursor": "c1", "id": "evt-1"}
+        row = _row(tmp_path / "midrun.db", automation_id)
+        assert (row["status"], row["run_count"], row["last_message_id"]) == ("paused", 1, f"msg_{automation_id}_1")
+        await service.resume(automation_id)
+        await _wait_for(lambda: len(sessions.sends) == 2, what="the event past the cursor")
+        assert manager.stream_calls[1]["cursor"] == "c1"
+        assert ["evt-1" in text for _, text in sessions.sends] == [True, False]
+        assert ["evt-2" in text for _, text in sessions.sends] == [False, True]
+        assert len(set(sessions.message_ids)) == 2
+
+    asyncio.run(_scenario(tmp_path, "midrun", manager, body, sessions=sessions))
+
+
+def test_stop_mid_run_waits_the_settle_and_still_ends_the_watcher(tmp_path: Path) -> None:
+    """T-C3-017: ``stop_watches`` over a watcher caught mid-run waits the
+    settle, then the watcher still ends cancelled (the wait does not swallow
+    the cancel): its stream is let go."""
+    manager = _ReplayManager([_event("evt-1", "c1")])
+    sessions = _ParkedSessions()
+
+    async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
+        await sessions.delivered.wait()
+        stop = asyncio.create_task(service.stop_watches())
+        sessions.release.set()
+        await _wait_for(lambda: manager.stream_closes == 1, what="the stopped watcher to let go of the stream")
+        await stop
+        assert _position(tmp_path, "midstop", created["id"]) == {"cursor": "c1", "id": "evt-1"}
+        assert _row(tmp_path / "midstop.db", created["id"])["run_count"] == 1
+
+    asyncio.run(_scenario(tmp_path, "midstop", manager, body, sessions=sessions, scheduler=False))
 
 
 def test_remove_cancels_the_watch_and_deletes_the_row(tmp_path: Path) -> None:

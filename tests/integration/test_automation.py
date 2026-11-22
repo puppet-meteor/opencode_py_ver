@@ -175,6 +175,22 @@ class _Sessions:
         return self.always_pending
 
 
+class _ParkedSessions(_Sessions):
+    """The prompt is delivered, then the run parks until released: the run is
+    caught after its side effect and before its settle (T-C3-017)."""
+
+    def __init__(self, entered: asyncio.Event, release: asyncio.Event) -> None:
+        super().__init__()
+        self._entered = entered
+        self._release = release
+
+    async def send_prompt(self, session_id: str, text: str, request_id: str) -> str:
+        self.sends.append((session_id, text, request_id))
+        self._entered.set()
+        await self._release.wait()
+        return f"msg_{len(self.sends)}"
+
+
 async def _make(
     db_path: Path, sessions: _Sessions, clock: _Clock, database: Any = None, **overrides: Any
 ) -> tuple[Any, Any]:
@@ -459,6 +475,37 @@ def test_prompt_failure_backoff_keeps_run_count(tmp_path: Path) -> None:
     assert after_failure["run_count"] == 0
     assert after_failure["next_due_at"] == due
     assert during_window["run_count"] == 0
+
+
+def test_cancelled_run_still_settles_its_slot(tmp_path: Path) -> None:
+    """T-C3-017: a run cancelled after its prompt was sent (the scheduler stop
+    cancels its tick mid-run) still settles; a dropped settle would repeat the
+    slot -- a second prompt for one due time -- at the next start."""
+    db_path = tmp_path / "red.db"
+    _migrate(db_path)
+    due = _BASE_MS - 30_000
+    automation_id = _insert_row(db_path, id="aut_red_cancelled", next_due_at=due)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _scenario() -> tuple[dict[str, Any], int]:
+        service, database = await _make(db_path, _ParkedSessions(entered, release), _Clock())
+        tick = asyncio.create_task(service.tick())
+        await entered.wait()
+        tick.cancel()  # the scheduler stop landing mid-run
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await tick
+        settled = _row(db_path, automation_id)
+        again = await service.tick()  # the next start must not repeat the slot
+        await database.close()
+        return settled, again
+
+    settled, again = _execute(_scenario())
+    assert settled["run_count"] == 1
+    assert (settled["last_outcome"], settled["last_message_id"]) == ("fired", f"msg_{automation_id}_1")
+    assert settled["next_due_at"] == _BASE_MS + _EVERY_MS
+    assert again == 0
 
 
 def test_invalid_target_pauses(tmp_path: Path) -> None:

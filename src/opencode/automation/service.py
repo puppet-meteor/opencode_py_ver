@@ -18,6 +18,11 @@ actions, at/every/cron triggers) per doc/plans/port-232-increments.md:
 - settlement -- optimistic concurrency: every run's UPDATE is guarded by
   ``id + run_count + status``, so a completion settle never resurrects a
   removed row and a failure settle never overwrites a concurrent pause;
+- cancellation -- a run is atomic to it (T-C3-017): upstream never
+  interrupts a run, so a cancel landing between ``send_prompt`` and its
+  settle waits the settle out instead of dropping it (a dropped settle
+  replays the delivered event after the reopen; the timer face repeats the
+  slot at the next start);
 - outcomes -- ``fired``/``late`` (past ``late_after_s``) on delivery,
   ``skipped`` when the previous prompt is still pending in the target's
   inbox (coalesce: no send, but the timer still advances), ``failed`` with
@@ -56,7 +61,7 @@ import math
 import re
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -257,6 +262,32 @@ def run_session_id(automation_id: str, run: int) -> str:
     """The child session a subagent run starts: derived from the run so a
     retry adopts it instead of starting another (upstream runSessionID)."""
     return f"ses_aut_{automation_id}_{run}"
+
+
+async def _run_to_completion(run: Coroutine[Any, Any, None]) -> None:
+    """Await ``run`` to its end even if the awaiting task is cancelled
+    meanwhile (T-C3-017); the cancel is re-raised once the run has ended.
+
+    The run is waited on as its own task and is never cancelled itself: a
+    cancel arriving mid-run only marks ``interrupted`` and the loop goes
+    back to waiting. Under a pending cancel the run's own failure is
+    retrieved but not raised -- the caller sees the teardown (the row is
+    paused or removed, or the next start re-runs and re-judges the slot).
+    """
+    task: asyncio.Task[None] = asyncio.create_task(run)
+    interrupted = False
+    while True:
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            interrupted = True
+        else:
+            break
+    if interrupted:
+        if not task.cancelled():
+            task.exception()  # retrieved, not reported: the teardown is what the caller sees
+        raise asyncio.CancelledError
+    task.result()
 
 
 def is_run_session(session_id: str) -> bool:
@@ -639,13 +670,24 @@ class AutomationService:
         raise InvalidAutomationError("A prompt action has no target")
 
     async def _run_action(self, row: _Row, now_ms: int, event: Mapping[str, Any] | None = None) -> None:
-        """One prompt run (upstream runAction, prompt branch).
+        """One prompt run (upstream runAction, prompt branch), atomic to
+        cancellation (T-C3-017).
 
         ``event`` is the T-C3-004 face: the prompt is the interpolated
         upstream text under the 32 KiB cap, coalescing never applies, and
         the settle advances ``event_position`` {cursor, id} instead of the
         timer cursor.
+
+        Upstream never interrupts a run. A cancel reaching the running task
+        after the prompt was sent (pause/remove/reconcile/stop cancelling a
+        watcher, the scheduler stop cancelling its tick) therefore waits for
+        the settle instead of dropping it: a dropped settle reopens from the
+        previous cursor and prompts the same event twice (the timer face
+        repeats the slot at the next start).
         """
+        await _run_to_completion(self._prompt_run(row, now_ms, event))
+
+    async def _prompt_run(self, row: _Row, now_ms: int, event: Mapping[str, Any] | None) -> None:
         action = row.action
         if action.get("type") != "prompt":
             raise InvalidAutomationError(f"Unsupported action type: {action.get('type')!r}")
@@ -782,6 +824,7 @@ class AutomationService:
     async def stop_watches(self) -> None:
         """Cancel every watcher and wait out their teardown (the rows stay
         as they are: active rows regain a watcher at the next reconcile).
+        A watcher caught mid-run settles that run first (T-C3-017).
 
         Harnesses call this BEFORE closing the MCP manager so a cancelled
         stream's ``notifications/cancelled`` still has a live loop to ride.
