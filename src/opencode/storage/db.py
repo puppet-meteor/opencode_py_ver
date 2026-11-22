@@ -7,7 +7,9 @@ connection. Python differences: a SQLAlchemy 2.0 async engine over aiosqlite
 instead of bun:sqlite; an explicit ``Database`` handle replaces the Effect
 Layer finalizer (async ``close()`` / async context manager); every pooled
 connection additionally sets ``foreign_keys=ON`` and ``busy_timeout=5000``
-(CORE-CONTRACTS §5; the TS layer relies on its client stack for those), and
+(CORE-CONTRACTS §5; the TS layer relies on its client stack for those), an
+idempotent aiosqlite ``stop()`` on every pooled connection (the
+omnilib/aiosqlite#403 workaround, T-C3-016), and
 writer opens take the data-directory OS file lock BEFORE the database is
 opened -- the exact msvcrt/fcntl scheme verified by the R0-B probe
 (``tools/r0/platform_probe.py``, evidence ``doc/evidence/r0/platform.json``):
@@ -18,6 +20,7 @@ R0-B and deliberately not retested here.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -158,6 +161,49 @@ def _install_connection_pragmas(engine: AsyncEngine, *, readonly: bool) -> None:
             cursor.close()
 
 
+def _make_stop_idempotent(driver: Any) -> None:
+    """Work around omnilib/aiosqlite#403 on one aiosqlite connection (T-C3-016).
+
+    ``Connection.stop()`` queues ONE stop item and returns a fresh future per
+    call, but the worker thread exits on the first item: the future of every
+    later call is resolved by nobody. SQLAlchemy 2.1 reaches exactly that
+    second call when a task is cancelled while a DBAPI call is parked on the
+    worker thread and a second cancel wave follows -- ``terminate()``
+    (sqlalchemy/connectors/asyncio.py) falls back to ``_terminate_force_close()``
+    = ``stop()`` #1, the cancelled ``Connection.close()`` runs its ``finally``
+    = ``stop()`` #2 and awaits that dead future forever. That orphan is the
+    task ``asyncio.run()``'s shutdown gather never sees finish. The wrapper
+    hands back the result of the FIRST call on every later call (``None`` when
+    the calling thread has no event loop is a result too: the stop item is
+    queued all the same), so nothing is queued behind the doomed worker.
+
+    The closure holds the bound original -- a reference cycle with the
+    connection, so a connection dropped without ``close()`` is finalised
+    (``__del__`` -> ``stop()``) by the cyclic GC instead of by refcount; the
+    worker thread is a daemon thread, nothing ever waits on it. ``stop()``
+    exists since aiosqlite 0.22.1; a driver without it is left untouched.
+    """
+    original = getattr(driver, "stop", None)
+    if original is None:
+        return
+    first: list[asyncio.Future[Any] | None] = []
+
+    def stop_once() -> asyncio.Future[Any] | None:
+        if not first:
+            first.append(original())
+        return first[0]
+
+    driver.stop = stop_once
+
+
+def _install_stop_once(engine: AsyncEngine) -> None:
+    """The aiosqlite#403 ``stop()`` guard on every pooled connection (T-C3-016)."""
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _wrap_stop(dbapi_connection: Any, _connection_record: Any) -> None:
+        _make_stop_idempotent(getattr(dbapi_connection, "driver_connection", None))
+
+
 class Database:
     """Opened storage engine handle: one async engine + the data-directory writer lock.
 
@@ -225,6 +271,7 @@ def open_database(path: str | Path, *, mode: OpenMode = "create") -> Database:
         lock.acquire()
     try:
         engine = create_async_engine(_engine_url(db_path, mode))
+        _install_stop_once(engine)
         _install_connection_pragmas(engine, readonly=mode == "readonly")
     except BaseException:
         if lock is not None:
