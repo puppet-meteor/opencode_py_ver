@@ -1244,6 +1244,14 @@ class AutomationService:
 
     async def remove(self, automation_id: str) -> None:
         await self._fetch(automation_id)
-        self._cancel_watch(automation_id)
+        # Delete first, cancel after (T-C3-021): while the row lives the
+        # watcher stays registered, so the scheduler's per-tick reconcile
+        # landing before the commit finds it and spawns no successor over
+        # the still-active row (the successor reopened the stream and the
+        # removed automation delivered once more, CI 45174989907). A
+        # reconcile that read the row before the commit and spawns only
+        # after the cancel meets no row: ``_watch`` returns at its first
+        # fetch.
         async with self._database.engine.begin() as connection:
             await connection.execute(text(f"delete from {TABLE} where id = :id").bindparams(id=automation_id))
+        self._cancel_watch(automation_id)

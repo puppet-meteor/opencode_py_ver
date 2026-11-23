@@ -210,6 +210,47 @@ class _ParkedSessions(_RecordingSessions):
         return message_id
 
 
+class _ParkedTxn:
+    """One transaction parked before it opens (nothing is held meanwhile)."""
+
+    def __init__(self, inner: Any, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._entered = entered
+        self._release = release
+
+    async def __aenter__(self) -> Any:
+        self._entered.set()
+        await self._release.wait()
+        return await self._inner.__aenter__()
+
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> Any:
+        return await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+class _FirstTxnParked:
+    """The engine face the service touches, with its FIRST ``begin()`` parked
+    before it opens: the test chooses what runs while that transaction waits
+    (T-C3-021, the remove/reconcile window). Later transactions pass through."""
+
+    def __init__(self, inner: Any, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self._inner = inner
+        self._entered = entered
+        self._release = release
+        self._armed = True
+
+    def begin(self) -> Any:
+        if not self._armed:
+            return self._inner.begin()
+        self._armed = False
+        return _ParkedTxn(self._inner.begin(), self._entered, self._release)
+
+    def connect(self) -> Any:
+        return self._inner.connect()
+
+    def dispose(self) -> Any:
+        return self._inner.dispose()
+
+
 async def _make_service(database: Any, sessions: Any, manager: McpManager) -> Any:
     return AutomationService(
         database=database,
@@ -679,6 +720,51 @@ def test_remove_cancels_the_watch_and_deletes_the_row(tmp_path: Path) -> None:
         assert len(_stream_requests(tmp_path)) == requests, _stream_trace(tmp_path)
 
     asyncio.run(_scenario(tmp_path, "rm", manager, body))
+
+
+def test_remove_keeps_the_watch_registered_until_the_row_is_deleted(tmp_path: Path) -> None:
+    """T-C3-021 (CI 45174989907, windows): ``remove`` unregistered the watcher
+    before deleting the row. A reconcile landing in that window (the scheduler
+    runs one every tick) still read the row as active and, finding no watcher
+    registered, spawned a successor over it: the stream reopened and the
+    removed automation delivered its next event once more. The watcher stays
+    registered until the delete has committed, so a reconcile inside the
+    window spawns nothing."""
+
+    manager = _ScriptedManager([[_event("evt-1", "c1")], [_event("evt-2", "c2")]])
+
+    async def body(service: Any, sessions: Any, created: dict[str, Any]) -> None:
+        automation_id = created["id"]
+        settled = {"cursor": "c1", "id": "evt-1"}
+        await _wait_for(
+            lambda: _position(tmp_path, "rmrace", automation_id) == settled,
+            what="the first delivery to settle",
+        )
+        watcher = service._watchers[automation_id]
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        database = service._database
+        database.engine = _FirstTxnParked(database.engine, entered, release)
+        removing = asyncio.create_task(service.remove(automation_id))
+        try:
+            await entered.wait()  # remove waits before its delete opens: the row is intact
+            await service.reconcile_event_watches()  # the scheduler's per-tick reconcile, inside the window
+            if service._watchers.get(automation_id) is not watcher:
+                # a successor was spawned: let it act, so the failure names the behavior
+                await _wait_for(lambda: len(manager.stream_calls) > 1, what="the successor to reopen the stream")
+            assert len(manager.stream_calls) == 1, "a reconcile inside remove spawned a successor watch"
+        finally:
+            release.set()
+            await removing
+        await _wait_for(lambda: manager.stream_closes == 1, what="the cancelled watcher to let go of the stream")
+        assert automation_id not in service._watchers
+        with pytest.raises(_NotFound):
+            await service.get(automation_id)
+        await asyncio.sleep(0.35)  # several scheduler periods: nothing is left to deliver
+        assert len(sessions.sends) == 1
+        assert len(manager.stream_calls) == 1
+
+    asyncio.run(_scenario(tmp_path, "rmrace", manager, body, scheduler=False))
 
 
 def test_event_prompts_never_coalesce(tmp_path: Path) -> None:
