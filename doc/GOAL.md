@@ -39,7 +39,7 @@
 
 | 载体 | 职责 |
 |---|---|
-| `opencode-2.2.2-py`（本仓） | 智能体框架基座：工具面、审批链、fail-soft、httpapi、memory、会话/存储 |
-| `agent_dsl_flow_framework` | 确定性方案的 **langgraph 表述与执行**载体（DSL→pipeline 编译/演练/发布） |
+| `opencode-2.2.2-py`（本仓） | 智能体框架基座：工具面、审批链、fail-soft、httpapi、memory、会话/存储；**确定性方案的运行态执行位置**（§3） |
+| `agent_dsl_flow_framework` | 确定性方案的 **langgraph 表述与创作期**载体（编译/演练/发布）；运行态执行在本仓（§3） |
 | `evolution_service_dir` | 案例收集、基线管理、双门评估、基线化发布仲裁 |
 | 上游 opencode（TS，`../opencode-2.3.2/`） | 增量特性追踪与择优移植源；**移植基线仍为 2.2.2**（裁决基准不变），2.2.2→2.3.2 增量按「对目标助益」择优翻译为 py |

@@ -1,9 +1,26 @@
-# OpenCode Python：先完成核心闭环，再按需扩展
+# OpenCode Python 路线图：以 GOAL 为准，按阶段交付
 
-> 更新：2026-11-07。状态：核心已实现并经全量验证（pytest 1139/mypy 110/双 ruff 绿+CI 绿链；R5 收官证据=[r5-exit-evidence §8](reference/r5-exit-evidence.md)，当前基线含 P2-S0 生产 MCP 接线增量）；Phase 2 模块扩展按 [p2-slices](plans/p2-slices.md) 规划推进。core 0.1 尚未发布/稳定（tag 暂缓[OP-R5-4]）；平台已知限制在册（[platform-support §9](platform-support.md)），不可主张平台无限制。状态行刷新：2026-11-07（T-A-012；恢复与 MCP 增量见 [ADR-0002](adr/0002-recovery-coordinator-and-mcp-client.md)）。
-> 目标：Python 3.12+，单用户、本地 workspace、headless 优先。
+> 更新：2026-11-23（换代：目标与阶段以 [GOAL.md](GOAL.md) 与 [goal-plan](plans/goal-plan.md) 为准）。交付基线：Phase 1（R0–R5）全链闭合；Phase 2 模块按 [p2-slices](plans/p2-slices.md) 增量落地（已落模块面见 §0）。质量门=CI 双 OS 全量 pytest + mypy + ruff format/check（最近一次 `b9caec7`：windows 2772 passed/24 skipped、ubuntu 绿）。core 0.1 的 tag 待用户定夺（台账待定夺 12）；平台已知限制在册（[platform-support §9](platform-support.md)），不可主张平台无限制。上一版状态行由 T-A-012 于 2026-11-07 刷新（恢复与 MCP 增量见 [ADR-0002](adr/0002-recovery-coordinator-and-mcp-client.md)）。
+> Phase 1 工程目标：Python 3.12+，单用户、本地 workspace、headless 优先；产品目标以 [GOAL.md](GOAL.md) 为准。
+
+## 0. 当前阶段：向 GOAL 对齐（2026-11-23 起）
+
+产品目标以 [GOAL.md](GOAL.md) 为唯一权威表述：运维与变更场景专用的智能体框架——确定性方案（langgraph 形式）为核心资产、动态方案兜底，以历史案例的评审发布（双门绿灯）为进化回路。本仓是智能体框架基座，也是确定性方案的运行态执行位置。下一阶段特性规划见 [goal-plan](plans/goal-plan.md)，票表与承诺级别以其 §3 为准。
+
+已落模块面（以 `src/opencode/` 目录为准，不代表各模块已达到 GOAL 的目标形态）：ai、artifact、automation、bus、config、contracts、httpapi、mcp、orchestrator（pipeline/langgraph 引擎）、process、sdk、session、shellparse、skills、storage、tools、util、watcher，以及 `memory.py`。
+
+- 本阶段承诺：G-12（已闭合）、G-01（设计稿待用户批准，批前不实现）、G-05、G-03 薄切片、G-10 手工一例。
+- 可选：G-06。
+- 按需：G-02、G-04、G-09、G-11（跨仓）。
+- 不进本阶段：G-07、G-08。
+
+并行在池（与上述各票互不阻塞）：上游 2.3.2 增量移植（T-C3 系列，[port-232-increments](plans/port-232-increments.md)，按「对目标助益」择优，移植基线仍为 2.2.2）；Agent Memory 长期规划（[memory-longterm-plan](plans/memory-longterm-plan.md)，未排期、未裁决）。
+
+治理：特性先立项，设计经用户批准后才实现；每票按确定性复现→修→定向→全量→三门禁→CI 的纪律闭合，事实记于 [ORCHESTRATION.md](ORCHESTRATION.md)。
 
 ## 1. 交付边界
+
+> 以下 §1–§7 是 Phase 1 立项章程（2026-11-07 状态）。§3（接缝与依赖方向）与 §4（兼容承诺）持续有效；§1、§5 的范围与估算是历史记录，不再代表当前阶段。
 
 先做一个能对话、能修改代码、能恢复会话的 Python agent CLI。核心版本包含完整的输入、模型、工具、权限、事件、持久化和取消链路，后续功能通过小接口接入。
 
@@ -31,8 +48,13 @@
 | [PHASE2-MODULES.md](PHASE2-MODULES.md) | 可选模块、真实依赖、变更范围和估算 |
 | [parity.md](parity.md) | TS 对照、已知差异、参考源码锁定 |
 | [ADR-0001](adr/0001-core-architecture.md) | 单一写入路径、可信范围、兼容策略的理由 |
+| [GOAL.md](GOAL.md) | 项目目标（产品章程）；各计划文档向其对齐 |
+| [goal-plan](plans/goal-plan.md) | 下一阶段特性规划：缺口、票表与承诺级别、G-01 设计稿、跨仓对齐 |
+| [port-232-increments](plans/port-232-increments.md) | 上游 2.3.2 增量移植计划（T-C3 系列） |
+| [memory-longterm-plan](plans/memory-longterm-plan.md) | Agent Memory 长期存储规划（未排期） |
+| [ORCHESTRATION.md](ORCHESTRATION.md) | 调度台账：票表、时序事实、待定夺事项 |
 
-契约只在 `CORE-CONTRACTS.md` 定义，阶段文档引用它，避免重复的接口示例产生冲突。当前仓库只有规划文档，不能把规划中的验收项视为已经通过。
+契约只在 `CORE-CONTRACTS.md` 定义，阶段文档引用它，避免重复的接口示例产生冲突。规划文档里的验收项以 [ORCHESTRATION.md](ORCHESTRATION.md) 记录的闭合为准，未闭合项不得视为已通过。
 
 ## 3. 六个接缝和依赖方向
 
