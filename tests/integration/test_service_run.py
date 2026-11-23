@@ -23,7 +23,7 @@ import json
 import sqlite3
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeGuard
@@ -31,11 +31,13 @@ from typing import Any, TypeGuard
 import pytest
 from pydantic import BaseModel
 from sqlalchemy import event as sa_event
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from opencode.app import App
 from opencode.bus import VolatileBus
 from opencode.bus.eventlog import EventLog
 from opencode.contracts import ConfigSnapshot, CoreErrorCode
+from opencode.contracts.events import EVENT_VERSION, PY_RUN_FINISHED, EventDraft, RunFinishedData
 from opencode.contracts.llm import (
     ErrorChunk,
     FinishChunk,
@@ -66,6 +68,7 @@ from opencode.session.service import (
 )
 from opencode.storage import (
     ConflictError,
+    EventBatch,
     LifecycleCleanupFailedError,
     NotFoundError,
     ReadRepositories,
@@ -1125,4 +1128,128 @@ async def test_close_tolerates_a_quarantined_session(tmp_path: Path) -> None:
             await app.service.prompt(session_id, "more", "req_2")
 
         await app.close()  # repeated close reuses the finished cleanup task
+        assert provider.close_count == 1
+
+
+# ---------------------------------------------------------------------------
+# T-C3-020 (CI 45031014521, family B): the late-terminal window inside the intent commit
+# ---------------------------------------------------------------------------
+
+
+class _TerminalLandsAfterStatusRead(ReadRepositories):
+    """The CI 45031014521 window, made deterministic.
+
+    ``run_status_by_id`` is the intent loop's only ``runs.status`` read. The
+    first armed read answers with the value it just read (still non-terminal)
+    and only then, before returning, awaits ``land`` -- so the run's terminal
+    lands between that status read and whatever the caller does next. Every
+    later read goes straight through.
+    """
+
+    def __init__(self, engine: AsyncEngine, *, run_id: str, land: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(engine)
+        self._run_id = run_id
+        self._land: Callable[[], Awaitable[None]] | None = land
+        self.fired = False
+
+    async def run_status_by_id(self, run_id: str) -> str | None:
+        status = await super().run_status_by_id(run_id)
+        if run_id == self._run_id and self._land is not None:
+            land, self._land = self._land, None
+            self.fired = True
+            await land()
+        return status
+
+
+def _interrupted_terminal(session_id: str, run_id: str, event_id: str) -> EventDraft[RunFinishedData]:
+    """The runner's own interrupted terminal (the ``_finalize_interrupted`` tail)."""
+    return EventDraft[RunFinishedData](
+        id=event_id,
+        type=PY_RUN_FINISHED,
+        version=EVENT_VERSION,
+        session_id=session_id,
+        created_at=_CREATED_AT,
+        data=RunFinishedData(run_id=run_id, outcome="interrupted", error=None),
+        metadata={"run_id": run_id},
+    )
+
+
+async def test_cancel_tolerates_a_terminal_committed_after_its_status_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-C3-020: the run's terminal commits after the intent loop read
+    ``runs.status`` as non-terminal and before the intent's own commit. That
+    is a late cancel (§7 L335): the intent must never land -- the fold rejects
+    it as an illegal transition, and that StorageCorruptError is what killed
+    close() Phase 1 on CI. The retry sees the terminal, cancel() returns it,
+    and the log gains the terminal only."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    ids = _FixedIds()
+
+    async with _plain_app(db_path) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        events_before = _event_count(db_path, session_id)
+        assert _run_status_value(db_path, run_ref.run_id) == "accepted"
+
+        async def _land() -> None:
+            # The runner's terminal: one atomic store commit (CAS + insert +
+            # the runs projection); accepted -> interrupted is fold-legal (§2.1 L59).
+            high = await app.service._repos.log_high(session_id)
+            terminal = _interrupted_terminal(session_id, run_ref.run_id, ids.event_id())
+            await app.service._store.commit(session_id, EventBatch(ids.batch_id(), (terminal,)), high)
+
+        probe = _TerminalLandsAfterStatusRead(app.database.engine, run_id=run_ref.run_id, land=_land)
+        monkeypatch.setattr(app.service, "_repos", probe)
+
+        final = await app.service.cancel(run_ref.run_id)
+
+        assert probe.fired is True
+        assert final.status is RunStatusValue.INTERRUPTED
+        assert final.session_id == session_id
+        assert _event_data(db_path, session_id, "py.run.cancel_requested") == []
+        assert _event_count(db_path, session_id) == events_before + 1  # the terminal only
+        assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
+        assert _session_status_value(db_path, session_id) == "active"  # no cleanup_failed
+
+
+async def test_close_tolerates_a_terminal_committed_inside_the_shutdown_intent_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-C3-020, the CI shape: close() Phase 1 is committing the shutdown
+    intent for a live run when the scheduled runner commits its own
+    interrupted terminal (the CI run's provider stream was cut). The window
+    between the intent loop's status read and its commit must not turn that
+    late cancel into a StorageCorruptError that kills close(): no intent
+    lands, the runner's terminal stands, and close() reaches closed with
+    nothing marked cleanup_failed."""
+    db_path = tmp_path / "app.db"
+    _require_success(_upgrade_head(db_path))
+    gate = _Gate()
+    script = _Script().text("p1", "hello")
+    script.items.append(gate)  # opened -> the stream ends without a finish chunk: interrupted
+    provider = _ScriptedProvider([[script]])
+
+    async with _run_app(db_path, provider) as app:
+        session_id, run_ref = await _create_prompted(app.service)
+        await _await_run_status(app.service, run_ref.run_id, frozenset({RunStatusValue.RUNNING}))
+        await gate.entered.wait()
+        runner_task = app.service._tasks[run_ref.run_id][1]
+
+        async def _land() -> None:
+            gate.open()
+            await runner_task  # the runner's own terminal commit lands before the intent's CAS
+
+        probe = _TerminalLandsAfterStatusRead(app.database.engine, run_id=run_ref.run_id, land=_land)
+        monkeypatch.setattr(app.service, "_repos", probe)
+
+        await app.close()
+
+        assert probe.fired is True
+        assert app.service.closed is True
+        assert _event_data(db_path, session_id, "py.run.cancel_requested") == []
+        finished = _event_data(db_path, session_id, "py.run.finished")
+        assert [(event["run_id"], event["outcome"]) for event in finished] == [(run_ref.run_id, "interrupted")]
+        assert _run_status_value(db_path, run_ref.run_id) == "interrupted"
+        assert _session_status_value(db_path, session_id) == "active"  # no cleanup_failed
         assert provider.close_count == 1

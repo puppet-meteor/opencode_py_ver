@@ -3266,6 +3266,19 @@ class SessionService:
         scheduled runner commits concurrently and may have committed the
         terminal while we retried, and an intent must never land on a
         terminal run (late cancel never overwrites, §7 L335).
+
+        T-C3-020 (CI 45031014521): inside one attempt the watermark is read
+        FIRST and ``runs.status`` LAST, so the status read is the final read
+        before the CAS. The runner's terminal is one store transaction (CAS +
+        event + the ``runs.status`` projection, §3.2): a terminal visible to
+        the status read is durable (the attempt returns above), and one that
+        commits after it moves the watermark, so the CAS raises ConflictError
+        and the retry re-checks the status. The reverse order read the
+        watermark AFTER the status, so a terminal landing in between passed
+        the CAS and reached the fold, which rejects the intent as an illegal
+        transition (StorageCorruptError, isolate=False) -- neither ``cancel``
+        nor the close lifecycle treats that as a late cancel, and close()
+        died in Phase 1 on CI.
         """
         if await self._cancel_intent_row(session_id, run_id):
             return
@@ -3276,12 +3289,12 @@ class SessionService:
         )
         conflict: ConflictError | None = None
         for _ in range(_COMMIT_ATTEMPTS):
+            expected_seq = await self._repos.log_high(session_id)
             status = await self._runs_status_value(run_id)
             if status is not None and status.is_terminal:
                 # The runner finished first; the caller re-reads and returns
                 # the original terminal status (no intent, no overwrite).
                 return
-            expected_seq = await self._repos.log_high(session_id)
             try:
                 committed = await self._store.commit(session_id, batch, expected_seq)
             except ConflictError as error:
